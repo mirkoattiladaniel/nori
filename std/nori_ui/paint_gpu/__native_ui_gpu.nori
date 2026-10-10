@@ -1,0 +1,1461 @@
+// std/nori_ui/paint_gpu/__native_ui_gpu.nori: the `ui_gpu_*` seam of ui_gpu.nori, in Nori, for a program
+// built with `noric --build --native` (linked when the program uses a `ui_gpu_*` symbol; see std/native_seams).
+// It draws what ui_gpu_glue.c draws (the same WGSL, pipelines, instance layouts, batching cuts and
+// readbacks) through the same wgpu-native C API, called with no C in between.
+//
+// The `__` prefix keeps this file out of what `import "std/nori_ui"` gathers from the directory. It is a
+// runtime-floor module, built with `--runtime --cfg native` and linked beside the native runtime.
+//
+// libwgpu_native.so (wgpu_native.dll on Windows) is opened when the first canvas is made, found the way
+// the system's loader finds any library (LD_LIBRARY_PATH or the executable's directory and PATH). Without it a canvas is made
+// with no device, and `ui_gpu_ok` answers 0, which is what ui_gpu_glue.c answers on a machine with no GPU and
+// what ui_gpu_absent.c always answers, so a CPU-only program needs neither the library nor a flag.
+// Every wgpu function is called through a `CFn` pointer of its C signature; the three callback-info
+// structs travel by value, and the callbacks are `cfn_addr` entries.
+//
+// On Linux windowed canvases answer like a machine with no GPU. A wgpu surface is made from an Xlib
+// `Display*` or a libwayland `wl_display*`/`wl_surface*`, and std/window's native backends speak X11 and
+// Wayland over their sockets without either library, so they hold no such object to hand over. On
+// Windows a window is an HWND, which is all a surface needs: those canvases draw and present.
+
+extern fn malloc(Int) -> Int
+extern fn calloc(Int, Int) -> Int
+extern fn realloc(Int, Int) -> Int
+extern fn free(Int)
+extern fn memcpy(Int, Int, Int) -> Int
+extern fn memset(Int, Int, Int) -> Int
+extern fn write(Int, Int, Int) -> Int
+extern fn nori_cstr(Int) -> Int
+extern fn nori_str_ptr(Int) -> Int
+// the loader: dlopen on Linux, LoadLibraryA on Windows (wgpu_native.dll beside the executable or on PATH)
+cfg(linux) {
+extern fn dlopen(Int, Int) -> Int from "libc.so.6"
+extern fn dlsym(Int, Int) -> Int from "libc.so.6"
+fn ngu_lib_name() -> Str { return "libwgpu_native.so" }
+fn ngu_open(path: Int) -> Int { var h = 0  unsafe { h = dlopen(path, 2) }  return h }   // RTLD_NOW
+fn ngu_sym(lib: Int, name: Int) -> Int { var f = 0  unsafe { f = dlsym(lib, name) }  return f }
+}
+cfg(windows) {
+extern fn LoadLibraryA(Int) -> Int from "kernel32.dll"
+extern fn GetProcAddress(Int, Int) -> Int from "kernel32.dll"
+fn ngu_lib_name() -> Str { return "wgpu_native.dll" }
+fn ngu_open(path: Int) -> Int { var h = 0  unsafe { h = LoadLibraryA(path) }  return h }
+fn ngu_sym(lib: Int, name: Int) -> Int { var f = 0  unsafe { f = GetProcAddress(lib, name) }  return f }
+}
+
+// ---- wgpu layout (generated from the wgpu headers) ----
+fn wgk_SZ_STRINGVIEW() -> Int { return 16 }
+fn wgk_CH_STYPE() -> Int { return 8 }
+fn wgk_SZ_WGSL() -> Int { return 32 }
+fn wgk_WGSL_CODE() -> Int { return 16 }
+fn wgk_SZ_SMD() -> Int { return 24 }
+fn wgk_SMD_NEXT() -> Int { return 0 }
+fn wgk_SZ_BGLE() -> Int { return 120 }
+fn wgk_BGLE_BINDING() -> Int { return 8 }
+fn wgk_BGLE_VIS() -> Int { return 16 }
+fn wgk_BGLE_BUF_TYPE() -> Int { return 40 }
+fn wgk_BGLE_SAMP_TYPE() -> Int { return 64 }
+fn wgk_BGLE_TEX_SAMPLE() -> Int { return 80 }
+fn wgk_BGLE_TEX_DIM() -> Int { return 84 }
+fn wgk_SZ_BGLD() -> Int { return 40 }
+fn wgk_BGLD_COUNT() -> Int { return 24 }
+fn wgk_BGLD_ENTRIES() -> Int { return 32 }
+fn wgk_SZ_BUFD() -> Int { return 48 }
+fn wgk_BUFD_USAGE() -> Int { return 24 }
+fn wgk_BUFD_SIZE() -> Int { return 32 }
+fn wgk_SZ_BGE() -> Int { return 56 }
+fn wgk_BGE_BINDING() -> Int { return 8 }
+fn wgk_BGE_BUFFER() -> Int { return 16 }
+fn wgk_BGE_SIZE() -> Int { return 32 }
+fn wgk_BGE_SAMPLER() -> Int { return 40 }
+fn wgk_BGE_VIEW() -> Int { return 48 }
+fn wgk_SZ_BGD() -> Int { return 48 }
+fn wgk_BGD_LAYOUT() -> Int { return 24 }
+fn wgk_BGD_COUNT() -> Int { return 32 }
+fn wgk_BGD_ENTRIES() -> Int { return 40 }
+fn wgk_SZ_SAMPD() -> Int { return 64 }
+fn wgk_SAMPD_AU() -> Int { return 24 }
+fn wgk_SAMPD_AV() -> Int { return 28 }
+fn wgk_SAMPD_AW() -> Int { return 32 }
+fn wgk_SAMPD_MAG() -> Int { return 36 }
+fn wgk_SAMPD_MIN() -> Int { return 40 }
+fn wgk_SAMPD_MIP() -> Int { return 44 }
+fn wgk_SAMPD_ANISO() -> Int { return 60 }
+fn wgk_SZ_BLEND() -> Int { return 24 }
+fn wgk_BLEND_COP() -> Int { return 0 }
+fn wgk_BLEND_CSRC() -> Int { return 4 }
+fn wgk_BLEND_CDST() -> Int { return 8 }
+fn wgk_BLEND_AOP() -> Int { return 12 }
+fn wgk_BLEND_ASRC() -> Int { return 16 }
+fn wgk_BLEND_ADST() -> Int { return 20 }
+fn wgk_SZ_CTS() -> Int { return 32 }
+fn wgk_CTS_FORMAT() -> Int { return 8 }
+fn wgk_CTS_BLEND() -> Int { return 16 }
+fn wgk_CTS_MASK() -> Int { return 24 }
+fn wgk_SZ_VATTR() -> Int { return 32 }
+fn wgk_VATTR_FORMAT() -> Int { return 8 }
+fn wgk_VATTR_OFFSET() -> Int { return 16 }
+fn wgk_VATTR_LOC() -> Int { return 24 }
+fn wgk_SZ_VBL() -> Int { return 40 }
+fn wgk_VBL_STEP() -> Int { return 8 }
+fn wgk_VBL_STRIDE() -> Int { return 16 }
+fn wgk_VBL_COUNT() -> Int { return 24 }
+fn wgk_VBL_ATTRS() -> Int { return 32 }
+fn wgk_SZ_PLD() -> Int { return 48 }
+fn wgk_PLD_COUNT() -> Int { return 24 }
+fn wgk_PLD_LAYOUTS() -> Int { return 32 }
+fn wgk_SZ_RPD() -> Int { return 168 }
+fn wgk_RPD_LAYOUT() -> Int { return 24 }
+fn wgk_RPD_VMODULE() -> Int { return 40 }
+fn wgk_RPD_VENTRY() -> Int { return 48 }
+fn wgk_RPD_VBCOUNT() -> Int { return 80 }
+fn wgk_RPD_VBUFS() -> Int { return 88 }
+fn wgk_RPD_TOPO() -> Int { return 104 }
+fn wgk_RPD_MSCOUNT() -> Int { return 144 }
+fn wgk_RPD_MSMASK() -> Int { return 148 }
+fn wgk_RPD_FRAGMENT() -> Int { return 160 }
+fn wgk_SZ_FS() -> Int { return 64 }
+fn wgk_FS_MODULE() -> Int { return 8 }
+fn wgk_FS_ENTRY() -> Int { return 16 }
+fn wgk_FS_TCOUNT() -> Int { return 48 }
+fn wgk_FS_TARGETS() -> Int { return 56 }
+fn wgk_SZ_RAO() -> Int { return 32 }
+fn wgk_RAO_SURFACE() -> Int { return 24 }
+fn wgk_SZ_CBINFO() -> Int { return 40 }
+fn wgk_CBINFO_MODE() -> Int { return 8 }
+fn wgk_CBINFO_CB() -> Int { return 16 }
+fn wgk_CBINFO_U1() -> Int { return 24 }
+fn wgk_SZ_DEVCBINFO_SAME() -> Int { return 1 }
+fn wgk_SZ_SUPFEAT() -> Int { return 16 }
+fn wgk_SUPFEAT_COUNT() -> Int { return 0 }
+fn wgk_SUPFEAT_LIST() -> Int { return 8 }
+fn wgk_SZ_LIMITS() -> Int { return 152 }
+fn wgk_SZ_DEVD() -> Int { return 144 }
+fn wgk_DEVD_FCOUNT() -> Int { return 24 }
+fn wgk_DEVD_FEATURES() -> Int { return 32 }
+fn wgk_DEVD_LIMITS() -> Int { return 40 }
+fn wgk_SZ_TEXD() -> Int { return 80 }
+fn wgk_TEXD_USAGE() -> Int { return 24 }
+fn wgk_TEXD_DIM() -> Int { return 32 }
+fn wgk_TEXD_W() -> Int { return 36 }
+fn wgk_TEXD_H() -> Int { return 40 }
+fn wgk_TEXD_DEPTH() -> Int { return 44 }
+fn wgk_TEXD_FORMAT() -> Int { return 48 }
+fn wgk_TEXD_MIPS() -> Int { return 52 }
+fn wgk_TEXD_SAMPLES() -> Int { return 56 }
+fn wgk_SZ_XLIB() -> Int { return 32 }
+fn wgk_XLIB_DISPLAY() -> Int { return 16 }
+fn wgk_XLIB_WINDOW() -> Int { return 24 }
+fn wgk_SZ_WLSRC() -> Int { return 32 }
+fn wgk_WLSRC_DISPLAY() -> Int { return 16 }
+fn wgk_WLSRC_SURFACE() -> Int { return 24 }
+fn wgk_SZ_SURFD() -> Int { return 24 }
+fn wgk_SURFD_NEXT() -> Int { return 0 }
+fn wgk_SZ_CAPS() -> Int { return 64 }
+fn wgk_CAPS_FCOUNT() -> Int { return 16 }
+fn wgk_CAPS_FORMATS() -> Int { return 24 }
+fn wgk_SZ_SURFCFG() -> Int { return 64 }
+fn wgk_SURFCFG_DEVICE() -> Int { return 8 }
+fn wgk_SURFCFG_FORMAT() -> Int { return 16 }
+fn wgk_SURFCFG_USAGE() -> Int { return 24 }
+fn wgk_SURFCFG_W() -> Int { return 32 }
+fn wgk_SURFCFG_H() -> Int { return 36 }
+fn wgk_SURFCFG_ALPHA() -> Int { return 56 }
+fn wgk_SURFCFG_PRESENT() -> Int { return 60 }
+fn wgk_SZ_TCTI() -> Int { return 32 }
+fn wgk_TCTI_TEXTURE() -> Int { return 0 }
+fn wgk_TCTI_ASPECT() -> Int { return 24 }
+fn wgk_SZ_TCBL() -> Int { return 16 }
+fn wgk_TCBL_BPR() -> Int { return 8 }
+fn wgk_TCBL_RPI() -> Int { return 12 }
+fn wgk_SZ_TCBI() -> Int { return 24 }
+fn wgk_TCBI_BPR() -> Int { return 8 }
+fn wgk_TCBI_RPI() -> Int { return 12 }
+fn wgk_TCBI_BUFFER() -> Int { return 16 }
+fn wgk_SZ_EXT() -> Int { return 12 }
+fn wgk_SZ_RPCA() -> Int { return 72 }
+fn wgk_RPCA_VIEW() -> Int { return 8 }
+fn wgk_RPCA_SLICE() -> Int { return 16 }
+fn wgk_RPCA_LOAD() -> Int { return 32 }
+fn wgk_RPCA_STORE() -> Int { return 36 }
+fn wgk_RPCA_CLEAR() -> Int { return 40 }
+fn wgk_SZ_RPASSD() -> Int { return 64 }
+fn wgk_RPASSD_COUNT() -> Int { return 24 }
+fn wgk_RPASSD_ATTS() -> Int { return 32 }
+fn wgk_SZ_SURFTEX() -> Int { return 24 }
+fn wgk_SURFTEX_TEX() -> Int { return 8 }
+fn wgk_SURFTEX_STATUS() -> Int { return 16 }
+fn wgk_STYPE_WGSL() -> Int { return 2 }
+fn wgk_STYPE_XLIB() -> Int { return 6 }
+fn wgk_STYPE_WAYLAND() -> Int { return 7 }
+fn wgk_STAGE_VERTEX() -> Int { return 1 }
+fn wgk_STAGE_FRAGMENT() -> Int { return 2 }
+fn wgk_BUFBIND_UNIFORM() -> Int { return 2 }
+fn wgk_TEXSAMPLE_FLOAT() -> Int { return 2 }
+fn wgk_VIEWDIM_2D() -> Int { return 2 }
+fn wgk_SAMPBIND_FILTERING() -> Int { return 2 }
+fn wgk_BUFUSE_UNIFORM() -> Int { return 64 }
+fn wgk_BUFUSE_COPYDST() -> Int { return 8 }
+fn wgk_BUFUSE_MAPREAD() -> Int { return 1 }
+fn wgk_BUFUSE_VERTEX() -> Int { return 32 }
+fn wgk_ADDR_CLAMP() -> Int { return 1 }
+fn wgk_FILTER_NEAREST() -> Int { return 1 }
+fn wgk_FILTER_LINEAR() -> Int { return 2 }
+fn wgk_MIPFILTER_NEAREST() -> Int { return 1 }
+fn wgk_MIPFILTER_LINEAR() -> Int { return 2 }
+fn wgk_BLENDOP_ADD() -> Int { return 1 }
+fn wgk_BLEND_SRCALPHA() -> Int { return 5 }
+fn wgk_BLEND_ONEMINUSSRCALPHA() -> Int { return 6 }
+fn wgk_BLEND_ONE() -> Int { return 2 }
+fn wgk_COLORWRITE_ALL() -> Int { return 15 }
+fn wgk_VFMT_F32X4() -> Int { return 31 }
+fn wgk_VFMT_F32X2() -> Int { return 29 }
+fn wgk_STEP_INSTANCE() -> Int { return 2 }
+fn wgk_TOPO_TRIANGLES() -> Int { return 4 }
+fn wgk_CBMODE_ALLOW_PROCESS() -> Int { return 2 }
+fn wgk_ADAPTER_SUCCESS() -> Int { return 1 }
+fn wgk_DEVICE_SUCCESS() -> Int { return 1 }
+fn wgk_MAP_SUCCESS() -> Int { return 1 }
+fn wgk_STATUS_SUCCESS() -> Int { return 1 }
+fn wgk_FEATURE_RW_STORAGE() -> Int { return 196610 }
+fn wgk_TEXUSE_RENDER() -> Int { return 16 }
+fn wgk_TEXUSE_COPYSRC() -> Int { return 1 }
+fn wgk_TEXUSE_BINDING() -> Int { return 4 }
+fn wgk_TEXUSE_COPYDST() -> Int { return 2 }
+fn wgk_TEXDIM_2D() -> Int { return 2 }
+fn wgk_FMT_RGBA8() -> Int { return 22 }
+fn wgk_FMT_BGRA8() -> Int { return 27 }
+fn wgk_FMT_R8() -> Int { return 1 }
+fn wgk_PRESENT_FIFO() -> Int { return 1 }
+fn wgk_ALPHA_AUTO() -> Int { return 0 }
+fn wgk_ASPECT_ALL() -> Int { return 1 }
+fn wgk_LOAD_CLEAR() -> Int { return 2 }
+fn wgk_STORE_STORE() -> Int { return 1 }
+fn wgk_DEPTH_SLICE_UNDEFINED() -> Int { return 4294967295 }
+fn wgk_SURFTEX_OPTIMAL() -> Int { return 1 }
+fn wgk_SURFTEX_SUBOPTIMAL() -> Int { return 2 }
+fn wgk_MAPMODE_READ() -> Int { return 1 }
+// ---- end of wgpu layout ----
+
+// ---- the library ---------------------------------------------------------------------------------
+
+// `WGPUStringView` and the callback-info structs, which cross the C ABI by value.
+cstruct NguSv { data: Int, len: Int }
+cstruct NguCbInfo { next: Int, mode: I32, cb: Int, u1: Int, u2: Int }
+cstruct NguCaps { next: Int, usages: Int, fcount: Int, formats: Int, pcount: Int, pmodes: Int, acount: Int, amodes: Int }
+
+global g_ngu_lib: Int = 0
+global g_ngu_tried: Int = 0
+global g_ngu_tab: Int = 0          // one resolved address per NGU_* slot below
+
+fn NGU_NAMES() -> Str {
+    return "wgpuCreateInstance wgpuInstanceRequestAdapter wgpuAdapterRequestDevice wgpuAdapterGetFeatures " +
+        "wgpuAdapterGetLimits wgpuDeviceGetQueue wgpuDeviceCreateShaderModule wgpuDeviceCreateBindGroupLayout " +
+        "wgpuDeviceCreateBuffer wgpuDeviceCreateBindGroup wgpuDeviceCreateSampler wgpuDeviceCreatePipelineLayout " +
+        "wgpuDeviceCreateRenderPipeline wgpuShaderModuleRelease wgpuTextureViewRelease wgpuTextureRelease " +
+        "wgpuBufferRelease wgpuDeviceCreateTexture wgpuTextureCreateView wgpuBindGroupRelease " +
+        "wgpuQueueWriteTexture wgpuRenderPassEncoderSetPipeline wgpuRenderPassEncoderSetBindGroup " +
+        "wgpuRenderPassEncoderSetVertexBuffer wgpuRenderPassEncoderDraw wgpuQueueWriteBuffer " +
+        "wgpuDeviceCreateCommandEncoder wgpuCommandEncoderBeginRenderPass wgpuRenderPassEncoderEnd " +
+        "wgpuRenderPassEncoderRelease wgpuCommandEncoderFinish wgpuQueueSubmit wgpuCommandBufferRelease " +
+        "wgpuCommandEncoderRelease wgpuDevicePoll wgpuCommandEncoderCopyTextureToBuffer wgpuBufferMapAsync " +
+        "wgpuBufferGetConstMappedRange wgpuBufferUnmap wgpuRenderPipelineRelease wgpuSamplerRelease " +
+        "wgpuBindGroupLayoutRelease wgpuDeviceRelease wgpuAdapterRelease wgpuInstanceRelease " +
+        "wgpuSurfaceRelease "
+}
+fn NGU_COUNT() -> Int { return 46 }
+
+// open libwgpu_native.so and resolve every function above: 1 when all of them are there
+fn ngu_load() -> Int {
+    if g_ngu_tried == 1 { if g_ngu_lib != 0 { return 1 }  return 0 }
+    g_ngu_tried = 1
+    let path = nori_cstr(ngu_lib_name())
+    let lib = ngu_open(path)
+    free(path)
+    if lib == 0 { return 0 }
+    let names = NGU_NAMES()
+    let np = nori_str_ptr(names)
+    let tab = calloc(NGU_COUNT(), 8)
+    let buf = malloc(64)
+    var slot = 0
+    var st = 0
+    var i = 0
+    while i < names.len() {
+        if peek8(np + i) == 32 {
+            memcpy(buf, np + st, i - st)
+            poke8(buf + i - st, 0)
+            let f = ngu_sym(lib, buf)
+            if f == 0 { free(buf)  free(tab)  return 0 }
+            poke(tab + slot * 8, f)
+            slot = slot + 1
+            st = i + 1
+        }
+        i = i + 1
+    }
+    free(buf)
+    g_ngu_tab = tab
+    g_ngu_lib = lib
+    return 1
+}
+
+fn ngu_fn(slot: Int) -> Int { return peek(g_ngu_tab + slot * 8) }
+
+// One wrapper per wgpu function, in NGU_NAMES order. A C `int`/`uint32_t` result is its low 32 bits.
+fn w_create_instance(desc: Int) -> Int { var r = 0  unsafe { let f: CFn(Int) -> Int = ngu_fn(0)  r = f(desc) }  return r }
+fn w_request_adapter(inst: Int, opt: Int, info: Int) { unsafe { let f: CFn(Int, Int, NguCbInfo) -> Int = ngu_fn(1)  let _r = f(inst, opt, info) } }
+fn w_request_device(ad: Int, desc: Int, info: Int) { unsafe { let f: CFn(Int, Int, NguCbInfo) -> Int = ngu_fn(2)  let _r = f(ad, desc, info) } }
+fn w_adapter_features(ad: Int, out: Int) { unsafe { let f: CFn(Int, Int) = ngu_fn(3)  f(ad, out) } }
+fn w_adapter_limits(ad: Int, out: Int) -> Int { var r = 0  unsafe { let f: CFn(Int, Int) -> I32 = ngu_fn(4)  r = f(ad, out) }  return r }
+fn w_device_queue(d: Int) -> Int { var r = 0  unsafe { let f: CFn(Int) -> Int = ngu_fn(5)  r = f(d) }  return r }
+fn w_create_shader(d: Int, desc: Int) -> Int { var r = 0  unsafe { let f: CFn(Int, Int) -> Int = ngu_fn(6)  r = f(d, desc) }  return r }
+fn w_create_bgl(d: Int, desc: Int) -> Int { var r = 0  unsafe { let f: CFn(Int, Int) -> Int = ngu_fn(7)  r = f(d, desc) }  return r }
+fn w_create_buffer(d: Int, desc: Int) -> Int { var r = 0  unsafe { let f: CFn(Int, Int) -> Int = ngu_fn(8)  r = f(d, desc) }  return r }
+fn w_create_bg(d: Int, desc: Int) -> Int { var r = 0  unsafe { let f: CFn(Int, Int) -> Int = ngu_fn(9)  r = f(d, desc) }  return r }
+fn w_create_sampler(d: Int, desc: Int) -> Int { var r = 0  unsafe { let f: CFn(Int, Int) -> Int = ngu_fn(10)  r = f(d, desc) }  return r }
+fn w_create_pl(d: Int, desc: Int) -> Int { var r = 0  unsafe { let f: CFn(Int, Int) -> Int = ngu_fn(11)  r = f(d, desc) }  return r }
+fn w_create_pipeline(d: Int, desc: Int) -> Int { var r = 0  unsafe { let f: CFn(Int, Int) -> Int = ngu_fn(12)  r = f(d, desc) }  return r }
+fn w_release(slot: Int, h: Int) { unsafe { let f: CFn(Int) = ngu_fn(slot)  f(h) } }
+fn w_shader_release(h: Int) { w_release(13, h) }
+fn w_view_release(h: Int) { w_release(14, h) }
+fn w_texture_release(h: Int) { w_release(15, h) }
+fn w_buffer_release(h: Int) { w_release(16, h) }
+fn w_create_texture(d: Int, desc: Int) -> Int { var r = 0  unsafe { let f: CFn(Int, Int) -> Int = ngu_fn(17)  r = f(d, desc) }  return r }
+fn w_create_view(t: Int, desc: Int) -> Int { var r = 0  unsafe { let f: CFn(Int, Int) -> Int = ngu_fn(18)  r = f(t, desc) }  return r }
+fn w_bg_release(h: Int) { w_release(19, h) }
+fn w_write_texture(q: Int, dst: Int, data: Int, size: Int, lay: Int, ext: Int) {
+    unsafe { let f: CFn(Int, Int, Int, Int, Int, Int) = ngu_fn(20)  f(q, dst, data, size, lay, ext) }
+}
+fn w_set_pipeline(p: Int, pipe: Int) { unsafe { let f: CFn(Int, Int) = ngu_fn(21)  f(p, pipe) } }
+fn w_set_bind_group(p: Int, idx: Int, bg: Int) { unsafe { let f: CFn(Int, I32, Int, Int, Int) = ngu_fn(22)  f(p, idx, bg, 0, 0) } }
+fn w_set_vertex_buffer(p: Int, slot: Int, buf: Int, off: Int, size: Int) { unsafe { let f: CFn(Int, I32, Int, Int, Int) = ngu_fn(23)  f(p, slot, buf, off, size) } }
+fn w_draw(p: Int, verts: Int, insts: Int) { unsafe { let f: CFn(Int, I32, I32, I32, I32) = ngu_fn(24)  f(p, verts, insts, 0, 0) } }
+fn w_write_buffer(q: Int, buf: Int, off: Int, data: Int, size: Int) { unsafe { let f: CFn(Int, Int, Int, Int, Int) = ngu_fn(25)  f(q, buf, off, data, size) } }
+fn w_create_encoder(d: Int) -> Int { var r = 0  unsafe { let f: CFn(Int, Int) -> Int = ngu_fn(26)  r = f(d, 0) }  return r }
+fn w_begin_pass(enc: Int, desc: Int) -> Int { var r = 0  unsafe { let f: CFn(Int, Int) -> Int = ngu_fn(27)  r = f(enc, desc) }  return r }
+fn w_pass_end(p: Int) { w_release(28, p) }
+fn w_pass_release(p: Int) { w_release(29, p) }
+fn w_encoder_finish(enc: Int) -> Int { var r = 0  unsafe { let f: CFn(Int, Int) -> Int = ngu_fn(30)  r = f(enc, 0) }  return r }
+fn w_submit(q: Int, cmd: Int) {
+    let cellp = malloc(8)
+    poke(cellp, cmd)
+    unsafe { let f: CFn(Int, Int, Int) = ngu_fn(31)  f(q, 1, cellp) }
+    free(cellp)
+}
+fn w_cmdbuf_release(h: Int) { w_release(32, h) }
+fn w_encoder_release(h: Int) { w_release(33, h) }
+fn w_poll(d: Int) { unsafe { let f: CFn(Int, I32, Int) -> I32 = ngu_fn(34)  let _r = f(d, 1, 0) } }
+fn w_copy_tex_to_buf(enc: Int, src: Int, dst: Int, ext: Int) { unsafe { let f: CFn(Int, Int, Int, Int) = ngu_fn(35)  f(enc, src, dst, ext) } }
+fn w_map_async(buf: Int, mode: Int, off: Int, size: Int, info: Int) { unsafe { let f: CFn(Int, Int, Int, Int, NguCbInfo) -> Int = ngu_fn(36)  let _r = f(buf, mode, off, size, info) } }
+fn w_mapped_range(buf: Int, off: Int, size: Int) -> Int { var r = 0  unsafe { let f: CFn(Int, Int, Int) -> Int = ngu_fn(37)  r = f(buf, off, size) }  return r }
+fn w_unmap(buf: Int) { w_release(38, buf) }
+fn w_pipeline_release(h: Int) { w_release(39, h) }
+fn w_sampler_release(h: Int) { w_release(40, h) }
+fn w_bgl_release(h: Int) { w_release(41, h) }
+fn w_device_release(h: Int) { w_release(42, h) }
+fn w_adapter_release(h: Int) { w_release(43, h) }
+fn w_instance_release(h: Int) { w_release(44, h) }
+fn w_surface_release(h: Int) { w_release(45, h) }
+
+// ---- the callbacks -------------------------------------------------------------------------------
+
+fn ngu_stderr_sv(prefix: Str, data: Int, len: Int) {
+    let _a = write(2, nori_str_ptr(prefix), prefix.len())
+    if data != 0 && len > 0 { let _b = write(2, data, len) }
+    let nl = "\n"
+    let _c = write(2, nori_str_ptr(nl), 1)
+}
+
+// (status, adapter, message, userdata1, userdata2): the adapter lands in the slot userdata1 points at
+fn ngu_on_adapter(status: I32, adapter: Int, msg_a: NguSv, u1: Int, u2: Int) {
+    let s: Int = status
+    if s == wgk_ADAPTER_SUCCESS() { poke(u1, adapter) } else { ngu_stderr_sv("ui_gpu: adapter failed: ", msg_a.data, msg_a.len) }
+}
+fn ngu_on_device(status: I32, device: Int, msg_d: NguSv, u1: Int, u2: Int) {
+    let s: Int = status
+    if s == wgk_DEVICE_SUCCESS() { poke(u1, device) } else { ngu_stderr_sv("ui_gpu: device failed: ", msg_d.data, msg_d.len) }
+}
+// (status, message, userdata1, userdata2): userdata1 is the map cell: status in the low byte, 256 once
+// the callback ran
+fn ngu_on_map(status: I32, msg_m: NguSv, u1: Int, u2: Int) {
+    let s: Int = status
+    poke(u1, (s & 255) + 256)
+}
+
+global g_ngu_map: Int = 0          // the map cell every readback waits on
+fn ngu_mapped() -> Int { if peek(g_ngu_map) >= 256 { return 1 }  return 0 }
+fn ngu_map_ok() -> Int { if peek(g_ngu_map) == wgk_MAP_SUCCESS() + 256 { return 1 }  return 0 }
+
+// a zeroed callback-info block for `cb`, carrying `u1`
+fn ngu_cbinfo(cb: Int, u1: Int) -> Int {
+    let info: NguCbInfo = calloc(1, sizeof(NguCbInfo))
+    info.mode = wgk_CBMODE_ALLOW_PROCESS()
+    info.cb = cb
+    info.u1 = u1
+    return info
+}
+
+// ---- the context ---------------------------------------------------------------------------------
+
+cstruct NguCtx {
+    instance: Int, adapter: Int, device: Int, queue: Int,
+    offscreen: Int, surface: Int, format: Int,
+    target: Int, targetView: Int, readbuf: Int, rb_bpr: Int, rbuf2: Int, rb_cur: Int, rb_pending: Int,
+    w: Int, h: Int,
+    rectPipe: Int, textPipe: Int, imagePipe: Int, ubgl: Int, tbgl: Int, ubo: Int, ubg: Int,
+    samp: Int, sampLinear: Int,
+    rectData: Int, rectCount: Int, rectCap: Int, glyphData: Int, glyphCount: Int, glyphCap: Int,
+    rectBuf: Int, rectBufCap: Int, glyphBuf: Int, glyphBufCap: Int,
+    atlasTex: Int, atlasView: Int, atlasBG: Int, atlasW: Int, atlasH: Int, atlasGen: Int,
+    colorTex: Int, colorView: Int, colorW: Int, colorH: Int, tbgl3: Int,
+    imgData: Int, imgCount: Int, imgCap: Int, imgRes: Int,
+    cuts: Int, cutCount: Int, cutCap: Int, cutGlyph: Int,
+    imgBuf: Int, imgBufCap: Int,
+    clearR: F64, clearG: F64, clearB: F64,
+    clip0: F64, clip1: F64, clip2: F64, clip3: F64
+}
+
+fn RECT_FLOATS() -> Int { return 22 }    // rect(4) color(4) radius,border(2) clip(4) gradient-to(4) gradient-params(4)
+fn GLYPH_FLOATS() -> Int { return 24 }   // rect(4) uv(4) color(4) clip(4) gradient-to(4) gradient-params(4)
+fn IMG_FLOATS() -> Int { return 16 }     // rect(4) tint(4) clip(4) prm(4: flip_v, opaque, 0, 0)
+fn IMGRES_SIZE() -> Int { return 48 }    // tex, view, bg, owned, rectAt, glyphAt
+fn CUT_SIZE() -> Int { return 24 }       // rectAt, glyphAt, img
+
+// a WGPUStringView over the bytes of `s`, written at `p`
+fn ngu_sv(p: Int, s: Str) { poke(p, nori_str_ptr(s))  poke(p + 8, s.len()) }
+
+fn SHADER() -> Str {
+    return "struct U { vp: vec2<f32>, atlas: vec2<f32> };\n" +
+    "@group(0) @binding(0) var<uniform> u: U;\n" +
+    "var<private> CORNERS: array<vec2<f32>,6> = array<vec2<f32>,6>(\n" +
+    "  vec2<f32>(0.,0.), vec2<f32>(1.,0.), vec2<f32>(0.,1.),\n" +
+    "  vec2<f32>(0.,1.), vec2<f32>(1.,0.), vec2<f32>(1.,1.));\n" +
+    "struct RIn { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32>, @location(2) prm: vec2<f32>,\n" +
+    "             @location(3) clip: vec4<f32>, @location(4) gto: vec4<f32>, @location(5) gprm: vec4<f32> };\n" +
+    "struct RVO { @builtin(position) pos: vec4<f32>, @location(0) local: vec2<f32>,\n" +
+    "             @location(1) half: vec2<f32>, @location(2) color: vec4<f32>, @location(3) prm: vec2<f32>,\n" +
+    "             @location(4) clip: vec4<f32>, @location(5) gto: vec4<f32>, @location(6) gprm: vec4<f32> };\n" +
+    "@vertex fn rect_vs(@builtin(vertex_index) vi: u32, in: RIn) -> RVO {\n" +
+    "  let c = CORNERS[vi];\n" +
+    "  let px = in.rect.xy + c * in.rect.zw;\n" +
+    "  let ndc = vec2<f32>(px.x / u.vp.x * 2. - 1., 1. - px.y / u.vp.y * 2.);\n" +
+    "  var o: RVO; o.pos = vec4<f32>(ndc, 0., 1.);\n" +
+    "  o.half = in.rect.zw * 0.5;\n" +
+    "  o.local = (c - vec2<f32>(0.5, 0.5)) * in.rect.zw;\n" +
+    "  o.color = in.color; o.prm = in.prm; o.clip = in.clip; o.gto = in.gto; o.gprm = in.gprm; return o;\n" +
+    "}\n" +
+    "fn sd_round(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {\n" +
+    "  let q = abs(p) - b + vec2<f32>(r, r);\n" +
+    "  return min(max(q.x, q.y), 0.) + length(max(q, vec2<f32>(0., 0.))) - r;\n" +
+    "}\n" +
+    "fn clip_mask(pos: vec2<f32>, cl: vec4<f32>) -> f32 {\n" +
+    "  let p = floor(pos);\n" +
+    "  if (p.x < cl.x || p.y < cl.y || p.x >= cl.z || p.y >= cl.w) { return 0.0; }\n" +
+    "  return 1.0;\n" +
+    "}\n" +
+    "@fragment fn rect_fs(in: RVO) -> @location(0) vec4<f32> {\n" +
+    "  let r = min(in.prm.x, min(in.half.x, in.half.y));\n" +
+    "  let d = sd_round(in.local, in.half, r);\n" +
+    "  var cov: f32;\n" +
+    "  if (in.prm.y > 0.5) {\n" +
+    "    let dd = abs(d + in.prm.y * 0.5) - in.prm.y * 0.5;\n" +
+    "    cov = 1.0 - smoothstep(-0.5, 0.5, dd);\n" +
+    "  } else {\n" +
+    "    cov = 1.0 - smoothstep(-0.5, 0.5, d);\n" +
+    "  }\n" +
+    "  cov = cov * clip_mask(in.pos.xy, in.clip);\n" +
+    "  var col = in.color;\n" +
+    "  if (in.gprm.w > 0.5) {\n" +
+    "    var q = in.pos.y;\n" +
+    "    if (in.gprm.z > 0.5) { q = in.pos.x; }\n" +
+    "    let t = clamp((q - in.gprm.x) / max(in.gprm.y, 1.0), 0.0, 1.0);\n" +
+    "    col = mix(in.color, in.gto, t);\n" +
+    "  }\n" +
+    "  return vec4<f32>(col.rgb, col.a * cov);\n" +
+    "}\n" +
+    "@group(1) @binding(0) var atlas_tex: texture_2d<f32>;\n" +
+    "@group(1) @binding(1) var atlas_samp: sampler;\n" +
+    "struct GIn { @location(0) rect: vec4<f32>, @location(1) uv: vec4<f32>, @location(2) color: vec4<f32>,\n" +
+    "             @location(3) clip: vec4<f32>, @location(4) gto: vec4<f32>, @location(5) gprm: vec4<f32> };\n" +
+    "struct GVO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32>,\n" +
+    "             @location(2) clip: vec4<f32>, @location(3) gto: vec4<f32>, @location(4) gprm: vec4<f32> };\n" +
+    "@vertex fn text_vs(@builtin(vertex_index) vi: u32, in: GIn) -> GVO {\n" +
+    "  let c = CORNERS[vi];\n" +
+    "  let px = in.rect.xy + c * in.rect.zw;\n" +
+    "  let ndc = vec2<f32>(px.x / u.vp.x * 2. - 1., 1. - px.y / u.vp.y * 2.);\n" +
+    "  var o: GVO; o.pos = vec4<f32>(ndc, 0., 1.);\n" +
+    "  o.uv = (in.uv.xy + c * in.uv.zw) / u.atlas;\n" +
+    "  o.color = in.color; o.clip = in.clip; o.gto = in.gto; o.gprm = in.gprm; return o;\n" +
+    "}\n" +
+    "@group(1) @binding(2) var color_tex: texture_2d<f32>;\n" +
+    "@fragment fn text_fs(in: GVO) -> @location(0) vec4<f32> {\n" +
+    "  let m = clip_mask(in.pos.xy, in.clip);\n" +
+    "  let cov = textureSample(atlas_tex, atlas_samp, in.uv).r * m;\n" +
+    "  let rgba = textureSample(color_tex, atlas_samp, in.uv);\n" +
+    "  if (in.gprm.w > 1.5) {\n" +
+    "    if (rgba.a <= 0.0) { return vec4<f32>(0., 0., 0., 0.); }\n" +
+    "    return vec4<f32>(rgba.rgb / rgba.a, rgba.a * in.color.a * m);\n" +
+    "  }\n" +
+    "  var col = in.color;\n" +
+    "  if (in.gprm.w > 0.5) {\n" +
+    "    var q = in.pos.y;\n" +
+    "    if (in.gprm.z > 0.5) { q = in.pos.x; }\n" +
+    "    let t = clamp((q - in.gprm.x) / max(in.gprm.y, 1.0), 0.0, 1.0);\n" +
+    "    col = mix(in.color, in.gto, t);\n" +
+    "  }\n" +
+    "  return vec4<f32>(col.rgb, col.a * cov);\n" +
+    "}\n" +
+    "struct IIn { @location(0) rect: vec4<f32>, @location(1) tint: vec4<f32>, @location(2) clip: vec4<f32>,\n" +
+    "             @location(3) prm: vec4<f32> };\n" +
+    "struct IVO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) tint: vec4<f32>,\n" +
+    "             @location(2) clip: vec4<f32>, @location(3) prm: vec4<f32> };\n" +
+    "@vertex fn img_vs(@builtin(vertex_index) vi: u32, in: IIn) -> IVO {\n" +
+    "  let c = CORNERS[vi];\n" +
+    "  let px = in.rect.xy + c * in.rect.zw;\n" +
+    "  let ndc = vec2<f32>(px.x / u.vp.x * 2. - 1., 1. - px.y / u.vp.y * 2.);\n" +
+    "  var uv = c;\n" +
+    "  if (in.prm.x > 0.5) { uv = vec2<f32>(c.x, 1. - c.y); }\n" +
+    "  var o: IVO; o.pos = vec4<f32>(ndc, 0., 1.); o.uv = uv; o.tint = in.tint; o.clip = in.clip; o.prm = in.prm; return o;\n" +
+    "}\n" +
+    "@fragment fn img_fs(in: IVO) -> @location(0) vec4<f32> {\n" +
+    "  let t = textureSample(atlas_tex, atlas_samp, in.uv);\n" +
+    "  var a = t.a;\n" +
+    "  if (in.prm.y > 0.5) { a = 1.0; }\n" +
+    "  return vec4<f32>(t.rgb, a * in.tint.a * clip_mask(in.pos.xy, in.clip));\n" +
+    "}\n"
+}
+
+// ---- pipelines -----------------------------------------------------------------------------------
+
+// a vertex attribute `i` of the array at `arr`: Float32x4 unless `two`, at byte `off`, location `i`
+fn ngu_attr(arr: Int, i: Int, off: Int, two: Int) {
+    let a = arr + i * wgk_SZ_VATTR()
+    if two == 1 { poke32(a + wgk_VATTR_FORMAT(), wgk_VFMT_F32X2()) } else { poke32(a + wgk_VATTR_FORMAT(), wgk_VFMT_F32X4()) }
+    poke(a + wgk_VATTR_OFFSET(), off)
+    poke32(a + wgk_VATTR_LOC(), i)
+}
+
+// one instanced pipeline over the shader module: `vs`/`fs` entry points, `nattr` attributes at `attrs`,
+// `stride` bytes per instance, bind group layouts `layouts` (`nlayouts` of them), colour target `cts`
+fn ngu_pipeline(c: NguCtx, sm: Int, vs: Str, fs: Str, attrs: Int, nattr: Int, stride: Int, layouts: Int, nlayouts: Int, cts: Int) -> Int {
+    let vb = calloc(1, wgk_SZ_VBL())
+    poke32(vb + wgk_VBL_STEP(), wgk_STEP_INSTANCE())
+    poke(vb + wgk_VBL_STRIDE(), stride)
+    poke(vb + wgk_VBL_COUNT(), nattr)
+    poke(vb + wgk_VBL_ATTRS(), attrs)
+    let pld = calloc(1, wgk_SZ_PLD())
+    poke(pld + wgk_PLD_COUNT(), nlayouts)
+    poke(pld + wgk_PLD_LAYOUTS(), layouts)
+    let layout = w_create_pl(c.device, pld)
+    let rpd = calloc(1, wgk_SZ_RPD())
+    poke(rpd + wgk_RPD_LAYOUT(), layout)
+    poke(rpd + wgk_RPD_VMODULE(), sm)
+    ngu_sv(rpd + wgk_RPD_VENTRY(), vs)
+    poke(rpd + wgk_RPD_VBCOUNT(), 1)
+    poke(rpd + wgk_RPD_VBUFS(), vb)
+    poke32(rpd + wgk_RPD_TOPO(), wgk_TOPO_TRIANGLES())
+    poke32(rpd + wgk_RPD_MSCOUNT(), 1)
+    poke32(rpd + wgk_RPD_MSMASK(), 4294967295)
+    let fst = calloc(1, wgk_SZ_FS())
+    poke(fst + wgk_FS_MODULE(), sm)
+    ngu_sv(fst + wgk_FS_ENTRY(), fs)
+    poke(fst + wgk_FS_TCOUNT(), 1)
+    poke(fst + wgk_FS_TARGETS(), cts)
+    poke(rpd + wgk_RPD_FRAGMENT(), fst)
+    let pipe = w_create_pipeline(c.device, rpd)
+    free(fst)  free(rpd)  free(pld)  free(vb)
+    return pipe
+}
+
+// the shader module, uniform buffer and bind groups, samplers and the three pipelines: 1 on success
+fn ngu_build_pipelines(c: NguCtx) -> Int {
+    let shader = SHADER()
+    let wsl = calloc(1, wgk_SZ_WGSL())
+    poke32(wsl + wgk_CH_STYPE(), wgk_STYPE_WGSL())
+    ngu_sv(wsl + wgk_WGSL_CODE(), shader)
+    let smd = calloc(1, wgk_SZ_SMD())
+    poke(smd + wgk_SMD_NEXT(), wsl)
+    let sm = w_create_shader(c.device, smd)
+    free(smd)  free(wsl)
+    if sm == 0 { ngu_stderr_sv("ui_gpu: shader compile failed", 0, 0)  return 0 }
+
+    // group 0: one uniform buffer, visible to both stages
+    let ue = calloc(1, wgk_SZ_BGLE())
+    poke32(ue + wgk_BGLE_BINDING(), 0)
+    poke(ue + wgk_BGLE_VIS(), wgk_STAGE_VERTEX() | wgk_STAGE_FRAGMENT())
+    poke32(ue + wgk_BGLE_BUF_TYPE(), wgk_BUFBIND_UNIFORM())
+    let ubld = calloc(1, wgk_SZ_BGLD())
+    poke(ubld + wgk_BGLD_COUNT(), 1)
+    poke(ubld + wgk_BGLD_ENTRIES(), ue)
+    c.ubgl = w_create_bgl(c.device, ubld)
+    free(ubld)  free(ue)
+
+    // group 1: texture + sampler, fragment only
+    let te = calloc(2, wgk_SZ_BGLE())
+    poke32(te + wgk_BGLE_BINDING(), 0)
+    poke(te + wgk_BGLE_VIS(), wgk_STAGE_FRAGMENT())
+    poke32(te + wgk_BGLE_TEX_SAMPLE(), wgk_TEXSAMPLE_FLOAT())
+    poke32(te + wgk_BGLE_TEX_DIM(), wgk_VIEWDIM_2D())
+    let te1 = te + wgk_SZ_BGLE()
+    poke32(te1 + wgk_BGLE_BINDING(), 1)
+    poke(te1 + wgk_BGLE_VIS(), wgk_STAGE_FRAGMENT())
+    poke32(te1 + wgk_BGLE_SAMP_TYPE(), wgk_SAMPBIND_FILTERING())
+    let tbld = calloc(1, wgk_SZ_BGLD())
+    poke(tbld + wgk_BGLD_COUNT(), 2)
+    poke(tbld + wgk_BGLD_ENTRIES(), te)
+    c.tbgl = w_create_bgl(c.device, tbld)
+    free(tbld)  free(te)
+
+    // the text pipeline's group 1: the coverage atlas, its sampler, and the colour-glyph atlas
+    // (premultiplied RGBA; an emoji's own colours). Images keep the two-entry layout.
+    let t3 = calloc(3, wgk_SZ_BGLE())
+    poke32(t3 + wgk_BGLE_BINDING(), 0)
+    poke(t3 + wgk_BGLE_VIS(), wgk_STAGE_FRAGMENT())
+    poke32(t3 + wgk_BGLE_TEX_SAMPLE(), wgk_TEXSAMPLE_FLOAT())
+    poke32(t3 + wgk_BGLE_TEX_DIM(), wgk_VIEWDIM_2D())
+    let t31 = t3 + wgk_SZ_BGLE()
+    poke32(t31 + wgk_BGLE_BINDING(), 1)
+    poke(t31 + wgk_BGLE_VIS(), wgk_STAGE_FRAGMENT())
+    poke32(t31 + wgk_BGLE_SAMP_TYPE(), wgk_SAMPBIND_FILTERING())
+    let t32 = t3 + 2 * wgk_SZ_BGLE()
+    poke32(t32 + wgk_BGLE_BINDING(), 2)
+    poke(t32 + wgk_BGLE_VIS(), wgk_STAGE_FRAGMENT())
+    poke32(t32 + wgk_BGLE_TEX_SAMPLE(), wgk_TEXSAMPLE_FLOAT())
+    poke32(t32 + wgk_BGLE_TEX_DIM(), wgk_VIEWDIM_2D())
+    let t3d = calloc(1, wgk_SZ_BGLD())
+    poke(t3d + wgk_BGLD_COUNT(), 3)
+    poke(t3d + wgk_BGLD_ENTRIES(), t3)
+    c.tbgl3 = w_create_bgl(c.device, t3d)
+    free(t3d)  free(t3)
+
+    // the uniform buffer (vp.xy, atlas.xy) and its bind group
+    let ubd = calloc(1, wgk_SZ_BUFD())
+    poke(ubd + wgk_BUFD_USAGE(), wgk_BUFUSE_UNIFORM() | wgk_BUFUSE_COPYDST())
+    poke(ubd + wgk_BUFD_SIZE(), 16)
+    c.ubo = w_create_buffer(c.device, ubd)
+    free(ubd)
+    let ube = calloc(1, wgk_SZ_BGE())
+    poke(ube + wgk_BGE_BUFFER(), c.ubo)
+    poke(ube + wgk_BGE_SIZE(), 16)
+    let ubgd = calloc(1, wgk_SZ_BGD())
+    poke(ubgd + wgk_BGD_LAYOUT(), c.ubgl)
+    poke(ubgd + wgk_BGD_COUNT(), 1)
+    poke(ubgd + wgk_BGD_ENTRIES(), ube)
+    c.ubg = w_create_bg(c.device, ubgd)
+    free(ubgd)  free(ube)
+
+    // Nearest for glyphs: quads map 1:1 to atlas texels, so the CPU painter's coverage comes through
+    // exactly. The Linear one blits a scene into a viewport rect.
+    let sd = calloc(1, wgk_SZ_SAMPD())
+    poke32(sd + wgk_SAMPD_AU(), wgk_ADDR_CLAMP())
+    poke32(sd + wgk_SAMPD_AV(), wgk_ADDR_CLAMP())
+    poke32(sd + wgk_SAMPD_AW(), wgk_ADDR_CLAMP())
+    poke32(sd + wgk_SAMPD_MAG(), wgk_FILTER_NEAREST())
+    poke32(sd + wgk_SAMPD_MIN(), wgk_FILTER_NEAREST())
+    poke32(sd + wgk_SAMPD_MIP(), wgk_MIPFILTER_NEAREST())
+    poke16(sd + wgk_SAMPD_ANISO(), 1)
+    c.samp = w_create_sampler(c.device, sd)
+    poke32(sd + wgk_SAMPD_MAG(), wgk_FILTER_LINEAR())
+    poke32(sd + wgk_SAMPD_MIN(), wgk_FILTER_LINEAR())
+    poke32(sd + wgk_SAMPD_MIP(), wgk_MIPFILTER_LINEAR())
+    c.sampLinear = w_create_sampler(c.device, sd)
+    free(sd)
+
+    // premultiplied-over alpha blend
+    let blend = calloc(1, wgk_SZ_BLEND())
+    poke32(blend + wgk_BLEND_COP(), wgk_BLENDOP_ADD())
+    poke32(blend + wgk_BLEND_CSRC(), wgk_BLEND_SRCALPHA())
+    poke32(blend + wgk_BLEND_CDST(), wgk_BLEND_ONEMINUSSRCALPHA())
+    poke32(blend + wgk_BLEND_AOP(), wgk_BLENDOP_ADD())
+    poke32(blend + wgk_BLEND_ASRC(), wgk_BLEND_ONE())
+    poke32(blend + wgk_BLEND_ADST(), wgk_BLEND_ONEMINUSSRCALPHA())
+    let cts = calloc(1, wgk_SZ_CTS())
+    poke32(cts + wgk_CTS_FORMAT(), c.format)
+    poke(cts + wgk_CTS_BLEND(), blend)
+    poke(cts + wgk_CTS_MASK(), wgk_COLORWRITE_ALL())
+
+    let one = malloc(8)
+    poke(one, c.ubgl)
+    let two = malloc(16)
+    poke(two, c.ubgl)  poke(two + 8, c.tbgl)
+    let two3 = malloc(16)
+    poke(two3, c.ubgl)  poke(two3 + 8, c.tbgl3)
+
+    let ra = calloc(6, wgk_SZ_VATTR())
+    ngu_attr(ra, 0, 0, 0)  ngu_attr(ra, 1, 16, 0)  ngu_attr(ra, 2, 32, 1)
+    ngu_attr(ra, 3, 40, 0)  ngu_attr(ra, 4, 56, 0)  ngu_attr(ra, 5, 72, 0)
+    c.rectPipe = ngu_pipeline(c, sm, "rect_vs", "rect_fs", ra, 6, RECT_FLOATS() * 4, one, 1, cts)
+    free(ra)
+
+    let ga = calloc(6, wgk_SZ_VATTR())
+    ngu_attr(ga, 0, 0, 0)  ngu_attr(ga, 1, 16, 0)  ngu_attr(ga, 2, 32, 0)
+    ngu_attr(ga, 3, 48, 0)  ngu_attr(ga, 4, 64, 0)  ngu_attr(ga, 5, 80, 0)
+    c.textPipe = ngu_pipeline(c, sm, "text_vs", "text_fs", ga, 6, GLYPH_FLOATS() * 4, two3, 2, cts)
+    free(ga)
+
+    let ia = calloc(4, wgk_SZ_VATTR())
+    ngu_attr(ia, 0, 0, 0)  ngu_attr(ia, 1, 16, 0)  ngu_attr(ia, 2, 32, 0)  ngu_attr(ia, 3, 48, 0)
+    c.imagePipe = ngu_pipeline(c, sm, "img_vs", "img_fs", ia, 4, IMG_FLOATS() * 4, two, 2, cts)
+    free(ia)
+
+    free(one)  free(two)  free(two3)  free(cts)  free(blend)
+    w_shader_release(sm)
+    if c.rectPipe != 0 && c.textPipe != 0 && c.imagePipe != 0 { return 1 }
+    return 0
+}
+
+// the adapter, then a device asking for everything the adapter offers (its limits, and the read-write
+// storage format feature when it is listed): 1 on success
+fn ngu_acquire_device(c: NguCtx) -> Int {
+    let opt = calloc(1, wgk_SZ_RAO())
+    if c.surface != 0 { poke(opt + wgk_RAO_SURFACE(), c.surface) }
+    let slot = calloc(1, 8)
+    var info = 0
+    unsafe { info = ngu_cbinfo(cfn_addr(ngu_on_adapter), slot) }
+    w_request_adapter(c.instance, opt, info)
+    free(info)  free(opt)
+    c.adapter = peek(slot)
+    if c.adapter == 0 { free(slot)  return 0 }
+    poke(slot, 0)
+    unsafe { info = ngu_cbinfo(cfn_addr(ngu_on_device), slot) }
+    let want = malloc(8)
+    poke32(want, wgk_FEATURE_RW_STORAGE())
+    var have_rw = 0
+    let sf = calloc(1, wgk_SZ_SUPFEAT())
+    w_adapter_features(c.adapter, sf)
+    var i = 0
+    while i < peek(sf + wgk_SUPFEAT_COUNT()) {
+        if peek32(peek(sf + wgk_SUPFEAT_LIST()) + i * 4) == wgk_FEATURE_RW_STORAGE() { have_rw = 1 }
+        i = i + 1
+    }
+    free(sf)
+    let alim = calloc(1, wgk_SZ_LIMITS())
+    if (w_adapter_limits(c.adapter, alim) & 4294967295) == wgk_STATUS_SUCCESS() {
+        let dd = calloc(1, wgk_SZ_DEVD())
+        poke(dd + wgk_DEVD_LIMITS(), alim)
+        if have_rw == 1 { poke(dd + wgk_DEVD_FCOUNT(), 1)  poke(dd + wgk_DEVD_FEATURES(), want) }
+        w_request_device(c.adapter, dd, info)
+        free(dd)
+    }
+    if peek(slot) == 0 { w_request_device(c.adapter, 0, info) }
+    c.device = peek(slot)
+    free(alim)  free(want)  free(info)  free(slot)
+    if c.device == 0 { return 0 }
+    c.queue = w_device_queue(c.device)
+    return 1
+}
+
+// (re)create the offscreen render target and the two readback buffers at w x h
+fn ngu_make_target(c: NguCtx) {
+    if c.targetView != 0 { w_view_release(c.targetView)  c.targetView = 0 }
+    if c.target != 0 { w_texture_release(c.target)  c.target = 0 }
+    ngu_rb_settle(c)
+    if c.readbuf != 0 { w_buffer_release(c.readbuf)  c.readbuf = 0 }
+    if c.rbuf2 != 0 { w_buffer_release(c.rbuf2)  c.rbuf2 = 0 }
+    let td = calloc(1, wgk_SZ_TEXD())
+    poke(td + wgk_TEXD_USAGE(), wgk_TEXUSE_RENDER() | wgk_TEXUSE_COPYSRC())
+    poke32(td + wgk_TEXD_DIM(), wgk_TEXDIM_2D())
+    poke32(td + wgk_TEXD_W(), c.w)
+    poke32(td + wgk_TEXD_H(), c.h)
+    poke32(td + wgk_TEXD_DEPTH(), 1)
+    poke32(td + wgk_TEXD_FORMAT(), c.format)
+    poke32(td + wgk_TEXD_MIPS(), 1)
+    poke32(td + wgk_TEXD_SAMPLES(), 1)
+    c.target = w_create_texture(c.device, td)
+    free(td)
+    c.targetView = w_create_view(c.target, 0)
+    c.rb_bpr = (c.w * 4 + 255) & (0 - 256)
+    let bd = calloc(1, wgk_SZ_BUFD())
+    poke(bd + wgk_BUFD_USAGE(), wgk_BUFUSE_COPYDST() | wgk_BUFUSE_MAPREAD())
+    poke(bd + wgk_BUFD_SIZE(), c.rb_bpr * c.h)
+    c.readbuf = w_create_buffer(c.device, bd)
+    c.rbuf2 = w_create_buffer(c.device, bd)
+    free(bd)
+    c.rb_cur = 0
+    c.rb_pending = 0
+}
+
+fn ngu_new_ctx(w: Int, h: Int) -> Int {
+    let c: NguCtx = calloc(1, sizeof(NguCtx))
+    ui_gpu_clip_none(c)
+    c.w = w
+    c.h = h
+    if g_ngu_map == 0 { g_ngu_map = calloc(1, 8) }
+    return c
+}
+
+fn ui_gpu_new_offscreen(w: Int, h: Int) -> Int {
+    let c: NguCtx = ngu_new_ctx(w, h)
+    c.offscreen = 1
+    c.format = wgk_FMT_RGBA8()
+    if ngu_load() == 0 { return c }
+    c.instance = w_create_instance(0)
+    if ngu_acquire_device(c) == 0 { return c }
+    if ngu_build_pipelines(c) == 0 { return c }
+    ngu_make_target(c)
+    return c
+}
+
+// the native Linux window backends hold no Xlib display or libwayland surface for wgpu to present to
+cfg(linux) {
+fn ui_gpu_new_window(disp: Int, win: Int, w: Int, h: Int) -> Int { return ngu_new_ctx(w, h) }
+}
+fn ui_gpu_new_window_wl(disp: Int, surf: Int, w: Int, h: Int) -> Int { return ngu_new_ctx(w, h) }
+
+// A Win32 window is an HWND, which is all a wgpu surface needs there (with the module it belongs to).
+cfg(windows) {
+extern fn GetModuleHandleW(Int) -> Int from "kernel32.dll"
+fn NGU_SURF_NAMES() -> Str {
+    return "wgpuInstanceCreateSurface wgpuSurfaceGetCapabilities wgpuSurfaceCapabilitiesFreeMembers " +
+        "wgpuSurfaceConfigure wgpuSurfaceGetCurrentTexture wgpuSurfacePresent "
+}
+global g_ngu_surf: Int = 0
+/// resolve the surface functions: 1 when all of them are there
+fn ngu_load_surface() -> Int {
+    if g_ngu_surf != 0 { return 1 }
+    let names = NGU_SURF_NAMES()
+    let np = nori_str_ptr(names)
+    let tab = calloc(6, 8)
+    let buf = malloc(64)
+    var slot = 0
+    var st = 0
+    var i = 0
+    while i < names.len() {
+        if peek8(np + i) == 32 {
+            memcpy(buf, np + st, i - st)
+            poke8(buf + i - st, 0)
+            let f = ngu_sym(g_ngu_lib, buf)
+            if f == 0 { free(buf)  free(tab)  return 0 }
+            poke(tab + slot * 8, f)
+            slot = slot + 1
+            st = i + 1
+        }
+        i = i + 1
+    }
+    free(buf)
+    g_ngu_surf = tab
+    return 1
+}
+fn ngu_sfn(slot: Int) -> Int { return peek(g_ngu_surf + slot * 8) }
+
+// WGPUSurfaceConfiguration: device @8, format @16, usage @24, width @32, height @36, alphaMode @56 (Auto),
+// presentMode @60 (Fifo)
+fn ngu_configure_surface(c: NguCtx) {
+    let cfg = calloc(1, 64)
+    poke(cfg + 8, c.device)
+    poke32(cfg + 16, c.format)
+    poke(cfg + 24, 16)                                          // WGPUTextureUsage_RenderAttachment
+    poke32(cfg + 32, c.w)  poke32(cfg + 36, c.h)
+    poke32(cfg + 60, 1)
+    unsafe { let fconf: CFn(Int, Int) = ngu_sfn(3)  fconf(c.surface, cfg) }
+    free(cfg)
+}
+
+fn ui_gpu_new_window(disp: Int, win: Int, w: Int, h: Int) -> Int {
+    let c: NguCtx = ngu_new_ctx(w, h)
+    if ngu_load() == 0 || ngu_load_surface() == 0 { return c }
+    c.instance = w_create_instance(0)
+    let src = calloc(1, 32)                                     // WGPUSurfaceSourceWindowsHWND
+    poke32(src + 8, 5)                                          // WGPUSType_SurfaceSourceWindowsHWND
+    poke(src + 16, GetModuleHandleW(0))
+    poke(src + 24, win)
+    let sd = calloc(1, 24)                                      // WGPUSurfaceDescriptor
+    poke(sd, src)
+    var sf = 0
+    let inst = c.instance
+    unsafe { let fsurf: CFn(Int, Int) -> Int = ngu_sfn(0)  sf = fsurf(inst, sd) }
+    c.surface = sf
+    free(sd)
+    free(src)
+    if c.surface == 0 || ngu_acquire_device(c) == 0 { return c }
+    // the first straight 8-bit UNORM format the surface takes, as the CPU renderer blends
+    let caps: NguCaps = calloc(1, 64)
+    unsafe { let fcaps: CFn(Int, Int, Int) -> I32 = ngu_sfn(1)  let _s = fcaps(c.surface, c.adapter, caps) }
+    c.format = wgk_FMT_BGRA8()
+    var picked = false
+    var i = 0
+    while i < caps.fcount && !picked {
+        let fm = peek32(caps.formats + i * 4)
+        if fm == wgk_FMT_BGRA8() || fm == wgk_FMT_RGBA8() { c.format = fm  picked = true }
+        i = i + 1
+    }
+    if !picked && caps.fcount > 0 { c.format = peek32(caps.formats) }
+    unsafe { let ffree: CFn(NguCaps) = ngu_sfn(2)  ffree(caps) }
+    free(caps)
+    if ngu_build_pipelines(c) == 0 { return c }
+    ngu_configure_surface(c)
+    return c
+}
+
+/// draw the frame into the window's current surface texture and present it
+fn ngu_present_frame(c: NguCtx) {
+    let st = calloc(1, 24)                                      // WGPUSurfaceTexture: texture @8, status @16
+    unsafe { let ftex: CFn(Int, Int) = ngu_sfn(4)  ftex(c.surface, st) }
+    let status = peek32(st + 16)
+    let tex = peek(st + 8)
+    free(st)
+    if !(status == 1 || status == 2) { return }                 // SuccessOptimal, SuccessSuboptimal
+    let tv = w_create_view(tex, 0)
+    ngu_encode_frame(c, tv)
+    unsafe { let fpres: CFn(Int) -> I32 = ngu_sfn(5)  let _p = fpres(c.surface) }
+    w_release(14, tv)
+    w_release(15, tex)
+}
+}
+cfg(linux) {
+fn ngu_present_frame(c: NguCtx) { }
+fn ngu_configure_surface(c: NguCtx) { }
+}
+
+fn ui_gpu_ok(ctx: Int) -> Int {
+    let c: NguCtx = ctx
+    if c.device != 0 && c.rectPipe != 0 && c.textPipe != 0 && c.imagePipe != 0 { return 1 }
+    return 0
+}
+
+fn ui_gpu_resize(ctx: Int, w: Int, h: Int) {
+    let c: NguCtx = ctx
+    if w <= 0 || h <= 0 || (w == c.w && h == c.h) { return }
+    c.w = w
+    c.h = h
+    if c.offscreen == 1 && c.device != 0 { ngu_make_target(c) }
+    if c.offscreen == 0 && c.surface != 0 && c.device != 0 { ngu_configure_surface(c) }
+}
+
+// the frame's clip box, copied into every instance emitted while it is set: a half-open pixel range
+fn ui_gpu_clip(ctx: Int, x0: Float, y0: Float, x1: Float, y1: Float) {
+    let c: NguCtx = ctx
+    c.clip0 = x0
+    c.clip1 = y0
+    c.clip2 = x1
+    c.clip3 = y1
+}
+fn ui_gpu_clip_none(ctx: Int) {
+    let c: NguCtx = ctx
+    c.clip0 = 0.0 - 1000000000.0
+    c.clip1 = 0.0 - 1000000000.0
+    c.clip2 = 1000000000.0
+    c.clip3 = 1000000000.0
+}
+
+// a batch break at the current position: everything queued so far is drawn before what follows,
+// and `img` >= 0 draws that image there
+fn ngu_push_cut(c: NguCtx, img: Int) {
+    if c.cutCount + 1 > c.cutCap {
+        if c.cutCap == 0 { c.cutCap = 16 } else { c.cutCap = c.cutCap * 2 }
+        c.cuts = realloc(c.cuts, c.cutCap * CUT_SIZE())
+    }
+    let at = c.cuts + c.cutCount * CUT_SIZE()
+    poke(at, c.rectCount)
+    poke(at + 8, c.glyphCount)
+    poke(at + 16, img)
+    c.cutCount = c.cutCount + 1
+    c.cutGlyph = c.glyphCount
+}
+
+fn ui_gpu_begin(ctx: Int, r: Float, g: Float, b: Float) {
+    let c: NguCtx = ctx
+    ngu_free_images(c)
+    c.rectCount = 0
+    c.glyphCount = 0
+    c.clearR = r
+    c.clearG = g
+    c.clearB = b
+    c.cutCount = 0
+    c.cutGlyph = 0
+    ui_gpu_clip_none(c)
+}
+
+fn ngu_clip4(c: NguCtx, p: Int) {
+    pokef32(p, c.clip0)
+    pokef32(p + 4, c.clip1)
+    pokef32(p + 8, c.clip2)
+    pokef32(p + 12, c.clip3)
+}
+
+fn ui_gpu_rect(ctx: Int, x: Float, y: Float, w: Float, h: Float, r: Float, g: Float, b: Float, a: Float, radius: Float, border: Float,
+               gtr: Float, gtg: Float, gtb: Float, gta: Float, gax: Float, gaxd: Float, ghoriz: Float, gon: Float) {
+    let c: NguCtx = ctx
+    // a rect that comes after text is drawn after it, not folded into the batch that goes first
+    if c.glyphCount > c.cutGlyph { ngu_push_cut(c, 0 - 1) }
+    if c.rectCount + 1 > c.rectCap {
+        if c.rectCap == 0 { c.rectCap = 256 } else { c.rectCap = c.rectCap * 2 }
+        c.rectData = realloc(c.rectData, c.rectCap * RECT_FLOATS() * 4)
+    }
+    let p = c.rectData + c.rectCount * RECT_FLOATS() * 4
+    pokef32(p, x)  pokef32(p + 4, y)  pokef32(p + 8, w)  pokef32(p + 12, h)
+    pokef32(p + 16, r)  pokef32(p + 20, g)  pokef32(p + 24, b)  pokef32(p + 28, a)
+    pokef32(p + 32, radius)  pokef32(p + 36, border)
+    ngu_clip4(c, p + 40)
+    pokef32(p + 56, gtr)  pokef32(p + 60, gtg)  pokef32(p + 64, gtb)  pokef32(p + 68, gta)
+    pokef32(p + 72, gax)  pokef32(p + 76, gaxd)  pokef32(p + 80, ghoriz)  pokef32(p + 84, gon)
+    c.rectCount = c.rectCount + 1
+}
+
+fn ui_gpu_glyph(ctx: Int, x: Float, y: Float, w: Float, h: Float, ux: Float, uy: Float, uw: Float, uh: Float,
+                r: Float, g: Float, b: Float, a: Float, gtr: Float, gtg: Float, gtb: Float, gta: Float,
+                gax: Float, gaxd: Float, ghoriz: Float, gon: Float) {
+    let c: NguCtx = ctx
+    if c.glyphCount + 1 > c.glyphCap {
+        if c.glyphCap == 0 { c.glyphCap = 512 } else { c.glyphCap = c.glyphCap * 2 }
+        c.glyphData = realloc(c.glyphData, c.glyphCap * GLYPH_FLOATS() * 4)
+    }
+    let p = c.glyphData + c.glyphCount * GLYPH_FLOATS() * 4
+    pokef32(p, x)  pokef32(p + 4, y)  pokef32(p + 8, w)  pokef32(p + 12, h)
+    pokef32(p + 16, ux)  pokef32(p + 20, uy)  pokef32(p + 24, uw)  pokef32(p + 28, uh)
+    pokef32(p + 32, r)  pokef32(p + 36, g)  pokef32(p + 40, b)  pokef32(p + 44, a)
+    ngu_clip4(c, p + 48)
+    pokef32(p + 64, gtr)  pokef32(p + 68, gtg)  pokef32(p + 72, gtb)  pokef32(p + 76, gta)
+    pokef32(p + 80, gax)  pokef32(p + 84, gaxd)  pokef32(p + 88, ghoriz)  pokef32(p + 92, gon)
+    c.glyphCount = c.glyphCount + 1
+}
+
+// the last uploaded atlas glyph count, -1 before the first upload
+fn ui_gpu_atlas_gen(ctx: Int) -> Int {
+    let c: NguCtx = ctx
+    if c.atlasTex == 0 { return 0 - 1 }
+    return c.atlasGen
+}
+
+// a texture-and-sampler bind group over `view`
+fn ngu_tex_bind_group(c: NguCtx, tview: Int, samp: Int) -> Int {
+    let be = calloc(2, wgk_SZ_BGE())
+    poke32(be + wgk_BGE_BINDING(), 0)
+    poke(be + wgk_BGE_VIEW(), tview)
+    poke32(be + wgk_SZ_BGE() + wgk_BGE_BINDING(), 1)
+    poke(be + wgk_SZ_BGE() + wgk_BGE_SAMPLER(), samp)
+    let bgd = calloc(1, wgk_SZ_BGD())
+    poke(bgd + wgk_BGD_LAYOUT(), c.tbgl)
+    poke(bgd + wgk_BGD_COUNT(), 2)
+    poke(bgd + wgk_BGD_ENTRIES(), be)
+    let bg = w_create_bg(c.device, bgd)
+    free(bgd)  free(be)
+    return bg
+}
+
+// a sampled 2D texture of `fmt`, `tw` x `th`
+fn ngu_sampled_texture(c: NguCtx, tw: Int, th: Int, fmt: Int) -> Int {
+    let td = calloc(1, wgk_SZ_TEXD())
+    poke(td + wgk_TEXD_USAGE(), wgk_TEXUSE_BINDING() | wgk_TEXUSE_COPYDST())
+    poke32(td + wgk_TEXD_DIM(), wgk_TEXDIM_2D())
+    poke32(td + wgk_TEXD_W(), tw)
+    poke32(td + wgk_TEXD_H(), th)
+    poke32(td + wgk_TEXD_DEPTH(), 1)
+    poke32(td + wgk_TEXD_FORMAT(), fmt)
+    poke32(td + wgk_TEXD_MIPS(), 1)
+    poke32(td + wgk_TEXD_SAMPLES(), 1)
+    let t = w_create_texture(c.device, td)
+    free(td)
+    return t
+}
+
+// upload `n` bytes at `data` into `tex`, `bpr` bytes per row, `tw` x `th`
+fn ngu_upload(c: NguCtx, tex: Int, data: Int, n: Int, bpr: Int, tw: Int, th: Int) {
+    let dst = calloc(1, wgk_SZ_TCTI())
+    poke(dst + wgk_TCTI_TEXTURE(), tex)
+    poke32(dst + wgk_TCTI_ASPECT(), wgk_ASPECT_ALL())
+    let lay = calloc(1, wgk_SZ_TCBL())
+    poke32(lay + wgk_TCBL_BPR(), bpr)
+    poke32(lay + wgk_TCBL_RPI(), th)
+    let ext = calloc(1, wgk_SZ_EXT())
+    poke32(ext, tw)  poke32(ext + 4, th)  poke32(ext + 8, 1)
+    w_write_texture(c.queue, dst, data, n, lay, ext)
+    free(ext)  free(lay)  free(dst)
+}
+
+// the text pipeline's bind group: the coverage atlas, the sampler, and the colour atlas (a 1x1
+// transparent texture until the first colour glyph is uploaded, so the group is always complete)
+fn ngu_atlas_bind_group(c: NguCtx) {
+    if c.atlasBG != 0 { w_bg_release(c.atlasBG)  c.atlasBG = 0 }
+    if c.atlasView == 0 { return }
+    if c.colorTex == 0 {
+        c.colorTex = ngu_sampled_texture(c, 1, 1, wgk_FMT_RGBA8())
+        c.colorView = w_create_view(c.colorTex, 0)
+        c.colorW = 1
+        c.colorH = 1
+        let z = calloc(1, 4)
+        ngu_upload(c, c.colorTex, z, 4, 4, 1, 1)
+        free(z)
+    }
+    let be = calloc(3, wgk_SZ_BGE())
+    poke32(be + wgk_BGE_BINDING(), 0)
+    poke(be + wgk_BGE_VIEW(), c.atlasView)
+    poke32(be + wgk_SZ_BGE() + wgk_BGE_BINDING(), 1)
+    poke(be + wgk_SZ_BGE() + wgk_BGE_SAMPLER(), c.samp)
+    poke32(be + 2 * wgk_SZ_BGE() + wgk_BGE_BINDING(), 2)
+    poke(be + 2 * wgk_SZ_BGE() + wgk_BGE_VIEW(), c.colorView)
+    let bgd = calloc(1, wgk_SZ_BGD())
+    poke(bgd + wgk_BGD_LAYOUT(), c.tbgl3)
+    poke(bgd + wgk_BGD_COUNT(), 3)
+    poke(bgd + wgk_BGD_ENTRIES(), be)
+    c.atlasBG = w_create_bg(c.device, bgd)
+    free(bgd)  free(be)
+}
+
+// upload the colour-glyph plane of the atlas: `aw` x `ah` premultiplied RGBA8 at `bytes`, the same
+// size and layout as the coverage atlas (a colour glyph's texels sit where its coverage does)
+fn ui_gpu_atlas_color(ctx: Int, bytes: Int, aw: Int, ah: Int) {
+    let c: NguCtx = ctx
+    if aw <= 0 || ah <= 0 || c.device == 0 { return }
+    if c.colorTex == 0 || c.colorW != aw || c.colorH != ah {
+        if c.colorView != 0 { w_view_release(c.colorView)  c.colorView = 0 }
+        if c.colorTex != 0 { w_texture_release(c.colorTex)  c.colorTex = 0 }
+        c.colorTex = ngu_sampled_texture(c, aw, ah, wgk_FMT_RGBA8())
+        c.colorView = w_create_view(c.colorTex, 0)
+        c.colorW = aw
+        c.colorH = ah
+        ngu_atlas_bind_group(c)
+    }
+    ngu_upload(c, c.colorTex, bytes, aw * ah * 4, aw * 4, aw, ah)
+}
+
+// upload the R8 glyph atlas, recreating its texture and bind group when the size changes
+fn ui_gpu_atlas(ctx: Int, bytes: Int, aw: Int, ah: Int, gen: Int) {
+    let c: NguCtx = ctx
+    if aw <= 0 || ah <= 0 || c.device == 0 { return }
+    c.atlasGen = gen
+    if c.atlasTex == 0 || aw != c.atlasW || ah != c.atlasH {
+        if c.atlasBG != 0 { w_bg_release(c.atlasBG)  c.atlasBG = 0 }
+        if c.atlasView != 0 { w_view_release(c.atlasView)  c.atlasView = 0 }
+        if c.atlasTex != 0 { w_texture_release(c.atlasTex)  c.atlasTex = 0 }
+        c.atlasTex = ngu_sampled_texture(c, aw, ah, wgk_FMT_R8())
+        c.atlasView = w_create_view(c.atlasTex, 0)
+        c.atlasW = aw
+        c.atlasH = ah
+        ngu_atlas_bind_group(c)
+    }
+    ngu_upload(c, c.atlasTex, bytes, aw * ah, aw, aw, ah)
+}
+
+// room for one more image instance and its resources
+fn ngu_grow_images(c: NguCtx) {
+    if c.imgCount + 1 > c.imgCap {
+        if c.imgCap == 0 { c.imgCap = 8 } else { c.imgCap = c.imgCap * 2 }
+        c.imgData = realloc(c.imgData, c.imgCap * IMG_FLOATS() * 4)
+        c.imgRes = realloc(c.imgRes, c.imgCap * IMGRES_SIZE())
+    }
+}
+
+// the image instance at the current count: rect, tint alpha, clip, flip and opacity flags
+fn ngu_image_instance(c: NguCtx, x: Float, y: Float, w: Float, h: Float, alpha: Float, flip: Float, opaque: Float) {
+    let p = c.imgData + c.imgCount * IMG_FLOATS() * 4
+    pokef32(p, x)  pokef32(p + 4, y)  pokef32(p + 8, w)  pokef32(p + 12, h)
+    pokef32(p + 16, 1.0)  pokef32(p + 20, 1.0)  pokef32(p + 24, 1.0)  pokef32(p + 28, alpha)
+    ngu_clip4(c, p + 32)
+    pokef32(p + 48, flip)  pokef32(p + 52, opaque)  pokef32(p + 56, 0.0)  pokef32(p + 60, 0.0)
+    c.imgCount = c.imgCount + 1
+}
+
+// queue a straight-RGBA8 image into (x, y, w, h) this frame; its texture is released after the frame
+fn ui_gpu_image(ctx: Int, rgba: Int, iw: Int, ih: Int, x: Float, y: Float, w: Float, h: Float, alpha: Float) {
+    let c: NguCtx = ctx
+    if iw <= 0 || ih <= 0 || c.device == 0 { return }
+    ngu_grow_images(c)
+    let tex = ngu_sampled_texture(c, iw, ih, wgk_FMT_RGBA8())
+    let tview = w_create_view(tex, 0)
+    ngu_upload(c, tex, rgba, iw * ih * 4, iw * 4, iw, ih)
+    let bg = ngu_tex_bind_group(c, tview, c.samp)
+    let res = c.imgRes + c.imgCount * IMGRES_SIZE()
+    poke(res, tex)  poke(res + 8, tview)  poke(res + 16, bg)  poke(res + 24, 1)
+    poke(res + 32, c.rectCount)  poke(res + 40, c.glyphCount)
+    ngu_push_cut(c, c.imgCount)
+    ngu_image_instance(c, x, y, w, h, alpha, 0.0, 0.0)
+}
+
+// the device, queue, format, adapter and instance, borrowed
+fn ui_gpu_device(ctx: Int) -> Int {
+    let c: NguCtx = ctx
+    if ctx == 0 || c.device == 0 || c.rectPipe == 0 { return 0 }
+    return c.device
+}
+fn ui_gpu_queue(ctx: Int) -> Int {
+    let c: NguCtx = ctx
+    if ctx == 0 || c.queue == 0 || c.rectPipe == 0 { return 0 }
+    return c.queue
+}
+fn ui_gpu_target_format(ctx: Int) -> Int { let c: NguCtx = ctx  if ctx == 0 { return 0 }  return c.format }
+fn ui_gpu_adapter(ctx: Int) -> Int { let c: NguCtx = ctx  if ctx == 0 { return 0 }  return c.adapter }
+fn ui_gpu_instance(ctx: Int) -> Int { let c: NguCtx = ctx  if ctx == 0 { return 0 }  return c.instance }
+
+// queue a texture view somebody else owns into (x, y, w, h) this frame, drawn opaque and scaled by `alpha`
+fn ui_gpu_image_view(ctx: Int, tview: Int, x: Float, y: Float, w: Float, h: Float, alpha: Float, linear: Int, flip_v: Int) {
+    let c: NguCtx = ctx
+    if ctx == 0 || c.device == 0 || tview == 0 || w <= 0.0 || h <= 0.0 { return }
+    ngu_grow_images(c)
+    var samp = c.samp
+    if linear != 0 { samp = c.sampLinear }
+    let bg = ngu_tex_bind_group(c, tview, samp)
+    let res = c.imgRes + c.imgCount * IMGRES_SIZE()
+    poke(res, 0)  poke(res + 8, 0)  poke(res + 16, bg)  poke(res + 24, 0)
+    poke(res + 32, c.rectCount)  poke(res + 40, c.glyphCount)
+    ngu_push_cut(c, c.imgCount)
+    var fl = 0.0
+    if flip_v != 0 { fl = 1.0 }
+    ngu_image_instance(c, x, y, w, h, alpha, fl, 1.0)
+}
+
+// release this frame's image bind groups, and the textures of the images that are ours
+fn ngu_free_images(c: NguCtx) {
+    var i = 0
+    while i < c.imgCount {
+        let res = c.imgRes + i * IMGRES_SIZE()
+        if peek(res + 16) != 0 { w_bg_release(peek(res + 16)) }
+        if peek(res + 24) == 1 {
+            if peek(res + 8) != 0 { w_view_release(peek(res + 8)) }
+            if peek(res) != 0 { w_texture_release(peek(res)) }
+        }
+        i = i + 1
+    }
+    c.imgCount = 0
+}
+
+// a vertex buffer of at least `bytes` in the slot at `slotp` (capacity at `capp`), grown by recreation
+fn ngu_ensure_buf(c: NguCtx, slotp: Int, capp: Int, bytes: Int) -> Int {
+    if peek(slotp) == 0 || peek(capp) < bytes {
+        if peek(slotp) != 0 { w_buffer_release(peek(slotp)) }
+        var nc = bytes
+        if nc < 4096 { nc = 4096 }
+        let bd = calloc(1, wgk_SZ_BUFD())
+        poke(bd + wgk_BUFD_USAGE(), wgk_BUFUSE_VERTEX() | wgk_BUFUSE_COPYDST())
+        poke(bd + wgk_BUFD_SIZE(), nc)
+        poke(slotp, w_create_buffer(c.device, bd))
+        poke(capp, nc)
+        free(bd)
+    }
+    return peek(slotp)
+}
+
+fn ngu_draw_rect_run(c: NguCtx, pass: Int, a: Int, b: Int) {
+    if b <= a { return }
+    let stride = RECT_FLOATS() * 4
+    w_set_pipeline(pass, c.rectPipe)
+    w_set_bind_group(pass, 0, c.ubg)
+    w_set_vertex_buffer(pass, 0, c.rectBuf, a * stride, (b - a) * stride)
+    w_draw(pass, 6, b - a)
+}
+fn ngu_draw_glyph_run(c: NguCtx, pass: Int, a: Int, b: Int) {
+    if b <= a || c.atlasBG == 0 { return }
+    let stride = GLYPH_FLOATS() * 4
+    w_set_pipeline(pass, c.textPipe)
+    w_set_bind_group(pass, 0, c.ubg)
+    w_set_bind_group(pass, 1, c.atlasBG)
+    w_set_vertex_buffer(pass, 0, c.glyphBuf, a * stride, (b - a) * stride)
+    w_draw(pass, 6, b - a)
+}
+
+// record and submit the frame into `view`: the batches in emission order, split at every cut
+fn ngu_encode_frame(c: NguCtx, tview: Int) {
+    let uni = malloc(16)
+    pokef32(uni, to_float(c.w))
+    pokef32(uni + 4, to_float(c.h))
+    var aw = c.atlasW
+    if aw == 0 { aw = 1 }
+    var ah = c.atlasH
+    if ah == 0 { ah = 1 }
+    pokef32(uni + 8, to_float(aw))
+    pokef32(uni + 12, to_float(ah))
+    w_write_buffer(c.queue, c.ubo, 0, uni, 16)
+    free(uni)
+    if c.rectCount > 0 {
+        let nb = c.rectCount * RECT_FLOATS() * 4
+        let b = ngu_ensure_buf(c, addr(c) + offsetof(NguCtx, rectBuf), addr(c) + offsetof(NguCtx, rectBufCap), nb)
+        w_write_buffer(c.queue, b, 0, c.rectData, nb)
+    }
+    if c.glyphCount > 0 {
+        let nb = c.glyphCount * GLYPH_FLOATS() * 4
+        let b = ngu_ensure_buf(c, addr(c) + offsetof(NguCtx, glyphBuf), addr(c) + offsetof(NguCtx, glyphBufCap), nb)
+        w_write_buffer(c.queue, b, 0, c.glyphData, nb)
+    }
+    if c.imgCount > 0 {
+        let nb = c.imgCount * IMG_FLOATS() * 4
+        let b = ngu_ensure_buf(c, addr(c) + offsetof(NguCtx, imgBuf), addr(c) + offsetof(NguCtx, imgBufCap), nb)
+        w_write_buffer(c.queue, b, 0, c.imgData, nb)
+    }
+    let enc = w_create_encoder(c.device)
+    let ca = calloc(1, wgk_SZ_RPCA())
+    poke(ca + wgk_RPCA_VIEW(), tview)
+    poke32(ca + wgk_RPCA_SLICE(), wgk_DEPTH_SLICE_UNDEFINED())
+    poke32(ca + wgk_RPCA_LOAD(), wgk_LOAD_CLEAR())
+    poke32(ca + wgk_RPCA_STORE(), wgk_STORE_STORE())
+    pokef64(ca + wgk_RPCA_CLEAR(), c.clearR)
+    pokef64(ca + wgk_RPCA_CLEAR() + 8, c.clearG)
+    pokef64(ca + wgk_RPCA_CLEAR() + 16, c.clearB)
+    pokef64(ca + wgk_RPCA_CLEAR() + 24, 1.0)
+    let rp = calloc(1, wgk_SZ_RPASSD())
+    poke(rp + wgk_RPASSD_COUNT(), 1)
+    poke(rp + wgk_RPASSD_ATTS(), ca)
+    let pass = w_begin_pass(enc, rp)
+    free(rp)  free(ca)
+    var rdone = 0
+    var gdone = 0
+    let istride = IMG_FLOATS() * 4
+    var i = 0
+    while i < c.cutCount {
+        let cut = c.cuts + i * CUT_SIZE()
+        ngu_draw_rect_run(c, pass, rdone, peek(cut))
+        rdone = peek(cut)
+        ngu_draw_glyph_run(c, pass, gdone, peek(cut + 8))
+        gdone = peek(cut + 8)
+        let im = peek(cut + 16)
+        if im >= 0 {
+            w_set_pipeline(pass, c.imagePipe)
+            w_set_bind_group(pass, 0, c.ubg)
+            w_set_bind_group(pass, 1, peek(c.imgRes + im * IMGRES_SIZE() + 16))
+            w_set_vertex_buffer(pass, 0, c.imgBuf, im * istride, istride)
+            w_draw(pass, 6, 1)
+        }
+        i = i + 1
+    }
+    ngu_draw_rect_run(c, pass, rdone, c.rectCount)
+    ngu_draw_glyph_run(c, pass, gdone, c.glyphCount)
+    w_pass_end(pass)
+    w_pass_release(pass)
+    let cmd = w_encoder_finish(enc)
+    w_submit(c.queue, cmd)
+    w_cmdbuf_release(cmd)
+    w_encoder_release(enc)
+}
+
+fn ui_gpu_end(ctx: Int) {
+    let c: NguCtx = ctx
+    if c.device == 0 { return }
+    if c.offscreen == 0 { if c.surface != 0 { ngu_present_frame(c) }  return }
+    ngu_encode_frame(c, c.targetView)
+    w_poll(c.device)
+}
+
+// copy the target into `buf` and start mapping it
+fn ngu_copy_and_map(c: NguCtx, buf: Int) {
+    let enc = w_create_encoder(c.device)
+    let src = calloc(1, wgk_SZ_TCTI())
+    poke(src + wgk_TCTI_TEXTURE(), c.target)
+    poke32(src + wgk_TCTI_ASPECT(), wgk_ASPECT_ALL())
+    let dst = calloc(1, wgk_SZ_TCBI())
+    poke(dst + wgk_TCBI_BUFFER(), buf)
+    poke32(dst + wgk_TCBI_BPR(), c.rb_bpr)
+    poke32(dst + wgk_TCBI_RPI(), c.h)
+    let ext = calloc(1, wgk_SZ_EXT())
+    poke32(ext, c.w)  poke32(ext + 4, c.h)  poke32(ext + 8, 1)
+    w_copy_tex_to_buf(enc, src, dst, ext)
+    free(ext)  free(dst)  free(src)
+    let cmd = w_encoder_finish(enc)
+    w_submit(c.queue, cmd)
+    w_cmdbuf_release(cmd)
+    w_encoder_release(enc)
+    poke(g_ngu_map, 0)
+    var info = 0
+    unsafe { info = ngu_cbinfo(cfn_addr(ngu_on_map), g_ngu_map) }
+    w_map_async(buf, wgk_MAPMODE_READ(), 0, c.rb_bpr * c.h, info)
+    free(info)
+}
+
+fn ngu_wait_map(c: NguCtx) {
+    var i = 0
+    while i < 100000 && ngu_mapped() == 0 { w_poll(c.device)  i = i + 1 }
+}
+
+// read the offscreen frame into `out` as w*h 32-bit words 0x00RRGGBB: 1 when it was read
+fn ui_gpu_readback(ctx: Int, out: Int) -> Int {
+    let c: NguCtx = ctx
+    if c.offscreen == 0 || c.device == 0 { return 0 }
+    ngu_rb_settle(c)
+    ngu_copy_and_map(c, c.readbuf)
+    ngu_wait_map(c)
+    if ngu_map_ok() == 0 { return 0 }
+    let total = c.rb_bpr * c.h
+    let p = w_mapped_range(c.readbuf, 0, total)
+    var y = 0
+    while y < c.h {
+        let row = p + y * c.rb_bpr
+        let orow = out + y * c.w * 4
+        var x = 0
+        while x < c.w {
+            let px = row + x * 4
+            poke32(orow + x * 4, (peek8(px) << 16) | (peek8(px + 1) << 8) | peek8(px + 2))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    w_unmap(c.readbuf)
+    return 1
+}
+
+// finish and unmap whatever the pipelined readback left mapping
+fn ngu_rb_settle(c: NguCtx) {
+    if c.rb_pending == 0 { return }
+    var inflight = c.rbuf2
+    if c.rb_cur == 1 { inflight = c.readbuf }
+    ngu_wait_map(c)
+    if inflight != 0 && ngu_map_ok() == 1 { w_unmap(inflight) }
+    c.rb_pending = 0
+}
+
+// hand back the previous frame's pixels as tightly packed RGBA8 rows and start this frame's copy: 1 when
+// `out` was filled
+fn ui_gpu_readback_pipelined(ctx: Int, out: Int) -> Int {
+    let c: NguCtx = ctx
+    if c.offscreen == 0 || c.device == 0 || c.readbuf == 0 || c.rbuf2 == 0 { return 0 }
+    let total = c.rb_bpr * c.h
+    var writing = c.readbuf
+    var reading = c.rbuf2
+    if c.rb_cur == 1 { writing = c.rbuf2  reading = c.readbuf }
+    var got = 0
+    if c.rb_pending == 1 {
+        ngu_wait_map(c)
+        if ngu_map_ok() == 1 {
+            let p = w_mapped_range(reading, 0, total)
+            if p != 0 {
+                let row_bytes = c.w * 4
+                var y = 0
+                while y < c.h { memcpy(out + y * row_bytes, p + y * c.rb_bpr, row_bytes)  y = y + 1 }
+                got = 1
+            }
+            w_unmap(reading)
+        }
+        c.rb_pending = 0
+    }
+    ngu_copy_and_map(c, writing)
+    c.rb_pending = 1
+    c.rb_cur = 1 - c.rb_cur
+    return got
+}
+
+fn ui_gpu_free(ctx: Int) {
+    let c: NguCtx = ctx
+    if ctx == 0 { return }
+    if c.device != 0 {
+        ngu_free_images(c)
+        if c.imgBuf != 0 { w_buffer_release(c.imgBuf) }
+        if c.rectBuf != 0 { w_buffer_release(c.rectBuf) }
+        if c.glyphBuf != 0 { w_buffer_release(c.glyphBuf) }
+        if c.imagePipe != 0 { w_pipeline_release(c.imagePipe) }
+        if c.atlasBG != 0 { w_bg_release(c.atlasBG) }
+        if c.atlasView != 0 { w_view_release(c.atlasView) }
+        if c.atlasTex != 0 { w_texture_release(c.atlasTex) }
+        if c.colorView != 0 { w_view_release(c.colorView) }
+        if c.colorTex != 0 { w_texture_release(c.colorTex) }
+        if c.tbgl3 != 0 { w_bgl_release(c.tbgl3) }
+        if c.samp != 0 { w_sampler_release(c.samp) }
+        if c.sampLinear != 0 { w_sampler_release(c.sampLinear) }
+        if c.ubg != 0 { w_bg_release(c.ubg) }
+        if c.ubo != 0 { w_buffer_release(c.ubo) }
+        if c.rectPipe != 0 { w_pipeline_release(c.rectPipe) }
+        if c.textPipe != 0 { w_pipeline_release(c.textPipe) }
+        if c.ubgl != 0 { w_bgl_release(c.ubgl) }
+        if c.tbgl != 0 { w_bgl_release(c.tbgl) }
+        if c.targetView != 0 { w_view_release(c.targetView) }
+        if c.target != 0 { w_texture_release(c.target) }
+        ngu_rb_settle(c)
+        if c.readbuf != 0 { w_buffer_release(c.readbuf) }
+        if c.rbuf2 != 0 { w_buffer_release(c.rbuf2) }
+    }
+    if c.surface != 0 { w_surface_release(c.surface) }
+    if c.device != 0 { w_device_release(c.device) }
+    if c.adapter != 0 { w_adapter_release(c.adapter) }
+    if c.instance != 0 { w_instance_release(c.instance) }
+    free(c.imgData)
+    free(c.imgRes)
+    free(c.rectData)
+    free(c.glyphData)
+    free(c.cuts)
+    free(ctx)
+}

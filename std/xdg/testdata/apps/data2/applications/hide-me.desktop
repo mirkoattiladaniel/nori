@@ -1,0 +1,6 @@
+[Desktop Entry]
+# The Hidden=true for the "hide-me" id in the LATER data dir removes the id from the list,
+# even though data1's applications dir was searched first.
+Type=Application
+Name=Hide Me Later
+Hidden=true

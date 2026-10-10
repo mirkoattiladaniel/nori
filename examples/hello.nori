@@ -1,0 +1,8 @@
+// The smallest Nori program: print a line, return 0.
+// `${...}` inside a string literal interpolates any scalar or string.
+fn main() -> Int {
+    let name = "Nori"
+    printl("hello from ${name}")
+    printl("2 + 3 = ${2 + 3}")
+    return 0
+}

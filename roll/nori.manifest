@@ -1,0 +1,24 @@
+name = roll
+kind = bin
+version = 0.1.0
+entry = src/main.nori
+
+# No [native] section: roll links no C library and runs no other program. Git dependencies are fetched over
+# HTTPS (src/git), std/http speaks TLS itself, and SHA-256 (std/crypto) and unpack (std/archive) are Nori
+# code, so the release binary is static and has no runtime dependencies.
+
+# build profiles: `roll build` -> [profile.dev], `--release` -> [profile.release],
+# `--profile NAME` -> [profile.NAME]. Override these or add as many as you like.
+[profile.dev]
+auto-order = false
+simd = true
+opt = 1
+lto = false
+incremental = true
+
+[profile.release]
+auto-order = true
+simd = true
+opt = 3
+lto = thin        # `thin`, not `true`: the incremental backend honours ThinLTO and silently skips full LTO
+incremental = true

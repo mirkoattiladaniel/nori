@@ -1,0 +1,135 @@
+use core::*
+import "std/math" as math
+
+// ===========================================================================
+// layout/fx: the whole-subtree paint effects: opacity, translate and scale.
+//
+// They are applied to laid-out primitives, never to layout: a translated node
+// still occupies its slot in the flow, as with a CSS transform. That
+// keeps both painters ignorant of them (a primitive that has been moved and
+// faded is an ordinary primitive) and makes an animated slide or fade cost a
+// re-transform of the subtree's primitives, not a relayout.
+//
+// The transform is the 2D map  p' = (sx * p.x + tx, sy * p.y + ty), translate
+// plus per-axis scale, which is everything `.style` can ask for and closes
+// under composition, so an ancestor's transform composes with a descendant's
+// (and a scroll offset, which is a translate too) into one Xf per node.
+//
+// Opacity is per primitive, not a group: the alpha of every primitive in the
+// subtree is multiplied by the subtree's opacity. CSS group opacity would draw
+// the subtree into a layer and fade the layer, so where two children overlap
+// the one underneath does not show through; here it does. Neither painter has
+// layers, and for the desktop's fades (a whole menu or a notification fading
+// in and out) the difference is overlap inside a fading panel, mid-fade.
+// ===========================================================================
+
+/// p' = (sx * x + tx, sy * y + ty).
+pub struct Xf { sx: Float, sy: Float, tx: Float, ty: Float }
+
+pub fn xf_identity() -> Xf { return Xf { sx: 1.0, sy: 1.0, tx: 0.0, ty: 0.0 } }
+pub fn xf_translate(dx: Float, dy: Float) -> Xf { return Xf { sx: 1.0, sy: 1.0, tx: dx, ty: dy } }
+pub fn xf_dup(x: Xf) -> Xf { return Xf { sx: x.sx, sy: x.sy, tx: x.tx, ty: x.ty } }
+pub fn xf_is_identity(x: Xf) -> Bool { return x.sx == 1.0 && x.sy == 1.0 && x.tx == 0.0 && x.ty == 0.0 }
+pub fn xf_eq(a: Xf, b: Xf) -> Bool { return a.sx == b.sx && a.sy == b.sy && a.tx == b.tx && a.ty == b.ty }
+/// `first`, then `second`: second(first(p)).
+pub fn xf_then(first: Xf, second: Xf) -> Xf {
+    return Xf { sx: second.sx * first.sx, sy: second.sy * first.sy, tx: second.sx * first.tx + second.tx, ty: second.sy * first.ty + second.ty }
+}
+pub fn xf_point(x: Xf, p: Vec2) -> Vec2 { return vec2(x.sx * p.x + x.tx, x.sy * p.y + x.ty) }
+/// the inverse map of a point (a zero scale maps everything to the origin it collapsed onto).
+pub fn xf_unpoint(x: Xf, p: Vec2) -> Vec2 {
+    var ux = p.x - x.tx
+    var uy = p.y - x.ty
+    if x.sx != 0.0 { ux = ux / x.sx }
+    if x.sy != 0.0 { uy = uy / x.sy }
+    return vec2(ux, uy)
+}
+/// the image of `r`, normalised so min <= max whatever the sign of the scale.
+pub fn xf_rect(x: Xf, r: Rect) -> Rect {
+    if xf_is_identity(x) { return rect_dup(r) }
+    let ax = x.sx * r.min.x + x.tx
+    let bx = x.sx * r.max.x + x.tx
+    let ay = x.sy * r.min.y + x.ty
+    let by = x.sy * r.max.y + x.ty
+    return rect_min_max(vec2(math::fmin(ax, bx), math::fmin(ay, by)), vec2(math::fmax(ax, bx), math::fmax(ay, by)))
+}
+/// a length scaled by the transform (the mean of the two axes: a radius or a font size has one).
+pub fn xf_len(x: Xf, v: Float) -> Float { return v * (math::fabs(x.sx) + math::fabs(x.sy)) * 0.5 }
+
+/// true when `node` asks for any of the three effects.
+pub fn node_has_fx(node: UiNode) -> Bool {
+    return node.opacity != 1.0 || node.translate_x != 0.0 || node.translate_y != 0.0 || node.scale_x != 1.0 || node.scale_y != 1.0
+}
+/// the node's own transform for a node laid out at `rect`: scale about the rect's centre, then translate.
+pub fn node_fx_xf(node: UiNode, rect: Rect) -> Xf {
+    let c = rect.center()
+    return Xf { sx: node.scale_x, sy: node.scale_y, tx: c.x - node.scale_x * c.x + node.translate_x, ty: c.y - node.scale_y * c.y + node.translate_y }
+}
+/// clamp an opacity to 0..1.
+pub fn fx_opacity(v: Float) -> Float { if v < 0.0 { return 0.0 }  if v > 1.0 { return 1.0 }  return v }
+
+/// move and scale one primitive.
+pub fn pp_apply_xf(inout p: PaintPrimitive, x: Xf) {
+    if xf_is_identity(x) { return }
+    p.rect = xf_rect(x, p.rect)
+    p.clip = xf_rect(x, p.clip)
+    p.pos = xf_point(x, p.pos)
+    p.size_px = xf_len(x, p.size_px)
+    p.radius = xf_len(x, p.radius)
+    p.border_w = xf_len(x, p.border_w)
+    p.outline_w = xf_len(x, p.outline_w)
+    p.letter_spacing = p.letter_spacing * math::fabs(x.sx)
+    p.word_spacing = p.word_spacing * math::fabs(x.sx)
+    var k = 0
+    while k < p.line_x.len() { p.line_x[k] = p.line_x[k] * math::fabs(x.sx)  k = k + 1 }
+    if p.grad_horizontal { p.grad_a = x.sx * p.grad_a + x.tx  p.grad_b = p.grad_b * math::fabs(x.sx) }
+    else { p.grad_a = x.sy * p.grad_a + x.ty  p.grad_b = p.grad_b * math::fabs(x.sy) }
+}
+fn alpha_mul(a: Int, op: Float) -> Int {
+    var v = to_int(to_float(a) * op + 0.5)
+    if v < 0 { v = 0 }
+    if v > 255 { v = 255 }
+    return v
+}
+/// fade one primitive: every colour it draws with (an image's is the alpha it is blitted at).
+pub fn pp_apply_opacity(inout p: PaintPrimitive, op: Float) {
+    if op >= 1.0 { return }
+    p.color = color_rgba(p.color.r, p.color.g, p.color.b, alpha_mul(p.color.a, op))
+    p.outline_color = color_rgba(p.outline_color.r, p.outline_color.g, p.outline_color.b, alpha_mul(p.outline_color.a, op))
+    p.grad_to = color_rgba(p.grad_to.r, p.grad_to.g, p.grad_to.b, alpha_mul(p.grad_to.a, op))
+}
+/// apply a transform and an opacity to everything an overlay holds: primitives (and the popup
+/// layer's), hit regions, surfaces and scroll viewports. Hit regions move with what they hit, as
+/// they do under a CSS transform.
+pub fn overlay_apply_fx(inout ov: ComputedOverlay, x: Xf, op: Float) {
+    let ident = xf_is_identity(x)
+    if ident && op >= 1.0 { return }
+    var i = 0
+    while i < ov.prims.len() { pp_apply_xf(ov.prims[i], x)  pp_apply_opacity(ov.prims[i], op)  i = i + 1 }
+    var j = 0
+    while j < ov.pop_prims.len() { pp_apply_xf(ov.pop_prims[j], x)  pp_apply_opacity(ov.pop_prims[j], op)  j = j + 1 }
+    if ident { return }
+    var h = 0
+    while h < ov.hits.len() { ov.hits[h].rect = xf_rect(x, ov.hits[h].rect)  h = h + 1 }
+    var ph = 0
+    while ph < ov.pop_hits.len() { ov.pop_hits[ph].rect = xf_rect(x, ov.pop_hits[ph].rect)  ph = ph + 1 }
+    var s = 0
+    while s < ov.surfaces.len() { ov.surfaces[s].rect = xf_rect(x, ov.surfaces[s].rect)  s = s + 1 }
+    var c = 0
+    while c < ov.scrolls.len() { ov.scrolls[c].viewport = xf_rect(x, ov.scrolls[c].viewport)  c = c + 1 }
+}
+/// move everything `src` holds onto the end of `out`, layer by layer.
+pub fn overlay_append(inout out: ComputedOverlay, sink src: ComputedOverlay) {
+    var i = 0
+    while i < src.prims.len() { out.prims.push(sink src.prims[i])  i = i + 1 }
+    var h = 0
+    while h < src.hits.len() { out.hits.push(sink src.hits[h])  h = h + 1 }
+    var s = 0
+    while s < src.surfaces.len() { out.surfaces.push(sink src.surfaces[s])  s = s + 1 }
+    var c = 0
+    while c < src.scrolls.len() { out.scrolls.push(sink src.scrolls[c])  c = c + 1 }
+    var pp = 0
+    while pp < src.pop_prims.len() { out.pop_prims.push(sink src.pop_prims[pp])  pp = pp + 1 }
+    var ph = 0
+    while ph < src.pop_hits.len() { out.pop_hits.push(sink src.pop_hits[ph])  ph = ph + 1 }
+}

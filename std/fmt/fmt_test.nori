@@ -1,0 +1,255 @@
+// Tests for std/fmt. Run with
+//   noric --test std/fmt/fmt_test.nori compiler/runtime.nori --import-root .
+//
+// The float half of this file is verified against the parser: `parse_float` is correctly
+// rounded, so "the text reads back as the same double" is a checkable statement. Every float
+// comparison here is `==` on the double, never a tolerance.
+import "std/fmt" as fmt
+import "std/parse" as parse
+import "std/json" as json
+
+fn test_fmt() {
+    assert_streq(fmt::pad_int(7, 3), "007")
+    assert_streq(fmt::to_hex(255), "ff")
+    assert_streq(fmt::format("{}-{}", fmt::vec_str("a", "b")), "a-b")
+}
+
+// ---- helpers ------------------------------------------------------------------------------------
+
+/// the double a decimal literal denotes. The compiler's own literal parser is not reachable from a
+/// loop, so the hard cases are spelled as text and read with the correctly-rounded reader.
+fn fmtt_v(s: Str) -> Float { return parse::parse_float(s).value }
+
+/// assert that `v` survives format -> parse unchanged, bit for bit.
+fn fmtt_round_trip(v: Float) {
+    let s = fmt::float_shortest(v)
+    assert_true(parse::parse_float(s).value == v)
+}
+
+/// the significant digit count of a formatted number: sign, point, exponent and the leading zeros
+/// of a `0.00…` form do not count.
+fn fmtt_ndigits(s: Str) -> Int {
+    var n = 0
+    var i = 0
+    var stop = false
+    var started = false
+    while i < s.len() {
+        let c = s.at(i)
+        if c == 'e' { stop = true }
+        if !stop && c >= '1' && c <= '9' { started = true }
+        if !stop && started && c >= '0' && c <= '9' { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+/// `s` with one significant digit removed from the end of its digit run, used to prove the output
+/// is not one digit longer than it has to be.
+fn fmtt_chop(s: Str) -> Str {
+    var head = s
+    var tail = ""
+    var i = 0
+    while i < s.len() { if s.at(i) == 'e' { head = s.slice(0, i)  tail = s.slice(i, s.len()) }  i = i + 1 }
+    var out = head.slice(0, head.len() - 1)
+    if out.len() > 0 && out.at(out.len() - 1) == '.' { out = out.slice(0, out.len() - 1) }
+    return out + tail
+}
+
+// ---- the spellings ------------------------------------------------------------------------------
+
+fn test_float_notation_and_specials() {
+    // integral values in the plain range: no invented ".0"
+    assert_streq(fmt::float_shortest(0.0), "0")
+    assert_streq(fmt::float_shortest(1.0), "1")
+    assert_streq(fmt::float_shortest(100.0), "100")
+    assert_streq(fmt::float_shortest(0.0 - 2.5), "-2.5")
+    assert_streq(fmt::float_shortest(fmtt_v("9007199254740992")), "9007199254740992")
+    // the notation switch, both directions and both ends
+    assert_streq(fmt::float_shortest(fmtt_v("1e16")), "10000000000000000")
+    assert_streq(fmt::float_shortest(fmtt_v("1e17")), "1e17")
+    assert_streq(fmt::float_shortest(fmtt_v("0.00001")), "0.00001")
+    assert_streq(fmt::float_shortest(fmtt_v("0.000001")), "1e-6")
+    assert_streq(fmt::float_shortest(fmtt_v("1e22")), "1e22")
+    assert_streq(fmt::float_shortest(fmtt_v("-1e-22")), "-1e-22")
+    // negative zero is a distinct double and keeps its sign (there is no -0.0 literal to write)
+    let nz = fmtt_v("-0")
+    assert_true(nz == 0.0)
+    assert_true(1.0 / nz < 0.0)
+    assert_streq(fmt::float_shortest(nz), "-0")
+    assert_true(1.0 / parse::parse_float(fmt::float_shortest(nz)).value < 0.0)
+    // NaN and the infinities: spelled for `float_shortest`, `null` for JSON
+    let inf = fmtt_v("1e400")
+    assert_streq(fmt::float_shortest(inf), "inf")
+    assert_streq(fmt::float_shortest(0.0 - inf), "-inf")
+    assert_streq(fmt::float_json(inf), "null")
+    assert_streq(fmt::float_json(0.0 - inf), "null")
+    let nan = inf - inf
+    assert_streq(fmt::float_shortest(nan), "NaN")
+    assert_streq(fmt::float_json(nan), "null")
+}
+
+// the thing `"" + f` cannot do: six significant digits is not enough to name a double.
+fn test_float_beats_the_builtin_formatter() {
+    assert_streq("" + 0.1, "0.1")                                   // agrees where %g can spell it
+    assert_streq("" + (0.1 + 0.2), "0.3")                           // and here it does not
+    assert_streq(fmt::float_shortest(0.1 + 0.2), "0.30000000000000004")
+    assert_streq(fmt::float_shortest(1.0 / 3.0), "0.3333333333333333")
+    assert_streq(fmt::float_shortest(fmtt_v("123456.789")), "123456.789")
+    assert_streq(fmt::float_shortest(fmtt_v("0.25882354378700256")), "0.25882354378700256")
+}
+
+// the hard literals, each asserted with `==` on the double
+fn test_float_hard_literals_round_trip() {
+    var cases: Vec<Str> = vec()
+    cases.push("0.25882354378700256")
+    cases.push("1.2345678901234567")
+    cases.push("1.0000000000000002")
+    cases.push("9007199254740993")
+    cases.push("0.30000000000000004")
+    cases.push("2.2204460492503131e-16")
+    cases.push("1e22")
+    cases.push("1e-22")
+    cases.push("1e26")
+    cases.push("1e-26")
+    cases.push("2.2250738585072014e-308")
+    cases.push("5e-324")
+    cases.push("1.7976931348623157e308")
+    cases.push("0.8500000238418579")
+    cases.push("0.08627451211214066")
+    cases.push("3.141592653589793")
+    var i = 0
+    while i < cases.len() {
+        let v = fmtt_v(cases[i])
+        fmtt_round_trip(v)
+        fmtt_round_trip(0.0 - v)
+        i = i + 1
+    }
+    // and the ones whose canonical spelling is the literal itself come back character-identical
+    assert_streq(fmt::float_shortest(fmtt_v("1.2345678901234567")), "1.2345678901234567")
+    assert_streq(fmt::float_shortest(fmtt_v("1.0000000000000002")), "1.0000000000000002")
+    assert_streq(fmt::float_shortest(fmtt_v("2.2250738585072014e-308")), "2.2250738585072014e-308")
+    assert_streq(fmt::float_shortest(fmtt_v("5e-324")), "5e-324")
+    assert_streq(fmt::float_shortest(fmtt_v("1.7976931348623157e308")), "1.7976931348623157e308")
+    // 9007199254740993 is not a double at all; it is 9007199254740992 and prints as that
+    assert_streq(fmt::float_shortest(fmtt_v("9007199254740993")), "9007199254740992")
+}
+
+// A sweep: several thousand values, spread over the magnitudes real data reaches, every one
+// asserted exactly. `1e-10 .. 1e20` is the band in which the output is also measured (against
+// std/js's bignum dtoa) to be shortest and correctly rounded; the round trip itself
+// holds everywhere and is asserted everywhere.
+fn test_float_round_trip_sweep() {
+    var n = 0
+    // (a) every integer 1..600, its reciprocal, its square root-ish ratios
+    var i = 1
+    while i <= 600 {
+        let x = to_float(i)
+        fmtt_round_trip(x)
+        fmtt_round_trip(1.0 / x)
+        fmtt_round_trip(0.0 - (1.0 / x))
+        fmtt_round_trip(x / 7.0)
+        fmtt_round_trip(x * 1.0e-8)
+        fmtt_round_trip(x * 1.0e12)
+        n = n + 6
+        i = i + 1
+    }
+    // (b) a linear-congruential walk over mantissas, at a spread of decimal exponents
+    var seed = 123456789
+    var e = 0 - 9
+    while e <= 19 {
+        var k = 0
+        while k < 60 {
+            seed = (seed * 1103515245 + 12345) % 1000000007
+            var m = seed
+            if m < 0 { m = 0 - m }
+            let mant = to_float(m % 1000000000) / 1000000000.0 + 1.0
+            var x = mant
+            var q = 0
+            while q < e { x = x * 10.0  q = q + 1 }
+            while q > e { x = x / 10.0  q = q - 1 }
+            fmtt_round_trip(x)
+            fmtt_round_trip(0.0 - x)
+            n = n + 2
+            k = k + 1
+        }
+        e = e + 1
+    }
+    // (c) powers of two and of ten, up and down, including the subnormal floor
+    var p = 0
+    var pw = 1.0
+    while p < 60 { fmtt_round_trip(pw)  fmtt_round_trip(1.0 / pw)  pw = pw * 2.0  n = n + 2  p = p + 1 }
+    var t = 0 - 25
+    while t <= 25 { fmtt_round_trip(fmtt_v("1e" + to_str(t)))  n = n + 1  t = t + 1 }
+    assert_true(n >= 5000)
+}
+
+// Shortest, not merely correct: chopping one significant digit must break the round trip.
+fn test_float_output_is_shortest() {
+    var cases: Vec<Str> = vec()
+    cases.push("0.1")
+    cases.push("0.30000000000000004")
+    cases.push("0.25882354378700256")
+    cases.push("1.2345678901234567")
+    cases.push("123456.789")
+    cases.push("3.141592653589793")
+    cases.push("1.0000000000000002")
+    cases.push("2.5")
+    cases.push("6.02e23")
+    var i = 0
+    while i < cases.len() {
+        let v = fmtt_v(cases[i])
+        let s = fmt::float_shortest(v)
+        assert_true(parse::parse_float(s).value == v)
+        let c = fmtt_chop(s)
+        let r = parse::parse_float(c)
+        assert_true(!r.ok || r.value != v)                 // one digit less no longer names the value
+        assert_true(fmtt_ndigits(c) == fmtt_ndigits(s) - 1)
+        i = i + 1
+    }
+    // and the short values really are short, with no 17-digit padding
+    assert_eq(fmtt_ndigits(fmt::float_shortest(0.1)), 1)
+    assert_eq(fmtt_ndigits(fmt::float_shortest(0.5)), 1)
+    assert_eq(fmtt_ndigits(fmt::float_shortest(fmtt_v("2.5"))), 2)
+    assert_eq(fmtt_ndigits(fmt::float_shortest(fmtt_v("1e22"))), 1)
+}
+
+fn test_float_prec() {
+    let pi = fmtt_v("3.141592653589793")
+    assert_streq(fmt::float_prec(pi, 1), "3")
+    assert_streq(fmt::float_prec(pi, 3), "3.14")
+    assert_streq(fmt::float_prec(pi, 5), "3.1416")
+    assert_streq(fmt::float_prec(pi, 17), "3.1415926535897931")
+    assert_streq(fmt::float_prec(0.0 - pi, 3), "-3.14")
+    assert_streq(fmt::float_prec(0.5, 4), "0.5000")             // trailing zeros are kept
+    assert_streq(fmt::float_prec(fmtt_v("999.9"), 2), "1000")   // rounding carries out of the run
+    assert_streq(fmt::float_prec(0.0, 3), "0.00")
+    assert_streq(fmt::float_prec(pi, 0), "3")                   // clamped
+    assert_streq(fmt::float_prec(pi, 99), "3.1415926535897931")
+}
+
+// ---- JSON round-trips ------------------------------------------------
+
+fn test_json_number_round_trip_is_now_lossless() {
+    let src = "[0.25882354378700256,1.2345678901234567,0.30000000000000004,1.0000000000000002," +
+              "2.2204460492503131e-16,1e22,1e-22,0.75,0.6,0.1,100.001,-1.5e-2,2.5,-0.015625," +
+              "0.08627451211214066,3.141592653589793,1234567890123456.7,-0]"
+    let a = json::parse(src)
+    let text = json::stringify(a)
+    let b = json::parse(text)
+    let c = json::parse(json::stringify(b))
+    var i = 0
+    while i < 18 {
+        let x = json::as_num(json::at(a, i))
+        assert_true(json::as_num(json::at(b, i)) == x)
+        assert_true(json::as_num(json::at(c, i)) == x)
+        i = i + 1
+    }
+    // stringify is a fixed point: the second rendering is character-identical to the first
+    assert_streq(json::stringify(b), text)
+    // and the hard literal is spelled out in full, not rounded to six digits
+    assert_true(text.len() > src.len() - 20)
+    assert_streq(json::stringify(json::at(a, 0)), "0.25882354378700256")
+    assert_streq(json::stringify(json::at(a, 5)), "1e22")
+    // negative zero survives a JSON round trip
+    assert_true(1.0 / json::as_num(json::at(b, 17)) < 0.0)
+}

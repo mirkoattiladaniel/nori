@@ -1,0 +1,715 @@
+//! std/archive: gunzip (DEFLATE / RFC 1951 + gzip / RFC 1952) and tar extraction.
+//!   import "std/archive" as ar
+//!   ar::unpack("foo.tar.gz", "dir")   // gunzip + untar into dir (which must exist); 0 = ok
+//! Decompression runs into a raw heap buffer (unsafe malloc/peek8) so LZ77 back-references and the tar
+//! parser have O(1) random access. Handles .tar.gz and plain .tar (gzip magic 0x1f 0x8b is auto-detected).
+
+extern fn malloc(Int) -> Int
+extern fn realloc(Int, Int) -> Int
+extern fn free(Int)
+extern fn chmod(Int, Int) -> I32 // POSIX: int chmod(const char* path, mode_t mode)
+extern fn mkdir(Int, Int) -> I32 // POSIX: int mkdir(const char* path, mode_t mode)
+extern fn access(Int, Int) -> I32 // POSIX: int access(const char* path, int mode); F_OK = 0
+extern fn nori_str_ptr(Str) -> Int // runtime: a Str's raw data pointer (for plain-tar input)
+
+// ── a growable raw byte buffer (the inflate sink + random-access window) ────────────────────────────
+struct Buf {
+    p: Int,
+    len: Int,
+    cap: Int
+}
+fn buf_new() -> Buf {
+    var b: Buf = Buf { p: 0, len: 0, cap: 65536 }
+    unsafe {
+        b.p = malloc(65536)
+    }
+    return b
+}
+fn buf_push(inout b: Buf, byte: Int) -> Int {
+    if b.len == b.cap {
+        b.cap = b.cap * 2
+        unsafe {
+            b.p = realloc(b.p, b.cap)
+        }
+    }
+    unsafe {
+        poke8(b.p + b.len, byte)
+    }
+    b.len = b.len + 1
+    return 0
+}
+fn buf_at(b: Buf, i: Int) -> Int {
+    unsafe {
+        return peek8(b.p + i)
+    }
+}
+
+// ── LSB-first bit reader over the compressed input ─────────────────────────────────────────────────
+// `buf` holds exactly `cnt` still-unconsumed low bits (bits above cnt are 0); `pos` is the next byte to
+// pull. bits_fill() tops the buffer up to at least `need` bits at once (reading whole bytes), so the hot
+// path avoids a per-bit char_at. Past end-of-input it shifts in zero bytes (a code near the end of a
+// stream is decoded from a full window), but consuming a bit past the end is an error (`err`): every
+// read that takes bits checks it, so a truncated stream stops instead of decoding zeros forever.
+//
+// The inflater is safe on any input. Every value the stream supplies is checked before it is used:
+// block types, the dynamic header's counts (HLIT <= 286, HDIST <= 30), every code-length set
+// (over-subscribed sets are refused; an incomplete set decodes, and a code it does not assign is an
+// error), repeat codes (none before the first length, none past the end), the end-of-block code's
+// presence, literal/length symbols 286-287 and distance symbols 30-31, a distance reaching before the
+// start of the output, stored blocks' LEN/NLEN and their length against the input, and (when the
+// caller gives one) the output's size. A malformed stream ends with `err` set and whatever was decoded
+// before the fault; nothing reads outside the input or the output.
+struct Bits {
+    d: view Str,
+    n: Int,
+    pos: Int,
+    buf: Int,
+    cnt: Int,
+    err: Int = 0,
+    max_out: Int = 0
+}
+fn bits_fill(inout s: Bits, need: Int) {
+    while s.cnt < need {
+        var byte = 0
+        if s.pos < s.n {
+            byte = ord(s.d.at(s.pos))
+        }
+        s.buf = (s.buf | (byte << s.cnt))
+        s.pos = s.pos + 1
+        s.cnt = s.cnt + 8
+    }
+}
+// has more been consumed than the input holds?
+fn bits_over(inout s: Bits) {
+    if s.pos * 8 - s.cnt > s.n * 8 && s.err == 0 { s.err = 1 }
+}
+fn nbit(inout s: Bits) -> Int {
+    if s.cnt == 0 {
+        bits_fill(s, 1)
+    }
+    let b = (s.buf & 1)
+    s.buf = (s.buf >> 1)
+    s.cnt = s.cnt - 1
+    bits_over(s)
+    return b
+}
+fn nbits(inout s: Bits, n: Int) -> Int {
+    if n == 0 {
+        return 0
+    }
+    bits_fill(s, n)
+    let v = (s.buf & ((1 << n) - 1))
+    s.buf = (s.buf >> n)
+    s.cnt = s.cnt - n
+    bits_over(s)
+    return v
+}
+
+// the error codes (see inflate_err_text)
+fn IE_TRUNC() -> Int { return 1 }
+fn IE_BTYPE() -> Int { return 2 }
+fn IE_STORED() -> Int { return 3 }
+fn IE_COUNTS() -> Int { return 4 }
+fn IE_LENGTHS() -> Int { return 5 }
+fn IE_REPEAT() -> Int { return 6 }
+fn IE_NOEOB() -> Int { return 7 }
+fn IE_CODE() -> Int { return 8 }
+fn IE_SYMBOL() -> Int { return 9 }
+fn IE_DIST() -> Int { return 10 }
+fn IE_TOOBIG() -> Int { return 11 }
+fn IE_HEADER() -> Int { return 12 }
+fn IE_CHECK() -> Int { return 13 }
+/// what an inflate error code means.
+pub fn inflate_err_text(code: Int) -> Str {
+    if code == 0 { return "" }
+    if code == 1 { return "the stream ends before its last block does" }
+    if code == 2 { return "a block of type 3 (reserved)" }
+    if code == 3 { return "a stored block whose length is damaged or runs past the input" }
+    if code == 4 { return "a dynamic block's header counts more codes than DEFLATE has" }
+    if code == 5 { return "a set of Huffman code lengths that is over-subscribed" }
+    if code == 6 { return "a code-length repeat with nothing before it, or past the end" }
+    if code == 7 { return "a block with no end-of-block code" }
+    if code == 8 { return "a Huffman code the block's tables do not assign" }
+    if code == 9 { return "a literal/length or distance symbol DEFLATE does not define" }
+    if code == 10 { return "a distance reaching back before the start of the output" }
+    if code == 11 { return "the output is larger than the caller allows" }
+    if code == 12 { return "a damaged zlib or gzip header" }
+    if code == 13 { return "the checksum does not match the data" }
+    return "a damaged stream"
+}
+
+// ── canonical Huffman (puff-style: per-length counts + symbols sorted by code) ──────────────────────
+// `ok` false: the lengths are over-subscribed (no prefix code has them). An incomplete set is kept:
+// zlib accepts one (a single distance code is common), and a code it leaves unassigned is refused
+// when it is met.
+struct Huff {
+    count: Vec<Int>,
+    symbol: Vec<Int>,
+    ok: Bool = true
+}
+fn huff_build(lengths: Vec<Int>, n: Int) -> Huff {
+    var count: Vec<Int> = vec() var i = 0 while i <= 15 { count.push(0) i = i + 1 }
+    var ok = n <= lengths.len()
+    var m = n
+    if m > lengths.len() { m = lengths.len() }
+    i = 0
+    while i < m {
+        let l = lengths[i]
+        if l < 0 || l > 15 { ok = false } else { count[l] = count[l] + 1 }
+        i = i + 1
+    }
+    // over-subscribed?
+    var left = 1
+    var b = 1
+    while b <= 15 { left = left * 2 - count[b]  if left < 0 { ok = false }  b = b + 1 }
+    var offs: Vec<Int> = vec() i = 0 while i <= 15 { offs.push(0) i = i + 1 }
+    var l = 1 while l < 15 { offs[l + 1] = offs[l] + count[l] l = l + 1 }
+    var symbol: Vec<Int> = vec() i = 0 while i < m { symbol.push(0) i = i + 1 }
+    if ok {
+        i = 0 while i < m { if lengths[i] != 0 { symbol[offs[lengths[i]]] = i offs[lengths[i]] = offs[lengths[i]] + 1 } i = i + 1 }
+    }
+    return Huff { count: count, symbol: symbol, ok: ok }
+}
+// the next symbol, or -1 for a code the table does not assign (the caller reports it)
+fn huff_decode(inout s: Bits, h: Huff) -> Int {
+    bits_fill(s, 15) // max code length is 15; buffer them all, then bit-walk locally
+    var acc = s.buf
+    var used = 0
+    var code = 0 var first = 0 var index = 0 var l = 1
+    while l <= 15 {
+        code = (code | (acc & 1))
+        acc = (acc >> 1)
+        used = used + 1
+        let cnt = h.count[l]
+        if code - cnt < first {
+            s.buf = (s.buf >> used)
+            s.cnt = s.cnt - used
+            bits_over(s)
+            let k = index + (code - first)
+            if k < 0 || k >= h.symbol.len() { return 0 - 1 }
+            return h.symbol[k]
+        }
+        index = index + cnt
+        first = ((first + cnt) << 1)
+        code = (code << 1)
+        l = l + 1
+    }
+    return 0 - 1
+}
+
+// length/distance base + extra-bit tables (RFC 1951 §3.2.5)
+struct Tabs {
+    lbase: Vec<Int>,
+    lext: Vec<Int>,
+    dbase: Vec<Int>,
+    dext: Vec<Int>
+}
+fn tabs() -> Tabs {
+    var lbase: Vec<Int> = vec()
+    lbase.push(3) lbase.push(4) lbase.push(5) lbase.push(6) lbase.push(7) lbase.push(8) lbase.push(9) lbase.push(10)
+    lbase.push(11) lbase.push(13) lbase.push(15) lbase.push(17) lbase.push(19) lbase.push(23) lbase.push(27) lbase.push(31)
+    lbase.push(35) lbase.push(43) lbase.push(51) lbase.push(59) lbase.push(67) lbase.push(83) lbase.push(99) lbase.push(115)
+    lbase.push(131) lbase.push(163) lbase.push(195) lbase.push(227) lbase.push(258)
+    var lext: Vec<Int> = vec()
+    lext.push(0) lext.push(0) lext.push(0) lext.push(0) lext.push(0) lext.push(0) lext.push(0) lext.push(0)
+    lext.push(1) lext.push(1) lext.push(1) lext.push(1) lext.push(2) lext.push(2) lext.push(2) lext.push(2)
+    lext.push(3) lext.push(3) lext.push(3) lext.push(3) lext.push(4) lext.push(4) lext.push(4) lext.push(4)
+    lext.push(5) lext.push(5) lext.push(5) lext.push(5) lext.push(0)
+    var dbase: Vec<Int> = vec()
+    dbase.push(1) dbase.push(2) dbase.push(3) dbase.push(4) dbase.push(5) dbase.push(7) dbase.push(9) dbase.push(13)
+    dbase.push(17) dbase.push(25) dbase.push(33) dbase.push(49) dbase.push(65) dbase.push(97) dbase.push(129) dbase.push(193)
+    dbase.push(257) dbase.push(385) dbase.push(513) dbase.push(769) dbase.push(1025) dbase.push(1537) dbase.push(2049) dbase.push(3073)
+    dbase.push(4097) dbase.push(6145) dbase.push(8193) dbase.push(12289) dbase.push(16385) dbase.push(24577)
+    var dext: Vec<Int> = vec()
+    dext.push(0) dext.push(0) dext.push(0) dext.push(0) dext.push(1) dext.push(1) dext.push(2) dext.push(2)
+    dext.push(3) dext.push(3) dext.push(4) dext.push(4) dext.push(5) dext.push(5) dext.push(6) dext.push(6)
+    dext.push(7) dext.push(7) dext.push(8) dext.push(8) dext.push(9) dext.push(9) dext.push(10) dext.push(10)
+    dext.push(11) dext.push(11) dext.push(12) dext.push(12) dext.push(13) dext.push(13)
+    return Tabs { lbase: lbase, lext: lext, dbase: dbase, dext: dext }
+}
+
+// may `n` more bytes be written? (the caller's cap on the output)
+fn out_room(inout s: Bits, out: Buf, n: Int) -> Bool {
+    if s.max_out > 0 && out.len + n > s.max_out { if s.err == 0 { s.err = IE_TOOBIG() }  return false }
+    return true
+}
+
+// decode one (already-typed) block's symbols into `out`
+fn inflate_block(inout s: Bits, inout out: Buf, lh: Huff, dh: Huff, t: Tabs) -> Int {
+    var done = 0
+    while done == 0 && s.err == 0 {
+        let sym = huff_decode(s, lh)
+        if s.err != 0 { done = 1 }
+        else if sym < 0 { s.err = IE_CODE()  done = 1 }
+        else if sym == 256 {
+            done = 1
+        }
+        else {
+            if sym < 256 {
+                if !out_room(s, out, 1) { return 0 }
+                // literal byte: emit directly (one cap check, no per-byte call overhead)
+                if out.len == out.cap {
+                    out.cap = (out.cap * 2)
+                    unsafe {
+                        out.p = realloc(out.p, out.cap)
+                    }
+                }
+                unsafe {
+                    poke8(out.p + out.len, sym)
+                }
+                out.len = out.len + 1
+            } else {
+                let li = sym - 257
+                if li >= 29 { s.err = IE_SYMBOL()  return 0 }
+                let length = t.lbase[li] + nbits(s, t.lext[li])
+                let dsym = huff_decode(s, dh)
+                if dsym < 0 { if s.err == 0 { s.err = IE_CODE() }  return 0 }
+                if dsym >= 30 { s.err = IE_SYMBOL()  return 0 }
+                let dist = t.dbase[dsym] + nbits(s, t.dext[dsym])
+                if s.err != 0 { return 0 }
+                // a distance may reach back to the first byte of the output and no further
+                if dist > out.len { s.err = IE_DIST()  return 0 }
+                if !out_room(s, out, length) { return 0 }
+                // back-reference copy: reserve once, then byte-by-byte (overlap-safe) via direct pointers
+                let need = out.len + length
+                if need > out.cap {
+                    while out.cap < need {
+                        out.cap = (out.cap * 2)
+                    }
+                    unsafe {
+                        out.p = realloc(out.p, out.cap)
+                    }
+                }
+                let src = (out.p + out.len) - dist
+                let dst = out.p + out.len
+                var i = 0
+                unsafe {
+                    while i < length {
+                        poke8(dst + i, peek8(src + i))
+                        i = i + 1
+                    }
+                }
+                out.len = out.len + length
+        } }
+    }
+    return 0
+}
+
+fn fixed_litlens() -> Vec<Int> {
+    var v: Vec<Int> = vec() var i = 0
+    while i < 144 {
+        v.push(8)
+        i = i + 1
+    }
+    while i < 256 {
+        v.push(9)
+        i = i + 1
+    }
+    while i < 280 {
+        v.push(7)
+        i = i + 1
+    }
+    while i < 288 {
+        v.push(8)
+        i = i + 1
+    }
+    return v
+}
+
+// read a dynamic block's two Huffman tables (RFC 1951 §3.2.7); sets s.err on a damaged header
+fn read_dynamic(inout s: Bits, inout litlens: Vec<Int>, inout distlens: Vec<Int>) -> Int {
+    let hlit = nbits(s, 5) + 257
+    let hdist = nbits(s, 5) + 1
+    let hclen = nbits(s, 4) + 4
+    if s.err != 0 { return 0 }
+    if hlit > 286 || hdist > 30 { s.err = IE_COUNTS()  return 0 }
+    var order: Vec<Int> = vec()
+    order.push(16) order.push(17) order.push(18) order.push(0) order.push(8) order.push(7) order.push(9) order.push(6)
+    order.push(10) order.push(5) order.push(11) order.push(4) order.push(12) order.push(3) order.push(13) order.push(2)
+    order.push(14) order.push(1) order.push(15)
+    var cl: Vec<Int> = vec() var i = 0 while i < 19 { cl.push(0) i = i + 1 }
+    i = 0 while i < hclen { cl[order[i]] = nbits(s, 3) i = i + 1 }
+    let clh = huff_build(cl, 19)
+    if !clh.ok { s.err = IE_LENGTHS()  return 0 }
+    var lens: Vec<Int> = vec()
+    var n = 0
+    let total = hlit + hdist
+    while n < total && s.err == 0 {
+        let sym = huff_decode(s, clh)
+        if s.err != 0 { return 0 }
+        if sym < 0 { s.err = IE_CODE()  return 0 }
+        if sym < 16 {
+            lens.push(sym)
+            n = n + 1
+        }
+        else {
+            var r = 0
+            var v = 0
+            if sym == 16 {
+                if n == 0 { s.err = IE_REPEAT()  return 0 }
+                r = nbits(s, 2) + 3
+                v = lens[n - 1]
+            }
+            else if sym == 17 { r = nbits(s, 3) + 3 }
+            else { r = nbits(s, 7) + 11 }
+            if n + r > total { s.err = IE_REPEAT()  return 0 }
+            var j = 0
+            while j < r {
+                lens.push(v)
+                n = n + 1
+                j = j + 1
+            }
+        }
+    }
+    if s.err != 0 { return 0 }
+    // a block must be able to end
+    if lens[256] == 0 { s.err = IE_NOEOB()  return 0 }
+    i = 0 while i < hlit { litlens.push(lens[i]) i = i + 1 }
+    i = 0 while i < hdist { distlens.push(lens[hlit + i]) i = i + 1 }
+    return hlit // (hdist recoverable as len(distlens))
+}
+
+// inflate a raw DEFLATE stream from `s` into `out`; s.err says how it ended (0: whole)
+fn inflate(inout s: Bits, inout out: Buf) -> Int {
+    let t = tabs()
+    var last = 0
+    while last == 0 && s.err == 0 {
+        last = nbit(s)
+        let btype = nbits(s, 2)
+        if s.err != 0 { return s.err }
+        if btype == 0 {
+            // stored: align to next byte, LEN/NLEN, raw copy
+            let bitpos = s.pos * 8 - s.cnt // next unconsumed bit (buffer may be read-ahead)
+            s.pos = (bitpos + 7) >> 3 // round up to the next whole byte
+            s.buf = 0 s.cnt = 0
+            if s.pos + 4 > s.n { s.err = IE_TRUNC()  return s.err }
+            let blen = ord(s.d.at(s.pos)) + 256 * ord(s.d.at(s.pos + 1))
+            let nlen = ord(s.d.at(s.pos + 2)) + 256 * ord(s.d.at(s.pos + 3))
+            if blen != 65535 - nlen { s.err = IE_STORED()  return s.err }
+            s.pos = s.pos + 4
+            if s.pos + blen > s.n { s.err = IE_STORED()  return s.err }
+            if !out_room(s, out, blen) { return s.err }
+            var i = 0
+            while i < blen {
+                buf_push(out, ord(s.d.at(s.pos)))
+                s.pos = s.pos + 1
+                i = i + 1
+            }
+        } else { if btype == 1 { // fixed Huffman
+                // 32 distance codes: 30 and 31 have fixed codes but no meaning, and are refused as symbols
+                var dl: Vec<Int> = vec() var i = 0 while i < 32 { dl.push(5) i = i + 1 }
+                inflate_block(s, out, huff_build(fixed_litlens(), 288), huff_build(dl, 32), t)
+            } else { if btype == 2 { // dynamic Huffman
+                var litlens: Vec<Int> = vec()
+                var distlens: Vec<Int> = vec()
+                let hlit = read_dynamic(s, litlens, distlens)
+                if s.err != 0 { return s.err }
+                let lh = huff_build(litlens, hlit)
+                let dh = huff_build(distlens, distlens.len())
+                if !lh.ok || !dh.ok { s.err = IE_LENGTHS()  return s.err }
+                inflate_block(s, out, lh, dh, t)
+            } else { s.err = IE_BTYPE()  return s.err } } }
+    }
+    return s.err
+}
+
+// where a gzip member's DEFLATE data starts (RFC 1952 header), or -1 when the header is damaged
+fn gzip_data_start(data: Str) -> Int {
+    let n = data.len()
+    if n < 18 || ord(data.at(0)) != 31 || ord(data.at(1)) != 139 || ord(data.at(2)) != 8 { return 0 - 1 }
+    let flg = ord(data.at(3))
+    if (flg & 224) != 0 { return 0 - 1 }                    // reserved bits
+    var pos = 10
+    if (flg & 4) != 0 {                                     // FEXTRA
+        if pos + 2 > n { return 0 - 1 }
+        let xl = ord(data.at(pos)) + 256 * ord(data.at(pos + 1))
+        pos = pos + 2 + xl
+    }
+    if (flg & 8) != 0 {                                     // FNAME
+        while pos < n && ord(data.at(pos)) != 0 { pos = pos + 1 }
+        pos = pos + 1
+    }
+    if (flg & 16) != 0 {                                    // FCOMMENT
+        while pos < n && ord(data.at(pos)) != 0 { pos = pos + 1 }
+        pos = pos + 1
+    }
+    if (flg & 2) != 0 { pos = pos + 2 }                     // FHCRC
+    if pos > n { return 0 - 1 }
+    return pos
+}
+
+// a raw inflated blob: heap pointer + length (caller reads via peek8, frees via inflated_free).
+pub struct Inflated {
+    p: Int,
+    len: Int
+}
+/// the blob's heap pointer: read it with `peek8`, and hand it back with `inflated_free`.
+pub fn inflated_ptr(b: Inflated) -> Int {
+    return b.p
+}
+/// how many bytes the blob holds.
+pub fn inflated_len(b: Inflated) -> Int {
+    return b.len
+}
+/// release the blob. The buffer is raw memory, so nothing else will.
+pub fn inflated_free(b: Inflated) {
+    unsafe {
+        free(b.p)
+    }
+}
+/// an inflate's outcome: `ok`, or `err` saying what was wrong; `data` holds what was decoded (on an
+/// error, the bytes before the fault) and must be freed with inflated_free either way.
+pub struct InflateResult { ok: Bool, err: Str, data: Inflated }
+
+fn adler_ptr(p: Int, n: Int) -> Int {
+    var a = 1
+    var b = 0
+    var i = 0
+    while i < n {
+        var c = 0
+        unsafe { c = peek8(p + i) }
+        a = a + c
+        if a >= 65521 { a = a - 65521 }
+        b = b + a
+        if b >= 65521 { b = b - 65521 }
+        i = i + 1
+    }
+    return b * 65536 + a
+}
+global g_crc_tab: Vec<Int>
+fn crc_ptr(p: Int, n: Int) -> Int {
+    if g_crc_tab.len() == 0 {
+        var k = 0
+        while k < 256 {
+            var c = k
+            var j = 0
+            while j < 8 { if (c & 1) != 0 { c = 3988292384 ^ (c >> 1) } else { c = c >> 1 }  j = j + 1 }
+            g_crc_tab.push(c)
+            k = k + 1
+        }
+    }
+    var crc = 4294967295
+    var i = 0
+    while i < n {
+        var b = 0
+        unsafe { b = peek8(p + i) }
+        crc = g_crc_tab[(crc ^ b) & 255] ^ (crc >> 8)
+        i = i + 1
+    }
+    return crc ^ 4294967295
+}
+fn rd32be(d: Str, at: Int) -> Int { return (ord(d.at(at)) << 24) | (ord(d.at(at + 1)) << 16) | (ord(d.at(at + 2)) << 8) | ord(d.at(at + 3)) }
+fn rd32le(d: Str, at: Int) -> Int { return ord(d.at(at)) | (ord(d.at(at + 1)) << 8) | (ord(d.at(at + 2)) << 16) | (ord(d.at(at + 3)) << 24) }
+fn ir_of(out: Buf, code: Int) -> InflateResult {
+    return InflateResult { ok: code == 0, err: inflate_err_text(code), data: Inflated { p: out.p, len: out.len } }
+}
+// the byte after the last bit the inflater consumed
+fn bits_end(s: Bits) -> Int { return (s.pos * 8 - s.cnt + 7) >> 3 }
+
+/// inflate a raw DEFLATE stream (RFC 1951), checked: any malformed stream is an error, never a trap
+/// or a read outside the input. `max_out` > 0 caps the output (a stream that would inflate past it
+/// is an error, which keeps a hostile stream from asking for gigabytes); 0 is no cap.
+pub fn inflate_raw_checked(data: Str, max_out: Int) -> InflateResult {
+    var s: Bits = Bits { d: data, n: data.len(), pos: 0, buf: 0, cnt: 0, err: 0, max_out: max_out }
+    var out = buf_new()
+    let e = inflate(s, out)
+    return ir_of(out, e)
+}
+/// inflate a zlib stream (RFC 1950), checked: the 2-byte header (compression method 8, window, the
+/// header check, no preset dictionary), the DEFLATE data, and the Adler-32 of the output.
+pub fn inflate_zlib_checked(data: Str, max_out: Int) -> InflateResult {
+    var out = buf_new()
+    let n = data.len()
+    if n < 6 { return ir_of(out, IE_HEADER()) }
+    let cmf = ord(data.at(0))
+    let flg = ord(data.at(1))
+    if (cmf & 15) != 8 || (cmf >> 4) > 7 || (cmf * 256 + flg) % 31 != 0 || (flg & 32) != 0 { return ir_of(out, IE_HEADER()) }
+    var s: Bits = Bits { d: data, n: n, pos: 2, buf: 0, cnt: 0, err: 0, max_out: max_out }
+    let e = inflate(s, out)
+    if e != 0 { return ir_of(out, e) }
+    let at = bits_end(s)
+    if at + 4 > n { return ir_of(out, IE_TRUNC()) }
+    if rd32be(data, at) != adler_ptr(out.p, out.len) { return ir_of(out, IE_CHECK()) }
+    return ir_of(out, 0)
+}
+/// gunzip one gzip member (RFC 1952), checked: the header, the DEFLATE data, the CRC-32 and the
+/// length in the trailer.
+pub fn gunzip_checked(data: Str, max_out: Int) -> InflateResult {
+    var out = buf_new()
+    let start = gzip_data_start(data)
+    if start < 0 { return ir_of(out, IE_HEADER()) }
+    var s: Bits = Bits { d: data, n: data.len(), pos: start, buf: 0, cnt: 0, err: 0, max_out: max_out }
+    let e = inflate(s, out)
+    if e != 0 { return ir_of(out, e) }
+    let at = bits_end(s)
+    if at + 8 > data.len() { return ir_of(out, IE_TRUNC()) }
+    if rd32le(data, at) != crc_ptr(out.p, out.len) || rd32le(data, at + 4) != (out.len & 4294967295) { return ir_of(out, IE_CHECK()) }
+    return ir_of(out, 0)
+}
+/// inflate a zlib stream (RFC 1950: 2-byte header + DEFLATE + adler32), e.g. a PNG IDAT stream.
+///
+/// Safe on any input (a malformed stream stops where it goes wrong and the bytes decoded before
+/// that are returned), but it does not say so, and it checks neither the header nor the Adler-32.
+/// A caller that must know whether the data is whole uses inflate_zlib_checked.
+pub fn inflate_zlib(data: Str) -> Inflated {
+    var s: Bits = Bits { d: data, n: data.len(), pos: 2, buf: 0, cnt: 0, err: 0, max_out: 0 } // skip the 2-byte zlib header (CMF+FLG)
+    var out = buf_new()
+    let _e = inflate(s, out)
+    return Inflated { p: out.p, len: out.len }
+}
+
+// ── tar extraction ─────────────────────────────────────────────────────────────────────────────────
+fn a_cstr(s: Str) -> Int {
+    let n = s.len()
+    var c = 0 unsafe { c = malloc(n + 1) }
+    var i = 0 while i < n { unsafe { poke8(c + i, ord(s.at(i))) } i = i + 1 }
+    unsafe {
+        poke8(c + n, 0)
+    }
+    return c
+}
+// mkdir -p: create `path` and any missing parents (mode 0o755 = 493); existing dirs are ignored.
+fn mkdir_p(path: Str) -> Int {
+    var i = 1
+    while i < path.len() {
+        if ord(path.at(i)) == 47 {
+            // '/': make each prefix
+            let c = a_cstr(path.slice(0, i)) to_int(mkdir(c, 493)) unsafe { free(c) }
+        }
+        i = i + 1
+    }
+    let c = a_cstr(path) to_int(mkdir(c, 493)) unsafe { free(c) }
+    return 0
+}
+fn parent_of(path: Str) -> Str {
+    var cut = 0 - 1 var i = 0
+    while i < path.len() {
+        if ord(path.at(i)) == 47 {
+            cut = i
+        }
+        i = i + 1
+    }
+    if cut <= 0 {
+        return ""
+    }
+    return path.slice(0, cut)
+}
+// read an octal field of `n` bytes at `off` (ASCII digits, space/NUL terminated)
+fn oct_at(p: Int, off: Int, n: Int) -> Int {
+    var v = 0 var i = 0
+    while i < n {
+        var c = 0
+        unsafe {
+            c = peek8(p + off + i)
+        }
+        if c >= 48 {
+            if c <= 55 {
+                v = v * 8 + (c - 48)
+            }
+        }
+        i = i + 1
+    }
+    return v
+}
+fn cstr_field(p: Int, off: Int, n: Int) -> Str {
+    var s = "" var i = 0
+    while i < n {
+        var c = 0
+        unsafe {
+            c = peek8(p + off + i)
+        }
+        if c == 0 {
+            i = n
+        } else {
+            s = s + chr(c)
+            i = i + 1
+        }
+    }
+    return s
+}
+// does a member name leave the target directory: an absolute path, or a ".." segment?
+fn path_escapes(name: Str) -> Bool {
+    if name.len() > 0 && ord(name.at(0)) == 47 {
+        return true
+    }
+    var seg = ""
+    var i = 0
+    while i <= name.len() {
+        if i == name.len() || ord(name.at(i)) == 47 {
+            if seg == ".." {
+                return true
+            }
+            seg = ""
+        } else {
+            seg = seg + chr(ord(name.at(i)))
+        }
+        i = i + 1
+    }
+    return false
+}
+// extract a tar image at raw memory [p, p+total) into `dest`
+fn untar(p: Int, total: Int, dest: Str) -> Int {
+    var pos = 0
+    while pos + 512 <= total {
+        var first = 0 unsafe { first = peek8(p + pos) }
+        if first == 0 {
+            return 0
+        }
+        // zero block -> end of archive
+        var name = cstr_field(p, pos + 0, 100)
+        let prefix = cstr_field(p, pos + 345, 155)
+        if !(prefix == "") {
+            name = prefix + ("/" + name)
+        }
+        // ustar long-name prefix
+        if path_escapes(name) { return 1 }
+        let size = oct_at(p, pos + 124, 12)
+        if size < 0 || pos + 512 + size > total { return 1 }       // a member running past the archive
+        let mode = oct_at(p, pos + 100, 8)
+        var typ = 0 unsafe { typ = peek8(p + pos + 156) }
+        let full = dest + ("/" + name)
+        pos = pos + 512
+        if typ == 53 {
+            mkdir_p(full)
+        }
+        // '5' = directory
+        else {
+            if typ == 48 || typ == 0 {
+                // '0' or NUL = regular file
+                let par = parent_of(full)
+                if !(par == "") {
+                    mkdir_p(par)
+                }
+                var content = "" unsafe { content = str_from_buf(p + pos, size) }
+                write_file(full, content)
+                let c = a_cstr(full) to_int(chmod(c, mode)) unsafe { free(c) }
+        } }
+        pos = pos + ((size + 511) / 512) * 512 // skip the data blocks (512-padded)
+    }
+    return 0
+}
+
+/// unpack archive `apath` into directory `dir` (which must exist). Handles .tar.gz and plain .tar. 0 = ok.
+pub fn unpack(apath: Str, dir: Str) -> Int {
+    let ap = a_cstr(apath)
+    var ok = 0 unsafe { ok = to_int(access(ap, 0)) } // F_OK: 0 if the archive exists
+    unsafe {
+        free(ap)
+    }
+    if ok != 0 {
+        return 1
+    }
+    let data = read_file(apath)
+    if data.len() < 2 {
+        return 1
+    }
+    if ord(data.at(0)) == 31 && ord(data.at(1)) == 139 {
+        // gzip magic 0x1f 0x8b; a damaged archive is refused whole, not half-extracted
+        let r = gunzip_checked(data, 0)
+        if !r.ok { inflated_free(r.data)  return 1 }
+        let u = untar(r.data.p, r.data.len, dir)
+        inflated_free(r.data)
+        return u
+    }
+    return untar(nori_str_ptr(data), data.len(), dir) // plain tar
+}

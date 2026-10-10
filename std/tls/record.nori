@@ -1,0 +1,179 @@
+// The TLS 1.3 record layer (RFC 8446 §5): framing, and the AEAD that protects it.
+//
+// A record is five bytes of header and a fragment. Before the handshake is keyed the fragment is
+// the plaintext; afterwards it is an AEAD ciphertext whose additional authenticated data is that
+// same five-byte header, so the header cannot be edited without the tag failing.
+//
+// Two things here are load-bearing and easy to get wrong.
+//
+// The nonce is the write IV XORed with the record sequence number, and the sequence number is
+// never transmitted; both sides count. So a lost, reordered or replayed record does not decrypt,
+// and that is the anti-replay mechanism rather than an accident of it. The counter resets to zero
+// on every key change, which is why the keys and the counter live in one struct: separating them
+// is how a sequence number survives a rekey it should not have.
+//
+// The real content type is inside the encrypted fragment, not in the header. A protected record
+// always says `application_data` on the outside whatever it carries, so the type a caller acts on
+// must come from the plaintext, and it is the last non-zero byte, because a sender may append any
+// number of zero bytes to disguise the true length.
+
+import "std/crypto" as crypto
+
+/// One direction's record-protection state: the key, the IV, and the count of records sent or
+/// received under them. A rekey replaces the whole thing.
+pub struct Keys { key: Str, iv: Str, seq: Int }
+
+/// A record after decryption: its true content type, its contents, and why it could not be read.
+/// `err` is "" on success, and on failure `body` is empty; there is no partial result.
+pub struct Record { ctype: Int, body: Str, err: Str }
+
+/// content type 20: meaningless in TLS 1.3, sent only so middleboxes see a familiar shape.
+pub fn ct_change_cipher_spec() -> Int { return 20 }
+/// content type 21
+pub fn ct_alert() -> Int { return 21 }
+/// content type 22
+pub fn ct_handshake() -> Int { return 22 }
+/// content type 23, which every protected record claims on the outside, whatever it carries.
+pub fn ct_application_data() -> Int { return 23 }
+
+/// The largest plaintext a record may carry, 2^14 (RFC 8446 §5.1).
+pub fn max_plaintext() -> Int { return 16384 }
+/// The largest protected fragment a record may carry: the plaintext limit, plus one byte of
+/// content type, plus up to 255 of padding, plus the 16-byte tag (RFC 8446 §5.2).
+///
+/// This bound is the reason a hostile server cannot make a client allocate without limit. The
+/// length field is 16 bits, so a peer can always ask for 64KiB; refusing at this cap is what keeps
+/// the answer bounded, and it must be checked before anything is read, not after.
+pub fn max_ciphertext() -> Int { return 16384 + 256 }
+
+/// The cipher suites this client offers. Both are AEAD_AES_GCM; they differ in key length and in
+/// the hash the whole key schedule runs on.
+pub fn suite_aes128_gcm_sha256() -> Int { return 0x1301 }
+/// TLS_AES_256_GCM_SHA384 (0x1302): a 32-byte key, and a key schedule over SHA-384.
+pub fn suite_aes256_gcm_sha384() -> Int { return 0x1302 }
+
+/// The AEAD key length a suite uses, or 0 if the suite is not one we speak.
+pub fn suite_key_len(suite: Int) -> Int {
+    if suite == 0x1301 { return 16 }
+    if suite == 0x1302 { return 32 }
+    return 0
+}
+/// The hash length a suite's key schedule runs on, or 0 if the suite is not one we speak.
+pub fn suite_hash_len(suite: Int) -> Int {
+    if suite == 0x1301 { return 32 }
+    if suite == 0x1302 { return 48 }
+    return 0
+}
+
+/// Record-protection state for one direction, with the sequence number at zero.
+pub fn keys_new(sink key: Str, sink iv: Str) -> Keys { return Keys { key: key, iv: iv, seq: 0 } }
+
+// The per-record nonce: the 12-byte write IV XORed with the sequence number, right-aligned and
+// big-endian. Left-aligning it, or forgetting the XOR and using the counter alone, produces a
+// nonce that is perfectly well-formed and shared with no other implementation.
+fn nonce_of(iv: Str, seq: Int) -> Str {
+    var out = ""
+    var i = 0
+    while i < 12 {
+        var sb = 0
+        // the counter occupies the last 8 bytes; above that the IV passes through untouched
+        if i >= 4 { sb = ((seq >> ((11 - i) * 8)) & 0xff) }
+        out = (out + chr((ord(iv.at(i)) ^ sb)))
+        i = i + 1
+    }
+    return out
+}
+
+fn u16(n: Int) -> Str { return (("" + chr(((n >> 8) & 0xff))) + chr((n & 0xff))) }
+
+// The version a protected record header carries: 0x0303, "TLS 1.2". TLS 1.3 records say 1.2 on the
+// outside because middleboxes drop what they do not recognise; the real version is negotiated in an
+// extension. Written with u16() rather than an escape because Nori has no \xNN escape and an
+// unknown escape loses its backslash silently.
+fn legacy_version() -> Str { return u16(0x0303) }
+
+fn seal_with(key: Str, nonce: Str, aad: Str, plain: Str) -> Str {
+    if key.len() == 16 { return crypto::aes128_gcm_seal(key, nonce, aad, plain) }
+    if key.len() == 32 { return crypto::aes256_gcm_seal(key, nonce, aad, plain) }
+    return ""
+}
+fn open_with(key: Str, nonce: Str, aad: Str, sealed: Str) -> Str {
+    if key.len() == 16 { return crypto::aes128_gcm_open(key, nonce, aad, sealed) }
+    if key.len() == 32 { return crypto::aes256_gcm_open(key, nonce, aad, sealed) }
+    return ""
+}
+
+/// The legacy record version every record after the first must carry: 0x0303, "TLS 1.2".
+pub fn version_tls12() -> Int { return 0x0303 }
+/// 0x0301, "TLS 1.0", permitted on the initial ClientHello only (RFC 8446 §5.1), because some
+/// middleboxes reject a first record that claims anything newer.
+pub fn version_tls10() -> Int { return 0x0301 }
+
+/// An unprotected record, as the ClientHello and the compatibility ChangeCipherSpec are sent.
+/// "" if the fragment is over the 2^14 limit.
+///
+/// `version` is a parameter and not a constant because the initial ClientHello is allowed to
+/// differ, and it is the one record where interoperability actually depends on the choice.
+pub fn record_plain(ctype: Int, version: Int, body: Str) -> Str {
+    if body.len() > max_plaintext() { return "" }
+    return ((chr(ctype) + u16(version)) + (u16(body.len()) + body))
+}
+
+/// Seal one record and advance the sequence number. "" if the body is too long or the keys are
+/// not a length we can use.
+///
+/// The outer header always says `application_data` and version 0x0303 whatever is inside: a
+/// protected record does not advertise what it carries, and a middlebox watching the outside sees
+/// the same thing for a Finished as for a byte of application data.
+pub fn record_seal(inout k: Keys, ctype: Int, body: Str) -> Str {
+    if body.len() > max_plaintext() { return "" }
+    if k.iv.len() != 12 { return "" }
+    let inner = (body + chr(ctype))
+    let hdr = ((chr(23) + legacy_version()) + u16((inner.len() + 16)))
+    let ct = seal_with(k.key, nonce_of(k.iv, k.seq), hdr, inner)
+    if ct.len() == 0 { return "" }
+    k.seq = (k.seq + 1)
+    return (hdr + ct)
+}
+
+/// How many bytes the record starting at the front of `buf` occupies, or 0 if `buf` does not yet
+/// hold a complete one, or -1 if its declared length is over the limit.
+///
+/// Separated from reading so that a caller can decide it has enough bytes without having to buffer
+/// whatever length a peer claims. A peer that announces 64KiB is refused here, before the read.
+pub fn record_len(buf: Str) -> Int {
+    if buf.len() < 5 { return 0 }
+    let n = ((ord(buf.at(3)) << 8) | ord(buf.at(4)))
+    if n > max_ciphertext() { return 0 - 1 }
+    if buf.len() < (5 + n) { return 0 }
+    return (5 + n)
+}
+
+/// Open one complete protected record and advance the sequence number.
+///
+/// Every failure is the same failure. A record that will not authenticate is indistinguishable
+/// from one that was altered, reordered, replayed or sent under another key, and reporting which
+/// is which would hand an attacker the oracle the AEAD exists to deny, so the reasons
+/// below describe the framing, which is public, and never the outcome of the tag check.
+pub fn record_open(inout k: Keys, wire: Str) -> Record {
+    if wire.len() < 5 { return Record { ctype: 0, body: "", err: "short record header" } }
+    let n = ((ord(wire.at(3)) << 8) | ord(wire.at(4)))
+    if n > max_ciphertext() { return Record { ctype: 0, body: "", err: "record over the size limit" } }
+    if wire.len() < (5 + n) { return Record { ctype: 0, body: "", err: "truncated record" } }
+    if n < 17 { return Record { ctype: 0, body: "", err: "protected record too short to hold a tag" } }
+    if k.iv.len() != 12 { return Record { ctype: 0, body: "", err: "no keys" } }
+    let hdr = wire.slice(0, 5)
+    let inner = open_with(k.key, nonce_of(k.iv, k.seq), hdr, wire.slice(5, 5 + n))
+    if inner.len() == 0 { return Record { ctype: 0, body: "", err: "record did not authenticate" } }
+    k.seq = (k.seq + 1)
+    // The true content type is the last non-zero byte. A sender may append any number of zero
+    // bytes to hide how long the real content was, so the type is found by scanning back past
+    // them; taking the final byte instead would read padding as a content type.
+    var last = inner.len() - 1
+    while last >= 0 {
+        if ord(inner.at(last)) != 0 { break }
+        last = last - 1
+    }
+    if last < 0 { return Record { ctype: 0, body: "", err: "record is all padding and has no content type" } }
+    return Record { ctype: ord(inner.at(last)), body: inner.slice(0, last), err: "" }
+}

@@ -1,0 +1,339 @@
+// roll/src/git: how roll fetches a dependency that lives in a git repository, with nothing but its own
+// HTTPS client: no git program and no C library. roll-specific (dependency fetching), not a general
+// std library.
+//
+// A repository is read in two steps. The refs (branches and tags) come from the smart-HTTP
+// advertisement every git host serves at `<repo>.git/info/refs?service=git-upload-pack`, which also
+// gives the commit a branch, a tag or HEAD points at. The source of that exact commit is then
+// downloaded as the host's tarball and unpacked. So a dependency is always pinned to a commit id.
+//
+// Supported hosts: github.com, gitlab.com and codeberg.org, written as https://host/owner/repo,
+// ssh://git@host/owner/repo or git@host:owner/repo (the address is only used to find the repository
+// over HTTPS). Any other host is refused with a message; vendor the code or use a path dependency.
+//
+// The fetched directory has no .git. Two small files record where it came from:
+// `.nori-commit` (the 40-hex commit id) and `.nori-origin` (the address it was fetched from).
+import "std/os" as os
+import "std/http" as http
+import "std/archive" as archive
+import "std/strutil" as strutil
+import "std/time" as time
+
+struct Repo { ok: Bool, host: Str, path: Str }
+
+fn repo_none() -> Repo {
+    return Repo { ok: false, host: "", path: "" }
+}
+// the host and "owner/repo" of a repository address, or ok = false
+fn parse_repo(url: Str) -> Repo {
+    var rest = ""
+    var host = ""
+    var path = ""
+    var schemed = false
+    if strutil::starts_with(url, "https://") {
+        rest = url.slice(8, url.len())
+        schemed = true
+    }
+    if strutil::starts_with(url, "http://") {
+        rest = url.slice(7, url.len())
+        schemed = true
+    }
+    if strutil::starts_with(url, "ssh://") {
+        rest = url.slice(6, url.len())
+        schemed = true
+    }
+    if strutil::starts_with(url, "git://") {
+        rest = url.slice(6, url.len())
+        schemed = true
+    }
+    if schemed {
+        let slash = strutil::index_of(rest, "/")
+        if slash < 0 {
+            return repo_none()
+        }
+        host = rest.slice(0, slash)
+        path = rest.slice(slash + 1, rest.len())
+        let at = strutil::index_of(host, "@")
+        if at >= 0 {
+            host = host.slice(at + 1, host.len())
+        }
+        let colon = strutil::index_of(host, ":")
+        if colon >= 0 {
+            host = host.slice(0, colon)
+        }
+    } else {
+        // the scp-like form: git@host:owner/repo
+        let at = strutil::index_of(url, "@")
+        let colon = strutil::index_of(url, ":")
+        if at < 0 || colon < at {
+            return repo_none()
+        }
+        host = url.slice(at + 1, colon)
+        path = url.slice(colon + 1, url.len())
+    }
+    while path.len() > 0 && ord(path.at(0)) == 47 {
+        path = path.slice(1, path.len())
+    }
+    while path.len() > 0 && ord(path.at(path.len() - 1)) == 47 {
+        path = path.slice(0, path.len() - 1)
+    }
+    if strutil::ends_with(path, ".git") {
+        path = path.slice(0, path.len() - 4)
+    }
+    if host.len() == 0 || strutil::index_of(path, "/") < 1 || strutil::index_of(path, "..") >= 0 {
+        return repo_none()
+    }
+    return Repo { ok: true, host: copy host, path: copy path }
+}
+// where the host serves the tarball of `ref` (a commit id), or "" for a host that is not supported
+fn archive_url(host: Str, path: Str, ref: Str) -> Str {
+    if host == "github.com" {
+        return ("https://github.com/" + (path + ("/archive/" + (ref + ".tar.gz"))))
+    }
+    if host == "gitlab.com" {
+        return ("https://gitlab.com/" + (path + ("/-/archive/" + (ref + "/archive.tar.gz"))))
+    }
+    if host == "codeberg.org" {
+        return ("https://codeberg.org/" + (path + ("/archive/" + (ref + ".tar.gz"))))
+    }
+    return ""
+}
+fn hex_val(c: Int) -> Int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    return 0 - 1
+}
+// the leading hex digits of `s` (a commit id, possibly followed by a newline)
+fn hex_prefix(s: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        if hex_val(ord(s.at(i))) >= 0 {
+            out = (out + s.slice(i, i + 1))
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    return copy out
+}
+fn is_commit_id(s: Str) -> Bool {
+    return s.len() == 40 && hex_prefix(s).len() == 40
+}
+// the refs the repository advertises, one "<commit id> <name>" string each ([] when it cannot be read).
+// The advertisement is a sequence of pkt-lines: four hex digits giving the length of the line including
+// those four, then the line; a length of 0000 is a separator. The first ref line also carries the
+// server's capabilities after a NUL byte, which is cut off here.
+fn advertised(r: Repo) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let url = ("https://" + (r.host + ("/" + (r.path + ".git/info/refs?service=git-upload-pack"))))
+    let tmp = os::temp_path(("roll-refs-" + to_str(time::unix_ns())))
+    let got = http::http_fetch_hdr(url, tmp, "User-Agent: git/2.43.0\r\nAccept: */*\r\n")
+    if got.rc != 0 {
+        os::remove_tree(tmp)
+        return out
+    }
+    let text = read_file(tmp)
+    os::remove_tree(tmp)
+    var pos = 0
+    while pos + 4 <= text.len() {
+        var n = 0
+        var k = 0
+        var bad = false
+        while k < 4 {
+            let h = hex_val(ord(text.at(pos + k)))
+            if h < 0 {
+                bad = true
+            } else {
+                n = n * 16 + h
+            }
+            k = k + 1
+        }
+        if bad || n == 1 || n == 2 || n == 3 {
+            break
+        }
+        if n == 0 {
+            pos = pos + 4
+        } else {
+            if pos + n > text.len() {
+                break
+            }
+            var line = ""
+            var j = pos + 4
+            while j < pos + n {
+                let c = ord(text.at(j))
+                if c == 0 || c == 10 {
+                    break
+                }
+                line = (line + text.slice(j, j + 1))
+                j = j + 1
+            }
+            if line.len() > 41 && ord(line.at(40)) == 32 && hex_val(ord(line.at(0))) >= 0 {
+                out.push(copy line)
+            }
+            pos = pos + n
+        }
+    }
+    return out
+}
+// the commit id advertised for the ref called `name`, or ""
+fn sha_of(lines: Vec<Str>, name: Str) -> Str {
+    var i = 0
+    while i < lines.len() {
+        let l = lines[i]
+        if l.slice(41, l.len()) == name {
+            return l.slice(0, 40)
+        }
+        i = i + 1
+    }
+    return ""
+}
+// the commit a branch, a tag (an annotated one is peeled to its commit), a commit id or, when `ref`
+// is empty, the default branch points at; "" if there is none
+fn resolve(lines: Vec<Str>, ref: Str) -> Str {
+    if ref.len() == 0 {
+        return sha_of(lines, "HEAD")
+    }
+    if is_commit_id(ref) {
+        return copy ref
+    }
+    var s = sha_of(lines, ("refs/tags/" + (ref + "^{}")))
+    if s.len() == 0 {
+        s = sha_of(lines, ("refs/tags/" + ref))
+    }
+    if s.len() == 0 {
+        s = sha_of(lines, ("refs/heads/" + ref))
+    }
+    if s.len() == 0 {
+        s = sha_of(lines, ref)
+    }
+    return copy s
+}
+// download the tarball of commit `sha` and leave its source tree at `dest` (replacing what is there). 0 = ok.
+fn fetch_commit(r: Repo, sha: Str, dest: Str) -> Int {
+    let url = archive_url(r.host, r.path, sha)
+    if url.len() == 0 {
+        return 0 - 1
+    }
+    let tar = os::temp_path(("roll-dep-" + (to_str(time::unix_ns()) + ".tar.gz")))
+    if http::http_get(url, tar) != 0 {
+        os::remove_tree(tar)
+        return 1
+    }
+    let stage = (dest + ".unpack")
+    os::remove_tree(stage)
+    os::make_dir_p(stage)
+    let rc = archive::unpack(tar, stage)
+    os::remove_tree(tar)
+    if rc != 0 {
+        os::remove_tree(stage)
+        return 1
+    }
+    let entries = os::read_dir(stage)
+    if entries.len() != 1 {
+        os::remove_tree(stage)
+        return 1
+    }
+    os::remove_tree(dest)
+    let moved = os::move_path((stage + ("/" + entries[0])), dest)
+    os::remove_tree(stage)
+    if moved != 0 {
+        return 1
+    }
+    write_file((dest + "/.nori-commit"), sha)
+    return 0
+}
+fn unsupported(host: Str) {
+    printl(("roll: cannot fetch from " + (host + ": git dependencies work from github.com, gitlab.com and codeberg.org; vendor the code or use a path dependency")))
+}
+
+/// fetch the repository at `url` into `dest`, at branch/tag/commit `ref` ("" = the default branch).
+/// 0 on success, non-zero on failure (unsupported host, unknown ref, network error). `dest` must not exist.
+pub fn clone(url: Str, ref: Str, dest: Str) -> Int {
+    let r = parse_repo(url)
+    if !r.ok {
+        printl(("roll: not a repository address: " + url))
+        return 0 - 1
+    }
+    if archive_url(r.host, r.path, "x").len() == 0 {
+        unsupported(r.host)
+        return 0 - 1
+    }
+    let lines = advertised(r)
+    if lines.len() == 0 {
+        printl(("roll: cannot read " + (url + " (no such repository, it is private, or there is no network)")))
+        return 0 - 1
+    }
+    let sha = resolve(lines, ref)
+    if sha.len() == 0 {
+        printl(("roll: no such branch, tag or commit in " + (url + (": " + ref))))
+        return 0 - 1
+    }
+    let rc = fetch_commit(r, sha, dest)
+    if rc == 0 {
+        write_file((dest + "/.nori-origin"), url)
+    }
+    return rc
+}
+
+/// the commit id (40 hex) the directory at `dest` was fetched at, or "" (the content hash for nori.lock).
+pub fn head(dest: Str) -> Str {
+    let p = (dest + "/.nori-commit")
+    if !os::path_exists(p) {
+        return ""
+    }
+    return hex_prefix(read_file(p))
+}
+
+/// make the directory at `dest` hold exactly commit `commit`, fetching it again if it holds another.
+/// 0 = ok, non-zero = unreachable.
+pub fn checkout(dest: Str, commit: Str) -> Int {
+    if !is_commit_id(commit) {
+        return 0 - 1
+    }
+    if head(dest) == commit {
+        return 0
+    }
+    let op = (dest + "/.nori-origin")
+    if !os::path_exists(op) {
+        return 0 - 1
+    }
+    let url = read_file(op)
+    let r = parse_repo(url)
+    if !r.ok {
+        return 0 - 1
+    }
+    let rc = fetch_commit(r, commit, dest)
+    if rc == 0 {
+        write_file((dest + "/.nori-origin"), url)
+    }
+    return rc
+}
+
+/// the tag names of the repository at `url` (without fetching any source), for semver resolution.
+/// Peeled `^{}` entries are not listed, since they name the same tag a second time. [] on any failure.
+pub fn tags(url: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let r = parse_repo(url)
+    if !r.ok {
+        return out
+    }
+    let lines = advertised(r)
+    let pfx = "refs/tags/"
+    var i = 0
+    while i < lines.len() {
+        let name = lines[i].slice(41, lines[i].len())
+        if strutil::starts_with(name, pfx) && !strutil::ends_with(name, "^{}") {
+            out.push(name.slice(pfx.len(), name.len()))
+        }
+        i = i + 1
+    }
+    return out
+}

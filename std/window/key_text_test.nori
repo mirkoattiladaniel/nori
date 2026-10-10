@@ -1,0 +1,33 @@
+// Native .nori tests for window::key_text. Run with
+//   noric --test std/window/key_text_test.nori compiler/runtime.nori --import-root .
+//
+// The keysyms a keymap produces, as the X11 protocol's Appendix A numbers them, and the text each types: ASCII and
+// Latin-1 as they are, Unicode keysyms by their code point, and the older character sets a layout still names:
+// Hungarian's ő and ű (Latin-2), Turkish's ğ (Latin-3), Latvian's ģ (Latin-4), Cyrillic, Greek, Latin-9's Œ, the euro.
+import "std/window" as window
+
+fn test_key_text_ascii_latin1_unicode() {
+    assert_streq(window::key_text(97), "a")
+    assert_streq(window::key_text(65), "A")
+    assert_streq(window::key_text(233), "é")
+    assert_streq(window::key_text(16777216 + 8364), "€")
+    assert_streq(window::key_text(65293), "")                 // Return types nothing
+}
+
+fn test_key_text_older_sets() {
+    assert_streq(window::key_text(501), "ő")                  // odoubleacute 0x1f5
+    assert_streq(window::key_text(507), "ű")                  // udoubleacute 0x1fb
+    assert_streq(window::key_text(469), "Ő")                  // Odoubleacute 0x1d5
+    assert_streq(window::key_text(442), "ş")                  // scedilla 0x1ba (Latin-2)
+    assert_streq(window::key_text(699), "ğ")                  // gbreve 0x2bb (Latin-3)
+    assert_streq(window::key_text(955), "ģ")                  // gcedilla 0x3bb (Latin-4)
+    assert_streq(window::key_text(1729), "ђ")                 // Serbian_dje 0x6a1
+    assert_streq(window::key_text(1761), "а")                 // Cyrillic_a 0x6c1
+    assert_streq(window::key_text(1823), "Ъ")                 // Cyrillic_HARDSIGN 0x6ff
+    assert_streq(window::key_text(2017), "α")                 // Greek_alpha 0x7e1
+    assert_streq(window::key_text(2002), "Σ")                 // Greek_SIGMA 0x7d2
+    assert_streq(window::key_text(2035), "ς")                 // Greek_finalsmallsigma 0x7f3
+    assert_streq(window::key_text(2041), "ω")                 // Greek_omega 0x7f9
+    assert_streq(window::key_text(5052), "Œ")                 // OE 0x13bc
+    assert_streq(window::key_text(8364), "€")                 // EuroSign 0x20ac
+}

@@ -1,0 +1,542 @@
+// Native .nori tests for the per-kind attribute tables of the core `.ui` node
+// kinds: column/panel, row, scroll_column/scroll, scroll_row, spacer, text, button, rect, surface
+// (layout/dsl_core_nodes.nori). Run with
+//   noric --test std/nori_ui/layout/dsl_core_nodes_test.nori compiler/runtime.nori --import-root .
+// A root file of std/nori_ui/layout, so it shares the module scope and can call the parser
+// directly.
+//
+// The shape of every kind's test: one attribute the kind accepts, one attribute it rejects with
+// the exact `unknown <kind> field "X"` text, and the value-strictness differences.
+import "std/nori_ui" as ui
+
+// ---- helpers (must not be named test_*) ----
+
+/// parse `src` as a whole document and return its root node; asserts the parse succeeded.
+fn dcnt_root(src: Str) -> ui::layout::UiNode {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    return sink r.doc.tree
+}
+/// parse `src`, assert it failed, and assert the message contains `needle`.
+fn dcnt_err(src: Str, needle: Str) {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_false(r.ok)
+    assert_true(ui::layout::nui_contains(r.err, needle))
+}
+/// parse `src`, assert it failed, and assert the message is exactly `msg` (no line:col prefix).
+fn dcnt_msg(src: Str, msg: Str) {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_false(r.ok)
+    assert_streq(r.emsg, msg)
+}
+/// `unknown <kind> field "<name>"`: the offending name is double-quoted, not backticked.
+fn dcnt_dq(s: Str) -> Str { return (chr(34) + (s + chr(34))) }
+fn dcnt_unknown(kind: Str, name: Str) -> Str { return ("unknown " + (kind + (" field " + (chr(34) + (name + chr(34)))))) }
+
+// ---- 1. the per-kind `unknown … field "X"` text ----
+
+fn test_unknown_field_message_is_per_kind() {
+    // the same attribute name, nine different messages: this is the point of the per-kind split
+    dcnt_msg("column { zzz: 1 }", dcnt_unknown("column", "zzz"))
+    dcnt_msg("row { zzz: 1 }", dcnt_unknown("row", "zzz"))
+    dcnt_msg("scroll_column { zzz: 1 text { text: x } }", dcnt_unknown("scroll_column", "zzz"))
+    dcnt_msg("scroll_row { zzz: 1 text { text: x } }", dcnt_unknown("scroll_row", "zzz"))
+    dcnt_msg("spacer { zzz: 1 }", dcnt_unknown("spacer", "zzz"))
+    dcnt_msg("text { text: x zzz: 1 }", dcnt_unknown("text", "zzz"))
+    dcnt_msg("button { label: \"a\" on_click: b zzz: 1 }", dcnt_unknown("button", "zzz"))
+    dcnt_msg("rect { w: 1 h: 1 zzz: 1 }", dcnt_unknown("rect", "zzz"))
+    dcnt_msg("surface { id: cam zzz: 1 }", dcnt_unknown("surface", "zzz"))
+    // `panel` is an alias for column and the message follows the canonical name, not the
+    // spelling: it prints "column".
+    dcnt_msg("panel { zzz: 1 }", dcnt_unknown("column", "zzz"))
+    // ...and `scroll` likewise reports as scroll_column.
+    dcnt_msg("scroll { zzz: 1 text { text: x } }", dcnt_unknown("scroll_column", "zzz"))
+    // an unknown element is `unknown node type "..."`, also double-quoted
+    dcnt_msg("column { wizard { } }", "unknown node type \"wizard\"")
+}
+
+// ---- 2. attributes a kind does not take ----
+
+fn test_button_padding_and_spacer_classes_are_rejected() {
+    // the button table has no padding at all
+    dcnt_msg("button { label: \"a\" on_click: b padding: 4 }", dcnt_unknown("button", "padding"))
+    dcnt_msg("button { label: \"a\" on_click: b gap: 4 }", dcnt_unknown("button", "gap"))
+    // a spacer has exactly `h` and `w`
+    dcnt_msg("spacer { classes: [a] }", dcnt_unknown("spacer", "classes"))
+    dcnt_msg("spacer { class: a }", dcnt_unknown("spacer", "class"))
+    dcnt_msg("spacer { id: s }", dcnt_unknown("spacer", "id"))
+    dcnt_msg("spacer { color: #f00 }", dcnt_unknown("spacer", "color"))
+    // ...and the two it does have still work
+    var sp = dcnt_root("spacer { w: 12 h: 30% }")
+    assert_feq(sp.w.value, 12.0, 0.001)
+    assert_eq(sp.h.unit, 1)
+}
+
+// ---- 3. column / row ----
+
+fn test_column_row_accept_and_reject() {
+    var c = dcnt_root("column { gap: 6 padding: 4 bg: #101010 min_height: 40 on_click: go classes: [a, b] }")
+    assert_feq(c.gap, 6.0, 0.001)
+    assert_feq(c.min_height, 40.0, 0.001)
+    assert_streq(c.on_click, "go")
+    assert_eq(c.classes.len(), 2)
+    // Column/row have no align_self and no id / w-as-attribute table.
+    // `id` is accepted as an extension (dsl_core_nodes.nori dcn_ext): a retained document
+    // matches a re-rendered document's nodes by it, and a host reaches a node by it.
+    assert_streq(dcnt_root("column { id: x }").id, "x")
+    dcnt_msg("row { node_id: x }", dcnt_unknown("row", "node_id"))
+    dcnt_msg("column { on_click_x: y }", dcnt_unknown("column", "on_click_x"))
+    // the typography tail belongs to `text`, not to a container
+    dcnt_msg("row { size_px: 12 }", dcnt_unknown("row", "size_px"))
+    dcnt_msg("column { text: hi }", dcnt_unknown("column", "text"))
+    // `flex_wrap` / `wrap` are gated on `if !is_column`
+    assert_true(dcnt_root("row { flex_wrap: wrap }").flex_wrap)
+    dcnt_msg("column { flex_wrap: true }", dcnt_unknown("column", "flex_wrap"))
+    dcnt_msg("column { wrap: true }", dcnt_unknown("column", "wrap"))
+}
+
+fn test_column_row_value_strictness() {
+    // gap / padding / radius / border_w / min_height / flex_* are strict Numbers, no ident coercion
+    dcnt_msg("column { gap: wide }", "gap must be a number")
+    dcnt_msg("column { padding: true }", "padding must be a number")
+    dcnt_msg("row { min_height: tall }", "min_height must be a number")
+    dcnt_msg("row { flex_weight: heavy }", "flex_weight must be a number")
+    // ...but fill_w / fill_h go through value_bool, which does coerce a Number
+    assert_true(dcnt_root("column { fill_w: 1 }").fill_w)
+    assert_false(dcnt_root("column { fill_h: 0 }").fill_h)
+    dcnt_msg("column { fill_w: yes }", "fill_w must be true or false")
+    // parse_cross / parse_main_align: idents only, and an unknown word has its own message
+    dcnt_msg("column { cross_align: middle }", "unknown cross_align \"middle\"")
+    dcnt_msg("column { cross_align: 3 }", "cross_align must be stretch, center, or end")
+    dcnt_msg("column { main_align: stretch }", "main_align must be start, center, end, or space_between")
+    // on_click is string-or-ident with the container's own wording
+    dcnt_msg("column { on_click: 3 }", "on_click must be a string or ident")
+    // class / classes
+    dcnt_msg("column { class: 3 }", "class must be string or ident")
+    dcnt_msg("column { classes: solo }", "classes must be [...]")
+    dcnt_msg("column { classes: [1, 2] }", "class names must be strings or identifiers")
+}
+
+// ---- 4. scroll_column / scroll_row ----
+
+fn test_scroll_min_asymmetry_and_missing_attrs() {
+    // scroll_row takes min_width, scroll_column takes min_height, never the reverse
+    assert_feq(dcnt_root("scroll_row { min_width: 200 text { text: x } }").min_width, 200.0, 0.001)
+    assert_feq(dcnt_root("scroll_column { min_height: 150 text { text: x } }").min_height, 150.0, 0.001)
+    dcnt_msg("scroll_row { min_height: 1 text { text: x } }", dcnt_unknown("scroll_row", "min_height"))
+    dcnt_msg("scroll_column { min_width: 1 text { text: x } }", dcnt_unknown("scroll_column", "min_width"))
+    // neither takes on_click, main_align, the flex pair, or the `fill` alias of fill_w
+    dcnt_msg("scroll_column { on_click: go text { text: x } }", dcnt_unknown("scroll_column", "on_click"))
+    dcnt_msg("scroll_row { main_align: end text { text: x } }", dcnt_unknown("scroll_row", "main_align"))
+    dcnt_msg("scroll_column { flex_weight: 2 text { text: x } }", dcnt_unknown("scroll_column", "flex_weight"))
+    dcnt_msg("scroll_row { fill: true text { text: x } }", dcnt_unknown("scroll_row", "fill"))
+    // fill_w / fill_h themselves are fine, and the defaults are col true/true, row true/false
+    var sc = dcnt_root("scroll_column { text { text: x } }")
+    assert_true(sc.fill_w)
+    assert_true(sc.fill_h)
+    var sr = dcnt_root("scroll_row { text { text: x } }")
+    assert_true(sr.fill_w)
+    assert_false(sr.fill_h)
+    // `id` on a scroll container has its own error wording (`id must be a string`)
+    assert_streq(dcnt_root("scroll_column { id: body text { text: x } }").id, "body")
+    dcnt_msg("scroll_column { id: 3 text { text: x } }", "id must be a string")
+}
+
+// ---- 5. text ----
+
+fn test_text_typography_is_text_only() {
+    var t = dcnt_root("text { text: \"hi\" bold: true italic: true letter_spacing: 1.5 word_spacing: 2 line_height_mult: 1.4 max_width: 90 min_height: 20 }")
+    assert_true(t.font_bold)
+    assert_true(t.has_letter_spacing)
+    assert_true(t.has_max_width)
+    assert_feq(t.min_height, 20.0, 0.001)
+    // the same names on any other kind are that kind's unknown-field error
+    dcnt_msg("rect { w: 1 h: 1 bold: true }", dcnt_unknown("rect", "bold"))
+    dcnt_msg("surface { id: s italic: true }", dcnt_unknown("surface", "italic"))
+    dcnt_msg("button { label: \"a\" on_click: b letter_spacing: 1 }", dcnt_unknown("button", "letter_spacing"))
+    dcnt_msg("column { wrap_text: true }", dcnt_unknown("column", "wrap_text"))
+    dcnt_msg("row { anchor: [0, 0] }", dcnt_unknown("row", "anchor"))
+    // and the button-only label typography is rejected on text
+    dcnt_msg("text { text: x label_bold: true }", dcnt_unknown("text", "label_bold"))
+}
+
+fn test_text_value_strictness_and_deliberate_gaps() {
+    // bold / italic / wrap_text / wrap_hard_break are strict bools; nowrap goes through value_bool
+    dcnt_msg("text { text: x bold: 1 }", "bold must be true or false")
+    dcnt_msg("text { text: x wrap_text: 1 }", "wrap_text must be true or false")
+    dcnt_msg("text { text: x wrap_hard_break: 1 }", "wrap_hard_break must be true or false")
+    assert_false(dcnt_root("text { text: \"a b\" wrap_text: true nowrap: 1 }").wrap)   // Number coerces
+    // line_clamp is a strict Number clamped up to 1 (floored at 1)
+    assert_eq(dcnt_root("text { text: x line_clamp: 0 }").line_clamp, 1)
+    dcnt_msg("text { text: x line_clamp: many }", "line_clamp must be a number")
+    // the remaining unsupported attributes stay unknown fields rather than silently-dropped no-ops.
+    // The outline / gradient / shadow / decoration tail is parsed:
+    // section 5b below asserts it reaches the paint primitives.
+    dcnt_msg("text { text: x anim_delay: 3 }", dcnt_unknown("text", "anim_delay"))
+    dcnt_msg("text { text: x anim_pulse_alpha: 0.5 }", dcnt_unknown("text", "anim_pulse_alpha"))
+    dcnt_msg("text { text: x anim_fade_in_s: 1 }", dcnt_unknown("text", "anim_fade_in_s"))
+    dcnt_msg("text { text: x text_typing_cps: 4 }", dcnt_unknown("text", "text_typing_cps"))
+    // a non-span child names the offender
+    dcnt_err("text { rect { } }", "unknown child node \"rect\" in text")
+    // ...and the node still requires content
+    dcnt_msg("text { size_px: 12 }", "text node requires text: and/or span { … } children")
+}
+
+// ---- 5b. the outline / gradient / shadow / decoration tail ----
+
+/// lay `src`'s root out in a `w` x `h` viewport at the origin.
+fn dcnt_lay(src: Str, w: Float, h: Float) -> ui::layout::ComputedOverlay {
+    var root = dcnt_root(src)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(w, h))
+    return ui::layout::layout_overlay(root, vp)
+}
+/// the n-th primitive of kind `k` (0 fill / 1 border / 2 text / 3 image).
+fn dcnt_prim(ov: ui::layout::ComputedOverlay, k: Int, n: Int) -> ui::layout::PaintPrimitive {
+    var seen = 0
+    var i = 0
+    var found = 0 - 1
+    while i < ov.prims.len() {
+        if ov.prims[i].kind == k {
+            if seen == n { if found < 0 { found = i } }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    assert_true(found >= 0)
+    if found < 0 { return ui::layout::pp_dup(ov.prims[0]) }
+    return ui::layout::pp_dup(ov.prims[found])
+}
+/// how many primitives of kind `k` the overlay holds.
+fn dcnt_count(ov: ui::layout::ComputedOverlay, k: Int) -> Int {
+    var n = 0
+    var i = 0
+    while i < ov.prims.len() { if ov.prims[i].kind == k { n = n + 1 }  i = i + 1 }
+    return n
+}
+
+fn test_text_outline_parses_and_reaches_the_primitive() {
+    var n = dcnt_root("text { text: x text_outline_color: [10, 20, 30, 255] text_outline_width_px: 3 }")
+    assert_true(n.has_text_outline)
+    assert_eq(ui::core::rgba_color(n.text_outline_color).r, 10)
+    assert_feq(n.text_outline_width_px, 3.0, 0.001)
+    // all three spellings of each name
+    assert_true(dcnt_root("text { text: x outline_color: #ff0000 }").has_text_outline)
+    assert_true(dcnt_root("text { text: x stroke_color: #ff0000 }").has_text_outline)
+    assert_feq(dcnt_root("text { text: x outline_width: 2 }").text_outline_width_px, 2.0, 0.001)
+    assert_feq(dcnt_root("text { text: x stroke_width: 2 }").text_outline_width_px, 2.0, 0.001)
+    // strictness: the colour is parse_u8_4, the width a strict Number
+    dcnt_msg("text { text: x text_outline_color: 4 }", "expected [r,g,b,a] or #RRGGBB/#RRGGBBAA")
+    dcnt_msg("text { text: x text_outline_width_px: thick }", "text_outline_width_px must be a number")
+    // ...and it lands on the text primitive, clamped to 0.5..16
+    var ov = dcnt_lay("text { text: x text_outline_color: [10, 20, 30, 255] text_outline_width_px: 3 }", 200.0, 40.0)
+    var tp = dcnt_prim(ov, 2, 0)
+    assert_feq(tp.outline_w, 3.0, 0.001)
+    assert_eq(tp.outline_color.g, 20)
+    // a lone width draws no outline: the width is zeroed unless outline_color is set
+    var ov2 = dcnt_lay("text { text: x text_outline_width_px: 3 }", 200.0, 40.0)
+    assert_feq(dcnt_prim(ov2, 2, 0).outline_w, 0.0, 0.001)
+    // 40 is clamped down to 16, 0.1 up to 0.5
+    var ov3 = dcnt_lay("text { text: x outline_color: #fff outline_width: 40 }", 200.0, 40.0)
+    assert_feq(dcnt_prim(ov3, 2, 0).outline_w, 16.0, 0.001)
+    var ov4 = dcnt_lay("text { text: x outline_color: #fff outline_width: 0.1 }", 200.0, 40.0)
+    assert_feq(dcnt_prim(ov4, 2, 0).outline_w, 0.5, 0.001)
+}
+
+fn test_text_gradient_parses_and_reaches_the_primitive() {
+    var n = dcnt_root("text { text: x text_gradient_from: [255, 0, 0, 255] text_gradient_to: [0, 0, 255, 255] text_gradient_dir: vertical }")
+    assert_true(n.has_text_gradient_from)
+    assert_true(n.has_text_gradient_to)
+    assert_false(n.text_gradient_horizontal)
+    // every accepted direction word and the default
+    assert_true(dcnt_root("text { text: x text_gradient_dir: x }").text_gradient_horizontal)
+    assert_true(dcnt_root("text { text: x text_gradient_dir: right }").text_gradient_horizontal)
+    assert_true(dcnt_root("text { text: x text_gradient_direction: to_right }").text_gradient_horizontal)
+    assert_false(dcnt_root("text { text: x text_gradient_dir: y }").text_gradient_horizontal)
+    assert_false(dcnt_root("text { text: x text_gradient_dir: down }").text_gradient_horizontal)
+    assert_false(dcnt_root("text { text: x text_gradient_dir: to_bottom }").text_gradient_horizontal)
+    assert_true(dcnt_root("text { text: x }").text_gradient_horizontal)
+    dcnt_msg("text { text: x text_gradient_dir: sideways }", "text_gradient_dir must be horizontal or vertical")
+    dcnt_msg("text { text: x text_gradient_dir: 3 }", "text_gradient_dir must be horizontal or vertical")
+    dcnt_msg("text { text: x text_gradient_from: red }", "expected [r,g,b,a] or #RRGGBB/#RRGGBBAA")
+    // ...and it lands on the text primitive: colour becomes the from end, grad_to the other, and
+    // the axis span is the laid-out text box
+    var ov = dcnt_lay("text { text: \"gradient\" text_gradient_from: [255, 0, 0, 255] text_gradient_to: [0, 0, 255, 255] }", 200.0, 40.0)
+    var tp = dcnt_prim(ov, 2, 0)
+    assert_true(tp.has_grad)
+    assert_true(tp.grad_horizontal)
+    assert_eq(tp.color.r, 255)
+    assert_eq(tp.grad_to.b, 255)
+    assert_true(tp.grad_b > 1.0)
+    // one endpoint is not a gradient: it needs both endpoints
+    assert_false(dcnt_prim(dcnt_lay("text { text: x text_gradient_from: #f00 }", 200.0, 40.0), 2, 0).has_grad)
+    assert_false(dcnt_prim(dcnt_lay("text { text: x text_gradient_to: #f00 }", 200.0, 40.0), 2, 0).has_grad)
+    // vertical picks the y axis
+    var ovv = dcnt_lay("text { text: \"g\" text_gradient_from: #f00 text_gradient_to: #00f text_gradient_dir: vertical }", 200.0, 40.0)
+    assert_false(dcnt_prim(ovv, 2, 0).grad_horizontal)
+}
+
+fn test_text_shadow_parses_and_emits_stacked_copies() {
+    var n = dcnt_root("text { text: x shadow_color: [0, 0, 0, 200] shadow_blur: 6 shadow_spread: 1 shadow_offset_x: 2 shadow_offset_y: 3 }")
+    assert_true(n.has_text_shadow)
+    assert_eq(ui::core::rgba_color(n.text_shadow_color).a, 200)
+    assert_feq(n.shadow_blur, 6.0, 0.001)
+    assert_feq(n.shadow_spread, 1.0, 0.001)
+    assert_feq(n.shadow_offset_x, 2.0, 0.001)
+    assert_feq(n.shadow_offset_y, 3.0, 0.001)
+    // the text_shadow_* aliases
+    assert_true(dcnt_root("text { text: x text_shadow_color: #000 }").has_text_shadow)
+    assert_feq(dcnt_root("text { text: x text_shadow_blur: 4 }").shadow_blur, 4.0, 0.001)
+    assert_feq(dcnt_root("text { text: x text_shadow_offset_y: 5 }").shadow_offset_y, 5.0, 0.001)
+    dcnt_msg("text { text: x shadow_blur: soft }", "shadow_blur must be a number")
+    dcnt_msg("text { text: x shadow_spread: wide }", "shadow_spread must be a number")
+    dcnt_msg("text { text: x shadow_offset_x: left }", "shadow_offset_x must be a number")
+    dcnt_msg("text { text: x shadow_offset_y: down }", "shadow_offset_y must be a number")
+    dcnt_msg("text { text: x shadow_color: 7 }", "expected [r,g,b,a] or #RRGGBB/#RRGGBBAA")
+    // the shadow is stacked text primitives in front of the glyph run (push_text_shadow), so a
+    // shadowed node emits many more text prims than a plain one, and the plain one is last.
+    var plain = dcnt_lay("text { text: \"S\" }", 200.0, 40.0)
+    var shad = dcnt_lay("text { text: \"S\" shadow_color: [0, 0, 0, 255] shadow_blur: 6 shadow_offset_y: 3 }", 200.0, 40.0)
+    assert_eq(dcnt_count(plain, 2), 1)
+    assert_true(dcnt_count(shad, 2) >= 4)
+    // ...and every copy is offset from the real one
+    var real = dcnt_prim(shad, 2, dcnt_count(shad, 2) - 1)
+    var first = dcnt_prim(shad, 2, 0)
+    assert_true(first.pos.y > real.pos.y)
+    // a fully transparent shadow emits nothing at all
+    assert_eq(dcnt_count(dcnt_lay("text { text: \"S\" shadow_color: [0, 0, 0, 0] shadow_blur: 6 }", 200.0, 40.0), 2), 1)
+}
+
+fn test_text_decoration_parses_and_emits_a_rule() {
+    assert_eq(dcnt_root("text { text: x text_decoration: underline }").text_decoration, 1)
+    assert_eq(dcnt_root("text { text: x decoration: strikethrough }").text_decoration, 2)
+    assert_eq(dcnt_root("text { text: x decoration: line_through }").text_decoration, 2)
+    assert_eq(dcnt_root("text { text: x text_decoration: overline }").text_decoration, 3)
+    assert_eq(dcnt_root("text { text: x text_decoration: none }").text_decoration, 0)
+    var n = dcnt_root("text { text: x decoration: underline decoration_color: [9, 9, 9, 255] decoration_width: 4 }")
+    assert_true(n.has_text_decoration_color)
+    assert_eq(ui::core::rgba_color(n.text_decoration_color).r, 9)
+    assert_feq(n.text_decoration_width_px, 4.0, 0.001)
+    assert_feq(dcnt_root("text { text: x decoration_thickness: 2 }").text_decoration_width_px, 2.0, 0.001)
+    // two distinct messages
+    dcnt_msg("text { text: x text_decoration: 3 }", "text_decoration must be an identifier")
+    dcnt_msg("text { text: x text_decoration: wavy }", "unknown text_decoration \"wavy\" (use none, underline, strikethrough, overline)")
+    dcnt_msg("text { text: x text_decoration_width_px: thin }", "text_decoration_width_px must be a number")
+    dcnt_msg("text { text: x decoration_color: 1 }", "expected [r,g,b,a] or #RRGGBB/#RRGGBBAA")
+    // the rule is a fill primitive under the text box, one per non-empty line, and it sits lower
+    // for an underline (size*0.88) than for an overline (size*0.15)
+    var un = dcnt_lay("text { text: \"under\" size_px: 20 text_decoration: underline decoration_color: [200, 30, 30, 255] decoration_width: 2 }", 200.0, 40.0)
+    var ovl = dcnt_lay("text { text: \"under\" size_px: 20 text_decoration: overline decoration_color: [200, 30, 30, 255] decoration_width: 2 }", 200.0, 40.0)
+    var ur = dcnt_prim(un, 0, 0)
+    var orr = dcnt_prim(ovl, 0, 0)
+    assert_eq(ur.color.r, 200)
+    assert_feq(ur.rect.max.y - ur.rect.min.y, 2.0, 0.001)
+    assert_feq(ur.rect.min.y - orr.rect.min.y, 20.0 * 0.73, 0.01)
+    // `none` emits nothing, and a transparent colour emits nothing
+    assert_eq(dcnt_count(dcnt_lay("text { text: \"u\" text_decoration: none }", 200.0, 40.0), 0), 0)
+    assert_eq(dcnt_count(dcnt_lay("text { text: \"u\" text_decoration: underline decoration_color: [1, 2, 3, 0] }", 200.0, 40.0), 0), 0)
+    // with no explicit colour the rule inherits the text colour
+    var inh = dcnt_lay("text { text: \"u\" color: [7, 8, 9, 255] text_decoration: underline }", 200.0, 40.0)
+    assert_eq(dcnt_prim(inh, 0, 0).color.r, 7)
+}
+
+// ---- 6. button ----
+
+fn test_button_table_and_strictness() {
+    var b = dcnt_root("button { label: \"Go\" on_click: go bg: #202020 text_color: #fff radius: 4 height: 30 label_size_px: 11 align_self: end tab_index: 2 }")
+    assert_streq(b.text, "Go")
+    assert_feq(b.h.value, 30.0, 0.001)
+    assert_feq(b.size_px, 11.0, 0.001)
+    assert_true(b.has_align_self)
+    assert_eq(b.tab_index, 2)
+    // label is String-only and fill_w is Bool-only
+    dcnt_msg("button { label: Go on_click: go }", "label must be a quoted string")
+    dcnt_msg("button { label: \"a\" on_click: b fill_w: 1 }", "fill_w must be true or false")
+    // `height` is a plain f32 on a button, not a UiLength, so a unit
+    // suffix is left unconsumed and the `%` then fails the next parse_ident.
+    dcnt_msg("button { label: \"a\" on_click: b height: 50% }", "expected identifier")
+    // no `text`, no `fill`, no `border_color`, no `min_height`, no `padding`
+    dcnt_msg("button { label: \"a\" on_click: b text: hi }", dcnt_unknown("button", "text"))
+    dcnt_msg("button { label: \"a\" on_click: b fill: true }", dcnt_unknown("button", "fill"))
+    dcnt_msg("button { label: \"a\" on_click: b border_color: #f00 }", dcnt_unknown("button", "border_color"))
+    dcnt_msg("button { label: \"a\" on_click: b min_height: 10 }", dcnt_unknown("button", "min_height"))
+    // both required attributes are still enforced at the closing brace
+    dcnt_msg("button { label: \"a\" }", "button requires on_click:")
+    dcnt_msg("button { on_click: go }", "button requires label:")
+}
+
+// ---- 7. rect / surface ----
+
+fn test_rect_and_surface_tables() {
+    var rc = dcnt_root("rect { w: fill h: 20 color: #f00 radius: 3 align_self: center classes: [k] }")
+    assert_true(rc.fill_w)
+    assert_feq(rc.h.value, 20.0, 0.001)
+    assert_true(rc.has_color)
+    // rect's table is nine names: no bg, no on_click, no border_*, no flex_*, and `id` only as the
+    // extension every core kind but spacer takes (see test_column_row_accept_and_reject)
+    assert_streq(dcnt_root("rect { w: 1 h: 1 id: r }").id, "r")
+    dcnt_msg("rect { w: 1 h: 1 bg: #f00 }", dcnt_unknown("rect", "bg"))
+    dcnt_msg("rect { w: 1 h: 1 on_click: go }", dcnt_unknown("rect", "on_click"))
+    dcnt_msg("rect { w: 1 h: 1 border_w: 2 }", dcnt_unknown("rect", "border_w"))
+    dcnt_msg("rect { w: 1 h: 1 flex_weight: 2 }", dcnt_unknown("rect", "flex_weight"))
+    // surface adds id / on_click / the flex pair on top of rect's, but still no bg
+    var sf = dcnt_root("surface { id: cam on_click: pick flex_weight: 2 flex_shrink: 3 w: 30vw h: fill }")
+    assert_streq(sf.id, "cam")
+    assert_streq(sf.on_click, "pick")
+    assert_true(sf.has_flex_weight)
+    assert_true(sf.fill_h)
+    assert_eq(sf.w.unit, 2)
+    dcnt_msg("surface { id: s bg: #f00 }", dcnt_unknown("surface", "bg"))
+    dcnt_msg("surface { id: s padding: 2 }", dcnt_unknown("surface", "padding"))
+    // the `w: fill` quirk is bare-ident only; a quoted "fill" still takes the value_length path
+    dcnt_msg("rect { w: \"fill\" h: 1 }", "w: use fill_w / fill_h instead of `fill`")
+    dcnt_msg("rect { w: bogus h: 1 }", "invalid w: \"bogus\"")
+    dcnt_msg("rect { w: true h: 1 }", "w must be a number or length")
+}
+
+// ---- 8. the two `:`-enforcement styles ----
+
+fn test_colon_enforcement_styles_per_kind() {
+    // Style A: button / rect / surface / spacer use a bare `expect ':'` with a per-kind message,
+    // which is also what a nested block gets, because they have no `{`-child branch at all.
+    dcnt_msg("button { label: \"a\" on_click: b rect { w: 1 h: 1 } }", "expected `:` in button node")
+    dcnt_msg("rect { w: 1 h: 1 rect { } }", "expected `:` in rect node")
+    dcnt_msg("surface { id: s text { text: x } }", "expected `:` in surface node")
+    dcnt_msg("spacer { spacer { } }", "expected `:` in spacer node")
+    // the hyphen aliases are not accepted: the lexer stops at the `-`, so `flex-weight`
+    // lexes as ident `flex` and then hits the missing-colon path of whichever kind it is in
+    dcnt_msg("surface { id: s flex-weight: 2 }", "expected `:` in surface node")
+    // Style `: or {`: the four containers and text take children, so they report the other
+    // message, with double quotes around the offending name
+    dcnt_msg("column { flex-weight: 2 }", "expected `:` or `{` after \"flex\"")
+    dcnt_msg("scroll_row { flex-shrink: 2 text { text: x } }", "expected `:` or `{` after \"flex\"")
+    dcnt_msg("text { text: x flex-weight: 2 }", "expected `:` or `{` after \"flex\"")
+}
+
+// ---- 9. EOF mid-node ----
+
+fn test_eof_mid_node_says_expected_identifier() {
+    // the error is `expected identifier`.
+    dcnt_msg("column { gap: 4", "expected identifier")
+    dcnt_msg("rect { w: 1", "expected identifier")
+    dcnt_msg("text { text: x", "expected identifier")
+    dcnt_msg("spacer {", "expected identifier")
+    dcnt_msg("button { label: \"a\" on_click: b", "expected identifier")
+}
+
+// ---- 10. the Nori extension tail ----
+
+fn test_nori_extension_tail_is_uniform() {
+    // UiNode carries the NodeStyle properties inline. They are otherwise accepted only inside a
+    // `stylesheet { }` rule, so this is a documented superset, pinned here so it stays deliberate
+    // and stays uniform across the seven kinds rather than drifting per kind.
+    assert_eq(dcnt_root("rect { w: 1 h: 1 z_index: -2 }").z_index, 0 - 2)
+    assert_streq(dcnt_root("text { tag: title text: x }").tag, "title")
+    assert_eq(dcnt_root("column { overflow_y: hidden }").overflow_y, 1)
+    assert_feq(dcnt_root("column { line_height: 2 }").line_height_mult, 2.0, 0.001)
+    assert_eq(dcnt_root("row { position: absolute top: 4 left: 8 }").position, 1)
+    // `w` / `h` as lengths on a container are part of the same extension; the `fill` hint survives
+    assert_feq(dcnt_root("column { h: 40 }").h.value, 40.0, 0.001)
+    dcnt_msg("column { w: fill }", "w: use fill_w / fill_h instead of `fill`")
+    // spacer is the one core kind with no extension tail: its table really is just h and w
+    dcnt_msg("spacer { z_index: 1 }", dcnt_unknown("spacer", "z_index"))
+    dcnt_msg("spacer { tag: t }", dcnt_unknown("spacer", "tag"))
+}
+
+// ---- 11. binds are per-kind ----
+
+fn test_rect_and_spacer_take_no_binds_or_classes() {
+    // The bind-less leaves are rect, surface, spacer and divider, and they are bind-less together:
+    // there is no rect/surface asymmetry to smooth over. The rect and surface
+    // parsers both have no bind arm, and the nodes they produce have no `bind_visible`
+    // or `bind_disabled`. A conditionally-shown rect or separator wraps in a bound `column`.
+    dcnt_msg("rect { bind_visible: v }", dcnt_unknown("rect", "bind_visible"))
+    dcnt_msg("rect { bind_disabled: v }", dcnt_unknown("rect", "bind_disabled"))
+    dcnt_msg("surface { id: s bind_visible: v }", dcnt_unknown("surface", "bind_visible"))
+    dcnt_msg("surface { id: s bind_disabled: v }", dcnt_unknown("surface", "bind_disabled"))
+    // the containers, `text` and `button` do take both; that is the dividing line
+    assert_streq(dcnt_root("column { bind_visible: cv bind_disabled: cd }").bind_disabled, "cd")
+    assert_streq(dcnt_root("text { text: x bind_visible: tv }").bind_visible, "tv")
+    // the wrap-in-a-column workaround
+    var wrapped = dcnt_root("column { bind_visible: v rect { h: 1 fill_w: true } }")
+    assert_streq(wrapped.bind_visible, "v")
+    // spacer: UiNode::Spacer is `{ h, w }` and nothing else, so there is no field a class could
+    // reach. `tag spacer { }` in a stylesheet is the only way to style spacers, and it hits all.
+    dcnt_msg("spacer { bind_visible: v }", dcnt_unknown("spacer", "bind_visible"))
+}
+
+// ---- 12. z_index actually orders absolute siblings ----
+
+fn test_z_index_orders_absolute_children_stably() {
+    // four absolute rects, distinguishable by their red channel. Written 50, 60, 70, 80 in document
+    // order with z_index 5, 1, 5, (unset = 0) -> painted 80, 60, 50, 70: ascending z_index, and the
+    // two z_index: 5 siblings keeping the order they were written in.
+    var src = "column { gap: 0 padding: 0"
+    src = src + " rect { position: absolute z_index: 5 w: 10 h: 10 color: [50, 0, 0, 255] }"
+    src = src + " rect { position: absolute z_index: 1 w: 10 h: 10 color: [60, 0, 0, 255] }"
+    src = src + " rect { position: absolute z_index: 5 w: 10 h: 10 color: [70, 0, 0, 255] }"
+    src = src + " rect { position: absolute w: 10 h: 10 color: [80, 0, 0, 255] }"
+    src = src + " }"
+    var ov = dcnt_lay(src, 200.0, 60.0)
+    assert_eq(dcnt_prim(ov, 0, 0).color.r, 80)
+    assert_eq(dcnt_prim(ov, 0, 1).color.r, 60)
+    assert_eq(dcnt_prim(ov, 0, 2).color.r, 50)
+    assert_eq(dcnt_prim(ov, 0, 3).color.r, 70)
+    // stability on its own: no z_index anywhere is document order, byte for byte
+    var flat = "column { gap: 0 padding: 0"
+    flat = flat + " rect { position: absolute w: 10 h: 10 color: [11, 0, 0, 255] }"
+    flat = flat + " rect { position: absolute w: 10 h: 10 color: [22, 0, 0, 255] }"
+    flat = flat + " rect { position: absolute w: 10 h: 10 color: [33, 0, 0, 255] }"
+    flat = flat + " }"
+    var ov2 = dcnt_lay(flat, 200.0, 60.0)
+    assert_eq(dcnt_prim(ov2, 0, 0).color.r, 11)
+    assert_eq(dcnt_prim(ov2, 0, 1).color.r, 22)
+    assert_eq(dcnt_prim(ov2, 0, 2).color.r, 33)
+    // in-flow siblings are not reordered by z_index: the sort only sees out-of-flow children,
+    // and every absolute child still paints after every in-flow one.
+    var mixed = "column { gap: 0 padding: 0"
+    mixed = mixed + " rect { position: absolute z_index: 9 w: 10 h: 10 color: [1, 0, 0, 255] }"
+    mixed = mixed + " rect { fill_w: true h: 10 color: [2, 0, 0, 255] }"
+    mixed = mixed + " }"
+    var ov3 = dcnt_lay(mixed, 200.0, 60.0)
+    assert_eq(dcnt_prim(ov3, 0, 0).color.r, 2)
+    assert_eq(dcnt_prim(ov3, 0, 1).color.r, 1)
+}
+
+// ---- 13. the "second root" message depends on the form ----
+
+fn test_duplicate_root_message_per_form() {
+    // top level: the two forms spell the message differently,
+    // so both are covered.
+    dcnt_msg("column { } row { }", "only one root node allowed")
+    dcnt_msg("tree column { } tree row { }", "only one root allowed")
+    dcnt_msg("column { } tree row { }", "only one root allowed")
+    // inside a `document { }` wrapper both cases are one message, because there the wrapper is the
+    // thing with one root.
+    dcnt_msg("document { column { } row { } }", "only one root in document")
+    dcnt_msg("document { tree column { } tree row { } }", "only one root in document")
+    dcnt_msg("document { tree column { } row { } }", "only one root in document")
+}
+
+// ---- 14. the `document { }` wrapper has its own wording for five more messages ----
+
+fn test_document_wrapper_message_per_form() {
+    // The two forms are parsed in two separate loops
+    // (top level and document wrapper) and the loops do not share a single string. Inside the wrapper
+    // the subject is the document; outside it, the top level. Both are covered.
+    dcnt_msg("document { zzz: 1 column { } }", ("unknown document field " + dcnt_dq("zzz")))
+    dcnt_msg("zzz: 1 column { }", ("unknown top-level field " + dcnt_dq("zzz")))
+    dcnt_msg("document { zzz column { } }", ("bad document item " + dcnt_dq("zzz")))
+    dcnt_msg("zzz column { }", ("unexpected after " + dcnt_dq("zzz")))
+    // `tree:` with a value is only reachable inside the wrapper: the wrapper's parser checks the
+    // name in its `:` branch; the top-level loop has no such case.
+    dcnt_msg("document { tree: column }", "use `tree column {` form: tree keyword expects a block")
+    // no root at all
+    dcnt_msg("document { style: dark }", "document needs tree column/panel { ... } or root block")
+    dcnt_msg("style: dark", "document needs a root column/panel/row/text/button/rect/surface block")
+    // content after the wrapper's closing brace
+    dcnt_msg("document { column { } } row { }", "trailing content after document")
+    // the wrapper still parses when it is well formed
+    var r = ui::layout::dsl_parse_document("document { style: dark tree column { text { text: hi } } }")
+    assert_true(r.ok)
+    assert_streq(r.doc.style, "dark")
+}

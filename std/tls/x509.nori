@@ -1,0 +1,752 @@
+// X.509 certificate parsing (RFC 5280).
+//
+// Parsing only. Nothing here decides whether a certificate is acceptable: that is chain
+// validation, and it lives in its own file so that the code which reads hostile bytes and the code
+// which makes trust decisions are never the same code. A `Cert` with `err == ""` means the bytes
+// were well formed and says nothing about whether they should be believed.
+//
+// Two fields are carried as raw DER rather than decoded, and it matters that they are: `tbs`,
+// which is what a signature is computed over, and the issuer and subject names, which are compared
+// between certificates in a chain. Both must be the bytes as they arrived. Re-encoding a
+// name that was parsed and rebuilt is how a chain links to something it was never signed for, and
+// re-encoding a TBS is how a signature check verifies a document nobody signed.
+
+import "std/time" as time
+import "std/crypto" as crypto
+
+/// A parsed certificate. `err` is "" only if every field below was read successfully.
+pub struct Cert {
+    raw: Str,                   // the whole certificate, as received
+    tbs: Str,                   // the TBSCertificate bytes the signature covers, as received
+    version: Int,               // 1, 2 or 3 (the encoded value plus one)
+    serial: Str,
+    sig_alg: Str,               // signatureAlgorithm OID from outside the TBS
+    tbs_sig_alg: Str,           // and from inside it; the two must agree
+    sig_params: Str,            // the AlgorithmIdentifier parameters, for RSA-PSS
+    issuer: Str,                // raw DER of the Name
+    subject: Str,               // raw DER of the Name
+    not_before: Int,            // unix seconds
+    not_after: Int,
+    spki_alg: Str,              // public key algorithm OID
+    spki_curve: Str,            // named-curve OID for an EC key, "" otherwise
+    spki_key: Str,              // the subjectPublicKey BIT STRING contents
+    spki_raw: Str,              // the whole SubjectPublicKeyInfo, as received
+    is_ca: Bool,
+    has_basic_constraints: Bool,
+    path_len: Int,              // -1 when absent
+    key_usage: Int,             // a bitmask, -1 when absent
+    eku_server_auth: Bool,
+    has_eku: Bool,
+    dns_names: Vec<Str>,
+    ip_addresses: Vec<Str>,     // 4 or 16 raw bytes each
+    signature: Str,
+    err: Str
+}
+
+fn empty_cert(why: Str) -> Cert {
+    var d: Vec<Str> = vec()
+    var i: Vec<Str> = vec()
+    return Cert { raw: "", tbs: "", version: 0, serial: "", sig_alg: "", tbs_sig_alg: "",
+                  sig_params: "", issuer: "", subject: "", not_before: 0, not_after: 0,
+                  spki_alg: "", spki_curve: "", spki_key: "", spki_raw: "",
+                  is_ca: false, has_basic_constraints: false, path_len: 0 - 1, key_usage: 0 - 1,
+                  eku_server_auth: false, has_eku: false,
+                  dns_names: d, ip_addresses: i, signature: "", err: copy why }
+}
+
+// Two digits at `off`, or -1 if they are not digits. Used only by the time parsers below, where a
+// non-digit means a malformed certificate and never a value to guess at.
+fn two_digits(s: Str, off: Int) -> Int {
+    if (off + 2) > s.len() { return 0 - 1 }
+    let a = ord(s.at(off))
+    let b = ord(s.at(off + 1))
+    if a < 48 { return 0 - 1 }
+    if a > 57 { return 0 - 1 }
+    if b < 48 { return 0 - 1 }
+    if b > 57 { return 0 - 1 }
+    return (((a - 48) * 10) + (b - 48))
+}
+
+/// A UTCTime or GeneralizedTime as unix seconds, or -1 if it is not one this accepts.
+///
+/// Only the `Z` forms are accepted. RFC 5280 requires them, and a local-time offset would mean a
+/// validity window whose meaning depends on where the reader is standing.
+///
+/// UTCTime's two-digit year is the sliding window RFC 5280 fixes: 50 and above is 19xx, below is
+/// 20xx. It is not a heuristic to be improved on: a certificate issuer and a verifier that read
+/// the same two digits differently disagree about when a certificate expires.
+pub fn parse_time(s: Str, generalized: Bool) -> Int {
+    var y = 0
+    var off = 0
+    if generalized {
+        if s.len() < 15 { return 0 - 1 }
+        let c = two_digits(s, 0)
+        let yy = two_digits(s, 2)
+        if c < 0 { return 0 - 1 }
+        if yy < 0 { return 0 - 1 }
+        y = ((c * 100) + yy)
+        off = 4
+    } else {
+        if s.len() < 13 { return 0 - 1 }
+        let yy = two_digits(s, 0)
+        if yy < 0 { return 0 - 1 }
+        if yy >= 50 { y = (1900 + yy) } else { y = (2000 + yy) }
+        off = 2
+    }
+    let mo = two_digits(s, off)
+    let d = two_digits(s, off + 2)
+    let h = two_digits(s, off + 4)
+    let mi = two_digits(s, off + 6)
+    let se = two_digits(s, off + 8)
+    if mo < 0 { return 0 - 1 }
+    if d < 0 { return 0 - 1 }
+    if h < 0 { return 0 - 1 }
+    if mi < 0 { return 0 - 1 }
+    if se < 0 { return 0 - 1 }
+    if ord(s.at(off + 10)) != 90 { return 0 - 1 }          // 'Z'
+    if (off + 11) != s.len() { return 0 - 1 }              // no trailing bytes
+    if mo < 1 { return 0 - 1 }
+    if mo > 12 { return 0 - 1 }
+    if d < 1 { return 0 - 1 }
+    if d > 31 { return 0 - 1 }
+    if h > 23 { return 0 - 1 }
+    if mi > 59 { return 0 - 1 }
+    if se > 60 { return 0 - 1 }                            // a leap second is legal in the encoding
+    return (((time::days_from_civil(y, mo, d) * 86400) + (h * 3600)) + ((mi * 60) + se))
+}
+
+fn read_time(inout a: Asn1) -> Int {
+    // (no mark needed: a time is read by value, not by its encoded bytes)
+    let t = asn1_next(a)
+    if t.err.len() != 0 { return 0 - 1 }
+    if t.cls != 0 { return 0 - 1 }
+    if t.tag == tag_utctime() { return parse_time(asn1_content(a, t), false) }
+    if t.tag == tag_generalizedtime() { return parse_time(asn1_content(a, t), true) }
+    return 0 - 1
+}
+
+/// An AlgorithmIdentifier: an OID and whatever parameters followed it, kept as raw DER because
+/// RSA-PSS carries its whole configuration there and it must be read as written.
+pub struct AlgId { oid: Str, params: Str }
+
+// AlgorithmIdentifier ::= SEQUENCE { algorithm OBJECT IDENTIFIER, parameters ANY OPTIONAL }
+// An empty `oid` means it did not parse; returned as a struct rather than through an `inout Str`,
+// which Nori allows to be mutated but not replaced.
+fn read_alg_id(inout a: Asn1) -> AlgId {
+    let seq = asn1_expect(a, tag_sequence())
+    if seq.err.len() != 0 { return AlgId { oid: "", params: "" } }
+    var inner = asn1_inner(a, seq)
+    let o = asn1_expect(inner, tag_oid())
+    if o.err.len() != 0 { return AlgId { oid: "", params: "" } }
+    let oid = asn1_content(inner, o)
+    let pstart = asn1_mark(inner)
+    if asn1_left(inner) > 0 {
+        let p = asn1_next(inner)
+        if p.err.len() != 0 { return AlgId { oid: "", params: "" } }
+        return AlgId { oid: oid, params: asn1_raw(inner, p, pstart) }
+    }
+    return AlgId { oid: oid, params: "" }
+}
+
+/// Parse a DER certificate. `err` says why not, and every other field is meaningless when it is set.
+pub fn parse_cert(der: Str) -> Cert {
+    var c = empty_cert("")
+    c.raw = copy der
+    var a = asn1_new(der)
+    let outer = asn1_expect(a, tag_sequence())
+    if outer.err.len() != 0 { return empty_cert(a.err) }
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+    if !asn1_done(a) { return empty_cert("trailing bytes after the certificate") }
+    var top = asn1_inner(a, outer)
+
+    let tbs_start = asn1_mark(top)
+    let tbs = asn1_expect(top, tag_sequence())
+    if tbs.err.len() != 0 { return empty_cert(top.err) }
+    // The signature covers these bytes as they arrived, never a re-encoding of them.
+    c.tbs = asn1_raw(top, tbs, tbs_start)
+
+    let sa = read_alg_id(top)
+    if sa.oid.len() == 0 { return empty_cert("bad signatureAlgorithm") }
+    c.sig_alg = copy sa.oid
+    c.sig_params = copy sa.params
+    let sigbits = asn1_expect(top, tag_bit_string())
+    if sigbits.err.len() != 0 { return empty_cert(top.err) }
+    c.signature = asn1_bits(top, sigbits)
+    if c.signature.len() == 0 { return empty_cert("bad signature bit string") }
+    if !asn1_done(top) { return empty_cert("trailing bytes inside the certificate") }
+
+    var t = asn1_inner(top, tbs)
+
+    // version [0] EXPLICIT INTEGER DEFAULT v1
+    c.version = 1
+    if asn1_left(t) > 0 {
+        let save = asn1_mark(t)
+        let v = asn1_next(t)
+        if v.err.len() != 0 { return empty_cert(t.err) }
+        if v.cls == 2 {
+            if v.tag != 0 { return empty_cert("unexpected context tag where version belongs") }
+            var vi = asn1_inner(t, v)
+            let iv = asn1_expect(vi, tag_integer())
+            if iv.err.len() != 0 { return empty_cert(vi.err) }
+            let vb = asn1_content(vi, iv)
+            if vb.len() != 1 { return empty_cert("implausible certificate version") }
+            c.version = (ord(vb.at(0)) + 1)
+        } else {
+            t.pos = save                                    // no version: the value read was the serial
+        }
+    }
+    if c.version < 1 { return empty_cert("bad certificate version") }
+    if c.version > 3 { return empty_cert("certificate version from the future") }
+
+    let ser = asn1_expect(t, tag_integer())
+    if ser.err.len() != 0 { return empty_cert(t.err) }
+    c.serial = asn1_content(t, ser)
+
+    let ta = read_alg_id(t)
+    if ta.oid.len() == 0 { return empty_cert("bad inner signature algorithm") }
+    c.tbs_sig_alg = copy ta.oid
+
+    let istart = asn1_mark(t)
+    let iss = asn1_expect(t, tag_sequence())
+    if iss.err.len() != 0 { return empty_cert(t.err) }
+    c.issuer = asn1_raw(t, iss, istart)
+
+    let val = asn1_expect(t, tag_sequence())
+    if val.err.len() != 0 { return empty_cert(t.err) }
+    var vt = asn1_inner(t, val)
+    c.not_before = read_time(vt)
+    c.not_after = read_time(vt)
+    if c.not_before < 0 { return empty_cert("bad notBefore") }
+    if c.not_after < 0 { return empty_cert("bad notAfter") }
+    if !asn1_done(vt) { return empty_cert("trailing bytes in the validity period") }
+
+    let sstart = asn1_mark(t)
+    let sub = asn1_expect(t, tag_sequence())
+    if sub.err.len() != 0 { return empty_cert(t.err) }
+    c.subject = asn1_raw(t, sub, sstart)
+
+    let kstart = asn1_mark(t)
+    let spki = asn1_expect(t, tag_sequence())
+    if spki.err.len() != 0 { return empty_cert(t.err) }
+    c.spki_raw = asn1_raw(t, spki, kstart)
+    var k = asn1_inner(t, spki)
+    let ka = read_alg_id(k)
+    if ka.oid.len() == 0 { return empty_cert("bad public key algorithm") }
+    c.spki_alg = copy ka.oid
+    let curve = ka.params
+    // For an EC key the parameters are the named curve, encoded as an OID. Its raw form is kept
+    // and its content extracted, so an unusual encoding is not mistaken for a curve.
+    if curve.len() > 2 {
+        if ord(curve.at(0)) == 0x06 { c.spki_curve = curve.slice(2, curve.len()) }
+    }
+    let kb = asn1_expect(k, tag_bit_string())
+    if kb.err.len() != 0 { return empty_cert(k.err) }
+    c.spki_key = asn1_bits(k, kb)
+    if c.spki_key.len() == 0 { return empty_cert("bad public key bit string") }
+    if !asn1_done(k) { return empty_cert("trailing bytes in the public key") }
+
+    // The remaining fields are optional and context-tagged: issuerUniqueID [1], subjectUniqueID [2]
+    // and extensions [3]. Only the last is read; the unique IDs are obsolete and are skipped rather
+    // than rejected, because real certificates do occasionally still carry them.
+    var bad = ""
+    while asn1_left(t) > 0 {
+        let x = asn1_next(t)
+        if x.err.len() != 0 { return empty_cert(t.err) }
+        if x.cls == 2 {
+            if x.tag == 3 {
+                var e = asn1_inner(t, x)
+                let eseq = asn1_expect(e, tag_sequence())
+                if eseq.err.len() != 0 { return empty_cert(e.err) }
+                var el = asn1_inner(e, eseq)
+                bad = read_extensions(el, c)
+                if bad.len() > 0 { return empty_cert(bad) }
+                if !asn1_done(e) { return empty_cert("trailing bytes after the extensions") }
+            }
+        }
+    }
+    if t.err.len() != 0 { return empty_cert(t.err) }
+    return c
+}
+
+// Extensions ::= SEQUENCE OF Extension
+// Extension ::= SEQUENCE { extnID OID, critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING }
+//
+// A critical extension that this code does not understand makes the certificate unusable. That is
+// what critical means: the issuer is saying the certificate must not be accepted by anyone who
+// cannot enforce this constraint, and ignoring one is how a certificate restricted to something
+// narrow gets used for everything.
+fn read_extensions(inout el: Asn1, inout c: Cert) -> Str {
+    while asn1_left(el) > 0 {
+        let ext = asn1_expect(el, tag_sequence())
+        if ext.err.len() != 0 { return copy el.err }
+        var x = asn1_inner(el, ext)
+        let oidt = asn1_expect(x, tag_oid())
+        if oidt.err.len() != 0 { return copy x.err }
+        let oid = asn1_content(x, oidt)
+        var critical = false
+        let save = asn1_mark(x)
+        let maybe = asn1_next(x)
+        if maybe.err.len() != 0 { return copy x.err }
+        if maybe.cls == 0 {
+            if maybe.tag == tag_boolean() {
+                let b = asn1_content(x, maybe)
+                if b.len() != 1 { return "bad critical flag" }
+                // DER admits exactly two encodings of a boolean, and 0xFF is the only true.
+                if ord(b.at(0)) == 0xff { critical = true }
+                else { if ord(b.at(0)) != 0 { return "non-DER boolean in an extension" } }
+            } else { x.pos = save }
+        } else { x.pos = save }
+        let oct = asn1_expect(x, tag_octet_string())
+        if oct.err.len() != 0 { return copy x.err }
+        let body = asn1_content(x, oct)
+        if !asn1_done(x) { return "trailing bytes in an extension" }
+
+        var known = false
+        if oid == oid_ext_basic_constraints() {
+            known = true
+            let e = read_basic_constraints(body, c)
+            if e.len() > 0 { return e }
+        }
+        if oid == oid_ext_key_usage_bits() {
+            known = true
+            let e = read_key_usage(body, c)
+            if e.len() > 0 { return e }
+        }
+        if oid == oid_ext_subject_alt_name() {
+            known = true
+            let e = read_san(body, c)
+            if e.len() > 0 { return e }
+        }
+        if oid == oid_ext_extended_key_usage() {
+            known = true
+            let e = read_eku(body, c)
+            if e.len() > 0 { return e }
+        }
+        // Recognised and not acted on. Each is either advisory or belongs to
+        // machinery this client does not implement, and none of them narrows what a certificate
+        // may be used for in a way that matters here.
+        if oid == oid_ext_authority_key_id() { known = true }
+        if oid == oid_ext_subject_key_id() { known = true }
+        if oid == oid_ext_certificate_policies() { known = true }
+        if oid == oid_ext_crl_distribution() { known = true }
+        if oid == oid_ext_authority_info_access() { known = true }
+        if oid == oid_ext_sct() { known = true }
+
+        if critical {
+            if !known { return "certificate carries a critical extension this client cannot enforce" }
+        }
+    }
+    if el.err.len() != 0 { return copy el.err }
+    return ""
+}
+
+// BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPTIONAL }
+fn read_basic_constraints(body: Str, inout c: Cert) -> Str {
+    var a = asn1_new(body)
+    let seq = asn1_expect(a, tag_sequence())
+    if seq.err.len() != 0 { return "bad basicConstraints" }
+    if !asn1_done(a) { return "trailing bytes after basicConstraints" }
+    var i = asn1_inner(a, seq)
+    c.has_basic_constraints = true
+    c.is_ca = false
+    c.path_len = 0 - 1
+    if asn1_left(i) > 0 {
+        let save = asn1_mark(i)
+        let b = asn1_next(i)
+        if b.err.len() != 0 { return "bad basicConstraints" }
+        if b.cls == 0 {
+            if b.tag == tag_boolean() {
+                let v = asn1_content(i, b)
+                if v.len() != 1 { return "bad cA flag" }
+                if ord(v.at(0)) == 0xff { c.is_ca = true }
+                else { if ord(v.at(0)) != 0 { return "non-DER cA flag" } }
+            } else { i.pos = save }
+        } else { i.pos = save }
+    }
+    if asn1_left(i) > 0 {
+        let p = asn1_expect(i, tag_integer())
+        if p.err.len() != 0 { return "bad pathLenConstraint" }
+        let v = asn1_content(i, p)
+        if v.len() < 1 { return "bad pathLenConstraint" }
+        if v.len() > 2 { return "implausible pathLenConstraint" }
+        var n = 0
+        var j = 0
+        while j < v.len() { n = ((n << 8) | ord(v.at(j)))  j = j + 1 }
+        if n < 0 { return "negative pathLenConstraint" }
+        c.path_len = n
+    }
+    if !asn1_done(i) { return "trailing bytes in basicConstraints" }
+    return ""
+}
+
+// In a DER BIT STRING, bit 0 is the most significant bit of the first octet, so the masks below
+// count down from 0x80 and not up from 0x01. Reading them the other way round is a bug that fails
+// closed here (every CA looks forbidden to sign) and would fail open in a checker that tested for
+// a bit's absence instead of its presence.
+//
+//   KeyUsage ::= BIT STRING { digitalSignature(0), nonRepudiation(1), keyEncipherment(2),
+//                             dataEncipherment(3), keyAgreement(4), keyCertSign(5),
+//                             cRLSign(6), encipherOnly(7) }
+
+/// keyUsage bit 0, digitalSignature: 0x80.
+pub fn key_usage_digital_signature() -> Int { return 128 }
+/// keyUsage bit 5, keyCertSign: 0x04. The bit that says a key may sign other certificates.
+pub fn key_usage_cert_sign() -> Int { return 4 }
+/// keyUsage bit 6, cRLSign: 0x02.
+pub fn key_usage_crl_sign() -> Int { return 2 }
+
+// KeyUsage ::= BIT STRING. Only the first two octets can hold a bit this client tests, and they
+// are read as a big-endian bitmask with bit 0 the most significant.
+fn read_key_usage(body: Str, inout c: Cert) -> Str {
+    var a = asn1_new(body)
+    let b = asn1_expect(a, tag_bit_string())
+    if b.err.len() != 0 { return "bad keyUsage" }
+    if !asn1_done(a) { return "trailing bytes after keyUsage" }
+    let raw = asn1_content(a, b)
+    if raw.len() < 1 { return "empty keyUsage" }
+    let unused = ord(raw.at(0))
+    if unused > 7 { return "bad keyUsage padding" }
+    var mask = 0
+    if raw.len() > 1 { mask = ord(raw.at(1)) }
+    c.key_usage = mask
+    return ""
+}
+
+// ExtKeyUsageSyntax ::= SEQUENCE OF KeyPurposeId
+fn read_eku(body: Str, inout c: Cert) -> Str {
+    var a = asn1_new(body)
+    let seq = asn1_expect(a, tag_sequence())
+    if seq.err.len() != 0 { return "bad extendedKeyUsage" }
+    if !asn1_done(a) { return "trailing bytes after extendedKeyUsage" }
+    var i = asn1_inner(a, seq)
+    c.has_eku = true
+    while asn1_left(i) > 0 {
+        let o = asn1_expect(i, tag_oid())
+        if o.err.len() != 0 { return "bad extendedKeyUsage entry" }
+        let v = asn1_content(i, o)
+        if v == oid_eku_server_auth() { c.eku_server_auth = true }
+        if v == oid_eku_any() { c.eku_server_auth = true }
+    }
+    if i.err.len() != 0 { return "bad extendedKeyUsage" }
+    return ""
+}
+
+// SubjectAltName ::= GeneralNames ::= SEQUENCE OF GeneralName
+// dNSName is [2] IA5String and iPAddress is [7] OCTET STRING, both implicit and so primitive.
+//
+// Only these two are collected. An identity this client cannot match against a URL is an identity
+// it must not be influenced by, and quietly gathering e.g. a rfc822Name would invite a later
+// comparison that should never happen.
+fn read_san(body: Str, inout c: Cert) -> Str {
+    var a = asn1_new(body)
+    let seq = asn1_expect(a, tag_sequence())
+    if seq.err.len() != 0 { return "bad subjectAltName" }
+    if !asn1_done(a) { return "trailing bytes after subjectAltName" }
+    var i = asn1_inner(a, seq)
+    while asn1_left(i) > 0 {
+        let g = asn1_next(i)
+        if g.err.len() != 0 { return "bad subjectAltName entry" }
+        if g.cls == 2 {
+            if g.tag == 2 {
+                let n = asn1_content(i, g)
+                // A NUL inside a name is the classic way to make "evil.com\0good.com" look like
+                // one host to a C string and another to everything else. There is no legitimate
+                // certificate with one.
+                if has_nul(n) { return "subjectAltName contains a NUL byte" }
+                c.dns_names.push(n)
+            }
+            if g.tag == 7 {
+                let ip = asn1_content(i, g)
+                if ip.len() == 4 { c.ip_addresses.push(ip) }
+                else { if ip.len() == 16 { c.ip_addresses.push(ip) }
+                       else { return "subjectAltName iPAddress is neither v4 nor v6" } }
+            }
+        }
+    }
+    if i.err.len() != 0 { return "bad subjectAltName" }
+    return ""
+}
+
+fn has_nul(s: Str) -> Bool {
+    var i = 0
+    while i < s.len() { if ord(s.at(i)) == 0 { return true }  i = i + 1 }
+    return false
+}
+
+/// Is the certificate within its validity window at `now` (unix seconds)?
+pub fn cert_time_valid(c: Cert, now: Int) -> Bool {
+    if now < c.not_before { return false }
+    if now > c.not_after { return false }
+    return true
+}
+
+/// The RSA modulus and exponent from a SubjectPublicKeyInfo's key bits.
+///
+/// Here rather than in `std/crypto/rsa.nori` because it is DER parsing, and the DER reader lives
+/// in this module (`std/tls` imports `std/crypto`, not the other way round). The split is a
+/// reasonable one anyway: the arithmetic of RSA and the encoding of an X.509 key are different
+/// problems, and only one of them reads hostile bytes.
+///
+/// RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }. An empty modulus means
+/// it did not parse, and a caller must check: a key with no modulus verifies nothing, which is
+/// indistinguishable from a key that simply rejects every signature.
+pub fn rsa_pub_from_der(spki_key: Str) -> crypto::RsaPub {
+    var a = asn1_new(spki_key)
+    let seq = asn1_expect(a, tag_sequence())
+    if seq.err.len() != 0 { return crypto::RsaPub { n: "", e: "" } }
+    if !asn1_done(a) { return crypto::RsaPub { n: "", e: "" } }
+    var i = asn1_inner(a, seq)
+    let nt = asn1_expect(i, tag_integer())
+    let et = asn1_expect(i, tag_integer())
+    if i.err.len() != 0 { return crypto::RsaPub { n: "", e: "" } }
+    if !asn1_done(i) { return crypto::RsaPub { n: "", e: "" } }
+    let n = asn1_uint(i, nt)
+    let e = asn1_uint(i, et)
+    if n.len() == 0 { return crypto::RsaPub { n: "", e: "" } }
+    if e.len() == 0 { return crypto::RsaPub { n: "", e: "" } }
+    return crypto::RsaPub { n: n, e: e }
+}
+
+/// Verify an ECDSA signature whose r and s arrive DER-encoded, as they do in a certificate and in
+/// a TLS CertificateVerify: SEQUENCE { r INTEGER, s INTEGER }.
+///
+/// Here rather than beside the curve arithmetic for the same reason as `rsa_pub_from_der`: this is
+/// DER parsing, and `std/crypto` cannot see the DER reader.
+///
+/// The encoding is checked strictly. A signature with a non-minimal integer, trailing bytes, or a
+/// negative value is refused rather than repaired; those are the malleable re-encodings
+/// that let one signature be presented as several.
+pub fn ecdsa_verify_der(curve: crypto::EcCurve, pubkey: Str, digest: Str, der: Str) -> Bool {
+    let flen = (curve.len * 4)
+    var a = asn1_new(der)
+    let seq = asn1_expect(a, tag_sequence())
+    if seq.err.len() != 0 { return false }
+    if !asn1_done(a) { return false }
+    var i = asn1_inner(a, seq)
+    let rt = asn1_expect(i, tag_integer())
+    let st = asn1_expect(i, tag_integer())
+    if i.err.len() != 0 { return false }
+    if !asn1_done(i) { return false }
+    let r = asn1_uint(i, rt)
+    let s = asn1_uint(i, st)
+    if r.len() == 0 { return false }
+    if s.len() == 0 { return false }
+    if r.len() > flen { return false }
+    if s.len() > flen { return false }
+    return crypto::ecdsa_verify(curve, pubkey, digest, padn(r, flen), padn(s, flen))
+}
+
+
+// left-pad to the width a scalar occupies on this curve
+fn padn(s: Str, n: Int) -> Str {
+    var out = ""
+    var i = 0
+    while i < (n - s.len()) { out = (out + chr(0))  i = i + 1 }
+    return (out + s)
+}
+
+/// The curve a SubjectPublicKeyInfo named, or an empty one (len 0) if it is not one we implement.
+pub fn curve_of(oid: Str) -> crypto::EcCurve {
+    if oid == oid_prime256v1() { return crypto::ec_p256() }
+    if oid == oid_secp384r1() { return crypto::ec_p384() }
+    return crypto::EcCurve { len: 0, p: vec(), n: vec(), p0inv: 0, prr: vec(), n0inv: 0, nrr: vec(),
+                             one: vec(), b: vec(), gx: vec(), gy: vec() }
+}
+
+// ---- signature verification --------------------------------------------------------------------
+
+/// The hash a signature algorithm OID names, as its output length. 0 means this client will not
+/// verify signatures of that kind.
+///
+/// SHA-1 and MD5 are absent on purpose, not by omission. Both are collision-broken, and a
+/// collision is the attack a certificate signature must resist: an attacker who can find
+/// one gets a signature over a certificate the CA never saw. A verifier that still accepts them
+/// hands back every guarantee the chain was supposed to provide.
+pub fn sig_hash_len(oid: Str) -> Int {
+    if oid == oid_sha256_with_rsa() { return 32 }
+    if oid == oid_sha384_with_rsa() { return 48 }
+    if oid == oid_sha512_with_rsa() { return 64 }
+    if oid == oid_ecdsa_with_sha256() { return 32 }
+    if oid == oid_ecdsa_with_sha384() { return 48 }
+    return 0
+}
+
+/// The smallest RSA modulus this client will verify with.
+///
+/// 1024-bit RSA is within reach of a well-resourced attacker and has been off the public web for
+/// years; accepting one means accepting a chain anchored in a key someone may already have
+/// factored. Certificates using them still exist, so this is a refusal that will occasionally cost
+/// a connection, and that is the intended trade.
+pub fn rsa_min_bits() -> Int { return 2048 }
+
+fn hash_with(hash_len: Int, data: Str) -> Str {
+    if hash_len == 32 { return crypto::sha256_raw(data) }
+    if hash_len == 48 { return crypto::sha384_raw(data) }
+    if hash_len == 64 { return crypto::sha512_raw(data) }
+    return ""
+}
+
+// RSASSA-PSS-params ::= SEQUENCE {
+//   hashAlgorithm [0] DEFAULT sha1, maskGenAlgorithm [1] DEFAULT mgf1SHA1,
+//   saltLength [2] DEFAULT 20, trailerField [3] DEFAULT 1 }
+// The defaults are all SHA-1, so an omitted field is a SHA-1 parameter, which this refuses.
+// Returns the hash length, or 0 if the parameters are not ones this client will accept; `salt`
+// receives the salt length.
+fn parse_pss_params(params: Str) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    out.push(0)
+    out.push(0)
+    var a = asn1_new(params)
+    let seq = asn1_expect(a, tag_sequence())
+    if seq.err.len() != 0 { return out }
+    if !asn1_done(a) { return out }
+    var i = asn1_inner(a, seq)
+    var hlen = 0
+    var slen = 0 - 1
+    var mgf_ok = false
+    while asn1_left(i) > 0 {
+        let f = asn1_next(i)
+        if f.err.len() != 0 { return out }
+        if f.cls != 2 { return out }
+        var inner = asn1_inner(i, f)
+        if f.tag == 0 {
+            let alg = read_alg_id(inner)
+            if alg.oid == oid_sha256() { hlen = 32 }
+            if alg.oid == oid_sha384() { hlen = 48 }
+            if alg.oid == oid_sha512() { hlen = 64 }
+        }
+        if f.tag == 1 {
+            let alg = read_alg_id(inner)
+            // MGF1 over the same hash is the only configuration TLS 1.3 defines, and the only one
+            // rsa_pss_verify implements. A different mask hash is refused rather than ignored.
+            if alg.oid == oid_mgf1() {
+                var pa = asn1_new(alg.params)
+                let inner2 = read_alg_id(pa)
+                if inner2.oid == oid_sha256() { if hlen == 32 { mgf_ok = true } }
+                if inner2.oid == oid_sha384() { if hlen == 48 { mgf_ok = true } }
+                if inner2.oid == oid_sha512() { if hlen == 64 { mgf_ok = true } }
+            }
+        }
+        if f.tag == 2 {
+            let it = asn1_expect(inner, tag_integer())
+            if it.err.len() != 0 { return out }
+            let v = asn1_content(inner, it)
+            if v.len() > 2 { return out }
+            var n = 0
+            var j = 0
+            while j < v.len() { n = ((n << 8) | ord(v.at(j)))  j = j + 1 }
+            slen = n
+        }
+        if f.tag == 3 {
+            let it = asn1_expect(inner, tag_integer())
+            if it.err.len() != 0 { return out }
+            let v = asn1_content(inner, it)
+            if v.len() != 1 { return out }
+            if ord(v.at(0)) != 1 { return out }        // trailerField must be 0xbc
+        }
+    }
+    if i.err.len() != 0 { return out }
+    if !mgf_ok { return out }
+    if hlen == 0 { return out }
+    if slen < 0 { return out }                          // the default is 20, i.e. SHA-1 sized
+    out[0] = hlen
+    out[1] = slen
+    return out
+}
+
+/// Verify that `cert` was signed by the key in `issuer`. "" means the signature is good.
+///
+/// This is one link. It says nothing about whether the issuer is trusted, whether either
+/// certificate is in date, or whether the issuer was allowed to sign; those are chain validation,
+/// and keeping them apart is what stops a passing signature from being mistaken for a passing
+/// chain.
+pub fn verify_signed_by(cert: Cert, issuer: Cert) -> Str {
+    if cert.err.len() > 0 { return "the certificate did not parse" }
+    if issuer.err.len() > 0 { return "the issuer certificate did not parse" }
+    // The algorithm is stated twice, inside the signed body and outside it. Only the inner one is
+    // protected by the signature, so a mismatch means someone edited the outer copy, and a
+    // verifier that trusts the outer one can be steered to a weaker algorithm than was signed.
+    if !(cert.sig_alg == cert.tbs_sig_alg) { return "the signature algorithm inside and outside the signed body disagree" }
+    if cert.tbs.len() == 0 { return "no signed body" }
+
+    if cert.sig_alg == oid_rsassa_pss() {
+        let k = rsa_pub_from_der(issuer.spki_key)
+        if k.n.len() == 0 { return "the issuer does not have a usable RSA key" }
+        if crypto::rsa_bits(k) < rsa_min_bits() { return "the issuer's RSA key is too small" }
+        let hp = parse_pss_params(cert.sig_params)
+        if hp[0] == 0 { return "unsupported RSA-PSS parameters" }
+        let digest = hash_with(hp[0], cert.tbs)
+        if !crypto::rsa_pss_verify(k, digest, hp[0], hp[1], cert.signature) { return "the signature does not verify" }
+        return ""
+    }
+
+    let hlen = sig_hash_len(cert.sig_alg)
+    if hlen == 0 { return "unsupported or unacceptable signature algorithm" }
+    let digest = hash_with(hlen, cert.tbs)
+    if digest.len() == 0 { return "unsupported signature hash" }
+
+    if issuer.spki_alg == oid_rsa_encryption() {
+        if cert.sig_alg == oid_ecdsa_with_sha256() { return "an ECDSA signature under an RSA key" }
+        if cert.sig_alg == oid_ecdsa_with_sha384() { return "an ECDSA signature under an RSA key" }
+        let k = rsa_pub_from_der(issuer.spki_key)
+        if k.n.len() == 0 { return "the issuer does not have a usable RSA key" }
+        if crypto::rsa_bits(k) < rsa_min_bits() { return "the issuer's RSA key is too small" }
+        if !crypto::rsa_pkcs1_verify(k, digest, hlen, cert.signature) { return "the signature does not verify" }
+        return ""
+    }
+    if issuer.spki_alg == oid_ec_public_key() {
+        let curve = curve_of(issuer.spki_curve)
+        if curve.len == 0 { return "the issuer's curve is not one this client implements" }
+        // The signature must be an ECDSA one. An RSA algorithm paired with an EC key is not a
+        // mismatch to work around; it is a certificate that says two different things.
+        if cert.sig_alg == oid_sha256_with_rsa() { return "an RSA signature under an EC key" }
+        if cert.sig_alg == oid_sha384_with_rsa() { return "an RSA signature under an EC key" }
+        if cert.sig_alg == oid_sha512_with_rsa() { return "an RSA signature under an EC key" }
+        if !ecdsa_verify_der(curve, issuer.spki_key, digest, cert.signature) { return "the signature does not verify" }
+        return ""
+    }
+    return "the issuer's key algorithm is not one this client verifies"
+}
+
+/// Verify a TLS 1.3 CertificateVerify: `cv`'s signature over `content`, under the leaf's key.
+///
+/// TLS 1.3's algorithm set is narrower than X.509's, and the difference is the point. PKCS#1 v1.5
+/// is forbidden here (RFC 8446 §4.4.3 requires PSS) even though certificates in the same chain
+/// are routinely signed with v1.5. A verifier that reused its certificate policy for this message
+/// would accept a signature scheme the protocol removed.
+pub fn verify_transcript_signature(leaf: Cert, cv: CertVerify, content: Str) -> Str {
+    // rsa_pss_rsae_*: the salt length equals the hash length, which TLS 1.3 fixes.
+    var hlen = 0
+    var pss = false
+    var ecdsa_curve = ""
+    if cv.algorithm == 0x0804 { hlen = 32  pss = true }
+    if cv.algorithm == 0x0805 { hlen = 48  pss = true }
+    if cv.algorithm == 0x0806 { hlen = 64  pss = true }
+    if cv.algorithm == 0x0403 { hlen = 32  ecdsa_curve = oid_prime256v1() }
+    if cv.algorithm == 0x0503 { hlen = 48  ecdsa_curve = oid_secp384r1() }
+    if hlen == 0 { return "the server signed the handshake with an algorithm this client refuses" }
+
+    let digest = hash_with(hlen, content)
+    if digest.len() == 0 { return "unsupported handshake signature hash" }
+
+    if pss {
+        if !(leaf.spki_alg == oid_rsa_encryption()) { return "an RSA signature under a non-RSA certificate" }
+        let k = rsa_pub_from_der(leaf.spki_key)
+        if k.n.len() == 0 { return "the certificate does not have a usable RSA key" }
+        if crypto::rsa_bits(k) < rsa_min_bits() { return "the certificate's RSA key is too small" }
+        if !crypto::rsa_pss_verify(k, digest, hlen, hlen, cv.signature) {
+            return "the server's handshake signature does not verify"
+        }
+        return ""
+    }
+    if !(leaf.spki_alg == oid_ec_public_key()) { return "an ECDSA signature under a non-EC certificate" }
+    // The curve the signature scheme names must be the curve the certificate carries. Accepting a
+    // mismatch would mean verifying on whichever curve is convenient.
+    if !(leaf.spki_curve == ecdsa_curve) { return "the handshake signature names a different curve than the certificate" }
+    let curve = curve_of(leaf.spki_curve)
+    if curve.len == 0 { return "the certificate's curve is not one this client implements" }
+    if !ecdsa_verify_der(curve, leaf.spki_key, digest, cv.signature) {
+        return "the server's handshake signature does not verify"
+    }
+    return ""
+}

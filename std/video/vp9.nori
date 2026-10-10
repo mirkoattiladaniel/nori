@@ -1,0 +1,1206 @@
+// std/video: VP9, decoded on the CPU, written from the VP9 Bitstream & Decoding Process Specification (v0.7,
+// 22 February 2017; "the spec" below). Profile 0: 8-bit 4:2:0, with key frames, intra-only and inter frames, every
+// intra and inter prediction mode, compound prediction, scaled references, the four transform sizes and types and the
+// lossless WHT, the loop filter, segmentation, tiles, probability adaptation, show_existing_frame and superframes
+// (Annex B).
+//
+// The files: vp9.nori (this: the decoder's state, the bit readers §9.1-9.2, the uncompressed and compressed headers
+// §6.2-6.3, the probability contexts and their adaptation §8.4, the frame buffers and the reference update §8.10),
+// vp9_block.nori (tiles, partitions, blocks and their mode info §6.4, motion vector prediction §6.5, the tokens
+// §6.4.24 with the contexts of §9.3), vp9_recon.nori (intra and inter prediction §8.5, dequantization and the inverse
+// transforms §8.6-8.7), vp9_lf.nori (the loop filter §8.8), vp9_txfm.nori and vp9_tables.nori (generated from the
+// spec's text by make_vp9_txfm.py and make_vp9_tables.py).
+//
+// Memory. The state is a record (V9) of numbers and addresses; every array is raw memory it owns. Frames are kept in a
+// pool of buffers with a border of 96 samples (48 for chroma) filled by repeating the edge after a frame is decoded, so
+// motion compensation reads the reference directly (a prediction that would reach past the border, such as from a scaled reference,
+// takes the spec's clamped path). Mode info is kept per 8x8 block (MI_BYTES each) for the whole frame, the previous
+// frame's beside it for its motion vectors.
+
+extern fn malloc(Int) -> Int
+extern fn calloc(Int, Int) -> Int
+extern fn free(Int)
+extern fn memset(Int, Int, Int) -> Int
+extern fn memcpy(Int, Int, Int) -> Int
+
+// ---- the decoder's state --------------------------------------------------------------------------------------------
+
+/// one frame buffer: Y, U, V (origins inside their borders), strides, its size, how many references hold it
+record Fb { y: Int, u: Int, v: Int, ys: Int, uvs: Int, w: Int, h: Int, mic: Int, mir: Int, base: Int, refs: Int, alloc_w: Int, alloc_h: Int }
+
+/// a tile being decoded: its bool decoder, its left contexts, its scratch
+record T9 {
+    bpos: Int, bend: Int, bval: Int, bcnt: Int, brng: Int,       // the boolean decoder (§9.2)
+    col0: Int, col1: Int, row0: Int, row1: Int,                  // MiColStart.. and MiRowStart.. of the tile
+    lnz: Int,                                                    // LeftNonzeroContext[3][16] bytes
+    lpart: Int,                                                  // LeftPartitionContext[8]
+    lseg: Int,                                                   // LeftSegPredContext[8]
+    coef: Int,                                                   // Tokens: 1024 Ints (the dequantized coefficients)
+    tcache: Int,                                                 // TokenCache: 1024 bytes
+    pred: Int,                                                   // inter prediction scratch: 2 x 64x64 bytes + the intermediate 71x64 Ints
+    edge: Int,                                                   // intra edges: aboveRow (-1..63) and leftCol (0..31), Ints
+    counts: Int,                                                 // this tile's syntax element counts (Int32s)
+    blk: Int,                                                    // its Blk record
+    err: Int
+}
+
+record V9 {
+    // the uncompressed header (§6.2)
+    profile: Int, show_existing: Int, show_idx: Int, frame_type: Int, last_frame_type: Int, show_frame: Int,
+    last_show_frame: Int, error_res: Int, intra_only: Int, frame_is_intra: Int, reset_ctx: Int, refresh_flags: Int,
+    bit_depth: Int, color_space: Int, color_range: Int, ssx: Int, ssy: Int,
+    width: Int, height: Int, render_w: Int, render_h: Int, mi_cols: Int, mi_rows: Int, sb_cols: Int, sb_rows: Int,
+    last_w: Int, last_h: Int, sized_before: Int, use_prev_mvs: Int,
+    ref_idx: [Int; 3], sign_bias: [Int; 4], allow_hp: Int, interp_filter: Int,
+    refresh_ctx: Int, parallel: Int, ctx_idx: Int,
+    lf_level: Int, lf_sharp: Int, lf_delta_on: Int, lf_delta_update: Int, lf_ref: [Int; 4], lf_mode: [Int; 2],
+    base_q: Int, dq_ydc: Int, dq_uvdc: Int, dq_uvac: Int, lossless: Int,
+    seg_on: Int, seg_map: Int, seg_temporal: Int, seg_update_data: Int, seg_abs: Int,
+    seg_tree: [Int; 7], seg_pred: [Int; 3], seg_feat_on: [Int; 32], seg_feat: [Int; 32],
+    tile_cols_log2: Int, tile_rows_log2: Int, header_size: Int,
+    // the compressed header (§6.3)
+    tx_mode: Int, ref_mode: Int, comp_fixed: Int, comp_var0: Int, comp_var1: Int,
+    // probabilities: the current ones, four saved frame contexts; the counts
+    probs: Int, ctxs: Int, counts: Int,
+    // the frames: the pool, the eight references (§8.10), the one being decoded
+    pool: [Int; 12], refs: [Int; 8], cur: Int, out: Int,
+    ref_w: [Int; 8], ref_h: [Int; 8],
+    // mode info per 8x8 block: this frame's, the previous one's (PrevMvs, PrevRefFrames); the segmentation maps
+    mi: Int, prev_mi: Int, mi_cap: Int, seg_ids: Int, prev_seg: Int,
+    // above contexts: nonzero [3][MiCols*2 + 32], partition [Sb64Cols*8], segment prediction [MiCols]
+    anz: Int, apart: Int, aseg: Int,
+    // tables in raw memory (v9_tables_init)
+    tab: Int,
+    // per segment: the quantizers (ydc yac uvdc uvac) and the loop filter levels LvlLookup[seg][ref][mode]
+    seg_q: [Int; 32], lvl: [Int; 64],
+    tiles: Int, ntiles: Int,
+    threads: Int,
+    frames_decoded: Int,
+    errc: Int                         // why the last frame did not decode (v9_errmsg)
+}
+
+/// bytes of mode info per 8x8 block (see MI_*)
+fn MI_BYTES() -> Int { return 48 }
+// mode info offsets: 0 MiSize, 1 skip, 2 tx_size, 3 y_mode, 4 segment_id, 5 ref_frame[0], 6 ref_frame[1] (a NONE is
+// 255), 7 interp_filter, 8..11 sub_modes, 12 is_inter, 13 uv_mode; 16 SubMvs list 0 (4 x row,col int16), 32 list 1
+fn NONE_REF() -> Int { return 255 }
+
+// ---- the bit reader of the uncompressed header (§9.1) ----------------------------------------------------------------
+
+struct Bits { p: Int, n: Int, pos: Int }
+fn bits_f(inout b: Bits, n: Int) -> Int {
+    var x = 0
+    var i = 0
+    while i < n {
+        var bit = 0
+        let byte = b.pos >> 3
+        if byte < b.n { unsafe { bit = (peek8(b.p + byte) >> (7 - (b.pos & 7))) & 1 } }
+        x = x * 2 + bit
+        b.pos = b.pos + 1
+        i = i + 1
+    }
+    return x
+}
+fn bits_s(inout b: Bits, n: Int) -> Int {
+    let v = bits_f(b, n)
+    if bits_f(b, 1) == 1 { return 0 - v }
+    return v
+}
+
+// ---- the boolean decoder (§9.2), in the tile's record ------------------------------------------------------------------
+// BoolValue is kept with `bcnt` more bits below its top 8 (refilled a byte at a time); the arithmetic is §9.2.2's.
+
+fn bd_init(t: T9, p: Int, n: Int) -> Bool {
+    t.bpos = p
+    t.bend = p + n
+    t.bval = 0
+    t.bcnt = 0 - 8
+    t.brng = 255
+    bd_fill(t)
+    return bd_read(t, 128) == 0                              // the marker bit
+}
+fn bd_fill(t: T9) {
+    var v = t.bval
+    var c = t.bcnt
+    var p = t.bpos
+    let e = t.bend
+    while c < 40 {
+        var byte = 0
+        if p < e { unsafe { byte = peek8(p) } }
+        p = p + 1
+        v = (v << 8) | byte
+        c = c + 8
+    }
+    t.bval = v
+    t.bcnt = c
+    t.bpos = p
+}
+fn bd_read(t: T9, prob: Int) -> Int {
+    let rng = t.brng
+    let split = 1 + (((rng - 1) * prob) >> 8)
+    let c = t.bcnt
+    let bigs = split << c
+    let v = t.bval
+    var bit = 0
+    var r = split
+    if v >= bigs { r = rng - split  t.bval = v - bigs  bit = 1 }
+    var cc = c
+    while r < 128 { r = r << 1  cc = cc - 1 }
+    t.brng = r
+    t.bcnt = cc
+    if cc < 0 { bd_fill(t) }
+    return bit
+}
+fn bd_lit(t: T9, n: Int) -> Int {
+    var x = 0
+    var i = 0
+    while i < n { x = x * 2 + bd_read(t, 128)  i = i + 1 }
+    return x
+}
+/// a tree (an array of Int16 at `tree`) read with probabilities (bytes) at `probs`
+fn bd_tree(t: T9, tree: Int, probs: Int) -> Int {
+    var n = 0
+    unsafe {
+        var going = true
+        while going {
+            let b = bd_read(t, peek8(probs + (n >> 1)))
+            var v = peek16(tree + (n + b) * 2)
+            if v >= 32768 { v = v - 65536 }
+            n = v
+            if n <= 0 { going = false }
+        }
+    }
+    return 0 - n
+}
+
+// ---- the tables, in raw memory --------------------------------------------------------------------------------------
+// TB_* are byte offsets into d.tab. Scans and their neighbours are Int16; the rest bytes unless said.
+
+fn TB_SCAN() -> Int { return 0 }            // 10 scans (Int16), 1024 entries' room each: 4x4 dct,col,row 8x8 .. 32x32
+fn TB_NB() -> Int { return 20480 }          // the neighbours of each scan position: 10 x 1024 x 2 Int16
+fn TB_PARETO() -> Int { return 61440 }      // pareto(node 2..9, prob 0..255): 256 x 8 bytes
+fn TB_BAND48() -> Int { return 63488 }      // coefband_8x8plus: 1024 bytes
+fn TB_BAND4() -> Int { return 64512 }       // coefband_4x4: 16 bytes
+fn TB_TREES() -> Int { return 64528 }       // the trees (Int16): see v9_tables_init
+fn TB_KFY() -> Int { return 65024 }         // kf_y_mode_probs: 900 bytes
+fn TB_KFUV() -> Int { return 65924 }        // kf_uv_mode_probs: 90
+fn TB_KFPART() -> Int { return 66014 }      // kf_partition_probs: 48
+fn TB_FILT() -> Int { return 66064 }        // subpel_filters: 4 x 16 x 8 Int16 (signed)
+fn TB_DCQ() -> Int { return 67088 }         // dc_qlookup[0]: 256 Int16
+fn TB_ACQ() -> Int { return 67600 }         // ac_qlookup[0]: 256 Int16
+fn TB_MVREF() -> Int { return 68112 }       // mv_ref_blocks: 13 x 8 x 2 signed bytes
+fn TB_SIZE() -> Int { return 68336 }
+// the trees' offsets within TB_TREES (Int16 entries)
+fn TR_PART() -> Int { return 0 }            // partition_tree[6]
+fn TR_INTRA() -> Int { return 8 }           // intra_mode_tree[18]
+fn TR_SEG() -> Int { return 28 }            // segment_tree[14]
+fn TR_TX32() -> Int { return 44 }           // tx_size_32_tree[6]
+fn TR_TX16() -> Int { return 52 }           // tx_size_16_tree[4]
+fn TR_TX8() -> Int { return 58 }            // tx_size_8_tree[2]
+fn TR_INTER() -> Int { return 62 }          // inter_mode_tree[6]
+fn TR_INTERP() -> Int { return 70 }         // interp_filter_tree[4]
+fn TR_MVJ() -> Int { return 76 }            // mv_joint_tree[6]
+fn TR_MVCLASS() -> Int { return 84 }        // mv_class_tree[20]
+fn TR_MVFR() -> Int { return 106 }          // mv_fr_tree[6]
+fn TR_SMALLTOK() -> Int { return 114 }      // small_token_tree[6] (adaptation)
+fn TR_BIN() -> Int { return 122 }           // binary_tree[2]
+fn TR_COLSPART() -> Int { return 126 }      // cols_partition_tree[2]
+fn TR_ROWSPART() -> Int { return 130 }      // rows_partition_tree[2]
+
+fn put16s(base: Int, v: Vec<Int>) { var i = 0  unsafe { while i < v.len() { poke16(base + i * 2, v[i] & 65535)  i = i + 1 } } }
+fn put8s(base: Int, v: Vec<Int>) { var i = 0  unsafe { while i < v.len() { poke8(base + i, v[i])  i = i + 1 } } }
+
+fn v9_tables_init(d: V9) {
+    var t = 0
+    unsafe { t = calloc(TB_SIZE(), 1) }
+    d.tab = t
+    let scans: Vec<Vec<Int>> = [v9t_default_scan_4x4(), v9t_col_scan_4x4(), v9t_row_scan_4x4(), v9t_default_scan_8x8(), v9t_col_scan_8x8(),
+                                v9t_row_scan_8x8(), v9t_default_scan_16x16(), v9t_col_scan_16x16(), v9t_row_scan_16x16(), v9t_default_scan_32x32()]
+    var k = 0
+    while k < 10 {
+        let sc = scans[k]
+        put16s(t + TB_SCAN() + k * 2048, sc)
+        // the neighbours (§9.3.2, more_coefs): the scan's kind: 0 default, 1 col (DCT_ADST), 2 row (ADST_DCT)
+        var txsz = 0
+        if k >= 3 { txsz = 1 }
+        if k >= 6 { txsz = 2 }
+        if k == 9 { txsz = 3 }
+        var kind = 0
+        if k < 9 { kind = k % 3 }
+        let n = 4 << txsz
+        var c = 0
+        unsafe {
+            while c < sc.len() {
+                var nb0 = 0
+                var nb1 = 0
+                if c > 0 {
+                    let pos = sc[c]
+                    let i = pos / n
+                    let j = pos % n
+                    if i > 0 && j > 0 {
+                        let a = (i - 1) * n + j
+                        let a2 = i * n + j - 1
+                        if kind == 1 { nb0 = a  nb1 = a } else if kind == 2 { nb0 = a2  nb1 = a2 } else { nb0 = a  nb1 = a2 }
+                    } else if i > 0 { nb0 = (i - 1) * n + j  nb1 = nb0 }
+                    else { nb0 = i * n + j - 1  nb1 = nb0 }
+                }
+                poke16(t + TB_NB() + (k * 1024 + c) * 4, nb0)
+                poke16(t + TB_NB() + (k * 1024 + c) * 4 + 2, nb1)
+                c = c + 1
+            }
+        }
+        k = k + 1
+    }
+    // pareto(node, prob) for node 2..9 (§9.3.2)
+    let par = v9t_pareto_table()
+    var p = 1
+    unsafe {
+        while p < 256 {
+            let x = (p - 1) / 2
+            var nd = 0
+            while nd < 8 {
+                var v = 0
+                if (p & 1) == 1 { v = par[x * 8 + nd] } else { v = (par[x * 8 + nd] + par[(x + 1) * 8 + nd]) >> 1 }
+                poke8(t + TB_PARETO() + p * 8 + nd, v)
+                nd = nd + 1
+            }
+            p = p + 1
+        }
+    }
+    put8s(t + TB_BAND48(), v9t_coefband_8x8plus())
+    put8s(t + TB_BAND4(), v9t_coefband_4x4())
+    let tr = t + TB_TREES()
+    // the trees of §9.3.1, leaves as minus their value
+    put16s(tr + TR_PART() * 2, [0, 2, 0 - 1, 4, 0 - 2, 0 - 3])
+    put16s(tr + TR_INTRA() * 2, [0, 2, 0 - 9, 4, 0 - 1, 6, 8, 12, 0 - 2, 10, 0 - 4, 0 - 5, 0 - 3, 14, 0 - 8, 16, 0 - 6, 0 - 7])
+    put16s(tr + TR_SEG() * 2, [2, 4, 6, 8, 10, 12, 0, 0 - 1, 0 - 2, 0 - 3, 0 - 4, 0 - 5, 0 - 6, 0 - 7])
+    put16s(tr + TR_TX32() * 2, [0, 2, 0 - 1, 4, 0 - 2, 0 - 3])
+    put16s(tr + TR_TX16() * 2, [0, 2, 0 - 1, 0 - 2])
+    put16s(tr + TR_TX8() * 2, [0, 0 - 1])
+    put16s(tr + TR_INTER() * 2, [0 - 2, 2, 0, 4, 0 - 1, 0 - 3])
+    put16s(tr + TR_INTERP() * 2, [0, 2, 0 - 1, 0 - 2])
+    put16s(tr + TR_MVJ() * 2, [0, 2, 0 - 1, 4, 0 - 2, 0 - 3])
+    put16s(tr + TR_MVCLASS() * 2, [0, 2, 0 - 1, 4, 6, 8, 0 - 2, 0 - 3, 10, 12, 0 - 4, 0 - 5, 0 - 6, 14, 16, 18, 0 - 7, 0 - 8, 0 - 9, 0 - 10])
+    put16s(tr + TR_MVFR() * 2, [0, 2, 0 - 1, 4, 0 - 2, 0 - 3])
+    put16s(tr + TR_SMALLTOK() * 2, [0, 0, 0, 4, 0 - 1, 0 - 2])
+    put16s(tr + TR_BIN() * 2, [0, 0 - 1])
+    put16s(tr + TR_COLSPART() * 2, [0 - 1, 0 - 3])
+    put16s(tr + TR_ROWSPART() * 2, [0 - 2, 0 - 3])
+    put8s(t + TB_KFY(), v9t_kf_y_mode_probs())
+    put8s(t + TB_KFUV(), v9t_kf_uv_mode_probs())
+    put8s(t + TB_KFPART(), v9t_kf_partition_probs())
+    put16s(t + TB_FILT(), v9t_subpel_filters())
+    put8s(t + TB_MVREF(), v9t_mv_ref_blocks())
+    let dq = v9t_dc_qlookup()
+    let aq = v9t_ac_qlookup()
+    var i = 0
+    unsafe { while i < 256 { poke16(t + TB_DCQ() + i * 2, dq[i])  poke16(t + TB_ACQ() + i * 2, aq[i])  i = i + 1 } }
+}
+
+// ---- the probability tables: layout (bytes) ------------------------------------------------------------------------
+fn P_TX() -> Int { return 0 }           // tx_probs[maxTx 4][ctx 2][3] (only [1][..][0], [2][..][0..1], [3][..][0..2] used)
+fn P_SKIP() -> Int { return 24 }        // [3]
+fn P_COEF() -> Int { return 32 }        // [tx 4][plane>0 2][is_inter 2][band 6][ctx 6][3]
+fn P_INTERMODE() -> Int { return 1760 } // [7][3]
+fn P_INTERP() -> Int { return 1784 }    // [4][2]
+fn P_ISINTER() -> Int { return 1792 }   // [4]
+fn P_COMPMODE() -> Int { return 1796 }  // [5]
+fn P_SREF() -> Int { return 1801 }      // [5][2]
+fn P_CREF() -> Int { return 1811 }      // [5]
+fn P_YMODE() -> Int { return 1816 }     // [4][9]
+fn P_UVMODE() -> Int { return 1852 }    // [10][9]
+fn P_PART() -> Int { return 1942 }      // [16][3]
+fn P_MVJ() -> Int { return 1990 }       // [3]
+fn P_MVSIGN() -> Int { return 1993 }    // [2]
+fn P_MVCLASS() -> Int { return 1995 }   // [2][10]
+fn P_MVC0BIT() -> Int { return 2015 }   // [2]
+fn P_MVBITS() -> Int { return 2017 }    // [2][10]
+fn P_MVC0FR() -> Int { return 2037 }    // [2][2][3]
+fn P_MVFR() -> Int { return 2049 }      // [2][3]
+fn P_MVC0HP() -> Int { return 2055 }    // [2]
+fn P_MVHP() -> Int { return 2057 }      // [2]
+fn P_SIZE() -> Int { return 2064 }
+
+// the counts (Int32 entries)
+fn C_YMODE() -> Int { return 0 }        // counts_intra_mode[4][10]
+fn C_UVMODE() -> Int { return 40 }      // [10][10]
+fn C_PART() -> Int { return 140 }       // [16][4]
+fn C_INTERP() -> Int { return 204 }     // [4][3]
+fn C_INTERMODE() -> Int { return 216 }  // [7][4]
+fn C_TX() -> Int { return 244 }         // [maxTx 4][2][4]
+fn C_ISINTER() -> Int { return 276 }    // [4][2]
+fn C_COMPMODE() -> Int { return 284 }   // [5][2]
+fn C_SREF() -> Int { return 294 }       // [5][2][2]
+fn C_CREF() -> Int { return 314 }       // [5][2]
+fn C_SKIP() -> Int { return 324 }       // [3][2]
+fn C_MVJ() -> Int { return 330 }        // [4]
+fn C_MVSIGN() -> Int { return 334 }     // [2][2]
+fn C_MVCLASS() -> Int { return 338 }    // [2][11]
+fn C_MVC0BIT() -> Int { return 360 }    // [2][2]
+fn C_MVC0FR() -> Int { return 364 }     // [2][2][4]
+fn C_MVC0HP() -> Int { return 380 }     // [2][2]
+fn C_MVBITS() -> Int { return 384 }     // [2][10][2]
+fn C_MVFR() -> Int { return 424 }       // [2][4]
+fn C_MVHP() -> Int { return 432 }       // [2][2]
+fn C_TOKEN() -> Int { return 436 }      // [4][2][2][6][6][3]
+fn C_MORE() -> Int { return 2164 }      // [4][2][2][6][6][2]
+fn C_SIZE() -> Int { return 3316 }
+
+fn cnt_inc(c: Int, i: Int) { unsafe { poke32(c + i * 4, peek32(c + i * 4) + 1) } }
+
+/// the default probabilities (§10.5) into `p`
+fn v9_default_probs(p: Int) {
+    let tx = v9t_default_tx_probs()                  // [4][2][3]
+    put8s(p + P_TX(), tx)
+    put8s(p + P_SKIP(), v9t_default_skip_prob())
+    put8s(p + P_COEF(), v9t_default_coef_probs())
+    put8s(p + P_INTERMODE(), v9t_default_inter_mode_probs())
+    put8s(p + P_INTERP(), v9t_default_interp_filter_probs())
+    put8s(p + P_ISINTER(), v9t_default_is_inter_prob())
+    put8s(p + P_COMPMODE(), v9t_default_comp_mode_prob())
+    put8s(p + P_SREF(), v9t_default_single_ref_prob())
+    put8s(p + P_CREF(), v9t_default_comp_ref_prob())
+    put8s(p + P_YMODE(), v9t_default_y_mode_probs())
+    put8s(p + P_UVMODE(), v9t_default_uv_mode_probs())
+    put8s(p + P_PART(), v9t_default_partition_probs())
+    put8s(p + P_MVJ(), v9t_default_mv_joint_probs())
+    put8s(p + P_MVSIGN(), v9t_default_mv_sign_prob())
+    put8s(p + P_MVCLASS(), v9t_default_mv_class_probs())
+    put8s(p + P_MVC0BIT(), v9t_default_mv_class0_bit_prob())
+    put8s(p + P_MVBITS(), v9t_default_mv_bits_prob())
+    put8s(p + P_MVC0FR(), v9t_default_mv_class0_fr_probs())
+    put8s(p + P_MVFR(), v9t_default_mv_fr_probs())
+    put8s(p + P_MVC0HP(), v9t_default_mv_class0_hp_prob())
+    put8s(p + P_MVHP(), v9t_default_mv_hp_prob())
+}
+
+/// load_probs (every table but tx and skip) and load_probs2 (tx and skip) from saved context `ctx` (§7.1.2)
+fn v9_load_probs(d: V9, ctx: Int) {
+    unsafe { memcpy(d.probs + P_COEF(), d.ctxs + ctx * P_SIZE() + P_COEF(), P_SIZE() - P_COEF()) }
+}
+fn v9_load_probs2(d: V9, ctx: Int) {
+    unsafe { memcpy(d.probs, d.ctxs + ctx * P_SIZE(), P_COEF()) }
+}
+fn v9_save_probs(d: V9, ctx: Int) {
+    unsafe { memcpy(d.ctxs + ctx * P_SIZE(), d.probs, P_SIZE()) }
+}
+
+// ---- the decoder ----------------------------------------------------------------------------------------------------
+
+/// a new decoder (frames are made when the first key frame says their size)
+pub fn vp9_new() -> V9 {
+    let d = rnew(V9)
+    v9_tables_init(d)
+    unsafe {
+        d.probs = calloc(P_SIZE(), 1)
+        d.ctxs = calloc(P_SIZE() * 4, 1)
+        d.counts = calloc(C_SIZE(), 4)
+    }
+    v9_default_probs(d.probs)
+    var i = 0
+    while i < 4 { v9_save_probs(d, i)  i = i + 1 }
+    i = 0
+    while i < 8 { d.refs[i] = 0  i = i + 1 }
+    i = 0
+    while i < 12 { d.pool[i] = 0  i = i + 1 }
+    d.errc = 0
+    d.threads = 1
+    return d
+}
+
+/// let everything go
+pub fn vp9_free(d: V9) {
+    var i = 0
+    unsafe {
+        while i < 12 { let f = d.pool[i]  if f != 0 { let fb = rview(Fb, f)  free(fb.base)  rfree(fb) }  i = i + 1 }
+        free(d.tab)
+        free(d.probs)
+        free(d.ctxs)
+        free(d.counts)
+        if d.mi != 0 { free(d.mi)  free(d.prev_mi)  free(d.seg_ids)  free(d.prev_seg)  free(d.anz)  free(d.apart)  free(d.aseg) }
+        if d.tiles != 0 { v9_tiles_free(d) }
+        rfree(d)
+    }
+}
+
+/// a free frame buffer of the frame's size from the pool (made, or made again for a new size)
+fn v9_get_fb(d: V9) -> Int {
+    var i = 0
+    while i < 12 {
+        var f = d.pool[i]
+        var free_one = f == 0
+        if f != 0 { unsafe { let fb = rview(Fb, f)  free_one = fb.refs == 0 } }
+        if free_one {
+            if f == 0 { let nf = rnew(Fb)  f = raddr(nf)  d.pool[i] = f }
+            unsafe {
+                let fb = rview(Fb, f)
+                let aw = d.mi_cols * 8
+                let ah = d.mi_rows * 8
+                if fb.base == 0 || fb.alloc_w != aw || fb.alloc_h != ah {
+                    if fb.base != 0 { free(fb.base) }
+                    // 96 samples of border (48 in chroma), and room for a 64x64 block's transform past the 8-aligned edge
+                    let ys = ((aw + 192 + 64) + 31) / 32 * 32
+                    let uvs = ((aw / 2 + 96 + 32) + 31) / 32 * 32
+                    let yrows = ah + 192 + 64
+                    let uvrows = ah / 2 + 96 + 32
+                    let total = ys * yrows + 2 * uvs * uvrows + 64
+                    fb.base = malloc(total)
+                    if fb.base == 0 { return 0 }
+                    fb.ys = ys
+                    fb.uvs = uvs
+                    fb.y = fb.base + 96 * ys + 96
+                    fb.u = fb.base + ys * yrows + 48 * uvs + 48
+                    fb.v = fb.base + ys * yrows + uvs * uvrows + 48 * uvs + 48
+                    fb.alloc_w = aw
+                    fb.alloc_h = ah
+                }
+                fb.w = d.width
+                fb.h = d.height
+                fb.mic = d.mi_cols
+                fb.mir = d.mi_rows
+                fb.refs = 0
+            }
+            return f
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn fb_ref(f: Int, by: Int) { if f != 0 { unsafe { let fb = rview(Fb, f)  fb.refs = fb.refs + by } } }
+
+/// the frame's mode info and contexts, made (again) for MiCols x MiRows
+fn v9_alloc_mi(d: V9) -> Bool {
+    let n = d.mi_cols * d.mi_rows
+    if n <= d.mi_cap && d.mi != 0 { return true }
+    unsafe {
+        if d.mi != 0 { free(d.mi)  free(d.prev_mi)  free(d.seg_ids)  free(d.prev_seg)  free(d.anz)  free(d.apart)  free(d.aseg) }
+        d.mi = calloc(n, MI_BYTES())
+        d.prev_mi = calloc(n, MI_BYTES())
+        d.seg_ids = calloc(n, 1)
+        d.prev_seg = calloc(n, 1)
+        d.anz = calloc(3 * (d.mi_cols * 2 + 64), 1)
+        d.apart = calloc(d.sb_cols * 8 + 16, 1)
+        d.aseg = calloc(d.mi_cols + 16, 1)
+    }
+    d.mi_cap = n
+    return d.mi != 0
+}
+
+// ---- the uncompressed header (§6.2) ---------------------------------------------------------------------------------
+
+fn v9_color_config(d: V9, inout b: Bits) -> Bool {
+    if d.profile >= 2 { d.errc = 40  return false }
+    d.bit_depth = 8
+    d.color_space = bits_f(b, 3)
+    if d.color_space != 7 {
+        d.color_range = bits_f(b, 1)
+        if d.profile == 1 || d.profile == 3 { d.ssx = bits_f(b, 1)  d.ssy = bits_f(b, 1)  let _r = bits_f(b, 1) }
+        else { d.ssx = 1  d.ssy = 1 }
+    } else {
+        d.color_range = 1
+        if d.profile == 1 || d.profile == 3 { d.ssx = 0  d.ssy = 0  let _r2 = bits_f(b, 1) }
+    }
+    if d.ssx != 1 || d.ssy != 1 { d.errc = 3  return false }
+    return true
+}
+
+fn v9_compute_image_size(d: V9) {
+    d.mi_cols = (d.width + 7) >> 3
+    d.mi_rows = (d.height + 7) >> 3
+    d.sb_cols = (d.mi_cols + 7) >> 3
+    d.sb_rows = (d.mi_rows + 7) >> 3
+    // §7.2.6
+    let same = d.sized_before == 1 && d.width == d.last_w && d.height == d.last_h
+    if d.sized_before == 1 && !same && d.seg_ids != 0 && d.mi_cols * d.mi_rows <= d.mi_cap {
+        unsafe { memset(d.seg_ids, 0, d.mi_cols * d.mi_rows)  memset(d.prev_seg, 0, d.mi_cols * d.mi_rows) }
+    }
+    d.use_prev_mvs = 0
+    if same && d.last_show_frame == 1 && d.error_res == 0 && d.frame_is_intra == 0 { d.use_prev_mvs = 1 }
+    d.sized_before = 1
+    d.last_w = d.width
+    d.last_h = d.height
+}
+
+fn v9_frame_size(d: V9, inout b: Bits) {
+    d.width = bits_f(b, 16) + 1
+    d.height = bits_f(b, 16) + 1
+}
+fn v9_render_size(d: V9, inout b: Bits) {
+    if bits_f(b, 1) == 1 { d.render_w = bits_f(b, 16) + 1  d.render_h = bits_f(b, 16) + 1 }
+    else { d.render_w = d.width  d.render_h = d.height }
+}
+
+/// setup_past_independence (§7.2)
+fn v9_past_independence(d: V9) {
+    var i = 0
+    while i < 32 { d.seg_feat_on[i] = 0  d.seg_feat[i] = 0  i = i + 1 }
+    d.seg_abs = 0
+    if d.prev_seg != 0 { unsafe { memset(d.prev_seg, 0, d.mi_cap) } }
+    d.lf_delta_on = 1
+    d.lf_ref[0] = 1  d.lf_ref[1] = 0  d.lf_ref[2] = 0 - 1  d.lf_ref[3] = 0 - 1
+    d.lf_mode[0] = 0  d.lf_mode[1] = 0
+    i = 0
+    while i < 4 { d.sign_bias[i] = 0  i = i + 1 }
+    v9_default_probs(d.probs)
+}
+
+/// the uncompressed header; false (d.err said) when it is not one this decoder reads
+fn v9_uncompressed(d: V9, inout b: Bits) -> Bool {
+    if bits_f(b, 2) != 2 { d.errc = 4  return false }
+    let lo = bits_f(b, 1)
+    let hi = bits_f(b, 1)
+    d.profile = hi * 2 + lo
+    if d.profile == 3 { let _z = bits_f(b, 1) }
+    d.show_existing = bits_f(b, 1)
+    if d.show_existing == 1 {
+        d.show_idx = bits_f(b, 3)
+        d.header_size = 0
+        d.refresh_flags = 0
+        d.lf_level = 0
+        return true
+    }
+    d.last_frame_type = d.frame_type
+    d.frame_type = bits_f(b, 1)
+    d.show_frame = bits_f(b, 1)
+    d.error_res = bits_f(b, 1)
+    if d.frame_type == 0 {
+        if bits_f(b, 8) != 73 || bits_f(b, 8) != 131 || bits_f(b, 8) != 66 { d.errc = 5  return false }
+        if !v9_color_config(d, b) { return false }
+        v9_frame_size(d, b)
+        v9_render_size(d, b)
+        d.refresh_flags = 255
+        d.frame_is_intra = 1
+        d.intra_only = 0
+    } else {
+        if d.show_frame == 0 { d.intra_only = bits_f(b, 1) } else { d.intra_only = 0 }
+        d.frame_is_intra = d.intra_only
+        if d.error_res == 0 { d.reset_ctx = bits_f(b, 2) } else { d.reset_ctx = 0 }
+        if d.intra_only == 1 {
+            if bits_f(b, 8) != 73 || bits_f(b, 8) != 131 || bits_f(b, 8) != 66 { d.errc = 5  return false }
+            if d.profile > 0 { if !v9_color_config(d, b) { return false } }
+            else { d.color_space = 1  d.ssx = 1  d.ssy = 1  d.bit_depth = 8 }
+            d.refresh_flags = bits_f(b, 8)
+            v9_frame_size(d, b)
+            v9_render_size(d, b)
+        } else {
+            d.refresh_flags = bits_f(b, 8)
+            var i = 0
+            while i < 3 {
+                d.ref_idx[i] = bits_f(b, 3)
+                d.sign_bias[1 + i] = bits_f(b, 1)
+                i = i + 1
+            }
+            // frame_size_with_refs
+            var found = 0
+            i = 0
+            while i < 3 && found == 0 {
+                found = bits_f(b, 1)
+                if found == 1 {
+                    let r = d.ref_idx[i]
+                    if d.refs[r] == 0 { d.errc = 6  return false }
+                    d.width = d.ref_w[r]
+                    d.height = d.ref_h[r]
+                }
+                i = i + 1
+            }
+            if found == 0 { v9_frame_size(d, b) }
+            v9_render_size(d, b)
+            d.allow_hp = bits_f(b, 1)
+            if bits_f(b, 1) == 1 { d.interp_filter = 4 }
+            else {
+                // literal_to_type: EIGHTTAP_SMOOTH, EIGHTTAP, EIGHTTAP_SHARP, BILINEAR
+                let lit = bits_f(b, 2)
+                if lit == 0 { d.interp_filter = 1 } else if lit == 1 { d.interp_filter = 0 } else { d.interp_filter = lit }
+            }
+        }
+    }
+    if d.width > 16384 || d.height > 16384 { d.errc = 41  return false }
+    v9_compute_image_size(d)
+    if !v9_alloc_mi(d) { d.errc = 8  return false }
+    if d.error_res == 0 { d.refresh_ctx = bits_f(b, 1)  d.parallel = bits_f(b, 1) }
+    else { d.refresh_ctx = 0  d.parallel = 1 }
+    d.ctx_idx = bits_f(b, 2)
+    if d.frame_is_intra == 1 || d.error_res == 1 {
+        v9_past_independence(d)
+        if d.frame_type == 0 || d.error_res == 1 || d.reset_ctx == 3 {
+            var i = 0
+            while i < 4 { v9_save_probs(d, i)  i = i + 1 }
+        } else if d.reset_ctx == 2 { v9_save_probs(d, d.ctx_idx) }
+        d.ctx_idx = 0
+    }
+    // loop filter params (§6.2.8)
+    d.lf_level = bits_f(b, 6)
+    d.lf_sharp = bits_f(b, 3)
+    d.lf_delta_on = bits_f(b, 1)
+    d.lf_delta_update = 0
+    if d.lf_delta_on == 1 {
+        d.lf_delta_update = bits_f(b, 1)
+        if d.lf_delta_update == 1 {
+            var i = 0
+            while i < 4 { if bits_f(b, 1) == 1 { d.lf_ref[i] = bits_s(b, 6) }  i = i + 1 }
+            i = 0
+            while i < 2 { if bits_f(b, 1) == 1 { d.lf_mode[i] = bits_s(b, 6) }  i = i + 1 }
+        }
+    }
+    // quantization params (§6.2.9)
+    d.base_q = bits_f(b, 8)
+    d.dq_ydc = 0  d.dq_uvdc = 0  d.dq_uvac = 0
+    if bits_f(b, 1) == 1 { d.dq_ydc = bits_s(b, 4) }
+    if bits_f(b, 1) == 1 { d.dq_uvdc = bits_s(b, 4) }
+    if bits_f(b, 1) == 1 { d.dq_uvac = bits_s(b, 4) }
+    d.lossless = 0
+    if d.base_q == 0 && d.dq_ydc == 0 && d.dq_uvdc == 0 && d.dq_uvac == 0 { d.lossless = 1 }
+    // segmentation params (§6.2.11)
+    d.seg_on = bits_f(b, 1)
+    d.seg_map = 0
+    d.seg_temporal = 0
+    if d.seg_on == 1 {
+        d.seg_map = bits_f(b, 1)
+        if d.seg_map == 1 {
+            var i = 0
+            while i < 7 { if bits_f(b, 1) == 1 { d.seg_tree[i] = bits_f(b, 8) } else { d.seg_tree[i] = 255 }  i = i + 1 }
+            d.seg_temporal = bits_f(b, 1)
+            i = 0
+            while i < 3 {
+                d.seg_pred[i] = 255
+                if d.seg_temporal == 1 { if bits_f(b, 1) == 1 { d.seg_pred[i] = bits_f(b, 8) } }
+                i = i + 1
+            }
+        }
+        d.seg_update_data = bits_f(b, 1)
+        if d.seg_update_data == 1 {
+            d.seg_abs = bits_f(b, 1)
+            let fbits = [8, 6, 2, 0]
+            let fsigned = [1, 1, 0, 0]
+            var s = 0
+            while s < 8 {
+                var j = 0
+                while j < 4 {
+                    var v = 0
+                    let on = bits_f(b, 1)
+                    d.seg_feat_on[s * 4 + j] = on
+                    if on == 1 {
+                        v = bits_f(b, fbits[j])
+                        if fsigned[j] == 1 { if bits_f(b, 1) == 1 { v = 0 - v } }
+                    }
+                    d.seg_feat[s * 4 + j] = v
+                    j = j + 1
+                }
+                s = s + 1
+            }
+        }
+    }
+    // tile info (§6.2.13)
+    var minlog = 0
+    while (64 << minlog) < d.sb_cols { minlog = minlog + 1 }
+    var maxlog = 1
+    while (d.sb_cols >> maxlog) >= 4 { maxlog = maxlog + 1 }
+    maxlog = maxlog - 1
+    d.tile_cols_log2 = minlog
+    var going = true
+    while going && d.tile_cols_log2 < maxlog {
+        if bits_f(b, 1) == 1 { d.tile_cols_log2 = d.tile_cols_log2 + 1 } else { going = false }
+    }
+    d.tile_rows_log2 = bits_f(b, 1)
+    if d.tile_rows_log2 == 1 { d.tile_rows_log2 = d.tile_rows_log2 + bits_f(b, 1) }
+    d.header_size = bits_f(b, 16)
+    return true
+}
+
+// ---- the compressed header (§6.3) -----------------------------------------------------------------------------------
+
+fn v9_inv_recenter(v: Int, m: Int) -> Int {
+    if v > 2 * m { return v }
+    if (v & 1) == 1 { return m - ((v + 1) >> 1) }
+    return m + (v >> 1)
+}
+fn v9_diff_update(d: V9, t: T9, imap: Vec<Int>, at: Int) {
+    if bd_read(t, 252) == 0 { return }
+    var delta = 0
+    if bd_lit(t, 1) == 0 { delta = bd_lit(t, 4) }
+    else if bd_lit(t, 1) == 0 { delta = bd_lit(t, 4) + 16 }
+    else if bd_lit(t, 1) == 0 { delta = bd_lit(t, 5) + 32 }
+    else {
+        let v = bd_lit(t, 7)
+        if v < 65 { delta = v + 64 } else { delta = (v << 1) - 1 + bd_lit(t, 1) }
+    }
+    var m = 0
+    unsafe { m = peek8(at) }
+    if delta >= 255 { delta = 254 }
+    let v2 = imap[delta]
+    m = m - 1
+    if (m << 1) <= 255 { m = 1 + v9_inv_recenter(v2, m) } else { m = 255 - v9_inv_recenter(v2, 255 - 1 - m) }
+    unsafe { poke8(at, m) }
+}
+fn v9_mv_update(t: T9, at: Int) {
+    if bd_read(t, 252) == 1 { unsafe { poke8(at, (bd_lit(t, 7) << 1) | 1) } }
+}
+
+fn v9_compressed(d: V9, t: T9) -> Bool {
+    let imap = v9t_inv_map_table()
+    let p = d.probs
+    // tx mode
+    if d.lossless == 1 { d.tx_mode = 0 }
+    else {
+        d.tx_mode = bd_lit(t, 2)
+        if d.tx_mode == 3 { d.tx_mode = d.tx_mode + bd_lit(t, 1) }
+    }
+    if d.tx_mode == 4 {
+        var i = 0
+        while i < 2 { v9_diff_update(d, t, imap, p + P_TX() + (1 * 2 + i) * 3)  i = i + 1 }
+        i = 0
+        while i < 2 { var j = 0  while j < 2 { v9_diff_update(d, t, imap, p + P_TX() + (2 * 2 + i) * 3 + j)  j = j + 1 }  i = i + 1 }
+        i = 0
+        while i < 2 { var j = 0  while j < 3 { v9_diff_update(d, t, imap, p + P_TX() + (3 * 2 + i) * 3 + j)  j = j + 1 }  i = i + 1 }
+    }
+    // coefficient probabilities (§6.3.7)
+    let biggest = [0, 1, 2, 3, 3]
+    let maxtx = biggest[d.tx_mode]
+    var tx = 0
+    while tx <= maxtx {
+        if bd_lit(t, 1) == 1 {
+            var i = 0
+            while i < 2 {
+                var j = 0
+                while j < 2 {
+                    var k = 0
+                    while k < 6 {
+                        var maxl = 6
+                        if k == 0 { maxl = 3 }
+                        var l = 0
+                        while l < maxl {
+                            var m = 0
+                            while m < 3 {
+                                v9_diff_update(d, t, imap, p + P_COEF() + ((((tx * 2 + i) * 2 + j) * 6 + k) * 6 + l) * 3 + m)
+                                m = m + 1
+                            }
+                            l = l + 1
+                        }
+                        k = k + 1
+                    }
+                    j = j + 1
+                }
+                i = i + 1
+            }
+        }
+        tx = tx + 1
+    }
+    var i = 0
+    while i < 3 { v9_diff_update(d, t, imap, p + P_SKIP() + i)  i = i + 1 }
+    if d.frame_is_intra == 0 {
+        i = 0
+        while i < 21 { v9_diff_update(d, t, imap, p + P_INTERMODE() + i)  i = i + 1 }
+        if d.interp_filter == 4 { i = 0  while i < 8 { v9_diff_update(d, t, imap, p + P_INTERP() + i)  i = i + 1 } }
+        i = 0
+        while i < 4 { v9_diff_update(d, t, imap, p + P_ISINTER() + i)  i = i + 1 }
+        // frame reference mode (§6.3.12)
+        var allowed = 0
+        i = 1
+        while i < 3 { if d.sign_bias[i + 1] != d.sign_bias[1] { allowed = 1 }  i = i + 1 }
+        d.ref_mode = 0
+        if allowed == 1 {
+            if bd_lit(t, 1) == 1 {
+                if bd_lit(t, 1) == 0 { d.ref_mode = 1 } else { d.ref_mode = 2 }
+            }
+            // setup_compound_reference_mode (§6.3.18)
+            if d.sign_bias[1] == d.sign_bias[2] { d.comp_fixed = 3  d.comp_var0 = 1  d.comp_var1 = 2 }
+            else if d.sign_bias[1] == d.sign_bias[3] { d.comp_fixed = 2  d.comp_var0 = 1  d.comp_var1 = 3 }
+            else { d.comp_fixed = 1  d.comp_var0 = 2  d.comp_var1 = 3 }
+        }
+        if d.ref_mode == 2 { i = 0  while i < 5 { v9_diff_update(d, t, imap, p + P_COMPMODE() + i)  i = i + 1 } }
+        if d.ref_mode != 1 { i = 0  while i < 10 { v9_diff_update(d, t, imap, p + P_SREF() + i)  i = i + 1 } }
+        if d.ref_mode != 0 { i = 0  while i < 5 { v9_diff_update(d, t, imap, p + P_CREF() + i)  i = i + 1 } }
+        i = 0
+        while i < 36 { v9_diff_update(d, t, imap, p + P_YMODE() + i)  i = i + 1 }
+        i = 0
+        while i < 48 { v9_diff_update(d, t, imap, p + P_PART() + i)  i = i + 1 }
+        // mv probs (§6.3.16)
+        i = 0
+        while i < 3 { v9_mv_update(t, p + P_MVJ() + i)  i = i + 1 }
+        i = 0
+        while i < 2 {
+            v9_mv_update(t, p + P_MVSIGN() + i)
+            var j = 0
+            while j < 10 { v9_mv_update(t, p + P_MVCLASS() + i * 10 + j)  j = j + 1 }
+            v9_mv_update(t, p + P_MVC0BIT() + i)
+            j = 0
+            while j < 10 { v9_mv_update(t, p + P_MVBITS() + i * 10 + j)  j = j + 1 }
+            i = i + 1
+        }
+        i = 0
+        while i < 2 {
+            var j = 0
+            while j < 2 { var k = 0  while k < 3 { v9_mv_update(t, p + P_MVC0FR() + (i * 2 + j) * 3 + k)  k = k + 1 }  j = j + 1 }
+            var k2 = 0
+            while k2 < 3 { v9_mv_update(t, p + P_MVFR() + i * 3 + k2)  k2 = k2 + 1 }
+            i = i + 1
+        }
+        if d.allow_hp == 1 {
+            i = 0
+            while i < 2 { v9_mv_update(t, p + P_MVC0HP() + i)  v9_mv_update(t, p + P_MVHP() + i)  i = i + 1 }
+        }
+    }
+    return true
+}
+
+// ---- probability adaptation (§8.4) ----------------------------------------------------------------------------------
+
+fn v9_merge_prob(pre: Int, ct0: Int, ct1: Int, sat: Int, maxf: Int) -> Int {
+    let den = ct0 + ct1
+    var prob = 128
+    if den > 0 {
+        prob = (ct0 * 256 + (den >> 1)) / den
+        if prob < 1 { prob = 1 }
+        if prob > 255 { prob = 255 }
+    }
+    var count = den
+    if count > sat { count = sat }
+    let factor = maxf * count / sat
+    return (pre * (256 - factor) + prob * factor + 128) >> 8
+}
+/// merge_probs over a tree (Int16 entries at `tree`), probabilities at `probs` (bytes), counts at `counts` (Int32)
+fn v9_merge_probs(tree: Int, i: Int, probs: Int, counts: Int, sat: Int, maxf: Int) -> Int {
+    var s = 0
+    var r = 0
+    unsafe {
+        s = peek16(tree + i * 2)  if s >= 32768 { s = s - 65536 }
+        r = peek16(tree + (i + 1) * 2)  if r >= 32768 { r = r - 65536 }
+    }
+    var lc = 0
+    var rc = 0
+    unsafe {
+        if s <= 0 { lc = peek32(counts + (0 - s) * 4) } else { lc = v9_merge_probs(tree, s, probs, counts, sat, maxf) }
+        if r <= 0 { rc = peek32(counts + (0 - r) * 4) } else { rc = v9_merge_probs(tree, r, probs, counts, sat, maxf) }
+        poke8(probs + (i >> 1), v9_merge_prob(peek8(probs + (i >> 1)), lc, rc, sat, maxf))
+    }
+    return lc + rc
+}
+fn v9_adapt_probs(d: V9, tree: Int, probs: Int, counts: Int) { let _n = v9_merge_probs(d.tab + TB_TREES() + tree * 2, 0, probs, counts, 20, 128) }
+fn v9_adapt_prob(probs: Int, counts: Int) {
+    unsafe { poke8(probs, v9_merge_prob(peek8(probs), peek32(counts), peek32(counts + 4), 20, 128)) }
+}
+
+fn v9_adapt_coef(d: V9) {
+    var uf = 112
+    if d.frame_is_intra == 0 && d.last_frame_type == 0 { uf = 128 }
+    let c = d.counts
+    var t = 0
+    while t < 4 {
+        var i = 0
+        while i < 2 {
+            var j = 0
+            while j < 2 {
+                var k = 0
+                while k < 6 {
+                    var maxl = 6
+                    if k == 0 { maxl = 3 }
+                    var l = 0
+                    while l < maxl {
+                        let idx = (((t * 2 + i) * 2 + j) * 6 + k) * 6 + l
+                        let pr = d.probs + P_COEF() + idx * 3
+                        let _a = v9_merge_probs(d.tab + TB_TREES() + TR_SMALLTOK() * 2, 2, pr, c + (C_TOKEN() + idx * 3) * 4, 24, uf)
+                        let _b = v9_merge_probs(d.tab + TB_TREES() + TR_BIN() * 2, 0, pr, c + (C_MORE() + idx * 2) * 4, 24, uf)
+                        l = l + 1
+                    }
+                    k = k + 1
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        t = t + 1
+    }
+}
+
+fn v9_adapt_noncoef(d: V9) {
+    let p = d.probs
+    let c = d.counts
+    var i = 0
+    while i < 4 { v9_adapt_prob(p + P_ISINTER() + i, c + (C_ISINTER() + i * 2) * 4)  i = i + 1 }
+    i = 0
+    while i < 5 { v9_adapt_prob(p + P_COMPMODE() + i, c + (C_COMPMODE() + i * 2) * 4)  i = i + 1 }
+    i = 0
+    while i < 5 { v9_adapt_prob(p + P_CREF() + i, c + (C_CREF() + i * 2) * 4)  i = i + 1 }
+    i = 0
+    while i < 5 {
+        v9_adapt_prob(p + P_SREF() + i * 2, c + (C_SREF() + (i * 2 + 0) * 2) * 4)
+        v9_adapt_prob(p + P_SREF() + i * 2 + 1, c + (C_SREF() + (i * 2 + 1) * 2) * 4)
+        i = i + 1
+    }
+    i = 0
+    while i < 7 { v9_adapt_probs(d, TR_INTER(), p + P_INTERMODE() + i * 3, c + (C_INTERMODE() + i * 4) * 4)  i = i + 1 }
+    i = 0
+    while i < 4 { v9_adapt_probs(d, TR_INTRA(), p + P_YMODE() + i * 9, c + (C_YMODE() + i * 10) * 4)  i = i + 1 }
+    i = 0
+    while i < 10 { v9_adapt_probs(d, TR_INTRA(), p + P_UVMODE() + i * 9, c + (C_UVMODE() + i * 10) * 4)  i = i + 1 }
+    i = 0
+    while i < 16 { v9_adapt_probs(d, TR_PART(), p + P_PART() + i * 3, c + (C_PART() + i * 4) * 4)  i = i + 1 }
+    i = 0
+    while i < 3 { v9_adapt_prob(p + P_SKIP() + i, c + (C_SKIP() + i * 2) * 4)  i = i + 1 }
+    if d.interp_filter == 4 {
+        i = 0
+        while i < 4 { v9_adapt_probs(d, TR_INTERP(), p + P_INTERP() + i * 2, c + (C_INTERP() + i * 3) * 4)  i = i + 1 }
+    }
+    if d.tx_mode == 4 {
+        i = 0
+        while i < 2 {
+            v9_adapt_probs(d, TR_TX8(), p + P_TX() + (1 * 2 + i) * 3, c + (C_TX() + (1 * 2 + i) * 4) * 4)
+            v9_adapt_probs(d, TR_TX16(), p + P_TX() + (2 * 2 + i) * 3, c + (C_TX() + (2 * 2 + i) * 4) * 4)
+            v9_adapt_probs(d, TR_TX32(), p + P_TX() + (3 * 2 + i) * 3, c + (C_TX() + (3 * 2 + i) * 4) * 4)
+            i = i + 1
+        }
+    }
+    v9_adapt_probs(d, TR_MVJ(), p + P_MVJ(), c + C_MVJ() * 4)
+    i = 0
+    while i < 2 {
+        v9_adapt_prob(p + P_MVSIGN() + i, c + (C_MVSIGN() + i * 2) * 4)
+        v9_adapt_probs(d, TR_MVCLASS(), p + P_MVCLASS() + i * 10, c + (C_MVCLASS() + i * 11) * 4)
+        v9_adapt_prob(p + P_MVC0BIT() + i, c + (C_MVC0BIT() + i * 2) * 4)
+        var j = 0
+        while j < 10 { v9_adapt_prob(p + P_MVBITS() + i * 10 + j, c + (C_MVBITS() + (i * 10 + j) * 2) * 4)  j = j + 1 }
+        j = 0
+        while j < 2 { v9_adapt_probs(d, TR_MVFR(), p + P_MVC0FR() + (i * 2 + j) * 3, c + (C_MVC0FR() + (i * 2 + j) * 4) * 4)  j = j + 1 }
+        v9_adapt_probs(d, TR_MVFR(), p + P_MVFR() + i * 3, c + (C_MVFR() + i * 4) * 4)
+        if d.allow_hp == 1 {
+            v9_adapt_prob(p + P_MVC0HP() + i, c + (C_MVC0HP() + i * 2) * 4)
+            v9_adapt_prob(p + P_MVHP() + i, c + (C_MVHP() + i * 2) * 4)
+        }
+        i = i + 1
+    }
+}
+
+// ---- a frame --------------------------------------------------------------------------------------------------------
+
+/// the quantizers and the loop filter levels for each segment (§8.6.1 get_qindex, §8.8.1)
+fn v9_segment_params(d: V9) {
+    let t = d.tab
+    var s = 0
+    while s < 8 {
+        var q = d.base_q
+        if d.seg_on == 1 && d.seg_feat_on[s * 4] == 1 {
+            q = d.seg_feat[s * 4]
+            if d.seg_abs == 0 { q = d.base_q + q }
+            if q < 0 { q = 0 }
+            if q > 255 { q = 255 }
+        }
+        d.seg_q[s * 4] = v9_q(t + TB_DCQ(), q + d.dq_ydc)
+        d.seg_q[s * 4 + 1] = v9_q(t + TB_ACQ(), q)
+        d.seg_q[s * 4 + 2] = v9_q(t + TB_DCQ(), q + d.dq_uvdc)
+        d.seg_q[s * 4 + 3] = v9_q(t + TB_ACQ(), q + d.dq_uvac)
+        // loop filter levels
+        let nshift = d.lf_level >> 5
+        var lvl = d.lf_level
+        if d.seg_on == 1 && d.seg_feat_on[s * 4 + 1] == 1 {
+            if d.seg_abs == 1 { lvl = d.seg_feat[s * 4 + 1] } else { lvl = d.seg_feat[s * 4 + 1] + d.lf_level }
+            if lvl < 0 { lvl = 0 }
+            if lvl > 63 { lvl = 63 }
+        }
+        var r = 0
+        while r < 4 {
+            var m = 0
+            while m < 2 {
+                var v = lvl
+                if d.lf_delta_on == 1 {
+                    if r == 0 { v = lvl + (d.lf_ref[0] << nshift) }
+                    else { v = lvl + (d.lf_ref[r] << nshift) + (d.lf_mode[m] << nshift) }
+                    if v < 0 { v = 0 }
+                    if v > 63 { v = 63 }
+                }
+                d.lvl[s * 8 + r * 2 + m] = v
+                m = m + 1
+            }
+            r = r + 1
+        }
+        s = s + 1
+    }
+}
+fn v9_q(tab: Int, q: Int) -> Int {
+    var i = q
+    if i < 0 { i = 0 }
+    if i > 255 { i = 255 }
+    var v = 0
+    unsafe { v = peek16(tab + i * 2) }
+    return v
+}
+
+/// the frame's edges repeated into its border (after it is decoded and filtered): what a reference is read through
+fn v9_extend(f: Int) {
+    unsafe {
+        let fb = rview(Fb, f)
+        v9_extend_plane(fb.y, fb.ys, fb.w, fb.h, 96, fb.mir * 8 + 64 - fb.h)
+        v9_extend_plane(fb.u, fb.uvs, (fb.w + 1) >> 1, (fb.h + 1) >> 1, 48, fb.mir * 4 + 32 - ((fb.h + 1) >> 1))
+        v9_extend_plane(fb.v, fb.uvs, (fb.w + 1) >> 1, (fb.h + 1) >> 1, 48, fb.mir * 4 + 32 - ((fb.h + 1) >> 1))
+    }
+}
+fn v9_extend_plane(p: Int, s: Int, w: Int, h: Int, b: Int, below: Int) {
+    unsafe {
+        var y = 0
+        while y < h {
+            let row = p + y * s
+            let l = peek8(row)
+            let r = peek8(row + w - 1)
+            memset(row - b, l, b)
+            memset(row + w, r, s - b - w)
+            y = y + 1
+        }
+        let first = p - b
+        let last = p + (h - 1) * s - b
+        y = 1
+        while y <= b { memcpy(first - y * s, first, s)  y = y + 1 }
+        y = 0
+        while y < b + below { memcpy(last + (y + 1) * s, last, s)  y = y + 1 }
+    }
+}
+
+/// decode one frame (not a superframe) of `n` bytes at `p`. Returns 1 when it is to be shown (d.out is the frame), 0
+/// when it is not, -1 on an error (d.err).
+fn v9_frame(d: V9, p: Int, n: Int) -> Int {
+    var b = Bits { p: p, n: n, pos: 0 }
+    if !v9_uncompressed(d, b) { return 0 - 1 }
+    if d.show_existing == 1 {
+        let f = d.refs[d.show_idx]
+        if f == 0 { d.errc = 9  return 0 - 1 }
+        d.out = f
+        return 1
+    }
+    // trailing bits
+    while (b.pos & 7) != 0 { b.pos = b.pos + 1 }
+    let hdr = b.pos >> 3
+    if d.header_size == 0 { d.errc = 10  return 0 - 1 }
+    if hdr + d.header_size > n { d.errc = 11  return 0 - 1 }
+    v9_load_probs(d, d.ctx_idx)
+    v9_load_probs2(d, d.ctx_idx)
+    unsafe { memset(d.counts, 0, C_SIZE() * 4) }
+    v9_tiles_alloc(d)
+    let t0 = v9_tile(d, 0)
+    if !bd_init(t0, p + hdr, d.header_size) { d.errc = 12  return 0 - 1 }
+    if !v9_compressed(d, t0) { return 0 - 1 }
+    // the frame buffer
+    let f = v9_get_fb(d)
+    if f == 0 { d.errc = 13  return 0 - 1 }
+    d.cur = f
+    fb_ref(f, 1)
+    // references used must exist and be of a size the spec allows
+    if d.frame_is_intra == 0 {
+        var i = 0
+        while i < 3 {
+            let r = d.refs[d.ref_idx[i]]
+            if r == 0 { fb_ref(f, 0 - 1)  d.errc = 14  return 0 - 1 }
+            let rw = d.ref_w[d.ref_idx[i]]
+            let rh = d.ref_h[d.ref_idx[i]]
+            if 2 * d.width < rw || 2 * d.height < rh || d.width > 16 * rw || d.height > 16 * rh { fb_ref(f, 0 - 1)  d.errc = 15  return 0 - 1 }
+            i = i + 1
+        }
+    }
+    v9_segment_params(d)
+    if !v9_decode_tiles(d, p + hdr + d.header_size, n - hdr - d.header_size) { fb_ref(f, 0 - 1)  return 0 - 1 }
+    if d.lf_level > 0 { v9_loop_filter(d) }
+    // the segmentation map kept (§8.1 step 3)
+    if d.seg_on == 1 && d.seg_map == 1 { unsafe { memcpy(d.prev_seg, d.seg_ids, d.mi_cols * d.mi_rows) } }
+    // refresh probs (§6.1.2)
+    if d.error_res == 0 && d.parallel == 0 {
+        v9_tiles_sum_counts(d)
+        v9_load_probs(d, d.ctx_idx)
+        v9_adapt_coef(d)
+        if d.frame_is_intra == 0 {
+            v9_load_probs2(d, d.ctx_idx)
+            v9_adapt_noncoef(d)
+        }
+    }
+    if d.refresh_ctx == 1 { v9_save_probs(d, d.ctx_idx) }
+    // the reference update (§8.10)
+    v9_extend(f)
+    var i = 0
+    while i < 8 {
+        if ((d.refresh_flags >> i) & 1) == 1 {
+            fb_ref(d.refs[i], 0 - 1)
+            d.refs[i] = f
+            fb_ref(f, 1)
+            d.ref_w[i] = d.width
+            d.ref_h[i] = d.height
+        }
+        i = i + 1
+    }
+    // this frame's motion vectors become the previous ones
+    let tmp = d.prev_mi
+    d.prev_mi = d.mi
+    d.mi = tmp
+    d.last_show_frame = d.show_frame
+    d.frames_decoded = d.frames_decoded + 1
+    fb_ref(f, 0 - 1)
+    if d.show_frame == 1 { d.out = f  return 1 }
+    return 0
+}
+
+/// decode a packet (one frame, or a superframe of several: Annex B). Returns the number of frames to show (0 or 1:
+/// the last shown one is in d.out), or -1 with d.err said.
+pub fn vp9_decode(d: V9, p: Int, n: Int) -> Int {
+    d.errc = 0
+    if n <= 0 { return 0 }
+    var last = 0
+    unsafe { last = peek8(p + n - 1) }
+    var shown = 0
+    if (last & 224) == 192 {
+        let nf = (last & 7) + 1
+        let szb = ((last >> 3) & 3) + 1
+        let isz = 2 + szb * nf
+        var first = 0
+        if n >= isz { unsafe { first = peek8(p + n - isz) } }
+        if n >= isz && first == last {
+            var off = 0
+            var k = 0
+            while k < nf {
+                var sz = 0
+                var j = 0
+                unsafe { while j < szb { sz = sz | (peek8(p + n - isz + 1 + k * szb + j) << (8 * j))  j = j + 1 } }
+                if off + sz > n - isz { d.errc = 16  return 0 - 1 }
+                let r = v9_frame(d, p + off, sz)
+                if r < 0 { return 0 - 1 }
+                if r > 0 { shown = 1 }
+                off = off + sz
+                k = k + 1
+            }
+            return shown
+        }
+    }
+    let r2 = v9_frame(d, p, n)
+    if r2 < 0 { return 0 - 1 }
+    return r2
+}
+
+/// the frame to show after vp9_decode said 1: its planes (Y, U, V), strides and size
+pub fn vp9_out_y(d: V9) -> Int { var v = 0  unsafe { let fb = rview(Fb, d.out)  v = fb.y }  return v }
+pub fn vp9_out_u(d: V9) -> Int { var v = 0  unsafe { let fb = rview(Fb, d.out)  v = fb.u }  return v }
+pub fn vp9_out_v(d: V9) -> Int { var v = 0  unsafe { let fb = rview(Fb, d.out)  v = fb.v }  return v }
+pub fn vp9_out_ystride(d: V9) -> Int { var v = 0  unsafe { let fb = rview(Fb, d.out)  v = fb.ys }  return v }
+pub fn vp9_out_uvstride(d: V9) -> Int { var v = 0  unsafe { let fb = rview(Fb, d.out)  v = fb.uvs }  return v }
+pub fn vp9_out_w(d: V9) -> Int { var v = 0  unsafe { let fb = rview(Fb, d.out)  v = fb.w }  return v }
+pub fn vp9_out_h(d: V9) -> Int { var v = 0  unsafe { let fb = rview(Fb, d.out)  v = fb.h }  return v }
+pub fn vp9_error(d: V9) -> Str { return v9_errmsg(d.errc) }
+/// decode tiles on this many threads (1: on the caller's)
+pub fn vp9_set_threads(d: V9, n: Int) { if n >= 1 { d.threads = n } }
+
+/// what an error code says
+fn v9_errmsg(c: Int) -> Str {
+    if c == 0 { return "" }
+    if c == 3 { return "VP9 chroma that is not 4:2:0 (profile 1): not decoded yet" }
+    if c == 4 { return "VP9: no frame marker" }
+    if c == 5 { return "VP9: no sync code" }
+    if c == 6 { return "VP9: a frame refers to a reference never decoded" }
+    if c == 8 { return "VP9: no memory" }
+    if c == 9 { return "VP9: shows a frame never decoded" }
+    if c == 10 { return "VP9: an empty compressed header" }
+    if c == 11 { return "VP9: the compressed header runs past the frame" }
+    if c == 12 { return "VP9: the compressed header's marker bit is set" }
+    if c == 13 { return "VP9: no frame buffer" }
+    if c == 14 { return "VP9: a reference never decoded" }
+    if c == 15 { return "VP9: a reference of a size it cannot be scaled from" }
+    if c == 16 { return "VP9: a superframe's sizes run past it" }
+    if c == 20 { return "VP9: more tiles than this decoder keeps" }
+    if c == 21 { return "VP9: a tile's size runs past the frame" }
+    if c == 22 { return "VP9: a tile's marker bit is set" }
+    if c == 40 { return "VP9 profile 2 or 3 (10 or 12 bits): not decoded yet" }
+    if c == 41 { return "VP9: larger than 16384 on a side" }
+    return "VP9: error " + to_str(c)
+}

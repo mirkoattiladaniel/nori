@@ -1,0 +1,65 @@
+// Native tests for std/font's Unicode tables: run with
+//   noric --test std/font/ucd_test.nori compiler/runtime.nori --import-root .
+import "std/font" as font
+
+fn test_ucd_blob_whole() {
+    // the header's end marker is the blob's own length: a backslash the include lost would show here
+    assert_eq(font::rd_u32(font::ucd_blob_for_test(), 52), font::ucd_blob_size())
+}
+fn test_ucd_general_category() {
+    assert_eq(font::ucd_gc(65), font::GC_Lu())
+    assert_eq(font::ucd_gc(97), font::GC_Ll())
+    assert_eq(font::ucd_gc(769), font::GC_Mn())        // U+0301
+    assert_eq(font::ucd_gc(32), font::GC_Zs())
+    assert_eq(font::ucd_gc(1114111), font::GC_Cn())
+    assert_eq(font::ucd_gc(0 - 5), font::GC_Cn())
+    assert_eq(font::ucd_gc(19968), font::GC_Lo())      // U+4E00
+}
+fn test_ucd_bidi_class() {
+    assert_eq(font::ucd_bidi_class(65), font::BC_L())
+    assert_eq(font::ucd_bidi_class(1488), font::BC_R())    // alef
+    assert_eq(font::ucd_bidi_class(1575), font::BC_AL())   // arabic alef
+    assert_eq(font::ucd_bidi_class(48), font::BC_EN())
+    assert_eq(font::ucd_bidi_class(1632), font::BC_AN())   // arabic-indic zero
+    assert_eq(font::ucd_bidi_class(8297), font::BC_PDI())
+    assert_eq(font::ucd_bidi_class(2045), font::BC_NSM())  // U+07FD
+    assert_eq(font::ucd_bidi_class(2303), font::BC_NSM())  // U+08FF
+    assert_eq(font::ucd_bidi_class(1424), font::BC_R())    // unassigned in the Hebrew block: R
+    assert_eq(font::ucd_bidi_class(1984), font::BC_R())    // NKo digit zero
+}
+fn test_ucd_script_and_lb() {
+    assert_streq(font::script_code(font::ucd_script(1575)), "Arab")
+    assert_streq(font::script_code(font::ucd_script(65)), "Latn")
+    assert_streq(font::script_code(font::ucd_script(32)), "Zyyy")
+    assert_streq(font::script_code(font::ucd_script(769)), "Zinh")
+    assert_eq(font::script_from_code("Deva"), font::ucd_script(2325))
+    assert_eq(font::ucd_line_break(32), font::LB_SP())
+    assert_eq(font::ucd_line_break(65), font::LB_AL())
+    assert_eq(font::ucd_line_break(19968), font::LB_ID())
+}
+fn test_ucd_misc() {
+    assert_eq(font::ucd_ccc(769), 230)
+    assert_eq(font::ucd_ccc(1617), 33)                     // shadda
+    assert_eq(font::ucd_joining_type(1576), font::JT_D())  // beh
+    assert_eq(font::ucd_joining_type(1575), font::JT_R())  // alef
+    assert_eq(font::ucd_joining_type(1614), font::JT_T())  // fatha
+    assert_eq(font::ucd_mirror(40), 41)
+    assert_eq(font::ucd_mirror(65), 65)
+    assert_eq(font::ucd_bracket_type(91), 1)
+    assert_eq(font::ucd_bracket_type(93), 2)
+    assert_eq(font::ucd_bracket_pair(93), 91)
+    assert_true(font::ucd_is_extended_pictographic(128512))
+    assert_true(font::ucd_is_emoji_modifier(127997))
+    assert_true(font::ucd_is_default_ignorable(8205))
+}
+fn test_ucd_normalization() {
+    var o: Vec<Int> = vec()
+    assert_true(font::ucd_decompose(233, o))              // é
+    assert_eq(o[0], 101)  assert_eq(o[1], 769)
+    assert_true(!font::ucd_decompose(65, o))
+    assert_eq(font::ucd_compose(101, 769), 233)
+    assert_eq(font::ucd_compose(65, 66), 0)
+    assert_eq(font::ucd_compose(2325, 2364), 0)           // क़ is a composition exclusion
+    assert_true(font::ucd_decompose(54620, o))            // 한
+    assert_eq(font::ucd_compose(o[0], o[1]), 54620)
+}

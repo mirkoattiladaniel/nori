@@ -1,0 +1,82 @@
+//! std/test: assertions for native `.nori` tests. Write tests as `fn test_*()` functions that call
+//! these asserts; run them with `noric --test FILE` (or `roll test`), which finds every `fn test_*`,
+//! runs it, and reports pass/fail. Asserts don't abort on failure; they record it (so a test reports
+//! all its failures) and the runner fails the test if its assert-failure count went up.
+//!
+//!   import "std/test"
+//!   import "std/iter" as it
+//!   fn test_vsum() {
+//!     assert_eq(it::vsum(it::vmap(mkv(), |x| x * 2)), 12)
+//!     assert_true(it::vany(mkv(), |x| x == 3))
+//!   }
+
+global g_test_fails: Int = 0
+
+/// the source line of the assert currently running, used to say where a failure happened.
+///
+/// An assert is an ordinary function and cannot see its own call site, so on its own a failure
+/// could only say what was wrong, not where (`assert_eq failed: want 5, got 4`, somewhere in a file
+/// of a hundred assertions). `noric --test` sets this immediately before each assert it can see,
+/// and sets it to the test's own line for the ones it cannot, so a failure always names a place
+/// even when it cannot name the exact line.
+///
+/// Printed in the same `<file> · <line>` shape the compiler uses for a diagnostic, so tools that
+/// can jump to one can jump to this.
+global g_at_file: Str
+global g_at_line: Int = 0
+
+/// the file the tests are in. Set once by the generated harness.
+///
+/// Separate from `assert_at` so that what gets injected in front of an assert is as short as it can
+/// be: the harness prefixes the line, which shifts every column on it, and a compiler error on that
+/// line shows the injected call inside the source it quotes. `assert_at(12)` is short; a full path
+/// would not be.
+pub fn assert_file(f: Str) -> Int { g_at_file = copy f  return 0 }
+
+/// record which line the next assert is on. Called by the generated harness, not by hand.
+pub fn assert_at(l: Int) -> Int { g_at_line = l  return 0 }
+
+/// `  <file> · <line>` when a location is known, `` when it is not.
+fn at_str() -> Str {
+    if g_at_line <= 0 { return "" }
+    if g_at_file.len() == 0 { return "" }
+    return ("  " + (g_at_file + (" · " + to_str(g_at_line))))
+}
+
+/// the number of assert failures recorded so far (the runner brackets each test with this).
+pub fn assert_failures() -> Int { return g_test_fails }
+/// reset the recorded assert-failure count to zero.
+pub fn assert_reset() -> Int { g_test_fails = 0  return 0 }
+
+/// assert `c` is true; records a failure and prints "got false" otherwise.
+pub fn assert_true(c: Bool) -> Int {
+    if !c { g_test_fails = g_test_fails + 1  printl("    assert_true failed (got false)" + at_str()) }
+    return 0
+}
+/// assert `c` is false; records a failure and prints "got true" otherwise.
+pub fn assert_false(c: Bool) -> Int {
+    if c { g_test_fails = g_test_fails + 1  printl("    assert_false failed (got true)" + at_str()) }
+    return 0
+}
+/// assert `got == want`; records a failure and prints "want X, got Y" otherwise.
+pub fn assert_eq(got: Int, want: Int) -> Int {
+    if got != want { g_test_fails = g_test_fails + 1  printl("    assert_eq failed: want " + want + ", got " + got + at_str()) }
+    return 0
+}
+/// assert `got != bad`; records a failure and prints the offending value otherwise.
+pub fn assert_ne(got: Int, bad: Int) -> Int {
+    if got == bad { g_test_fails = g_test_fails + 1  printl("    assert_ne failed: got " + got + " (should differ)" + at_str()) }
+    return 0
+}
+/// assert strings `got` and `want` are equal; records a failure and prints "want X, got Y" otherwise.
+pub fn assert_streq(got: Str, want: Str) -> Int {
+    if !(got == want) { g_test_fails = g_test_fails + 1  printl("    assert_streq failed: want \"" + want + "\", got \"" + got + "\"" + at_str()) }
+    return 0
+}
+/// approximate float equality: fails if |got - want| > eps.
+pub fn assert_feq(got: Float, want: Float, eps: Float) -> Int {
+    var d = got - want
+    if d < 0.0 { d = 0.0 - d }
+    if d > eps { g_test_fails = g_test_fails + 1  printl("    assert_feq failed: want " + want + ", got " + got + at_str()) }
+    return 0
+}

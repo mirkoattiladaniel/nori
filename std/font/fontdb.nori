@@ -1,0 +1,377 @@
+// std/font: discovering the fonts a system has, without fontconfig.
+//
+//   let faces = font::scan_font_dirs(font::system_font_dirs())
+//   let i = font::match_face(faces, "Noto Sans", 400, false)
+//   let fs = font::fontset_for_text(faces, i, "Hello مرحبا नमस्ते 你好 😀")
+//
+// Every .ttf/.otf/.ttc/.otc/.woff/.woff2 under the given directories is opened and only the few
+// tables discovery needs are read, the table directory, `name`, `OS/2`, `post`, `head`, with
+// ranged reads, so a 20 MB CJK collection costs a few kilobytes. Coverage (does this face have that
+// character?) reads the face's `cmap` on first question and keeps it.
+
+import "std/os" as os
+
+/// one face found on disk: where it is, what it is called, and its style.
+pub struct FontFaceInfo {
+    path: Str,
+    index: Int,              // face index within a collection (0 for a single font)
+    family: Str,             // typographic family (name 16, else 1)
+    style: Str,              // typographic subfamily (name 17, else 2): "Regular", "Bold Italic"
+    full_name: Str,          // name 4
+    weight: Int,             // OS/2 usWeightClass (400 regular, 700 bold)
+    italic: Bool,            // OS/2 fsSelection italic or oblique
+    monospace: Bool,         // post isFixedPitch
+    color: Bool,             // has CBDT/CBLC, COLR or sbix (an emoji face)
+    cmap_off: Int,           // the cmap table in the file (for coverage questions)
+    cmap_len: Int,
+    ranges: Vec<Int>         // OS/2 ulUnicodeRange1..4 (a coarse coverage hint)
+}
+
+/// the directories fonts live in on this system: /usr/share/fonts, /usr/local/share/fonts, and the
+/// user's ~/.local/share/fonts and ~/.fonts: the ones that exist.
+pub fn system_font_dirs() -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let home = os::home_dir()
+    var cands: Vec<Str> = vec()
+    cands.push("/usr/share/fonts")
+    cands.push("/usr/local/share/fonts")
+    if home.len() > 0 { cands.push(home + "/.local/share/fonts")  cands.push(home + "/.fonts") }
+    var i = 0
+    while i < cands.len() { if os::is_dir(cands[i]) { out.push(copy cands[i]) }  i = i + 1 }
+    return out
+}
+
+fn is_font_path(p: Str) -> Bool {
+    let n = p.len()
+    if n < 5 { return false }
+    var ext = ""
+    var i = n - 1
+    while i > 0 && p.at(i) != '.' && p.at(i) != '/' { i = i - 1 }
+    if p.at(i) != '.' { return false }
+    var k = i + 1
+    while k < n {
+        var c = ord(p.at(k))
+        if c >= 65 && c <= 90 { c = c + 32 }
+        ext = ext + chr(c)
+        k = k + 1
+    }
+    return ext == "ttf" || ext == "otf" || ext == "ttc" || ext == "otc" || ext == "woff" || ext == "woff2"
+}
+
+/// every face in every font file under `dirs` (recursively), sorted by path then face index.
+pub fn scan_font_dirs(dirs: Vec<Str>) -> Vec<FontFaceInfo> {
+    var out: Vec<FontFaceInfo> = vec()
+    var d = 0
+    while d < dirs.len() {
+        let files = os::list_tree(dirs[d])
+        var i = 0
+        while i < files.len() {
+            if is_font_path(files[i]) { scan_font_file_into(files[i], out) }
+            i = i + 1
+        }
+        d = d + 1
+    }
+    return out
+}
+/// the faces of one font file (several for a collection; none if it is not a font).
+pub fn scan_font_file(path: Str) -> Vec<FontFaceInfo> {
+    var out: Vec<FontFaceInfo> = vec()
+    scan_font_file_into(path, out)
+    return out
+}
+
+fn scan_font_file_into(path: Str, inout out: Vec<FontFaceInfo>) {
+    let head = os::read_file_range(path, 0, 12)
+    if head.len() < 12 { return }
+    let tag = rd_u32(head, 0)
+    if tag == 2001684018 || tag == 2001684038 {                         // 'wOF2' / 'wOFF': decode the whole file
+        let fr = font_load(read_file(path))
+        if fr.ok { out.push(face_info_from_font(path, 0, fr.font)) }
+        return
+    }
+    if tag == 1953784678 {                                               // 'ttcf'
+        let n = rd_u32(head, 8)
+        if n <= 0 || n > 1000 { return }
+        let offs = os::read_file_range(path, 12, n * 4)
+        var i = 0
+        while i < n { scan_face(path, i, rd_u32(offs, i * 4), out)  i = i + 1 }
+        return
+    }
+    if tag == 65536 || tag == 1330926671 || tag == 1953658213 { scan_face(path, 0, 0, out) }
+}
+
+// a face's info from its table directory at `face`, reading each table it needs by range
+fn scan_face(path: Str, index: Int, face: Int, inout out: Vec<FontFaceInfo>) {
+    let hdr = os::read_file_range(path, face, 12)
+    if hdr.len() < 12 { return }
+    let nt = rd_u16(hdr, 4)
+    if nt == 0 || nt > 200 { return }
+    let dir = os::read_file_range(path, face + 12, nt * 16)
+    var name_off = 0 - 1  var name_len = 0
+    var os2_off = 0 - 1  var os2_len = 0
+    var post_off = 0 - 1
+    var cmap_off = 0 - 1  var cmap_len = 0
+    var color = false
+    var outlines = false
+    var i = 0
+    while i < nt {
+        let r = i * 16
+        let t = rd_tag(dir, r)
+        let off = rd_u32(dir, r + 8)
+        let ln = rd_u32(dir, r + 12)
+        if t == "name" { name_off = off  name_len = ln }
+        else if t == "OS/2" { os2_off = off  os2_len = ln }
+        else if t == "post" { post_off = off }
+        else if t == "cmap" { cmap_off = off  cmap_len = ln }
+        else if t == "CBDT" || t == "COLR" || t == "sbix" { color = true  outlines = true }
+        else if t == "glyf" || t == "CFF " || t == "CFF2" { outlines = true }
+        i = i + 1
+    }
+    if name_off < 0 || cmap_off < 0 || !outlines { return }
+    let nm = os::read_file_range(path, name_off, name_len)
+    var family = name_table_string(nm, 16)
+    if family.len() == 0 { family = name_table_string(nm, 1) }
+    var style = name_table_string(nm, 17)
+    if style.len() == 0 { style = name_table_string(nm, 2) }
+    let full = name_table_string(nm, 4)
+    var weight = 400
+    var italic = false
+    var ranges: Vec<Int> = vec()
+    if os2_off >= 0 {
+        let o2 = os::read_file_range(path, os2_off, os2_len)
+        weight = rd_u16(o2, 4)
+        let sel = rd_u16(o2, 62)
+        italic = (sel & 1) != 0 || (sel & 512) != 0
+        var k = 0
+        while k < 4 { ranges.push(rd_u32(o2, 42 + k * 4))  k = k + 1 }
+    }
+    if ranges.len() == 0 { var k = 0  while k < 4 { ranges.push(0)  k = k + 1 } }
+    var mono = false
+    if post_off >= 0 { let ps = os::read_file_range(path, post_off, 16)  mono = rd_u32(ps, 12) != 0 }
+    out.push(FontFaceInfo { path: copy path, index: index, family: family, style: style, full_name: full,
+        weight: weight, italic: italic, monospace: mono, color: color, cmap_off: cmap_off, cmap_len: cmap_len, ranges: ranges })
+}
+
+/// what a loaded face says about itself (family, style, weight, slant, monospace, colour) as
+/// discovery would report it (no path; coverage questions need a scanned face).
+pub fn font_face_info(f: Font) -> FontFaceInfo { return face_info_from_font("", 0, f) }
+
+fn face_info_from_font(path: Str, index: Int, f: Font) -> FontFaceInfo {
+    let d = f.d
+    var nm = ""
+    if f.name_off >= 0 { nm = d.slice(f.name_off, d.len()) }
+    var family = name_table_string(nm, 16)
+    if family.len() == 0 { family = name_table_string(nm, 1) }
+    var style = name_table_string(nm, 17)
+    if style.len() == 0 { style = name_table_string(nm, 2) }
+    var weight = 400
+    var italic = false
+    var ranges: Vec<Int> = vec()
+    if f.os2_off >= 0 {
+        weight = rd_u16(d, f.os2_off + 4)
+        let sel = rd_u16(d, f.os2_off + 62)
+        italic = (sel & 1) != 0 || (sel & 512) != 0
+    }
+    var k = 0
+    while k < 4 { if f.os2_off >= 0 { ranges.push(rd_u32(d, f.os2_off + 42 + k * 4)) } else { ranges.push(0) }  k = k + 1 }
+    var mono = false
+    if f.post_off >= 0 { mono = rd_u32(d, f.post_off + 12) != 0 }
+    return FontFaceInfo { path: copy path, index: index, family: family, style: style, full_name: name_table_string(nm, 4),
+        weight: weight, italic: italic, monospace: mono, color: f.cbdt_off >= 0 || f.colr_off >= 0 || f.sbix_off >= 0,
+        cmap_off: 0 - 1, cmap_len: 0, ranges: ranges }
+}
+
+/// string `name_id` of a `name` table held at the start of `nm`: a Windows English (3,1,0x409)
+/// record first, then any Windows Unicode record, then Mac Roman. UTF-16 is decoded to UTF-8 in
+/// full (surrogate pairs included), so non-Latin family names come through. "" when absent.
+pub fn name_table_string(nm: Str, name_id: Int) -> Str {
+    if nm.len() < 6 { return "" }
+    let cnt = rd_u16(nm, 2)
+    let sbase = rd_u16(nm, 4)
+    var best = 0 - 1
+    var best_score = 0
+    var r = 0
+    while r < cnt {
+        let rp = 6 + r * 12
+        if rp + 12 > nm.len() { r = cnt  continue }
+        let plat = rd_u16(nm, rp)
+        let enc = rd_u16(nm, rp + 2)
+        let lang = rd_u16(nm, rp + 4)
+        let nid = rd_u16(nm, rp + 6)
+        if nid == name_id {
+            var score = 0
+            if plat == 3 && (enc == 1 || enc == 10) && lang == 1033 { score = 5 }
+            else if plat == 3 && (enc == 1 || enc == 10) { score = 4 }
+            else if plat == 0 { score = 3 }
+            else if plat == 1 && enc == 0 { score = 2 }
+            if score > best_score { best_score = score  best = rp }
+        }
+        r = r + 1
+    }
+    if best < 0 { return "" }
+    let ln = rd_u16(nm, best + 8)
+    let so = sbase + rd_u16(nm, best + 10)
+    var out = ""
+    if best_score >= 3 {
+        var k = 0
+        while k + 1 < ln {
+            var u = rd_u16(nm, so + k)
+            k = k + 2
+            if u >= 55296 && u <= 56319 && k + 1 < ln {
+                let lo = rd_u16(nm, so + k)
+                if lo >= 56320 && lo <= 57343 { u = 65536 + ((u - 55296) << 10) + (lo - 56320)  k = k + 2 }
+            }
+            if u >= 32 { out = out + utf8_encode(u) }
+        }
+    } else {
+        var k = 0
+        while k < ln { let c = rd_u8(nm, so + k)  if c >= 32 && c < 128 { out = out + chr(c) }  k = k + 1 }
+    }
+    return out
+}
+fn utf8_encode(c: Int) -> Str {
+    if c < 128 { return "" + chr(c) }
+    if c < 2048 { return "" + chr(192 | (c >> 6)) + chr(128 | (c & 63)) }
+    if c < 65536 { return "" + chr(224 | (c >> 12)) + chr(128 | ((c >> 6) & 63)) + chr(128 | (c & 63)) }
+    return "" + chr(240 | (c >> 18)) + chr(128 | ((c >> 12) & 63)) + chr(128 | ((c >> 6) & 63)) + chr(128 | (c & 63))
+}
+
+fn lower_ascii(s: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < s.len() { var c = ord(s.at(i))  if c >= 65 && c <= 90 { c = c + 32 }  out = out + chr(c)  i = i + 1 }
+    return out
+}
+
+/// the face of `family` (case-insensitive) closest to `weight` and `italic`, or -1 when the family
+/// is not there. Closeness is CSS's: the right slant first, then the nearest weight.
+pub fn match_face(faces: Vec<FontFaceInfo>, family: Str, weight: Int, italic: Bool) -> Int {
+    let want = lower_ascii(family)
+    var best = 0 - 1
+    var best_cost = 1000000
+    var i = 0
+    while i < faces.len() {
+        if lower_ascii(faces[i].family) == want {
+            var cost = faces[i].weight - weight
+            if cost < 0 { cost = 0 - cost }
+            if faces[i].italic != italic { cost = cost + 10000 }
+            if cost < best_cost || (cost == best_cost && best >= 0 && faces[i].path.len() < faces[best].path.len()) { best_cost = cost  best = i }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// ── coverage ─────────────────────────────────────────────────────────────────────────────────────
+global g_cov_on: Int = 0
+global g_cov_key: Map<Str, Int>
+global g_cov_tab: Vec<Str>
+global g_cov_sub: Vec<Int>
+global g_cov_fmt: Vec<Int>
+
+/// does face `fi` map code point `cp` to a glyph? Reads and keeps the face's cmap on first use.
+pub fn face_covers(fi: FontFaceInfo, cp: Int) -> Bool {
+    if g_cov_on == 0 { var m: Map<Str, Int> = map()  g_cov_key = m  g_cov_tab = vec()  g_cov_sub = vec()  g_cov_fmt = vec()  g_cov_on = 1 }
+    let key = fi.path + "#" + to_str(fi.index)
+    var slot = 0 - 1
+    if g_cov_key.has(key) { slot = g_cov_key.get(key) }
+    else {
+        var tab = ""
+        if fi.cmap_off >= 0 { tab = os::read_file_range(fi.path, fi.cmap_off, fi.cmap_len) }
+        else {
+            // a WOFF face: decode it once
+            let fr = font_load_index(read_file(fi.path), fi.index)
+            if fr.ok && fr.font.cmap_off >= 0 { tab = fr.font.d.slice(fr.font.cmap_off, fr.font.d.len()) }
+        }
+        var f = font_blank(tab)
+        f.cmap_off = 0
+        resolve_cmap(f)
+        slot = g_cov_tab.len()
+        g_cov_tab.push(sink tab)
+        g_cov_sub.push(f.cmap_sub)
+        g_cov_fmt.push(f.cmap_fmt)
+        g_cov_key.put(key, slot)
+    }
+    let sub = g_cov_sub[slot]
+    if sub < 0 { return false }
+    if g_cov_fmt[slot] == 4 { return cmap4_lookup(g_cov_tab[slot], sub, cp) != 0 }
+    if g_cov_fmt[slot] == 12 { return cmap12_lookup(g_cov_tab[slot], sub, cp) != 0 }
+    return false
+}
+
+/// load face `fi` (its whole file) as a Font.
+pub fn load_face(fi: FontFaceInfo) -> FontResult { return font_load_index(read_file(fi.path), fi.index) }
+
+/// a FontSet for `text`: the primary face `primary` (an index into `faces`, or -1 for none), then,
+/// for each character no face so far has, the best face that does: a color face first for emoji,
+/// else the one closest to the primary's weight and slant, preferring the primary's family name
+/// prefix (so "Noto Sans" pulls in "Noto Sans Arabic" before an unrelated family).
+pub fn fontset_for_text(faces: Vec<FontFaceInfo>, primary: Int, text: Str) -> FontSet {
+    var fs = fontset_new()
+    var chosen: Vec<Int> = vec()
+    if primary >= 0 && primary < faces.len() {
+        let fr = load_face(faces[primary])
+        if fr.ok { fontset_add(fs, copy fr.font)  chosen.push(primary) }
+    }
+    var weight = 400
+    var italic = false
+    var prefix = ""
+    if primary >= 0 && primary < faces.len() {
+        weight = faces[primary].weight
+        italic = faces[primary].italic
+        prefix = lower_ascii(first_word(faces[primary].family))
+    }
+    let cps = utf8_codepoints(text)
+    var i = 0
+    while i < cps.len() {
+        let cp = cps[i]
+        i = i + 1
+        if hb_is_default_ignorable(cp) || is_variation_selector(cp) || cp < 32 { continue }
+        var have = false
+        var k = 0
+        while k < chosen.len() && !have { if face_covers(faces[chosen[k]], cp) { have = true }  k = k + 1 }
+        if have { continue }
+        let emoji = ucd_is_emoji_presentation(cp) || (i < cps.len() && cps[i] == 65039 && ucd_is_emoji(cp))
+        // rank the faces by how well they suit, then ask the cheapest ones first: a coverage question
+        // reads a cmap, and most faces never need to be asked
+        var cand: Vec<Int> = vec()
+        var cost: Vec<Int> = vec()
+        var j = 0
+        while j < faces.len() {
+            let fi = faces[j]
+            var c = fi.weight - weight
+            if c < 0 { c = 0 - c }
+            if fi.italic != italic { c = c + 10000 }
+            if emoji && !fi.color { c = c + 100000 }
+            if !emoji && fi.color { c = c + 100000 }
+            if prefix.len() > 0 && !(lower_ascii(first_word(fi.family)) == prefix) { c = c + 1000 }
+            if fi.monospace { c = c + 500 }
+            cand.push(j)
+            cost.push(c)
+            j = j + 1
+        }
+        var a = 1
+        while a < cand.len() {
+            let cj = cand[a]  let cc = cost[a]
+            var b = a
+            while b > 0 && cost[b - 1] > cc { cand[b] = cand[b - 1]  cost[b] = cost[b - 1]  b = b - 1 }
+            cand[b] = cj  cost[b] = cc
+            a = a + 1
+        }
+        var best = 0 - 1
+        j = 0
+        while j < cand.len() && best < 0 { if face_covers(faces[cand[j]], cp) { best = cand[j] }  j = j + 1 }
+        if best >= 0 {
+            let fr = load_face(faces[best])
+            if fr.ok { fontset_add(fs, copy fr.font)  chosen.push(best) }
+        }
+    }
+    return fs
+}
+fn first_word(s: Str) -> Str {
+    var i = 0
+    while i < s.len() && s.at(i) != ' ' { i = i + 1 }
+    return s.slice(0, i)
+}
+/// one code point as UTF-8.
+pub fn utf8_encode_cp(cp: Int) -> Str { return utf8_encode(cp) }

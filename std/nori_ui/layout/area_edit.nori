@@ -1,0 +1,265 @@
+// ===========================================================================
+// A multi-line text box you can type in.
+//
+// `field_edit.nori` is this file's sibling and the same argument applies: a
+// plugin re-emits its whole document every frame and keeps nothing, so the
+// state of the box has to live in the plugin. Without a shared editor, each
+// panel ends up writing the few lines that move a caret and stopping there,
+// with no selection.
+//
+// `text_area` takes three state attributes (caret, sel_anchor, scroll_y; see
+// dsl_input.nori), and this file is the editor that owns them. It is
+// `MultilineEditState` underneath, the same model the code editor uses, and
+// adds the input-bar parts: a height that grows with the content up to a cap,
+// a hit test against the wrapped rows, and a key map that knows Enter.
+//
+// What Enter means is left to the caller. `area_key` inserts a newline,
+// because that is what a text box does. A chat prompt wants Enter to send and
+// Shift+Enter to open a line; that is policy, it belongs to the panel that has
+// a Send button, and it is one `if` in front of this call.
+// ===========================================================================
+
+/// the inset a `text_area` uses when nothing says otherwise: CONTENT_PAD, and the default value of
+/// `node.padding`, so passing this is the same as passing nothing.
+///
+/// Padding is a style property. `padding`, `padding_x` and `padding_y` are node attributes and
+/// `padding` cascades from a stylesheet class, as on a `row`, so a panel that wants a
+/// tighter input bar says so in its `.ui` or its style block rather than subtracting pixels it does
+/// not own. These two take the number so that the height a panel reserves and the height the widget
+/// paints agree.
+pub fn area_pad() -> Float { return 8.0 }
+
+/// the caller-owned state of a `text_area`: the three attributes the node takes, plus the
+/// text itself.
+pub struct AreaEdit { text: Str, caret: Int, anchor: Int, scroll_y: Float }
+
+pub fn area_new(text: Str, caret: Int) -> AreaEdit {
+    var c = caret
+    if c < 0 { c = 0 }
+    if c > text.len() { c = text.len() }
+    return AreaEdit { text: copy text, caret: c, anchor: c, scroll_y: 0.0 }
+}
+
+/// ...restored from what a panel kept since the last frame.
+pub fn area_from(text: Str, caret: Int, anchor: Int, scroll_y: Float) -> AreaEdit {
+    var a = area_new(text, caret)
+    var an = anchor
+    if an < 0 { an = 0 }
+    if an > a.text.len() { an = a.text.len() }
+    a.anchor = an
+    var sy = scroll_y
+    if sy < 0.0 { sy = 0.0 }
+    a.scroll_y = sy
+    return a
+}
+
+fn area_state(a: AreaEdit) -> MultilineEditState {
+    var st = multiline_edit_new(copy a.text)
+    st.caret = a.caret
+    st.sel_anchor = a.anchor
+    st.scroll_y = a.scroll_y
+    st.word_wrap = true
+    return st
+}
+fn area_take(inout a: AreaEdit, st: MultilineEditState) {
+    a.text = copy st.text
+    a.caret = st.caret
+    a.anchor = st.sel_anchor
+    a.scroll_y = st.scroll_y
+}
+
+pub fn area_text(a: AreaEdit) -> Str { return copy a.text }
+pub fn area_caret(a: AreaEdit) -> Int { return a.caret }
+pub fn area_anchor(a: AreaEdit) -> Int { return a.anchor }
+pub fn area_scroll_y(a: AreaEdit) -> Float { return a.scroll_y }
+pub fn area_has_sel(a: AreaEdit) -> Bool { return !(a.caret == a.anchor) }
+pub fn area_sel_text(a: AreaEdit) -> Str { return me_selected_text(area_state(a)) }
+
+pub fn area_set(inout a: AreaEdit, text: Str) {
+    var st = area_state(a)
+    me_set_text(st, text)
+    area_take(a, st)
+}
+
+/// insert text at the caret, replacing the selection.
+///
+/// Newlines are kept, unlike `field_insert`, which runs its argument through `field_flatten` and
+/// turns a pasted paragraph into one long line. The shell delivers a paste as
+/// `char:<id>:<the text>`, so this is the path a paste takes.
+pub fn area_insert(inout a: AreaEdit, s: Str) {
+    var st = area_state(a)
+    me_insert(st, s)
+    area_take(a, st)
+}
+pub fn area_newline(inout a: AreaEdit) { var st = area_state(a)  me_insert_newline(st)  area_take(a, st) }
+pub fn area_backspace(inout a: AreaEdit) { var st = area_state(a)  me_backspace(st)  area_take(a, st) }
+pub fn area_delete(inout a: AreaEdit) { var st = area_state(a)  me_delete(st)  area_take(a, st) }
+pub fn area_select_all(inout a: AreaEdit) { var st = area_state(a)  me_select_all(st)  area_take(a, st) }
+
+/// does this keystroke belong to the box? The same question `field_takes` answers, plus the two
+/// keys that only mean something when there is more than one line.
+pub fn area_takes(sym: Int, mods: Int) -> Bool {
+    if (mods & 2) != 0 {
+        if sym == 97 || sym == 99 || sym == 120 || sym == 122 || sym == 121 { return true }
+        if sym == 65361 || sym == 65363 { return true }
+    }
+    if sym == 65361 || sym == 65363 { return true }        // Left / Right
+    if sym == 65362 || sym == 65364 { return true }        // Up / Down
+    if sym == 65360 || sym == 65367 { return true }        // Home / End
+    if sym == 65288 || sym == 65535 { return true }        // Backspace / Delete
+    if sym == 65293 || sym == 65421 { return true }        // Return / KP_Enter
+    return false
+}
+
+/// a keystroke. Returns "" for most, "copy" or "cut" when the caller should put `area_sel_text` on
+/// the clipboard (this module cannot reach it: the clipboard belongs to whatever
+/// owns the window).
+///
+/// `mods` is the shell's mask: 1 shift, 2 ctrl, 4 alt.
+///
+/// Enter opens a line here. A panel that wants Enter to do something else (send a message, accept a
+/// dialog) checks for it before calling this.
+///
+/// Paste is not a key. The shell catches Ctrl+V itself and delivers the clipboard as
+/// `char:<id>:<text>` before a plugin ever sees the keysym, so there is nothing here
+/// for 118: an insert is all a paste is.
+pub fn area_key(inout a: AreaEdit, sym: Int, mods: Int) -> Str {
+    let shift = (mods & 1) != 0
+    let ctrl = (mods & 2) != 0
+    var st = area_state(a)
+    if ctrl {
+        if sym == 97 { me_select_all(st)  area_take(a, st)  return "" }                  // Ctrl+A
+        if sym == 99 { return "copy" }                                                    // Ctrl+C
+        if sym == 120 {                                                                   // Ctrl+X
+            if area_has_sel(a) { me_insert(st, "")  area_take(a, st)  return "cut" }
+            return ""
+        }
+        if sym == 122 { me_undo(st)  area_take(a, st)  return "" }                        // Ctrl+Z
+        if sym == 121 { me_redo(st)  area_take(a, st)  return "" }                        // Ctrl+Y
+        if sym == 65361 { me_move_word_left(st, shift)  area_take(a, st)  return "" }
+        if sym == 65363 { me_move_word_right(st, shift)  area_take(a, st)  return "" }
+    }
+    if sym == 65361 { me_move_left(st, shift)  area_take(a, st)  return "" }              // Left
+    if sym == 65363 { me_move_right(st, shift)  area_take(a, st)  return "" }             // Right
+    if sym == 65362 { me_move_up(st, shift)  area_take(a, st)  return "" }                // Up
+    if sym == 65364 { me_move_down(st, shift)  area_take(a, st)  return "" }              // Down
+    if sym == 65360 { me_move_home(st, shift)  area_take(a, st)  return "" }              // Home
+    if sym == 65367 { me_move_end(st, shift)  area_take(a, st)  return "" }               // End
+    if sym == 65288 { me_backspace(st)  area_take(a, st)  return "" }                     // Backspace
+    if sym == 65535 { me_delete(st)  area_take(a, st)  return "" }                        // Delete
+    if sym == 65293 || sym == 65421 { me_insert_newline(st)  area_take(a, st)  return "" }
+    return ""
+}
+
+/// `caret: N sel_anchor: N scroll_y: N` for this box, as a `.ui` fragment: the three attributes
+/// `text_area` takes, emitted together so that no caller can send one and forget another.
+pub fn area_attrs(a: AreaEdit) -> Str {
+    var o = " caret: "
+    o = o + to_str(a.caret)
+    o = o + " sel_anchor: "
+    o = o + to_str(a.anchor)
+    o = o + " scroll_y: "
+    o = o + to_str(a.scroll_y)
+    return o
+}
+
+/// how many rows the text occupies at this width, wrapped: what the box would like to be tall
+/// enough for, before any cap is applied.
+pub fn area_rows(a: AreaEdit, box_w: Float, size_px: Float, wrap: Bool, pad_x: Float) -> Int {
+    var cw = box_w - pad_x * 2.0
+    if cw < 1.0 { cw = 1.0 }
+    var n = code_editor_rows(area_state(a), cw, size_px, wrap).len()
+    if n < 1 { n = 1 }
+    return n
+}
+
+/// ...and how tall that is, in the same arithmetic the node's own intrinsic height uses, capped by
+/// `max_rows` when one is given (0 for no cap).
+///
+/// A panel needs this before it emits the node, because the row the box sits in has to reserve the
+/// space, which is why it is a function here rather than something only the layout knows.
+pub fn area_height(a: AreaEdit, box_w: Float, size_px: Float, wrap: Bool, min_rows: Int, max_rows: Int, pad_x: Float, pad_y: Float) -> Float {
+    var rows = area_rows(a, box_w, size_px, wrap, pad_x)
+    // Same floor the widget uses. A panel that reserves one row for a box the widget will draw
+    // at three has reserved the wrong thing, and the widget wins: the row grows and the panel's
+    // arithmetic is 38px out. `min_rows` is passed to both or neither.
+    var lo = 3
+    if min_rows > 0 { lo = min_rows }
+    if max_rows > 0 && max_rows < lo { lo = max_rows }
+    if rows < lo { rows = lo }
+    if max_rows > 0 && rows > max_rows { rows = max_rows }
+    return to_float(rows) * (size_px + 5.0) + pad_y * 2.0
+}
+
+/// the byte offset under a point in the box, in widget-local coordinates. The inverse of the
+/// paint, so a press lands on the character it is over rather than near it.
+pub fn area_caret_at(a: AreaEdit, w: Float, h: Float, size_px: Float, wrap: Bool, lx: Float, ly: Float) -> Int {
+    return code_editor_caret_at(area_state(a), w, h, size_px, false, wrap, lx, ly)
+}
+
+fn ae_split(s: Str, n: Int) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var cur = ""
+    var i = 0
+    while i < s.len() {
+        if ord(s.at(i)) == 58 && out.len() < n - 1 { out.push(cur)  cur = "" } else { cur = cur + s.at(i) }
+        i = i + 1
+    }
+    out.push(cur)
+    return out
+}
+fn ae_int(s: Str) -> Int {
+    var neg = false
+    var i = 0
+    if s.len() > 0 { if ord(s.at(0)) == 45 { neg = true  i = 1 } }
+    var v = 0
+    while i < s.len() {
+        let c = ord(s.at(i))
+        if c < 48 || c > 57 { return 0 }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    if neg { return 0 - v }
+    return v
+}
+
+/// apply a pointer action the shell addressed to this box: `press:<id>:<x>:<y>:<w>:<h>:<clicks>:<mods>`
+/// or `dragto:` in the same shape. True when it was one of those, for this `id`, and it was applied.
+///
+/// A double click selects the word, a triple the line. Shift with a press extends from where the
+/// caret already is, the way it does in every other text box.
+pub fn area_pointer(inout a: AreaEdit, action: Str, id: Str, size_px: Float, wrap: Bool) -> Bool {
+    var kind = ""
+    if action.len() > 6 { if action.slice(0, 6) == "press:" { kind = "press" } }
+    if action.len() > 7 { if action.slice(0, 7) == "dragto:" { kind = "drag" } }
+    if kind.len() == 0 { return false }
+    var rest = action.slice(6, action.len())
+    if kind == "drag" { rest = action.slice(7, action.len()) }
+    let fs = ae_split(rest, 7)
+    if fs.len() < 7 { return false }
+    if !(fs[0] == id) { return false }
+    let x = to_float(ae_int(fs[1]))
+    let y = to_float(ae_int(fs[2]))
+    let w = to_float(ae_int(fs[3]))
+    let h = to_float(ae_int(fs[4]))
+    let clicks = ae_int(fs[5])
+    let mods = ae_int(fs[6])
+    if w <= 0.0 || h <= 0.0 { return false }
+    let at = area_caret_at(a, w, h, size_px, wrap, x, y)
+    var st = area_state(a)
+    st.caret = at
+    if kind == "drag" { area_take(a, st)  return true }
+    if clicks >= 3 {
+        let ls = me_line_start_index(st.text, at)
+        let le = me_line_end_index(st.text, ls)
+        st.sel_anchor = ls
+        st.caret = le
+    } else if clicks == 2 {
+        st.sel_anchor = at
+        me_select_word(st)
+    } else if (mods & 1) == 0 {
+        st.sel_anchor = at
+    }
+    area_take(a, st)
+    return true
+}

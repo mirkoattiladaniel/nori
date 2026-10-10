@@ -1,0 +1,271 @@
+//! std/hashmap: Int-keyed hash collections (the runtime `Map` is Str-keyed only). Open-addressing
+//! hash tables with linear probing and power-of-two capacity, growing at a 0.75 load factor.
+//!
+//! Keys and values are plain `Int` (i64). Because Nori values are i64-uniform, an `Int` slot can hold
+//! any i64 value: Int, Bool, Char, or a handle to a Str/Vec/Map/struct. The one exception is Float,
+//! which is f64 and cannot be stored here.
+//!
+//!   import "std/hashmap" as hm
+//!   var m = hm::intmap_new()
+//!   m.put(42, 100)
+//!   m.get_or(42, -1)     // 100
+//!   m.contains(42)       // true
+//!   m.remove(42)         // true; m.size() is now 0
+//!
+//!   var s = hm::intset_new()
+//!   s.add(7)  s.add(7)   // second add returns false
+//!   s.contains(7)        // true
+//!   s.items()            // Vec<Int> of members (any order)
+
+// slot states stored in `st`: 0 = empty, 1 = used, 2 = tombstone.
+
+struct IntMap { ks: Vec<Int>, vs: Vec<Int>, st: Vec<Int>, n: Int, cap: Int }
+
+/// a fresh empty Int->Int map (initial capacity 8).
+pub fn intmap_new() -> IntMap {
+    var ks: Vec<Int> = vec()
+    var vs: Vec<Int> = vec()
+    var st: Vec<Int> = vec()
+    var i = 0
+    while i < 8 { ks.push(0)  vs.push(0)  st.push(0)  i = i + 1 }
+    return IntMap { ks: ks, vs: vs, st: st, n: 0, cap: 8 }
+}
+
+// mix the key bits then mask to [0, cap). `cap` is a power of two so `cap - 1` is the mask.
+// The two mixing multiplies are defined on wraparound (that is what makes them mix), so they use
+// `wrapping_mul`: a `--overflow-checks` build can still use a map instead of trapping on its
+// first insert.
+fn intmap_hash(k: Int, cap: Int) -> Int {
+    var h = wrapping_mul(k, -7046029254386353131)
+    h = (h ^ (h >> 32))
+    h = wrapping_mul(h, -4417276706812531889)
+    h = (h ^ (h >> 29))
+    return (h & cap - 1)
+}
+
+// double the capacity of `m` and re-insert every used entry. probing uses the new cap.
+fn intmap_grow(inout m: IntMap) -> Int {
+    var oldks = sink m.ks
+    var oldvs = sink m.vs
+    var oldst = sink m.st
+    var oldcap = m.cap
+    var ncap = oldcap * 2
+    var nks: Vec<Int> = vec()
+    var nvs: Vec<Int> = vec()
+    var nst: Vec<Int> = vec()
+    var i = 0
+    while i < ncap { nks.push(0)  nvs.push(0)  nst.push(0)  i = i + 1 }
+    m.ks = nks
+    m.vs = nvs
+    m.st = nst
+    m.cap = ncap
+    // re-insert: walk old slots, place each used entry into the new arrays directly.
+    var j = 0
+    while j < oldcap {
+        if oldst[j] == 1 {
+            var k = oldks[j]
+            var v = oldvs[j]
+            var idx = intmap_hash(k, ncap)
+            while m.st[idx] == 1 { idx = (idx + 1 & ncap - 1) }
+            m.ks[idx] = k
+            m.vs[idx] = v
+            m.st[idx] = 1
+        }
+        j = j + 1
+    }
+    return 0
+}
+
+impl IntMap {
+    /// insert or overwrite key `k` with value `v`. grows (x2) at a 0.75 load factor. returns 0.
+    fn put(inout self, k: Int, v: Int) -> Int {
+        if self.n * 4 >= self.cap * 3 { intmap_grow(self) }
+        var idx = intmap_hash(k, self.cap)
+        var first_tomb = -1
+        while true {
+            var s = self.st[idx]
+            if s == 0 {
+                // empty: insert here, or reuse an earlier tombstone if we saw one.
+                if first_tomb >= 0 { idx = first_tomb }
+                self.ks[idx] = k
+                self.vs[idx] = v
+                self.st[idx] = 1
+                self.n = self.n + 1
+                return 0
+            }
+            if s == 1 {
+                if self.ks[idx] == k {
+                    self.vs[idx] = v   // overwrite, n unchanged
+                    return 0
+                }
+            }
+            if s == 2 {
+                if first_tomb < 0 { first_tomb = idx }
+            }
+            idx = (idx + 1 & self.cap - 1)
+        }
+        return 0
+    }
+    /// value for `k`, or `dflt` if `k` is absent.
+    fn get_or(self, k: Int, dflt: Int) -> Int {
+        var idx = intmap_hash(k, self.cap)
+        while true {
+            var s = self.st[idx]
+            if s == 0 { return dflt }
+            if s == 1 {
+                if self.ks[idx] == k { return self.vs[idx] }
+            }
+            idx = (idx + 1 & self.cap - 1)
+        }
+        return dflt
+    }
+    /// is `k` present?
+    fn contains(self, k: Int) -> Bool {
+        var idx = intmap_hash(k, self.cap)
+        while true {
+            var s = self.st[idx]
+            if s == 0 { return false }
+            if s == 1 {
+                if self.ks[idx] == k { return true }
+            }
+            idx = (idx + 1 & self.cap - 1)
+        }
+        return false
+    }
+    /// remove `k`; returns true if it was present.
+    fn remove(inout self, k: Int) -> Bool {
+        var idx = intmap_hash(k, self.cap)
+        while true {
+            var s = self.st[idx]
+            if s == 0 { return false }
+            if s == 1 {
+                if self.ks[idx] == k {
+                    self.st[idx] = 2   // tombstone
+                    self.n = self.n - 1
+                    return true
+                }
+            }
+            idx = (idx + 1 & self.cap - 1)
+        }
+        return false
+    }
+    /// number of present entries.
+    fn size(self) -> Int { return self.n }
+    /// all present keys, in arbitrary order.
+    fn keys(self) -> Vec<Int> {
+        var out: Vec<Int> = vec()
+        var i = 0
+        while i < self.cap {
+            if self.st[i] == 1 { out.push(self.ks[i]) }
+            i = i + 1
+        }
+        return out
+    }
+}
+
+struct IntSet { ks: Vec<Int>, st: Vec<Int>, n: Int, cap: Int }
+
+/// a fresh empty set of Ints (initial capacity 8).
+pub fn intset_new() -> IntSet {
+    var ks: Vec<Int> = vec()
+    var st: Vec<Int> = vec()
+    var i = 0
+    while i < 8 { ks.push(0)  st.push(0)  i = i + 1 }
+    return IntSet { ks: ks, st: st, n: 0, cap: 8 }
+}
+
+// double the capacity of set `s` and re-insert every member.
+fn intset_grow(inout s: IntSet) -> Int {
+    var oldks = sink s.ks
+    var oldst = sink s.st
+    var oldcap = s.cap
+    var ncap = oldcap * 2
+    var nks: Vec<Int> = vec()
+    var nst: Vec<Int> = vec()
+    var i = 0
+    while i < ncap { nks.push(0)  nst.push(0)  i = i + 1 }
+    s.ks = nks
+    s.st = nst
+    s.cap = ncap
+    var j = 0
+    while j < oldcap {
+        if oldst[j] == 1 {
+            var k = oldks[j]
+            var idx = intmap_hash(k, ncap)
+            while s.st[idx] == 1 { idx = (idx + 1 & ncap - 1) }
+            s.ks[idx] = k
+            s.st[idx] = 1
+        }
+        j = j + 1
+    }
+    return 0
+}
+
+impl IntSet {
+    /// insert `k`; returns true if newly added, false if already present.
+    fn add(inout self, k: Int) -> Bool {
+        if self.n * 4 >= self.cap * 3 { intset_grow(self) }
+        var idx = intmap_hash(k, self.cap)
+        var first_tomb = -1
+        while true {
+            var s = self.st[idx]
+            if s == 0 {
+                if first_tomb >= 0 { idx = first_tomb }
+                self.ks[idx] = k
+                self.st[idx] = 1
+                self.n = self.n + 1
+                return true
+            }
+            if s == 1 {
+                if self.ks[idx] == k { return false }
+            }
+            if s == 2 {
+                if first_tomb < 0 { first_tomb = idx }
+            }
+            idx = (idx + 1 & self.cap - 1)
+        }
+        return false
+    }
+    /// is `k` a member?
+    fn contains(self, k: Int) -> Bool {
+        var idx = intmap_hash(k, self.cap)
+        while true {
+            var s = self.st[idx]
+            if s == 0 { return false }
+            if s == 1 {
+                if self.ks[idx] == k { return true }
+            }
+            idx = (idx + 1 & self.cap - 1)
+        }
+        return false
+    }
+    /// remove `k`; returns true if it was present.
+    fn remove(inout self, k: Int) -> Bool {
+        var idx = intmap_hash(k, self.cap)
+        while true {
+            var s = self.st[idx]
+            if s == 0 { return false }
+            if s == 1 {
+                if self.ks[idx] == k {
+                    self.st[idx] = 2
+                    self.n = self.n - 1
+                    return true
+                }
+            }
+            idx = (idx + 1 & self.cap - 1)
+        }
+        return false
+    }
+    /// number of members.
+    fn size(self) -> Int { return self.n }
+    /// the members, in arbitrary order.
+    fn items(self) -> Vec<Int> {
+        var out: Vec<Int> = vec()
+        var i = 0
+        while i < self.cap {
+            if self.st[i] == 1 { out.push(self.ks[i]) }
+            i = i + 1
+        }
+        return out
+    }
+}

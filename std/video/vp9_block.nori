@@ -1,0 +1,1304 @@
+// std/video/vp9_block.nori: VP9's tiles, partitions and blocks (spec §6.4), their mode info, motion vector
+// prediction (§6.5) and the coefficient tokens (§6.4.24-26), with the probability contexts of §9.3.2 and the counts
+// of §9.3.4. A block is decoded into the tile's Blk record, predicted and reconstructed as its residual is read
+// (vp9_recon.nori), and its mode info written into the frame's 8x8 map (MI_BYTES each, vp9.nori).
+
+/// the block being decoded (one per tile)
+record Blk {
+    row: Int, col: Int, size: Int, avail_u: Int, avail_l: Int,
+    seg: Int, skip: Int, tx: Int, is_inter: Int, y_mode: Int, uv_mode: Int, sub: [Int; 4],
+    ref0: Int, ref1: Int, filt: Int,
+    bmv: [Int; 16],                 // BlockMvs[list 2][block 4][row, col]
+    mv: [Int; 4],                   // Mv[list][comp]
+    best: [Int; 4], nearest: [Int; 4], near: [Int; 4],
+    rlm: [Int; 4], rcount: Int,     // RefListMv[2][2], RefMvCount
+    cmv: [Int; 4], cframe: [Int; 2],
+    modectx: [Int; 4],
+    lref0: Int, lref1: Int, aref0: Int, aref1: Int,
+    eob_total: Int,
+    sub8: [Int; 4]
+}
+
+fn v9_tiles_alloc(d: V9) {
+    let want = 64
+    if d.tiles != 0 { return }
+    unsafe {
+        d.tiles = calloc(want, 8)
+        var i = 0
+        while i < want {
+            let t = rnew(T9)
+            t.lnz = calloc(3 * 16 + 16, 1)
+            t.lpart = calloc(16, 1)
+            t.lseg = calloc(16, 1)
+            t.coef = calloc(1024 + 32, 8)
+            t.tcache = calloc(1024 + 32, 1)
+            t.pred = calloc(2 * 64 * 64 + 80 * 64 * 8 + 64, 1)
+            t.edge = calloc(200, 8)
+            t.counts = calloc(C_SIZE(), 4)
+            let b = rnew(Blk)
+            t.blk = raddr(b)
+            poke(d.tiles + i * 8, raddr(t))
+            i = i + 1
+        }
+    }
+    d.ntiles = want
+}
+fn v9_tile(d: V9, i: Int) -> T9 { unsafe { return rview(T9, peek(d.tiles + i * 8)) } }
+/// the records behind addresses (views: nothing allocated)
+fn fb_of(a: Int) -> Fb { unsafe { return rview(Fb, a) } }
+fn blk_of(t: T9) -> Blk { unsafe { return rview(Blk, t.blk) } }
+fn v9_tiles_free(d: V9) {
+    unsafe {
+        var i = 0
+        while i < d.ntiles {
+            let t = rview(T9, peek(d.tiles + i * 8))
+            free(t.lnz)  free(t.lpart)  free(t.lseg)  free(t.coef)  free(t.tcache)  free(t.pred)  free(t.edge)  free(t.counts)
+            rfree(rview(Blk, t.blk))
+            rfree(t)
+            i = i + 1
+        }
+        free(d.tiles)
+    }
+    d.tiles = 0
+}
+/// the tiles' counts summed into the frame's (§8.4 reads them)
+fn v9_tiles_sum_counts(d: V9) {
+    unsafe {
+        memset(d.counts, 0, C_SIZE() * 4)
+        var i = 0
+        while i < d.ntiles {
+            let t = rview(T9, peek(d.tiles + i * 8))
+            var k = 0
+            while k < C_SIZE() { poke32(d.counts + k * 4, peek32(d.counts + k * 4) + peek32(t.counts + k * 4))  k = k + 1 }
+            i = i + 1
+        }
+    }
+}
+
+fn v9_tile_offset(i: Int, mis: Int, log2: Int) -> Int {
+    let sbs = (mis + 7) >> 3
+    let off = ((i * sbs) >> log2) << 3
+    if off < mis { return off }
+    return mis
+}
+
+/// decode_tiles (§6.4): each tile's size, its bool decoder, its superblocks; the tiles of one row on threads
+fn v9_decode_tiles(d: V9, p: Int, n: Int) -> Bool {
+    let cols = 1 << d.tile_cols_log2
+    let rows = 1 << d.tile_rows_log2
+    if cols * rows > d.ntiles { d.errc = 20  return false }
+    unsafe {
+        memset(d.anz, 0, 3 * (d.mi_cols * 2 + 64))
+        memset(d.apart, 0, d.sb_cols * 8 + 16)
+        memset(d.aseg, 0, d.mi_cols + 16)
+        var i = 0
+        while i < d.ntiles { let t = rview(T9, peek(d.tiles + i * 8))  memset(t.counts, 0, C_SIZE() * 4)  i = i + 1 }
+    }
+    var off = 0
+    var left = n
+    var tr = 0
+    while tr < rows {
+        var tc = 0
+        while tc < cols {
+            let last = tr == rows - 1 && tc == cols - 1
+            var size = left
+            if !last {
+                if left < 4 { d.errc = 21  return false }
+                unsafe { size = (peek8(p + off) << 24) | (peek8(p + off + 1) << 16) | (peek8(p + off + 2) << 8) | peek8(p + off + 3) }
+                off = off + 4
+                left = left - 4
+                if size > left { d.errc = 21  return false }
+            }
+            let t = v9_tile(d, tr * cols + tc)
+            t.row0 = v9_tile_offset(tr, d.mi_rows, d.tile_rows_log2)
+            t.row1 = v9_tile_offset(tr + 1, d.mi_rows, d.tile_rows_log2)
+            t.col0 = v9_tile_offset(tc, d.mi_cols, d.tile_cols_log2)
+            t.col1 = v9_tile_offset(tc + 1, d.mi_cols, d.tile_cols_log2)
+            t.err = 0
+            if size < 1 { d.errc = 21  return false }
+            if !bd_init(t, p + off, size) { d.errc = 22  return false }
+            off = off + size
+            left = left - size
+            tc = tc + 1
+        }
+        // the row's tiles: on threads when asked and there are several (they share nothing but the frame, each its
+        // own columns of it, and their counts are their own)
+        if d.threads > 1 && cols > 1 {
+            // up to four workers, each the tiles k, k + n, k + 2n … of the row (a fork and a join: `parallel`)
+            let dp = raddr(d)
+            let tb = d.tiles + tr * cols * 8
+            var nw = d.threads
+            if nw > 4 { nw = 4 }
+            if nw > cols { nw = cols }
+            if nw == 2 {
+                parallel {
+                    let _w0 = v9_tiles_worker(dp, tb, 0, cols, 2)
+                    let _w1 = v9_tiles_worker(dp, tb, 1, cols, 2)
+                }
+            } else if nw == 3 {
+                parallel {
+                    let _x0 = v9_tiles_worker(dp, tb, 0, cols, 3)
+                    let _x1 = v9_tiles_worker(dp, tb, 1, cols, 3)
+                    let _x2 = v9_tiles_worker(dp, tb, 2, cols, 3)
+                }
+            } else {
+                parallel {
+                    let _y0 = v9_tiles_worker(dp, tb, 0, cols, 4)
+                    let _y1 = v9_tiles_worker(dp, tb, 1, cols, 4)
+                    let _y2 = v9_tiles_worker(dp, tb, 2, cols, 4)
+                    let _y3 = v9_tiles_worker(dp, tb, 3, cols, 4)
+                }
+            }
+            tc = 0
+            while tc < cols {
+                let t2 = v9_tile(d, tr * cols + tc)
+                if t2.err != 0 { d.errc = t2.err  return false }
+                tc = tc + 1
+            }
+        } else {
+            tc = 0
+            while tc < cols {
+                let t = v9_tile(d, tr * cols + tc)
+                v9_decode_tile(d, t)
+                if t.err != 0 { d.errc = t.err  return false }
+                tc = tc + 1
+            }
+        }
+        tr = tr + 1
+    }
+    return true
+}
+/// the tiles first, first + step, … below `cols` of the row whose tile records are listed at `tb`
+fn v9_tiles_worker(dp: Int, tb: Int, first: Int, cols: Int, step: Int) -> Int {
+    var k = first
+    var bad = 0
+    while k < cols {
+        var tp = 0
+        unsafe { tp = peek(tb + k * 8) }
+        let e = v9_tile_task(dp, tp)
+        if e != 0 { bad = e }
+        k = k + step
+    }
+    return bad
+}
+
+fn v9_tile_task(dp: Int, tp: Int) -> Int {
+    var r = 0
+    unsafe {
+        let d = rview(V9, dp)
+        let t = rview(T9, tp)
+        v9_decode_tile(d, t)
+        r = t.err
+    }
+    return r
+}
+
+fn v9_decode_tile(d: V9, t: T9) {
+    var r = t.row0
+    while r < t.row1 && t.err == 0 {
+        unsafe { memset(t.lnz, 0, 3 * 16 + 16)  memset(t.lpart, 0, 16)  memset(t.lseg, 0, 16) }
+        var c = t.col0
+        while c < t.col1 && t.err == 0 {
+            v9_partition(d, t, r, c, 12)
+            c = c + 8
+        }
+        r = r + 8
+    }
+}
+
+// lookups (§10.2), as small functions over literal tables
+// the block size lookups (§10.2), packed four bits an entry into one number (no table made at each call)
+fn miwl(bs: Int) -> Int { return (899546826670080 >> (bs * 4)) & 15 }
+fn mihl(bs: Int) -> Int { return (883050124738560 >> (bs * 4)) & 15 }
+fn bwl(bs: Int) -> Int { return (1199786801828096 >> (bs * 4)) & 15 }
+fn bhl(bs: Int) -> Int { return (1183290099896336 >> (bs * 4)) & 15 }
+fn n8w(bs: Int) -> Int { return 1 << miwl(bs) }
+fn n8h(bs: Int) -> Int { return 1 << mihl(bs) }
+fn n4w(bs: Int) -> Int { return 1 << bwl(bs) }
+fn n4h(bs: Int) -> Int { return 1 << bhl(bs) }
+fn max_tx(bs: Int) -> Int { return (900715343056896 >> (bs * 4)) & 15 }
+fn size_group(bs: Int) -> Int { return max_tx(bs) }
+/// subsize_lookup[partition][bsize] for the square sizes a partition is read for (8x8, 16x16, 32x32, 64x64): NONE the
+/// same, HORZ one smaller (wide), VERT two smaller (tall), SPLIT the next square
+fn subsize(part: Int, bs: Int) -> Int { return bs - part }
+/// ss_size_lookup[bs][1][1] (the chroma block of a 4:2:0 frame; 13 BLOCK_INVALID below 8x8)
+fn uv_bsize(bs: Int) -> Int { if bs < 3 { return 13 }  return bs - 3 }
+
+/// decode_partition (§6.4.3)
+fn v9_partition(d: V9, t: T9, r: Int, c: Int, bsize: Int) {
+    if r >= d.mi_rows || c >= d.mi_cols || t.err != 0 { return }
+    let num8 = n8w(bsize)
+    let half = num8 >> 1
+    let has_rows = (r + half) < d.mi_rows
+    let has_cols = (c + half) < d.mi_cols
+    // the context (§9.3.2)
+    let bsl = miwl(bsize)
+    let boff = 3 - bsl
+    var above = 0
+    var left = 0
+    var i = 0
+    unsafe {
+        while i < num8 { above = above | peek8(d.apart + c + i)  left = left | peek8(t.lpart + ((r + i) & 7))  i = i + 1 }
+    }
+    var a1 = 0
+    var l1 = 0
+    if (above & (1 << boff)) != 0 { a1 = 1 }
+    if (left & (1 << boff)) != 0 { l1 = 1 }
+    let ctx = bsl * 4 + l1 * 2 + a1
+    var probs = d.probs + P_PART() + ctx * 3
+    if d.frame_is_intra == 1 { probs = d.tab + TB_KFPART() + ctx * 3 }
+    var part = 3
+    if has_rows && has_cols { part = bd_tree(t, d.tab + TB_TREES() + TR_PART() * 2, probs) }
+    else if has_cols { var pb = 0  unsafe { pb = peek8(probs + 1) }  if bd_read(t, pb) == 1 { part = 3 } else { part = 1 } }
+    else if has_rows { var pb2 = 0  unsafe { pb2 = peek8(probs + 2) }  if bd_read(t, pb2) == 1 { part = 3 } else { part = 2 } }
+    if d.frame_is_intra == 0 { cnt_inc(t.counts, C_PART() + ctx * 4 + part) }
+    let sub = subsize(part, bsize)
+    if sub < 3 || part == 0 { v9_block(d, t, r, c, sub) }
+    else if part == 1 {
+        v9_block(d, t, r, c, sub)
+        if has_rows { v9_block(d, t, r + half, c, sub) }
+    } else if part == 2 {
+        v9_block(d, t, r, c, sub)
+        if has_cols { v9_block(d, t, r, c + half, sub) }
+    } else {
+        v9_partition(d, t, r, c, sub)
+        v9_partition(d, t, r, c + half, sub)
+        v9_partition(d, t, r + half, c, sub)
+        v9_partition(d, t, r + half, c + half, sub)
+    }
+    if bsize == 3 || part != 3 {
+        let av = 15 >> bwl(sub)
+        let lv = 15 >> bhl(sub)
+        i = 0
+        unsafe { while i < num8 { poke8(d.apart + c + i, av)  poke8(t.lpart + ((r + i) & 7), lv)  i = i + 1 } }
+    }
+}
+
+fn mi_at(d: V9, r: Int, c: Int) -> Int { return d.mi + (r * d.mi_cols + c) * MI_BYTES() }
+fn s16(v: Int) -> Int { if v >= 32768 { return v - 65536 }  return v }
+
+/// decode_block (§6.4.4)
+fn v9_block(d: V9, t: T9, r: Int, c: Int, bsize: Int) {
+    let b = blk_of(t)
+    b.row = r
+    b.col = c
+    b.size = bsize
+    b.avail_u = 0
+    if r > 0 { b.avail_u = 1 }
+    b.avail_l = 0
+    if c > t.col0 { b.avail_l = 1 }
+    if d.frame_is_intra == 1 { v9_intra_frame_mode_info(d, t, b) } else { v9_inter_frame_mode_info(d, t, b) }
+    if t.err != 0 { return }
+    b.eob_total = 0
+    v9_residual(d, t, b)
+    if b.is_inter == 1 && bsize >= 3 && b.eob_total == 0 { b.skip = 1 }
+    // the block's mode info into the map
+    let w = n8w(bsize)
+    let h = n8h(bsize)
+    var y = 0
+    unsafe {
+        while y < h && r + y < d.mi_rows {
+            var x = 0
+            while x < w && c + x < d.mi_cols {
+                let m = mi_at(d, r + y, c + x)
+                poke8(m, bsize)
+                poke8(m + 1, b.skip)
+                poke8(m + 2, b.tx)
+                poke8(m + 3, b.y_mode)
+                poke8(m + 4, b.seg)
+                poke8(m + 5, b.ref0)
+                poke8(m + 6, b.ref1)
+                poke8(m + 7, b.filt)
+                poke8(m + 12, b.is_inter)
+                poke8(m + 13, b.uv_mode)
+                var k = 0
+                while k < 4 { poke8(m + 8 + k, b.sub[k])  k = k + 1 }
+                k = 0
+                while k < 16 { poke16(m + 16 + k * 2, b.bmv[k] & 65535)  k = k + 1 }
+                poke8(d.seg_ids + (r + y) * d.mi_cols + c + x, b.seg)
+                x = x + 1
+            }
+            y = y + 1
+        }
+    }
+}
+
+// ---- mode info (§6.4.5-6.4.20) ----------------------------------------------------------------------------------------
+
+fn seg_active(d: V9, seg: Int, f: Int) -> Bool { return d.seg_on == 1 && d.seg_feat_on[seg * 4 + f] == 1 }
+
+fn v9_read_skip(d: V9, t: T9, b: Blk) {
+    if seg_active(d, b.seg, 3) { b.skip = 1  return }
+    var ctx = 0
+    unsafe {
+        if b.avail_u == 1 { ctx = ctx + peek8(mi_at(d, b.row - 1, b.col) + 1) }
+        if b.avail_l == 1 { ctx = ctx + peek8(mi_at(d, b.row, b.col - 1) + 1) }
+        b.skip = bd_read(t, peek8(d.probs + P_SKIP() + ctx))
+    }
+    cnt_inc(t.counts, C_SKIP() + ctx * 2 + b.skip)
+}
+
+fn v9_read_tx_size(d: V9, t: T9, b: Blk, allow: Bool) {
+    let maxsz = max_tx(b.size)
+    if allow && d.tx_mode == 4 && b.size >= 3 {
+        var above = maxsz
+        var left = maxsz
+        unsafe {
+            if b.avail_u == 1 { let m = mi_at(d, b.row - 1, b.col)  if peek8(m + 1) == 0 { above = peek8(m + 2) } }
+            if b.avail_l == 1 { let m2 = mi_at(d, b.row, b.col - 1)  if peek8(m2 + 1) == 0 { left = peek8(m2 + 2) } }
+        }
+        if b.avail_l == 0 { left = above }
+        if b.avail_u == 0 { above = left }
+        var ctx = 0
+        if above + left > maxsz { ctx = 1 }
+        var tree = TR_TX8()
+        if maxsz == 3 { tree = TR_TX32() } else if maxsz == 2 { tree = TR_TX16() }
+        b.tx = bd_tree(t, d.tab + TB_TREES() + tree * 2, d.probs + P_TX() + (maxsz * 2 + ctx) * 3)
+        cnt_inc(t.counts, C_TX() + (maxsz * 2 + ctx) * 4 + b.tx)
+    } else {
+        var m = d.tx_mode
+        if m > 3 { m = 3 }
+        if maxsz < m { m = maxsz }
+        b.tx = m
+    }
+}
+
+fn v9_intra_segment_id(d: V9, t: T9, b: Blk) {
+    b.seg = 0
+    if d.seg_on == 1 && d.seg_map == 1 { b.seg = v9_seg_tree(d, t) }
+}
+fn v9_seg_tree(d: V9, t: T9) -> Int {
+    // segment_tree with segmentation_tree_probs[node]
+    var n = 0
+    var going = true
+    // segment_tree: {2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4, -5, -6, -7}: nodes 0..5 lead to 2n+2+bit, 6..13 are leaves
+    while going {
+        let bit = bd_read(t, d.seg_tree[n >> 1])
+        let i = n + bit
+        if i < 6 { n = 2 * i + 2 } else { n = 0 - (i - 6)  going = false }
+    }
+    return 0 - n
+}
+
+/// intra_frame_mode_info (§6.4.6), with the kf probabilities of §9.3.2
+fn v9_intra_frame_mode_info(d: V9, t: T9, b: Blk) {
+    v9_intra_segment_id(d, t, b)
+    v9_read_skip(d, t, b)
+    v9_read_tx_size(d, t, b, true)
+    b.ref0 = 0
+    b.ref1 = NONE_REF()
+    b.is_inter = 0
+    b.filt = 0
+    let tree = d.tab + TB_TREES() + TR_INTRA() * 2
+    if b.size >= 3 {
+        let am = v9_above_mode(d, b, 2)
+        let lm = v9_left_mode(d, b, 1)
+        b.y_mode = bd_tree(t, tree, d.tab + TB_KFY() + (am * 10 + lm) * 9)
+        var k = 0
+        while k < 4 { b.sub[k] = b.y_mode  k = k + 1 }
+    } else {
+        let w4 = n4w(b.size)
+        let h4 = n4h(b.size)
+        var idy = 0
+        var m = 0
+        while idy < 2 {
+            var idx = 0
+            while idx < 2 {
+                var am = 0
+                var lm = 0
+                if idy > 0 { am = b.sub[idx] } else { am = v9_above_mode(d, b, 2 + idx) }
+                if idx > 0 { lm = b.sub[idy * 2] } else { lm = v9_left_mode(d, b, 1 + idy * 2) }
+                m = bd_tree(t, tree, d.tab + TB_KFY() + (am * 10 + lm) * 9)
+                var y2 = 0
+                while y2 < h4 { var x2 = 0  while x2 < w4 { b.sub[(idy + y2) * 2 + idx + x2] = m  x2 = x2 + 1 }  y2 = y2 + 1 }
+                idx = idx + w4
+            }
+            idy = idy + h4
+        }
+        b.y_mode = m
+    }
+    b.uv_mode = bd_tree(t, tree, d.tab + TB_KFUV() + b.y_mode * 9)
+}
+/// the sub mode `k` of the block above (DC_PRED when there is none)
+fn v9_above_mode(d: V9, b: Blk, k: Int) -> Int {
+    if b.avail_u == 0 { return 0 }
+    var v = 0
+    unsafe { v = peek8(mi_at(d, b.row - 1, b.col) + 8 + k) }
+    return v
+}
+fn v9_left_mode(d: V9, b: Blk, k: Int) -> Int {
+    if b.avail_l == 0 { return 0 }
+    var v = 0
+    unsafe { v = peek8(mi_at(d, b.row, b.col - 1) + 8 + k) }
+    return v
+}
+
+/// inter_frame_mode_info (§6.4.11)
+fn v9_inter_frame_mode_info(d: V9, t: T9, b: Blk) {
+    b.lref0 = 0  b.lref1 = NONE_REF()  b.aref0 = 0  b.aref1 = NONE_REF()
+    unsafe {
+        if b.avail_l == 1 { let m = mi_at(d, b.row, b.col - 1)  b.lref0 = peek8(m + 5)  b.lref1 = peek8(m + 6) }
+        if b.avail_u == 1 { let m2 = mi_at(d, b.row - 1, b.col)  b.aref0 = peek8(m2 + 5)  b.aref1 = peek8(m2 + 6) }
+    }
+    v9_inter_segment_id(d, t, b)
+    v9_read_skip(d, t, b)
+    v9_read_is_inter(d, t, b)
+    v9_read_tx_size(d, t, b, b.skip == 0 || b.is_inter == 0)
+    if b.is_inter == 1 { v9_inter_block_mode_info(d, t, b) } else { v9_intra_block_mode_info(d, t, b) }
+}
+
+fn v9_get_segment_id(d: V9, b: Blk) -> Int {
+    var xmis = d.mi_cols - b.col
+    if n8w(b.size) < xmis { xmis = n8w(b.size) }
+    var ymis = d.mi_rows - b.row
+    if n8h(b.size) < ymis { ymis = n8h(b.size) }
+    var seg = 7
+    var y = 0
+    unsafe {
+        while y < ymis {
+            var x = 0
+            while x < xmis { let s = peek8(d.prev_seg + (b.row + y) * d.mi_cols + b.col + x)  if s < seg { seg = s }  x = x + 1 }
+            y = y + 1
+        }
+    }
+    return seg
+}
+
+fn v9_inter_segment_id(d: V9, t: T9, b: Blk) {
+    if d.seg_on == 0 { b.seg = 0  return }
+    let pred = v9_get_segment_id(d, b)
+    if d.seg_map == 0 { b.seg = pred  return }
+    if d.seg_temporal == 1 {
+        var ctx = 0
+        unsafe { ctx = peek8(t.lseg + (b.row & 7)) + peek8(d.aseg + b.col) }
+        let sp = bd_read(t, d.seg_pred[ctx])
+        if sp == 1 { b.seg = pred } else { b.seg = v9_seg_tree(d, t) }
+        var i = 0
+        unsafe {
+            while i < n8w(b.size) { poke8(d.aseg + b.col + i, sp)  i = i + 1 }
+            i = 0
+            while i < n8h(b.size) { poke8(t.lseg + ((b.row + i) & 7), sp)  i = i + 1 }
+        }
+    } else { b.seg = v9_seg_tree(d, t) }
+}
+
+fn is_intra_ref(r: Int) -> Bool { return r == 0 }
+fn is_single(r1: Int) -> Bool { return r1 == NONE_REF() }
+
+fn v9_read_is_inter(d: V9, t: T9, b: Blk) {
+    if seg_active(d, b.seg, 2) { if d.seg_feat[b.seg * 4 + 2] != 0 { b.is_inter = 1 } else { b.is_inter = 0 }  return }
+    let li = is_intra_ref(b.lref0)
+    let ai = is_intra_ref(b.aref0)
+    var ctx = 0
+    if b.avail_u == 1 && b.avail_l == 1 {
+        if li && ai { ctx = 3 } else if li || ai { ctx = 1 } else { ctx = 0 }
+    } else if b.avail_u == 1 || b.avail_l == 1 {
+        var x = li
+        if b.avail_u == 1 { x = ai }
+        if x { ctx = 2 }
+    }
+    unsafe { b.is_inter = bd_read(t, peek8(d.probs + P_ISINTER() + ctx)) }
+    cnt_inc(t.counts, C_ISINTER() + ctx * 2 + b.is_inter)
+}
+
+/// intra_block_mode_info (§6.4.15): intra blocks in inter frames
+fn v9_intra_block_mode_info(d: V9, t: T9, b: Blk) {
+    b.ref0 = 0
+    b.ref1 = NONE_REF()
+    b.filt = 0
+    let tree = d.tab + TB_TREES() + TR_INTRA() * 2
+    if b.size >= 3 {
+        let ctx = size_group(b.size)
+        b.y_mode = bd_tree(t, tree, d.probs + P_YMODE() + ctx * 9)
+        cnt_inc(t.counts, C_YMODE() + ctx * 10 + b.y_mode)
+        var k = 0
+        while k < 4 { b.sub[k] = b.y_mode  k = k + 1 }
+    } else {
+        let w4 = n4w(b.size)
+        let h4 = n4h(b.size)
+        var idy = 0
+        var m = 0
+        while idy < 2 {
+            var idx = 0
+            while idx < 2 {
+                m = bd_tree(t, tree, d.probs + P_YMODE())
+                cnt_inc(t.counts, C_YMODE() + m)
+                var y2 = 0
+                while y2 < h4 { var x2 = 0  while x2 < w4 { b.sub[(idy + y2) * 2 + idx + x2] = m  x2 = x2 + 1 }  y2 = y2 + 1 }
+                idx = idx + w4
+            }
+            idy = idy + h4
+        }
+        b.y_mode = m
+    }
+    b.uv_mode = bd_tree(t, tree, d.probs + P_UVMODE() + b.y_mode * 9)
+    cnt_inc(t.counts, C_UVMODE() + b.y_mode * 10 + b.uv_mode)
+}
+
+/// read_ref_frames (§6.4.17)
+fn v9_read_ref_frames(d: V9, t: T9, b: Blk) {
+    if seg_active(d, b.seg, 2) { b.ref0 = d.seg_feat[b.seg * 4 + 2]  b.ref1 = NONE_REF()  return }
+    var comp = d.ref_mode
+    if d.ref_mode == 2 {
+        let ctx = v9_ctx_comp_mode(d, b)
+        unsafe { comp = bd_read(t, peek8(d.probs + P_COMPMODE() + ctx)) }
+        cnt_inc(t.counts, C_COMPMODE() + ctx * 2 + comp)
+    }
+    if comp == 1 {
+        let idx = d.sign_bias[d.comp_fixed]
+        let ctx2 = v9_ctx_comp_ref(d, b)
+        var cr = 0
+        unsafe { cr = bd_read(t, peek8(d.probs + P_CREF() + ctx2)) }
+        cnt_inc(t.counts, C_CREF() + ctx2 * 2 + cr)
+        var var_ref = d.comp_var0
+        if cr == 1 { var_ref = d.comp_var1 }
+        if idx == 0 { b.ref0 = d.comp_fixed  b.ref1 = var_ref } else { b.ref1 = d.comp_fixed  b.ref0 = var_ref }
+    } else {
+        let c1 = v9_ctx_single_p1(b)
+        var p1 = 0
+        unsafe { p1 = bd_read(t, peek8(d.probs + P_SREF() + c1 * 2)) }
+        cnt_inc(t.counts, C_SREF() + (c1 * 2 + 0) * 2 + p1)
+        if p1 == 1 {
+            let c2 = v9_ctx_single_p2(b)
+            var p2 = 0
+            unsafe { p2 = bd_read(t, peek8(d.probs + P_SREF() + c2 * 2 + 1)) }
+            cnt_inc(t.counts, C_SREF() + (c2 * 2 + 1) * 2 + p2)
+            if p2 == 1 { b.ref0 = 3 } else { b.ref0 = 2 }
+        } else { b.ref0 = 1 }
+        b.ref1 = NONE_REF()
+    }
+}
+
+fn bi(c: Bool) -> Int { if c { return 1 }  return 0 }
+
+fn v9_ctx_comp_mode(d: V9, b: Blk) -> Int {
+    let au = b.avail_u == 1
+    let al = b.avail_l == 1
+    let as1 = is_single(b.aref1)
+    let ls1 = is_single(b.lref1)
+    let ai = is_intra_ref(b.aref0)
+    let li = is_intra_ref(b.lref0)
+    let fx = d.comp_fixed
+    if au && al {
+        if as1 && ls1 { return bi(b.aref0 == fx) ^ bi(b.lref0 == fx) }
+        if as1 { return 2 + bi(b.aref0 == fx || ai) }
+        if ls1 { return 2 + bi(b.lref0 == fx || li) }
+        return 4
+    }
+    if au { if as1 { return bi(b.aref0 == fx) }  return 3 }
+    if al { if ls1 { return bi(b.lref0 == fx) }  return 3 }
+    return 1
+}
+
+/// a block's reference `i` (0 or 1) of the above / left block
+fn aref(b: Blk, i: Int) -> Int { if i == 0 { return b.aref0 }  return b.aref1 }
+fn lref(b: Blk, i: Int) -> Int { if i == 0 { return b.lref0 }  return b.lref1 }
+
+fn v9_ctx_comp_ref(d: V9, b: Blk) -> Int {
+    let fix_idx = d.sign_bias[d.comp_fixed]
+    let var_idx = 1 - fix_idx
+    let au = b.avail_u == 1
+    let al = b.avail_l == 1
+    let as1 = is_single(b.aref1)
+    let ls1 = is_single(b.lref1)
+    let ai = is_intra_ref(b.aref0)
+    let li = is_intra_ref(b.lref0)
+    let v1 = d.comp_var1
+    let v0 = d.comp_var0
+    if au && al {
+        if ai && li { return 2 }
+        if li {
+            if as1 { return 1 + 2 * bi(b.aref0 != v1) }
+            return 1 + 2 * bi(aref(b, var_idx) != v1)
+        }
+        if ai {
+            if ls1 { return 1 + 2 * bi(b.lref0 != v1) }
+            return 1 + 2 * bi(lref(b, var_idx) != v1)
+        }
+        var vrfa = aref(b, var_idx)
+        if as1 { vrfa = b.aref0 }
+        var vrfl = lref(b, var_idx)
+        if ls1 { vrfl = b.lref0 }
+        if vrfa == vrfl && v1 == vrfa { return 0 }
+        if ls1 && as1 {
+            if (vrfa == d.comp_fixed && vrfl == v0) || (vrfl == d.comp_fixed && vrfa == v0) { return 4 }
+            if vrfa == vrfl { return 3 }
+            return 1
+        }
+        if ls1 || as1 {
+            var vrfc = vrfl
+            if ls1 { vrfc = vrfa }
+            var rfs = vrfl
+            if as1 { rfs = vrfa }
+            if vrfc == v1 && rfs != v1 { return 1 }
+            if rfs == v1 && vrfc != v1 { return 2 }
+            return 4
+        }
+        if vrfa == vrfl { return 4 }
+        return 2
+    }
+    if au {
+        if ai { return 2 }
+        if as1 { return 3 * bi(b.aref0 != v1) }
+        return 4 * bi(aref(b, var_idx) != v1)
+    }
+    if al {
+        if li { return 2 }
+        if ls1 { return 3 * bi(b.lref0 != v1) }
+        return 4 * bi(lref(b, var_idx) != v1)
+    }
+    return 2
+}
+
+fn v9_ctx_single_p1(b: Blk) -> Int {
+    let au = b.avail_u == 1
+    let al = b.avail_l == 1
+    let as1 = is_single(b.aref1)
+    let ls1 = is_single(b.lref1)
+    let ai = is_intra_ref(b.aref0)
+    let li = is_intra_ref(b.lref0)
+    if au && al {
+        if ai && li { return 2 }
+        if li {
+            if as1 { return 4 * bi(b.aref0 == 1) }
+            return 1 + bi(b.aref0 == 1 || b.aref1 == 1)
+        }
+        if ai {
+            if ls1 { return 4 * bi(b.lref0 == 1) }
+            return 1 + bi(b.lref0 == 1 || b.lref1 == 1)
+        }
+        if as1 && ls1 { return 2 * bi(b.aref0 == 1) + 2 * bi(b.lref0 == 1) }
+        if !as1 && !ls1 { return 1 + bi(b.aref0 == 1 || b.aref1 == 1 || b.lref0 == 1 || b.lref1 == 1) }
+        var rfs = b.lref0
+        var crf1 = b.aref0
+        var crf2 = b.aref1
+        if as1 { rfs = b.aref0  crf1 = b.lref0  crf2 = b.lref1 }
+        if rfs == 1 { return 3 + bi(crf1 == 1 || crf2 == 1) }
+        return bi(crf1 == 1 || crf2 == 1)
+    }
+    if au {
+        if ai { return 2 }
+        if as1 { return 4 * bi(b.aref0 == 1) }
+        return 1 + bi(b.aref0 == 1 || b.aref1 == 1)
+    }
+    if al {
+        if li { return 2 }
+        if ls1 { return 4 * bi(b.lref0 == 1) }
+        return 1 + bi(b.lref0 == 1 || b.lref1 == 1)
+    }
+    return 2
+}
+
+fn v9_ctx_single_p2(b: Blk) -> Int {
+    let au = b.avail_u == 1
+    let al = b.avail_l == 1
+    let as1 = is_single(b.aref1)
+    let ls1 = is_single(b.lref1)
+    let ai = is_intra_ref(b.aref0)
+    let li = is_intra_ref(b.lref0)
+    if au && al {
+        if ai && li { return 2 }
+        if li {
+            if as1 { if b.aref0 == 1 { return 3 }  return 4 * bi(b.aref0 == 2) }
+            return 1 + 2 * bi(b.aref0 == 2 || b.aref1 == 2)
+        }
+        if ai {
+            if ls1 { if b.lref0 == 1 { return 3 }  return 4 * bi(b.lref0 == 2) }
+            return 1 + 2 * bi(b.lref0 == 2 || b.lref1 == 2)
+        }
+        if as1 && ls1 {
+            if b.aref0 == 1 && b.lref0 == 1 { return 3 }
+            if b.aref0 == 1 { return 4 * bi(b.lref0 == 2) }
+            if b.lref0 == 1 { return 4 * bi(b.aref0 == 2) }
+            return 2 * bi(b.aref0 == 2) + 2 * bi(b.lref0 == 2)
+        }
+        if !as1 && !ls1 {
+            if b.aref0 == b.lref0 && b.aref1 == b.lref1 { return 3 * bi(b.aref0 == 2 || b.aref1 == 2) }
+            return 2
+        }
+        var rfs = b.lref0
+        var crf1 = b.aref0
+        var crf2 = b.aref1
+        if as1 { rfs = b.aref0  crf1 = b.lref0  crf2 = b.lref1 }
+        if rfs == 2 { return 3 + bi(crf1 == 2 || crf2 == 2) }
+        if rfs == 3 { return bi(crf1 == 2 || crf2 == 2) }
+        return 1 + 2 * bi(crf1 == 2 || crf2 == 2)
+    }
+    if au {
+        if ai || (b.aref0 == 1 && as1) { return 2 }
+        if as1 { return 4 * bi(b.aref0 == 2) }
+        return 3 * bi(b.aref0 == 2 || b.aref1 == 2)
+    }
+    if al {
+        if li || (b.lref0 == 1 && ls1) { return 2 }
+        if ls1 { return 4 * bi(b.lref0 == 2) }
+        return 3 * bi(b.lref0 == 2 || b.lref1 == 2)
+    }
+    return 2
+}
+
+/// inter_block_mode_info (§6.4.16)
+fn v9_inter_block_mode_info(d: V9, t: T9, b: Blk) {
+    v9_read_ref_frames(d, t, b)
+    b.uv_mode = 0
+    var k = 0
+    while k < 4 { b.sub[k] = 0  k = k + 1 }
+    k = 0
+    while k < 16 { b.bmv[k] = 0  k = k + 1 }
+    var j = 0
+    while j < 2 {
+        var rf = b.ref0
+        if j == 1 { rf = b.ref1 }
+        if rf > 0 && rf != NONE_REF() {
+            v9_find_mv_refs(d, t, b, rf, 0 - 1)
+            v9_find_best_ref_mvs(d, b, j)
+        }
+        j = j + 1
+    }
+    let compound = b.ref1 != NONE_REF() && b.ref1 > 0
+    if seg_active(d, b.seg, 3) { b.y_mode = 12 }
+    else if b.size >= 3 { b.y_mode = 10 + v9_read_inter_mode(d, t, b) }
+    if d.interp_filter == 4 {
+        // the context (§9.3.2)
+        var li = 3
+        var ai = 3
+        unsafe {
+            if b.avail_l == 1 && b.lref0 > 0 { li = peek8(mi_at(d, b.row, b.col - 1) + 7) }
+            if b.avail_u == 1 && b.aref0 > 0 { ai = peek8(mi_at(d, b.row - 1, b.col) + 7) }
+        }
+        var ctx = 3
+        if li == ai { ctx = li } else if li == 3 && ai != 3 { ctx = ai } else if li != 3 && ai == 3 { ctx = li }
+        b.filt = bd_tree(t, d.tab + TB_TREES() + TR_INTERP() * 2, d.probs + P_INTERP() + ctx * 2)
+        cnt_inc(t.counts, C_INTERP() + ctx * 3 + b.filt)
+    } else { b.filt = d.interp_filter }
+    var ncomp = 1
+    if compound { ncomp = 2 }
+    if b.size < 3 {
+        let w4 = n4w(b.size)
+        let h4 = n4h(b.size)
+        var idy = 0
+        while idy < 2 {
+            var idx = 0
+            while idx < 2 {
+                b.y_mode = 10 + v9_read_inter_mode(d, t, b)
+                if b.y_mode == 10 || b.y_mode == 11 {
+                    var jj = 0
+                    while jj < ncomp { v9_append_sub8x8_mvs(d, t, b, idy * 2 + idx, jj)  jj = jj + 1 }
+                }
+                v9_assign_mv(d, t, b, compound)
+                var y2 = 0
+                while y2 < h4 {
+                    var x2 = 0
+                    while x2 < w4 {
+                        let blk = (idy + y2) * 2 + idx + x2
+                        var l = 0
+                        while l < ncomp { b.bmv[l * 8 + blk * 2] = b.mv[l * 2]  b.bmv[l * 8 + blk * 2 + 1] = b.mv[l * 2 + 1]  l = l + 1 }
+                        x2 = x2 + 1
+                    }
+                    y2 = y2 + 1
+                }
+                idx = idx + w4
+            }
+            idy = idy + h4
+        }
+    } else {
+        v9_assign_mv(d, t, b, compound)
+        var l = 0
+        while l < ncomp {
+            var blk = 0
+            while blk < 4 { b.bmv[l * 8 + blk * 2] = b.mv[l * 2]  b.bmv[l * 8 + blk * 2 + 1] = b.mv[l * 2 + 1]  blk = blk + 1 }
+            l = l + 1
+        }
+    }
+}
+
+fn v9_read_inter_mode(d: V9, t: T9, b: Blk) -> Int {
+    let ctx = b.modectx[b.ref0]
+    let v = bd_tree(t, d.tab + TB_TREES() + TR_INTER() * 2, d.probs + P_INTERMODE() + ctx * 3)
+    cnt_inc(t.counts, C_INTERMODE() + ctx * 4 + v)
+    return v
+}
+
+fn v9_assign_mv(d: V9, t: T9, b: Blk, compound: Bool) {
+    b.mv[2] = 0
+    b.mv[3] = 0
+    var n = 1
+    if compound { n = 2 }
+    var i = 0
+    while i < n {
+        if b.y_mode == 13 { v9_read_mv(d, t, b, i) }
+        else if b.y_mode == 10 { b.mv[i * 2] = b.nearest[i * 2]  b.mv[i * 2 + 1] = b.nearest[i * 2 + 1] }
+        else if b.y_mode == 11 { b.mv[i * 2] = b.near[i * 2]  b.mv[i * 2 + 1] = b.near[i * 2 + 1] }
+        else { b.mv[i * 2] = 0  b.mv[i * 2 + 1] = 0 }
+        i = i + 1
+    }
+}
+
+fn use_mv_hp(r: Int, c: Int) -> Bool {
+    var ar = r
+    if ar < 0 { ar = 0 - ar }
+    var ac = c
+    if ac < 0 { ac = 0 - ac }
+    return (ar >> 3) < 8 && (ac >> 3) < 8
+}
+
+fn v9_read_mv(d: V9, t: T9, b: Blk, r: Int) {
+    let usehp = d.allow_hp == 1 && use_mv_hp(b.best[r * 2], b.best[r * 2 + 1])
+    var dr = 0
+    var dc = 0
+    let j = bd_tree(t, d.tab + TB_TREES() + TR_MVJ() * 2, d.probs + P_MVJ())
+    cnt_inc(t.counts, C_MVJ() + j)
+    if j == 2 || j == 3 { dr = v9_read_mv_component(d, t, 0, usehp) }
+    if j == 1 || j == 3 { dc = v9_read_mv_component(d, t, 1, usehp) }
+    b.mv[r * 2] = b.best[r * 2] + dr
+    b.mv[r * 2 + 1] = b.best[r * 2 + 1] + dc
+}
+
+fn v9_read_mv_component(d: V9, t: T9, comp: Int, usehp: Bool) -> Int {
+    let p = d.probs
+    let c = t.counts
+    var sign = 0
+    unsafe { sign = bd_read(t, peek8(p + P_MVSIGN() + comp)) }
+    cnt_inc(c, C_MVSIGN() + comp * 2 + sign)
+    let cls = bd_tree(t, d.tab + TB_TREES() + TR_MVCLASS() * 2, p + P_MVCLASS() + comp * 10)
+    cnt_inc(c, C_MVCLASS() + comp * 11 + cls)
+    var mag = 0
+    if cls == 0 {
+        var c0 = 0
+        unsafe { c0 = bd_read(t, peek8(p + P_MVC0BIT() + comp)) }
+        cnt_inc(c, C_MVC0BIT() + comp * 2 + c0)
+        let fr = bd_tree(t, d.tab + TB_TREES() + TR_MVFR() * 2, p + P_MVC0FR() + (comp * 2 + c0) * 3)
+        cnt_inc(c, C_MVC0FR() + (comp * 2 + c0) * 4 + fr)
+        var hp = 1
+        if usehp { unsafe { hp = bd_read(t, peek8(p + P_MVC0HP() + comp)) } }
+        cnt_inc(c, C_MVC0HP() + comp * 2 + hp)
+        mag = ((c0 << 3) | (fr << 1) | hp) + 1
+    } else {
+        var dd = 0
+        var i = 0
+        while i < cls {
+            var bit = 0
+            unsafe { bit = bd_read(t, peek8(p + P_MVBITS() + comp * 10 + i)) }
+            cnt_inc(c, C_MVBITS() + (comp * 10 + i) * 2 + bit)
+            dd = dd | (bit << i)
+            i = i + 1
+        }
+        mag = 2 << (cls + 2)
+        let fr2 = bd_tree(t, d.tab + TB_TREES() + TR_MVFR() * 2, p + P_MVFR() + comp * 3)
+        cnt_inc(c, C_MVFR() + comp * 4 + fr2)
+        var hp2 = 1
+        if usehp { unsafe { hp2 = bd_read(t, peek8(p + P_MVHP() + comp)) } }
+        cnt_inc(c, C_MVHP() + comp * 2 + hp2)
+        mag = mag + ((dd << 3) | (fr2 << 1) | hp2) + 1
+    }
+    if sign == 1 { return 0 - mag }
+    return mag
+}
+
+// ---- motion vector prediction (§6.5) ------------------------------------------------------------------------------
+
+/// mv_ref_blocks[bs][i / 2][i %% 2] (§6.5.1), from the tables' copy in raw memory (signed bytes)
+fn mv_ref_search(d: V9, bs: Int, i: Int) -> Int {
+    var v = 0
+    unsafe { v = peek8(d.tab + TB_MVREF() + bs * 16 + i) }
+    if v >= 128 { return v - 256 }
+    return v
+}
+
+fn mv_eq(a0: Int, a1: Int, b0: Int, b1: Int) -> Bool { return a0 == b0 && a1 == b1 }
+
+fn v9_add_mv_ref(b: Blk, l: Int) {
+    if b.rcount >= 2 { return }
+    if b.rcount > 0 && mv_eq(b.cmv[l * 2], b.cmv[l * 2 + 1], b.rlm[0], b.rlm[1]) { return }
+    b.rlm[b.rcount * 2] = b.cmv[l * 2]
+    b.rlm[b.rcount * 2 + 1] = b.cmv[l * 2 + 1]
+    b.rcount = b.rcount + 1
+}
+
+/// get_block_mv (§6.5.10): the candidate's motion vector and frame for list `l`, from this frame or the previous
+fn v9_get_block_mv(d: V9, b: Blk, r: Int, c: Int, l: Int, prev: Bool) {
+    var m = d.mi + (r * d.mi_cols + c) * MI_BYTES()
+    if prev { m = d.prev_mi + (r * d.mi_cols + c) * MI_BYTES() }
+    unsafe {
+        b.cmv[l * 2] = s16(peek16(m + 16 + l * 16 + 3 * 4))
+        b.cmv[l * 2 + 1] = s16(peek16(m + 16 + l * 16 + 3 * 4 + 2))
+        b.cframe[l] = peek8(m + 5 + l)
+    }
+}
+
+fn v9_same_ref_add(d: V9, b: Blk, r: Int, c: Int, rf: Int, prev: Bool) {
+    var j = 0
+    while j < 2 {
+        v9_get_block_mv(d, b, r, c, j, prev)
+        if b.cframe[j] == rf { v9_add_mv_ref(b, j)  return }
+        j = j + 1
+    }
+}
+
+fn v9_diff_ref_add(d: V9, b: Blk, r: Int, c: Int, rf: Int, prev: Bool) {
+    v9_get_block_mv(d, b, r, c, 0, prev)
+    v9_get_block_mv(d, b, r, c, 1, prev)
+    let same = mv_eq(b.cmv[0], b.cmv[1], b.cmv[2], b.cmv[3])
+    if b.cframe[0] > 0 && b.cframe[0] != NONE_REF() && b.cframe[0] != rf {
+        if d.sign_bias[b.cframe[0]] != d.sign_bias[rf] { b.cmv[0] = 0 - b.cmv[0]  b.cmv[1] = 0 - b.cmv[1] }
+        v9_add_mv_ref(b, 0)
+    }
+    if b.cframe[1] > 0 && b.cframe[1] != NONE_REF() && b.cframe[1] != rf && !same {
+        if d.sign_bias[b.cframe[1]] != d.sign_bias[rf] { b.cmv[2] = 0 - b.cmv[2]  b.cmv[3] = 0 - b.cmv[3] }
+        v9_add_mv_ref(b, 1)
+    }
+}
+
+fn clip3(lo: Int, hi: Int, v: Int) -> Int { if v < lo { return lo }  if v > hi { return hi }  return v }
+
+fn v9_clamp_row(d: V9, b: Blk, v: Int, border: Int) -> Int {
+    let bh = n8h(b.size)
+    let top = 0 - ((b.row * 8) * 8)
+    let bot = ((d.mi_rows - bh - b.row) * 8) * 8
+    return clip3(top - border, bot + border, v)
+}
+fn v9_clamp_col(d: V9, b: Blk, v: Int, border: Int) -> Int {
+    let bw = n8w(b.size)
+    let lft = 0 - ((b.col * 8) * 8)
+    let rgt = ((d.mi_cols - bw - b.col) * 8) * 8
+    return clip3(lft - border, rgt + border, v)
+}
+
+/// find_mv_refs (§6.5.1)
+fn v9_find_mv_refs(d: V9, t: T9, b: Blk, rf: Int, block: Int) {
+    b.rcount = 0
+    var diff_found = false
+    var counter = 0
+    b.rlm[0] = 0  b.rlm[1] = 0  b.rlm[2] = 0  b.rlm[3] = 0
+    var i = 0
+    while i < 2 {
+        let cr = b.row + mv_ref_search(d, b.size, i * 2)
+        let cc = b.col + mv_ref_search(d, b.size, i * 2 + 1)
+        if cr >= 0 && cr < d.mi_rows && cc >= t.col0 && cc < t.col1 {
+            diff_found = true
+            let m = mi_at(d, cr, cc)
+            var ym = 0
+            unsafe { ym = peek8(m + 3) }
+            // mode_2_counter: 9 for the intra modes, NEARESTMV 0, NEARMV 0, ZEROMV 3, NEWMV 1
+            if ym < 10 { counter = counter + 9 } else if ym == 12 { counter = counter + 3 } else if ym == 13 { counter = counter + 1 }
+            var j = 0
+            var done = false
+            while j < 2 && !done {
+                var fr = 0
+                unsafe { fr = peek8(m + 5 + j) }
+                if fr == rf {
+                    // get_sub_block_mv (§6.5.11)
+                    var idx = 3
+                    if block >= 0 {
+                        // idx_n_column_to_subblock[block][deltaCol == 0]: {1,2},{1,3},{3,2},{3,3}
+                        var dc0 = 0
+                        if mv_ref_search(d, b.size, i * 2 + 1) == 0 { dc0 = 1 }
+                        idx = (857944353 >> ((block * 2 + dc0) * 4)) & 15
+                    }
+                    unsafe {
+                        b.cmv[j * 2] = s16(peek16(m + 16 + j * 16 + idx * 4))
+                        b.cmv[j * 2 + 1] = s16(peek16(m + 16 + j * 16 + idx * 4 + 2))
+                    }
+                    v9_add_mv_ref(b, j)
+                    done = true
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    i = 2
+    while i < 8 {
+        let cr = b.row + mv_ref_search(d, b.size, i * 2)
+        let cc = b.col + mv_ref_search(d, b.size, i * 2 + 1)
+        if cr >= 0 && cr < d.mi_rows && cc >= t.col0 && cc < t.col1 {
+            diff_found = true
+            v9_same_ref_add(d, b, cr, cc, rf, false)
+        }
+        i = i + 1
+    }
+    if d.use_prev_mvs == 1 { v9_same_ref_add(d, b, b.row, b.col, rf, true) }
+    if diff_found {
+        i = 0
+        while i < 8 {
+            let cr = b.row + mv_ref_search(d, b.size, i * 2)
+            let cc = b.col + mv_ref_search(d, b.size, i * 2 + 1)
+            if cr >= 0 && cr < d.mi_rows && cc >= t.col0 && cc < t.col1 { v9_diff_ref_add(d, b, cr, cc, rf, false) }
+            i = i + 1
+        }
+    }
+    if d.use_prev_mvs == 1 { v9_diff_ref_add(d, b, b.row, b.col, rf, true) }
+    // counter_to_context: BOTH_ZERO 0, ZERO_PLUS_PREDICTED 1, BOTH_PREDICTED 2, NEW_PLUS_NON_INTRA 3, BOTH_NEW 4,
+    // INTRA_PLUS_NON_INTRA 5, BOTH_INTRA 6, INVALID_CASE 9
+    // counter_to_context (§6.5.1): BOTH_ZERO 0, ZERO_PLUS_PREDICTED 1, BOTH_PREDICTED 2, NEW_PLUS_NON_INTRA 3,
+    // BOTH_NEW 4, INTRA_PLUS_NON_INTRA 5, BOTH_INTRA 6 (the other counters cannot happen)
+    var mc = 9
+    if counter == 0 { mc = 2 } else if counter == 1 { mc = 3 } else if counter == 2 { mc = 4 } else if counter == 3 { mc = 1 }
+    else if counter == 4 { mc = 3 } else if counter == 6 { mc = 0 } else if counter == 9 || counter == 10 || counter == 12 { mc = 5 }
+    else if counter == 18 { mc = 6 }
+    b.modectx[rf] = mc
+    i = 0
+    while i < 2 {
+        b.rlm[i * 2] = v9_clamp_row(d, b, b.rlm[i * 2], 128)
+        b.rlm[i * 2 + 1] = v9_clamp_col(d, b, b.rlm[i * 2 + 1], 128)
+        i = i + 1
+    }
+}
+
+/// find_best_ref_mvs (§6.5.12)
+fn v9_find_best_ref_mvs(d: V9, b: Blk, l: Int) {
+    var i = 0
+    while i < 2 {
+        var dr = b.rlm[i * 2]
+        var dc = b.rlm[i * 2 + 1]
+        if d.allow_hp == 0 || !use_mv_hp(dr, dc) {
+            if (dr & 1) != 0 { if dr > 0 { dr = dr - 1 } else { dr = dr + 1 } }
+            if (dc & 1) != 0 { if dc > 0 { dc = dc - 1 } else { dc = dc + 1 } }
+        }
+        b.rlm[i * 2] = v9_clamp_row(d, b, dr, (160 - 4) << 3)
+        b.rlm[i * 2 + 1] = v9_clamp_col(d, b, dc, (160 - 4) << 3)
+        i = i + 1
+    }
+    b.nearest[l * 2] = b.rlm[0]  b.nearest[l * 2 + 1] = b.rlm[1]
+    b.near[l * 2] = b.rlm[2]  b.near[l * 2 + 1] = b.rlm[3]
+    b.best[l * 2] = b.rlm[0]  b.best[l * 2 + 1] = b.rlm[1]
+}
+
+/// append_sub8x8_mvs (§6.5.14)
+fn v9_append_sub8x8_mvs(d: V9, t: T9, b: Blk, block: Int, l: Int) {
+    var rf = b.ref0
+    if l == 1 { rf = b.ref1 }
+    v9_find_mv_refs(d, t, b, rf, block)
+    // sub8x8Mvs in b.sub8 (2 x row, col)
+    var dst = 0
+    if block == 0 {
+        b.sub8[0] = b.rlm[0]  b.sub8[1] = b.rlm[1]  b.sub8[2] = b.rlm[2]  b.sub8[3] = b.rlm[3]
+        dst = 2
+    } else if block <= 2 {
+        b.sub8[0] = b.bmv[l * 8]  b.sub8[1] = b.bmv[l * 8 + 1]
+        dst = 1
+    } else {
+        b.sub8[0] = b.bmv[l * 8 + 4]  b.sub8[1] = b.bmv[l * 8 + 5]
+        dst = 1
+        var idx = 1
+        while idx >= 0 && dst < 2 {
+            let r0 = b.bmv[l * 8 + idx * 2]
+            let c0 = b.bmv[l * 8 + idx * 2 + 1]
+            if !mv_eq(r0, c0, b.sub8[0], b.sub8[1]) { b.sub8[dst * 2] = r0  b.sub8[dst * 2 + 1] = c0  dst = dst + 1 }
+            idx = idx - 1
+        }
+    }
+    var n = 0
+    while n < 2 && dst < 2 {
+        if !mv_eq(b.rlm[n * 2], b.rlm[n * 2 + 1], b.sub8[0], b.sub8[1]) { b.sub8[dst * 2] = b.rlm[n * 2]  b.sub8[dst * 2 + 1] = b.rlm[n * 2 + 1]  dst = dst + 1 }
+        n = n + 1
+    }
+    if dst < 2 { b.sub8[dst * 2] = 0  b.sub8[dst * 2 + 1] = 0  dst = dst + 1 }
+    b.nearest[l * 2] = b.sub8[0]  b.nearest[l * 2 + 1] = b.sub8[1]
+    b.near[l * 2] = b.sub8[2]  b.near[l * 2 + 1] = b.sub8[3]
+}
+
+// ---- the residual (§6.4.21) and the tokens (§6.4.24) ----------------------------------------------------------------
+
+fn v9_residual(d: V9, t: T9, b: Blk) {
+    var bsize = b.size
+    if bsize < 3 { bsize = 3 }
+    let fb = fb_of(d.cur)
+    var plane = 0
+    while plane < 3 && t.err == 0 {
+        var txsz = b.tx
+        var psz = bsize
+        var subx = 0
+        var suby = 0
+        if plane > 0 {
+            subx = 1
+            suby = 1
+            psz = uv_bsize(bsize)
+            if b.size < 3 { txsz = 0 } else { let mt = max_tx(uv_bsize(b.size))  if b.tx < mt { txsz = b.tx } else { txsz = mt } }
+        }
+        let step = 1 << txsz
+        let w4 = n4w(psz)
+        let h4 = n4h(psz)
+        let basex = (b.col * 8) >> subx
+        let basey = (b.row * 8) >> suby
+        var dst = fb.y
+        var stride = fb.ys
+        if plane == 1 { dst = fb.u  stride = fb.uvs } else if plane == 2 { dst = fb.v  stride = fb.uvs }
+        if b.is_inter == 1 {
+            if b.size < 3 {
+                var y = 0
+                while y < h4 { var x = 0  while x < w4 { v9_predict_inter(d, t, b, plane, basex + 4 * x, basey + 4 * y, 4, 4, y * w4 + x, dst, stride)  x = x + 1 }  y = y + 1 }
+            } else { v9_predict_inter(d, t, b, plane, basex, basey, w4 * 4, h4 * 4, 0, dst, stride) }
+        }
+        let maxx = (d.mi_cols * 8) >> subx
+        let maxy = (d.mi_rows * 8) >> suby
+        var idx = 0
+        var y = 0
+        while y < h4 {
+            var x = 0
+            while x < w4 {
+                let sx = basex + 4 * x
+                let sy = basey + 4 * y
+                var nz = 0
+                if sx < maxx && sy < maxy {
+                    if b.is_inter == 0 {
+                        v9_predict_intra(d, t, b, plane, sx, sy, b.avail_l == 1 || x > 0, b.avail_u == 1 || y > 0, x + step < w4, txsz, idx, dst, stride)
+                    }
+                    if b.skip == 0 {
+                        let txtype = v9_tx_type(d, b, plane, txsz, idx)
+                        let eob = v9_tokens(d, t, b, plane, sx, sy, txsz, txtype)
+                        if eob > 0 { nz = 1 }
+                        b.eob_total = b.eob_total + nz
+                        if eob > 0 { v9_reconstruct(d, t, b, plane, dst + sy * stride + sx, stride, txsz, txtype, eob) }
+                    }
+                }
+                // the nonzero contexts (above: the frame's row of them; left: this superblock's, 16 a plane)
+                var i = 0
+                unsafe {
+                    let ab = d.anz + plane * (d.mi_cols * 2 + 64) + (sx >> 2)
+                    let lb = t.lnz + plane * 16
+                    let ly = (sy >> 2) & 15
+                    while i < step { poke8(ab + i, nz)  poke8(lb + ((ly + i) & 15), nz)  i = i + 1 }
+                }
+                idx = idx + 1
+                x = x + step
+            }
+            y = y + step
+        }
+        plane = plane + 1
+    }
+}
+
+/// mode2txfm_map (§10.2)
+fn m2txfm(m: Int) -> Int { return (211025068560 >> (m * 4)) & 15 }
+
+/// the transform type (§6.4.25's TxType): 0 DCT_DCT, 1 ADST_DCT, 2 DCT_ADST, 3 ADST_ADST
+fn v9_tx_type(d: V9, b: Blk, plane: Int, txsz: Int, idx: Int) -> Int {
+    if plane > 0 || txsz == 3 { return 0 }
+    if txsz == 0 {
+        if d.lossless == 1 || b.is_inter == 1 { return 0 }
+        if b.size < 3 { return m2txfm(b.sub[idx]) }
+        return m2txfm(b.y_mode)
+    }
+    return m2txfm(b.y_mode)
+}
+
+/// the coefficients of one transform block (§6.4.24): dequantized (§8.6.2 steps 1-2) into t.coef in raster order.
+/// Returns the end of block (the number of scan positions read: 0 when the first more_coefs was 0).
+fn v9_tokens(d: V9, t: T9, b: Blk, plane: Int, sx: Int, sy: Int, txsz: Int, txtype: Int) -> Int {
+    let tab = d.tab
+    // the scan: 0..9 (4x4 default, col, row; 8x8 …; 16x16 …; 32x32)
+    var sk = txsz * 3
+    if txsz == 3 { sk = 9 } else if txtype == 1 { sk = sk + 2 } else if txtype == 2 { sk = sk + 1 }
+    let scan = tab + TB_SCAN() + sk * 2048
+    let nbs = tab + TB_NB() + sk * 4096
+    let seg_eob = 16 << (txsz << 1)
+    // the first context: the above and left nonzero flags over the block's width and height (§9.3.2)
+    var sxs = 0
+    var sys = 0
+    if plane > 0 { sxs = 1  sys = 1 }
+    let maxx4 = (2 * d.mi_cols) >> sxs
+    let maxy4 = (2 * d.mi_rows) >> sys
+    let n = 1 << txsz
+    let x4 = sx >> 2
+    let y4 = sy >> 2
+    var above = 0
+    var left = 0
+    var i = 0
+    unsafe {
+        let ab = d.anz + plane * (d.mi_cols * 2 + 64)
+        let lb = t.lnz + plane * 16
+        while i < n {
+            if x4 + i < maxx4 { above = above | peek8(ab + x4 + i) }
+            if y4 + i < maxy4 { left = left | peek8(lb + ((y4 + i) & 15)) }
+            i = i + 1
+        }
+    }
+    var ctx = above + left
+    var ptype = 0
+    if plane > 0 { ptype = 1 }
+    let probs = d.probs + P_COEF() + ((txsz * 2 + ptype) * 2 + b.is_inter) * 108
+    let cnt_tok = t.counts + (C_TOKEN() + ((txsz * 2 + ptype) * 2 + b.is_inter) * 108) * 4
+    let cnt_more = t.counts + (C_MORE() + ((txsz * 2 + ptype) * 2 + b.is_inter) * 72) * 4
+    // the quantizers (§8.6.1)
+    var dcq = d.seg_q[b.seg * 4]
+    var acq = d.seg_q[b.seg * 4 + 1]
+    if plane > 0 { dcq = d.seg_q[b.seg * 4 + 2]  acq = d.seg_q[b.seg * 4 + 3] }
+    var den = 1
+    if txsz == 3 { den = 2 }
+    let coef = t.coef
+    let cache = t.tcache
+    var bands = tab + TB_BAND48()
+    if txsz == 0 { bands = tab + TB_BAND4() }
+    let par = tab + TB_PARETO()
+    var c = 0
+    var check = true
+    var going = true
+    unsafe {
+        while c < seg_eob && going {
+            let pos = peek16(scan + c * 2)
+            let band = peek8(bands + c)
+            if c > 0 { ctx = (1 + peek8(cache + peek16(nbs + c * 4)) + peek8(cache + peek16(nbs + c * 4 + 2))) >> 1 }
+            let pr = probs + (band * 6 + ctx) * 3
+            let ci = band * 6 + ctx
+            if check {
+                let more = bd_read(t, peek8(pr))
+                poke32(cnt_more + (ci * 2 + more) * 4, peek32(cnt_more + (ci * 2 + more) * 4) + 1)
+                if more == 0 { going = false }
+            }
+            if going {
+                // token_tree with pareto(node, ...) (§9.3.1-9.3.2)
+                var tok = 0
+                if bd_read(t, peek8(pr + 1)) == 0 { tok = 0 }
+                else if bd_read(t, peek8(pr + 2)) == 0 { tok = 1 }
+                else {
+                    let pp = par + peek8(pr + 2) * 8
+                    if bd_read(t, peek8(pp)) == 0 {
+                        if bd_read(t, peek8(pp + 1)) == 0 { tok = 2 }
+                        else if bd_read(t, peek8(pp + 2)) == 0 { tok = 3 } else { tok = 4 }
+                    } else if bd_read(t, peek8(pp + 3)) == 0 {
+                        if bd_read(t, peek8(pp + 4)) == 0 { tok = 5 } else { tok = 6 }
+                    } else if bd_read(t, peek8(pp + 5)) == 0 {
+                        if bd_read(t, peek8(pp + 6)) == 0 { tok = 7 } else { tok = 8 }
+                    } else if bd_read(t, peek8(pp + 7)) == 0 { tok = 9 } else { tok = 10 }
+                }
+                var tci = tok
+                if tci > 2 { tci = 2 }
+                poke32(cnt_tok + (ci * 3 + tci) * 4, peek32(cnt_tok + (ci * 3 + tci) * 4) + 1)
+                // energy_class
+                var en = 0
+                if tok == 1 { en = 1 } else if tok == 2 { en = 2 } else if tok <= 4 { en = 3 } else if tok <= 6 { en = 4 } else { en = 5 }
+                if tok == 0 { en = 0 }
+                poke8(cache + pos, en)
+                if tok == 0 { poke(coef + pos * 8, 0)  check = false }
+                else {
+                    var v = tok
+                    if tok >= 5 { v = v9_read_coef(t, tok) }
+                    if bd_read(t, 128) == 1 { v = 0 - v }
+                    var q = acq
+                    if c == 0 { q = dcq }
+                    poke(coef + pos * 8, (v * q) / den)
+                    check = true
+                }
+                c = c + 1
+            }
+        }
+    }
+    return c
+}
+
+/// read_coef (§6.4.26) for the categories (tokens 5..10)
+fn v9_read_coef(t: T9, tok: Int) -> Int {
+    if tok == 5 { return 5 + bd_read(t, 159) }
+    if tok == 6 { var v = 7 + bd_read(t, 165) * 2  v = v + bd_read(t, 145)  return v }
+    if tok == 7 { var v2 = bd_read(t, 173)  v2 = v2 * 2 + bd_read(t, 148)  v2 = v2 * 2 + bd_read(t, 140)  return 11 + v2 }
+    if tok == 8 { var v3 = bd_read(t, 176)  v3 = v3 * 2 + bd_read(t, 155)  v3 = v3 * 2 + bd_read(t, 140)  v3 = v3 * 2 + bd_read(t, 135)  return 19 + v3 }
+    if tok == 9 { var v4 = bd_read(t, 180)  v4 = v4 * 2 + bd_read(t, 157)  v4 = v4 * 2 + bd_read(t, 141)  v4 = v4 * 2 + bd_read(t, 134)  v4 = v4 * 2 + bd_read(t, 130)  return 35 + v4 }
+    // cat_probs[6]
+    var v5 = bd_read(t, 254)
+    v5 = v5 * 2 + bd_read(t, 254)  v5 = v5 * 2 + bd_read(t, 254)  v5 = v5 * 2 + bd_read(t, 252)  v5 = v5 * 2 + bd_read(t, 249)
+    v5 = v5 * 2 + bd_read(t, 243)  v5 = v5 * 2 + bd_read(t, 230)  v5 = v5 * 2 + bd_read(t, 196)  v5 = v5 * 2 + bd_read(t, 177)
+    v5 = v5 * 2 + bd_read(t, 153)  v5 = v5 * 2 + bd_read(t, 140)  v5 = v5 * 2 + bd_read(t, 133)  v5 = v5 * 2 + bd_read(t, 130)
+    v5 = v5 * 2 + bd_read(t, 129)
+    return 67 + v5
+}

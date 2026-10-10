@@ -1,0 +1,32 @@
+// Tests for std/iter. Run with
+//   noric --test std/iter/iter_test.nori compiler/runtime.nori --import-root .
+import "std/iter" as it
+
+fn mkv() -> Vec<Int> { var v: Vec<Int> = vec()  v.push(3)  v.push(1)  v.push(2)  return v }
+
+fn test_iter_sum_and_map() {
+    assert_eq(it::vsum(mkv()), 6)
+    assert_eq(it::vsum(it::vmap(mkv(), |x| x * 10)), 60)
+    assert_eq(it::vcount(mkv(), |x| x >= 2), 2)
+    assert_true(it::vany(mkv(), |x| x == 1))
+    assert_false(it::vall(mkv(), |x| x > 1))
+}
+
+fn test_iter_sort() {
+    var srt = it::vsort(mkv(), |a, b| a < b)
+    assert_eq(srt[0], 1)
+    assert_eq(srt[2], 3)
+}
+
+fn test_lazy_range_iterator() {
+    var t = 0
+    var r = it::lazy(2, 6)
+    foreach x in r { t = t + x }
+    assert_eq(t, 14)
+}
+fn test_bytes_iterator() {
+    var vowels = 0
+    var cs = it::bytes("iterator")
+    foreach c in cs { if c == 'i' || c == 'a' || c == 'e' || c == 'o' { vowels = vowels + 1 } }
+    assert_eq(vowels, 4)
+}

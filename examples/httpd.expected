@@ -1,0 +1,28 @@
+GET /
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 13
+Connection: close
+
+<h1>Nori</h1>
+GET /hello/Nori
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Content-Length: 11
+Connection: close
+
+hello, Nori
+GET /add?a=2&b=3
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Content-Length: 10
+Connection: close
+
+{"sum": 5}
+GET /nothing
+HTTP/1.1 404 Not Found
+Content-Type: text/html; charset=utf-8
+Content-Length: 22
+Connection: close
+
+<h1>404 Not Found</h1>

@@ -1,0 +1,295 @@
+// .nori tests for BLAKE3, run with
+//   noric --test std/crypto/blake3_test.nori compiler/runtime.nori --import-root .
+//
+// The vectors below are the official ones, from the BLAKE3 reference repository's
+// `test_vectors/test_vectors.json`: the input of length n is the byte sequence
+// `i % 251` for i in 0..n, the key is the 32-byte ASCII string "whats the Elvish word for
+// friend", and the derive-key context is "BLAKE3 2019-12-27 16:29:52 test vectors context".
+// They were re-derived with the `blake3` PyO3 binding (blake3 1.0.8, which
+// wraps the reference Rust crate) and cross-checked against two real exported
+// scene files, whose 64-byte headers carry a BLAKE3-256 checksum of their payload written by
+// a completely independent implementation.
+//
+// The length table is the core of the test. A BLAKE3 validated only on short inputs has
+// exercised the compression function and nothing of the algorithm above it. The interesting
+// lengths are the ones that change the shape of the tree:
+//
+//   0        the empty input: one chunk of one empty block, not zero blocks
+//   1..64    one block, so CHUNK_START|CHUNK_END|ROOT all land on the same compression
+//   1023     the last chunk block is short and the tree is still a single chunk
+//   1024     one full chunk, still no parent node at all
+//   1025     the first input with a parent node: two chunks, the second holding one byte
+//   2048     two full chunks, a balanced tree of depth 1
+//   2049     three chunks: the first unbalanced tree, where a left subtree of two chunks is
+//            merged with a lone right chunk. This is the case a stack-merge off-by-one gets
+//            wrong while every power-of-two length still passes.
+//   3072/3073/4096/4097/5120/6144/7168/8192/8193/16384/16385/31744
+//            depths 2 and 3, both balanced and ragged, including 31744 = 31 chunks whose
+//            tree is maximally lopsided at every level.
+//
+// The XOF cases matter separately: the output stream past 64 bytes is produced by a second
+// root compression with the output-block counter at 1, and an implementation that never asks
+// for more than 32 bytes has never run that path.
+import "std/crypto" as crypto
+
+fn hexv(c: Byte) -> Int {
+    let o = ord(c)
+    if o >= 97 { return (o - 87) }
+    if o >= 65 { return (o - 55) }
+    return (o - 48)
+}
+fn unhex(h: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < h.len() { out = (out + chr(((hexv(h.at(i)) << 4) | hexv(h.at(i + 1)))))  i = i + 2 }
+    return out
+}
+
+/// the official test-vector input: byte `i` is `i % 251`. 251 is prime and just under 256, so
+/// the pattern's period shares no factor with the 64-byte block or the 1024-byte chunk, and a
+/// block or chunk mixed up with its neighbour cannot coincidentally agree.
+fn tv(n: Int) -> Str {
+    var out = ""
+    var i = 0
+    while i < n { out = (out + chr(i % 251))  i = i + 1 }
+    return out
+}
+
+fn tohex(s: Str) -> Str {
+    let d = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        let b = ord(s.at(i))
+        out = (out + d.slice((b >> 4) & 15, ((b >> 4) & 15) + 1))
+        out = (out + d.slice(b & 15, (b & 15) + 1))
+        i = i + 1
+    }
+    return out
+}
+
+fn tv_key() -> Str { return "whats the Elvish word for friend" }
+fn tv_ctx() -> Str { return "BLAKE3 2019-12-27 16:29:52 test vectors context" }
+
+/// `assert_eq` is Int-only in Nori, so digests go through `assert_streq`. The `name` is printed
+/// only on failure, which turns "some digest is wrong" into "length 2049 is wrong", and with a
+/// table this size that is the difference between a diagnosis and a hunt.
+fn eq(name: Str, got: Str, want: Str) {
+    if got != want { printl("MISMATCH " + name) }
+    assert_streq(got, want)
+}
+
+fn test_blake3_official_vectors_unkeyed() {
+    eq("blake3 len 0", crypto::blake3(tv(0)), "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
+    eq("blake3 len 1", crypto::blake3(tv(1)), "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213")
+    eq("blake3 len 2", crypto::blake3(tv(2)), "7b7015bb92cf0b318037702a6cdd81dee41224f734684c2c122cd6359cb1ee63")
+    eq("blake3 len 3", crypto::blake3(tv(3)), "e1be4d7a8ab5560aa4199eea339849ba8e293d55ca0a81006726d184519e647f")
+    eq("blake3 len 4", crypto::blake3(tv(4)), "f30f5ab28fe047904037f77b6da4fea1e27241c5d132638d8bedce9d40494f32")
+    eq("blake3 len 5", crypto::blake3(tv(5)), "b40b44dfd97e7a84a996a91af8b85188c66c126940ba7aad2e7ae6b385402aa2")
+    eq("blake3 len 6", crypto::blake3(tv(6)), "06c4e8ffb6872fad96f9aaca5eee1553eb62aed0ad7198cef42e87f6a616c844")
+    eq("blake3 len 7", crypto::blake3(tv(7)), "3f8770f387faad08faa9d8414e9f449ac68e6ff0417f673f602a646a891419fe")
+    eq("blake3 len 8", crypto::blake3(tv(8)), "2351207d04fc16ade43ccab08600939c7c1fa70a5c0aaca76063d04c3228eaeb")
+    eq("blake3 len 63", crypto::blake3(tv(63)), "e9bc37a594daad83be9470df7f7b3798297c3d834ce80ba85d6e207627b7db7b")
+    eq("blake3 len 64", crypto::blake3(tv(64)), "4eed7141ea4a5cd4b788606bd23f46e212af9cacebacdc7d1f4c6dc7f2511b98")
+    eq("blake3 len 65", crypto::blake3(tv(65)), "de1e5fa0be70df6d2be8fffd0e99ceaa8eb6e8c93a63f2d8d1c30ecb6b263dee")
+    eq("blake3 len 127", crypto::blake3(tv(127)), "d81293fda863f008c09e92fc382a81f5a0b4a1251cba1634016a0f86a6bd640d")
+    eq("blake3 len 128", crypto::blake3(tv(128)), "f17e570564b26578c33bb7f44643f539624b05df1a76c81f30acd548c44b45ef")
+    eq("blake3 len 129", crypto::blake3(tv(129)), "683aaae9f3c5ba37eaaf072aed0f9e30bac0865137bae68b1fde4ca2aebdcb12")
+    eq("blake3 len 1023", crypto::blake3(tv(1023)), "10108970eeda3eb932baac1428c7a2163b0e924c9a9e25b35bba72b28f70bd11")
+    eq("blake3 len 1024", crypto::blake3(tv(1024)), "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7")
+    eq("blake3 len 1025", crypto::blake3(tv(1025)), "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444")
+    eq("blake3 len 2048", crypto::blake3(tv(2048)), "e776b6028c7cd22a4d0ba182a8bf62205d2ef576467e838ed6f2529b85fba24a")
+    eq("blake3 len 2049", crypto::blake3(tv(2049)), "5f4d72f40d7a5f82b15ca2b2e44b1de3c2ef86c426c95c1af0b6879522563030")
+    eq("blake3 len 3072", crypto::blake3(tv(3072)), "b98cb0ff3623be03326b373de6b9095218513e64f1ee2edd2525c7ad1e5cffd2")
+    eq("blake3 len 3073", crypto::blake3(tv(3073)), "7124b49501012f81cc7f11ca069ec9226cecb8a2c850cfe644e327d22d3e1cd3")
+    eq("blake3 len 4096", crypto::blake3(tv(4096)), "015094013f57a5277b59d8475c0501042c0b642e531b0a1c8f58d2163229e969")
+    eq("blake3 len 4097", crypto::blake3(tv(4097)), "9b4052b38f1c5fc8b1f9ff7ac7b27cd242487b3d890d15c96a1c25b8aa0fb995")
+    eq("blake3 len 5120", crypto::blake3(tv(5120)), "9cadc15fed8b5d854562b26a9536d9707cadeda9b143978f319ab34230535833")
+    eq("blake3 len 6144", crypto::blake3(tv(6144)), "3e2e5b74e048f3add6d21faab3f83aa44d3b2278afb83b80b3c35164ebeca205")
+    eq("blake3 len 7168", crypto::blake3(tv(7168)), "61da957ec2499a95d6b8023e2b0e604ec7f6b50e80a9678b89d2628e99ada77a")
+    eq("blake3 len 8192", crypto::blake3(tv(8192)), "aae792484c8efe4f19e2ca7d371d8c467ffb10748d8a5a1ae579948f718a2a63")
+    eq("blake3 len 8193", crypto::blake3(tv(8193)), "bab6c09cb8ce8cf459261398d2e7aef35700bf488116ceb94a36d0f5f1b7bc3b")
+    eq("blake3 len 16384", crypto::blake3(tv(16384)), "f875d6646de28985646f34ee13be9a576fd515f76b5b0a26bb324735041ddde4")
+    eq("blake3 len 16385", crypto::blake3(tv(16385)), "1dabe216be2578830263b049de1639f39f05a4da616b9b78c7a5e4e41662fd1f")
+    eq("blake3 len 31744", crypto::blake3(tv(31744)), "62b6960e1a44bcc1eb1a611a8d6235b6b4b78f32e7abc4fb4c6cdcce94895c47")
+}
+
+fn test_blake3_official_vectors_keyed() {
+    eq("keyed len 0", crypto::blake3_keyed(tv_key(), tv(0)), "92b2b75604ed3c761f9d6f62392c8a9227ad0ea3f09573e783f1498a4ed60d26")
+    eq("keyed len 1", crypto::blake3_keyed(tv_key(), tv(1)), "6d7878dfff2f485635d39013278ae14f1454b8c0a3a2d34bc1ab38228a80c95b")
+    eq("keyed len 2", crypto::blake3_keyed(tv_key(), tv(2)), "5392ddae0e0a69d5f40160462cbd9bd889375082ff224ac9c758802b7a6fd20a")
+    eq("keyed len 3", crypto::blake3_keyed(tv_key(), tv(3)), "39e67b76b5a007d4921969779fe666da67b5213b096084ab674742f0d5ec62b9")
+    eq("keyed len 4", crypto::blake3_keyed(tv_key(), tv(4)), "7671dde590c95d5ac9616651ff5aa0a27bee5913a348e053b8aa9108917fe070")
+    eq("keyed len 5", crypto::blake3_keyed(tv_key(), tv(5)), "73ac69eecf286894d8102018a6fc729f4b1f4247d3703f69bdc6a5fe3e0c8461")
+    eq("keyed len 6", crypto::blake3_keyed(tv_key(), tv(6)), "82d3199d0013035682cc7f2a399d4c212544376a839aa863a0f4c91220ca7a6d")
+    eq("keyed len 7", crypto::blake3_keyed(tv_key(), tv(7)), "af0a7ec382aedc0cfd626e49e7628bc7a353a4cb108855541a5651bf64fbb28a")
+    eq("keyed len 8", crypto::blake3_keyed(tv_key(), tv(8)), "be2f5495c61cba1bb348a34948c004045e3bd4dae8f0fe82bf44d0da245a0600")
+    eq("keyed len 63", crypto::blake3_keyed(tv_key(), tv(63)), "bb1eb5d4afa793c1ebdd9fb08def6c36d10096986ae0cfe148cd101170ce37ae")
+    eq("keyed len 64", crypto::blake3_keyed(tv_key(), tv(64)), "ba8ced36f327700d213f120b1a207a3b8c04330528586f414d09f2f7d9ccb7e6")
+    eq("keyed len 65", crypto::blake3_keyed(tv_key(), tv(65)), "c0a4edefa2d2accb9277c371ac12fcdbb52988a86edc54f0716e1591b4326e72")
+    eq("keyed len 127", crypto::blake3_keyed(tv_key(), tv(127)), "c64200ae7dfaf35577ac5a9521c47863fb71514a3bcad18819218b818de85818")
+    eq("keyed len 128", crypto::blake3_keyed(tv_key(), tv(128)), "b04fe15577457267ff3b6f3c947d93be581e7e3a4b018679125eaf86f6a628ec")
+    eq("keyed len 129", crypto::blake3_keyed(tv_key(), tv(129)), "d4a64dae6cdccbac1e5287f54f17c5f985105457c1a2ec1878ebd4b57e20d38f")
+    eq("keyed len 1023", crypto::blake3_keyed(tv_key(), tv(1023)), "c951ecdf03288d0fcc96ee3413563d8a6d3589547f2c2fb36d9786470f1b9d6e")
+    eq("keyed len 1024", crypto::blake3_keyed(tv_key(), tv(1024)), "75c46f6f3d9eb4f55ecaaee480db732e6c2105546f1e675003687c31719c7ba4")
+    eq("keyed len 1025", crypto::blake3_keyed(tv_key(), tv(1025)), "357dc55de0c7e382c900fd6e320acc04146be01db6a8ce7210b7189bd664ea69")
+    eq("keyed len 2048", crypto::blake3_keyed(tv_key(), tv(2048)), "879cf1fa2ea0e79126cb1063617a05b6ad9d0b696d0d757cf053439f60a99dd1")
+    eq("keyed len 2049", crypto::blake3_keyed(tv_key(), tv(2049)), "9f29700902f7c86e514ddc4df1e3049f258b2472b6dd5267f61bf13983b78dd5")
+    eq("keyed len 3072", crypto::blake3_keyed(tv_key(), tv(3072)), "044a0e7b172a312dc02a4c9a818c036ffa2776368d7f528268d2e6b5df191770")
+    eq("keyed len 3073", crypto::blake3_keyed(tv_key(), tv(3073)), "68dede9bef00ba89e43f31a6825f4cf433389fedae75c04ee9f0cf16a427c95a")
+    eq("keyed len 4096", crypto::blake3_keyed(tv_key(), tv(4096)), "befc660aea2f1718884cd8deb9902811d332f4fc4a38cf7c7300d597a081bfc0")
+    eq("keyed len 4097", crypto::blake3_keyed(tv_key(), tv(4097)), "00df940cd36bb9fa7cbbc3556744e0dbc8191401afe70520ba292ee3ca80abbc")
+    eq("keyed len 5120", crypto::blake3_keyed(tv_key(), tv(5120)), "2c493e48e9b9bf31e0553a22b23503c0a3388f035cece68eb438d22fa1943e20")
+    eq("keyed len 6144", crypto::blake3_keyed(tv_key(), tv(6144)), "3d6b6d21281d0ade5b2b016ae4034c5dec10ca7e475f90f76eac7138e9bc8f1d")
+    eq("keyed len 7168", crypto::blake3_keyed(tv_key(), tv(7168)), "b42835e40e9d4a7f42ad8cc04f85a963a76e18198377ed84adddeaecacc6f3fc")
+    eq("keyed len 8192", crypto::blake3_keyed(tv_key(), tv(8192)), "dc9637c8845a770b4cbf76b8daec0eebf7dc2eac11498517f08d44c8fc00d58a")
+    eq("keyed len 8193", crypto::blake3_keyed(tv_key(), tv(8193)), "954a2a75420c8d6547e3ba5b98d963e6fa6491addc8c023189cc519821b4a1f5")
+    eq("keyed len 16384", crypto::blake3_keyed(tv_key(), tv(16384)), "9e9fc4eb7cf081ea7c47d1807790ed211bfec56aa25bb7037784c13c4b707b0d")
+    eq("keyed len 16385", crypto::blake3_keyed(tv_key(), tv(16385)), "9f1e8750b485576aa8af42e403bfb340665b45a952799d0155756c994db7dfd2")
+    eq("keyed len 31744", crypto::blake3_keyed(tv_key(), tv(31744)), "efa53b389ab67c593dba624d898d0f7353ab99e4ac9d42302ee64cbf9939a419")
+}
+
+fn test_blake3_official_vectors_derive_key() {
+    eq("derive_key len 0", tohex(crypto::blake3_derive_key(tv_ctx(), tv(0), 32)), "2cc39783c223154fea8dfb7c1b1660f2ac2dcbd1c1de8277b0b0dd39b7e50d7d")
+    eq("derive_key len 1", tohex(crypto::blake3_derive_key(tv_ctx(), tv(1), 32)), "b3e2e340a117a499c6cf2398a19ee0d29cca2bb7404c73063382693bf66cb06c")
+    eq("derive_key len 2", tohex(crypto::blake3_derive_key(tv_ctx(), tv(2), 32)), "1f166565a7df0098ee65922d7fea425fb18b9943f19d6161e2d17939356168e6")
+    eq("derive_key len 3", tohex(crypto::blake3_derive_key(tv_ctx(), tv(3), 32)), "440aba35cb006b61fc17c0529255de438efc06a8c9ebf3f2ddac3b5a86705797")
+    eq("derive_key len 4", tohex(crypto::blake3_derive_key(tv_ctx(), tv(4), 32)), "f46085c8190d69022369ce1a18880e9b369c135eb93f3c63550d3e7630e91060")
+    eq("derive_key len 5", tohex(crypto::blake3_derive_key(tv_ctx(), tv(5), 32)), "1f24eda69dbcb752847ec3ebb5dd42836d86e58500c7c98d906ecd82ed9ae47f")
+    eq("derive_key len 6", tohex(crypto::blake3_derive_key(tv_ctx(), tv(6), 32)), "be96b30b37919fe4379dfbe752ae77b4f7e2ab92f7ff27435f76f2f065f6a5f4")
+    eq("derive_key len 7", tohex(crypto::blake3_derive_key(tv_ctx(), tv(7), 32)), "dc3b6485f9d94935329442916b0d059685ba815a1fa2a14107217453a7fc9f0e")
+    eq("derive_key len 8", tohex(crypto::blake3_derive_key(tv_ctx(), tv(8), 32)), "2b166978cef14d9d438046c720519d8b1cad707e199746f1562d0c87fbd32940")
+    eq("derive_key len 63", tohex(crypto::blake3_derive_key(tv_ctx(), tv(63), 32)), "b6451e30b953c206e34644c6803724e9d2725e0893039cfc49584f991f451af3")
+    eq("derive_key len 64", tohex(crypto::blake3_derive_key(tv_ctx(), tv(64), 32)), "a5c4a7053fa86b64746d4bb688d06ad1f02a18fce9afd3e818fefaa7126bf73e")
+    eq("derive_key len 65", tohex(crypto::blake3_derive_key(tv_ctx(), tv(65), 32)), "51fd05c3c1cfbc8ed67d139ad76f5cf8236cd2acd26627a30c104dfd9d3ff8a8")
+    eq("derive_key len 127", tohex(crypto::blake3_derive_key(tv_ctx(), tv(127), 32)), "c91c090ceee3a3ac81902da31838012625bbcd73fcb92e7d7e56f78deba4f0c3")
+    eq("derive_key len 128", tohex(crypto::blake3_derive_key(tv_ctx(), tv(128), 32)), "81720f34452f58a0120a58b6b4608384b5c51d11f39ce97161a0c0e442ca0225")
+    eq("derive_key len 129", tohex(crypto::blake3_derive_key(tv_ctx(), tv(129), 32)), "938d2d4435be30eafdbb2b7031f7857c98b04881227391dc40db3c7b21f41fc1")
+    eq("derive_key len 1023", tohex(crypto::blake3_derive_key(tv_ctx(), tv(1023), 32)), "74a16c1c3d44368a86e1ca6df64be6a2f64cce8f09220787450722d85725dea5")
+    eq("derive_key len 1024", tohex(crypto::blake3_derive_key(tv_ctx(), tv(1024), 32)), "7356cd7720d5b66b6d0697eb3177d9f8d73a4a5c5e968896eb6a689684302706")
+    eq("derive_key len 1025", tohex(crypto::blake3_derive_key(tv_ctx(), tv(1025), 32)), "effaa245f065fbf82ac186839a249707c3bddf6d3fdda22d1b95a3c970379bcb")
+    eq("derive_key len 2048", tohex(crypto::blake3_derive_key(tv_ctx(), tv(2048), 32)), "7b2945cb4fef70885cc5d78a87bf6f6207dd901ff239201351ffac04e1088a23")
+    eq("derive_key len 2049", tohex(crypto::blake3_derive_key(tv_ctx(), tv(2049), 32)), "2ea477c5515cc3dd606512ee72bb3e0e758cfae7232826f35fb98ca1bcbdf273")
+    eq("derive_key len 3072", tohex(crypto::blake3_derive_key(tv_ctx(), tv(3072), 32)), "050df97f8c2ead654d9bb3ab8c9178edcd902a32f8495949feadcc1e0480c46b")
+    eq("derive_key len 3073", tohex(crypto::blake3_derive_key(tv_ctx(), tv(3073), 32)), "72613c9ec9ff7e40f8f5c173784c532ad852e827dba2bf85b2ab4b76f7079081")
+    eq("derive_key len 4096", tohex(crypto::blake3_derive_key(tv_ctx(), tv(4096), 32)), "1e0d7f3db8c414c97c6307cbda6cd27ac3b030949da8e23be1a1a924ad2f25b9")
+    eq("derive_key len 4097", tohex(crypto::blake3_derive_key(tv_ctx(), tv(4097), 32)), "aca51029626b55fda7117b42a7c211f8c6e9ba4fe5b7a8ca922f34299500ead8")
+    eq("derive_key len 5120", tohex(crypto::blake3_derive_key(tv_ctx(), tv(5120), 32)), "7a7acac8a02adcf3038d74cdd1d34527de8a0fcc0ee3399d1262397ce5817f60")
+    eq("derive_key len 6144", tohex(crypto::blake3_derive_key(tv_ctx(), tv(6144), 32)), "2a95beae63ddce523762355cf4b9c1d8f131465780a391286a5d01abb5683a15")
+    eq("derive_key len 7168", tohex(crypto::blake3_derive_key(tv_ctx(), tv(7168), 32)), "11c37a112765370c94a51415d0d651190c288566e295d505defdad895dae2237")
+    eq("derive_key len 8192", tohex(crypto::blake3_derive_key(tv_ctx(), tv(8192), 32)), "ad01d7ae4ad059b0d33baa3c01319dcf8088094d0359e5fd45d6aeaa8b2d0c3d")
+    eq("derive_key len 8193", tohex(crypto::blake3_derive_key(tv_ctx(), tv(8193), 32)), "af1e0346e389b17c23200270a64aa4e1ead98c61695d917de7d5b00491c9b0f1")
+    eq("derive_key len 16384", tohex(crypto::blake3_derive_key(tv_ctx(), tv(16384), 32)), "160e18b5878cd0df1c3af85eb25a0db5344d43a6fbd7a8ef4ed98d0714c3f7e1")
+    eq("derive_key len 16385", tohex(crypto::blake3_derive_key(tv_ctx(), tv(16385), 32)), "3e5b2c02a576a65e8c7f37815b7a06a31834df3246441049f2dbf11398271072")
+    eq("derive_key len 31744", tohex(crypto::blake3_derive_key(tv_ctx(), tv(31744), 32)), "39772aef80e0ebe60596361e45b061e8f417429d529171b6764468c22928e28e")
+}
+
+// the official vectors publish 131 bytes of extended output for every length. 131 is
+// not a multiple of 64: it lands mid-block in the third output block, so a
+// truncation bug at the tail is visible.
+fn test_blake3_official_vectors_xof() {
+    eq("xof131 len 0", tohex(crypto::blake3_xof(tv(0), 131)), "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262e00f03e7b69af26b7faaf09fcd333050338ddfe085b8cc869ca98b206c08243a26f5487789e8f660afe6c99ef9e0c52b92e7393024a80459cf91f476f9ffdbda7001c22e159b402631f277ca96f2defdf1078282314e763699a31c5363165421cce14d")
+    eq("xof131 len 1", tohex(crypto::blake3_xof(tv(1), 131)), "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213c3a6cb8bf623e20cdb535f8d1a5ffb86342d9c0b64aca3bce1d31f60adfa137b358ad4d79f97b47c3d5e79f179df87a3b9776ef8325f8329886ba42f07fb138bb502f4081cbcec3195c5871e6c23e2cc97d3c69a613eba131e5f1351f3f1da786545e5")
+    eq("xof131 len 1023", tohex(crypto::blake3_xof(tv(1023), 131)), "10108970eeda3eb932baac1428c7a2163b0e924c9a9e25b35bba72b28f70bd11a182d27a591b05592b15607500e1e8dd56bc6c7fc063715b7a1d737df5bad3339c56778957d870eb9717b57ea3d9fb68d1b55127bba6a906a4a24bbd5acb2d123a37b28f9e9a81bbaae360d58f85e5fc9d75f7c370a0cc09b6522d9c8d822f2f28f485")
+    eq("xof131 len 1024", tohex(crypto::blake3_xof(tv(1024), 131)), "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af71cf8107265ecdaf8505b95d8fcec83a98a6a96ea5109d2c179c47a387ffbb404756f6eeae7883b446b70ebb144527c2075ab8ab204c0086bb22b7c93d465efc57f8d917f0b385c6df265e77003b85102967486ed57db5c5ca170ba441427ed9afa684e")
+    eq("xof131 len 1025", tohex(crypto::blake3_xof(tv(1025), 131)), "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444f4c4a22b4b399155358a994e52bf255de60035742ec71bd08ac275a1b51cc6bfe332b0ef84b409108cda080e6269ed4b3e2c3f7d722aa4cdc98d16deb554e5627be8f955c98e1d5f9565a9194cad0c4285f93700062d9595adb992ae68ff12800ab67a")
+    eq("xof131 len 2048", tohex(crypto::blake3_xof(tv(2048), 131)), "e776b6028c7cd22a4d0ba182a8bf62205d2ef576467e838ed6f2529b85fba24a9a60bf80001410ec9eea6698cd537939fad4749edd484cb541aced55cd9bf54764d063f23f6f1e32e12958ba5cfeb1bf618ad094266d4fc3c968c2088f677454c288c67ba0dba337b9d91c7e1ba586dc9a5bc2d5e90c14f53a8863ac75655461cea8f9")
+    eq("xof131 len 2049", tohex(crypto::blake3_xof(tv(2049), 131)), "5f4d72f40d7a5f82b15ca2b2e44b1de3c2ef86c426c95c1af0b687952256303096de31d71d74103403822a2e0bc1eb193e7aecc9643a76b7bbc0c9f9c52e8783aae98764ca468962b5c2ec92f0c74eb5448d519713e09413719431c802f948dd5d90425a4ecdadece9eb178d80f26efccae630734dff63340285adec2aed3b51073ad3")
+    eq("xof131 len 3072", tohex(crypto::blake3_xof(tv(3072), 131)), "b98cb0ff3623be03326b373de6b9095218513e64f1ee2edd2525c7ad1e5cffd29a3f6b0b978d6608335c09dc94ccf682f9951cdfc501bfe47b9c9189a6fc7b404d120258506341a6d802857322fbd20d3e5dae05b95c88793fa83db1cb08e7d8008d1599b6209d78336e24839724c191b2a52a80448306e0daa84a3fdb566661a37e11")
+    eq("xof131 len 4096", tohex(crypto::blake3_xof(tv(4096), 131)), "015094013f57a5277b59d8475c0501042c0b642e531b0a1c8f58d2163229e9690289e9409ddb1b99768eafe1623da896faf7e1114bebeadc1be30829b6f8af707d85c298f4f0ff4d9438aef948335612ae921e76d411c3a9111df62d27eaf871959ae0062b5492a0feb98ef3ed4af277f5395172dbe5c311918ea0074ce0036454f620")
+    eq("xof131 len 8192", tohex(crypto::blake3_xof(tv(8192), 131)), "aae792484c8efe4f19e2ca7d371d8c467ffb10748d8a5a1ae579948f718a2a635fe51a27db045a567c1ad51be5aa34c01c6651c4d9b5b5ac5d0fd58cf18dd61a47778566b797a8c67df7b1d60b97b19288d2d877bb2df417ace009dcb0241ca1257d62712b6a4043b4ff33f690d849da91ea3bf711ed583cb7b7a7da2839ba71309bbf")
+}
+
+// the incremental API must not depend on how the caller split the input. These splits are
+// chosen to straddle the two boundaries that matter: a block edge inside a chunk, and a chunk
+// edge, both of which are the moments internal buffered state is flushed.
+fn test_blake3_streaming_matches_one_shot() {
+    var h2049 = crypto::b3_new()
+    h2049.update(tv(2049).slice(0, 1))
+    h2049.update(tv(2049).slice(1, 1024))
+    h2049.update(tv(2049).slice(1024, 1025))
+    h2049.update(tv(2049).slice(1025, 2049))
+    eq("stream len 2049", h2049.hex(), "5f4d72f40d7a5f82b15ca2b2e44b1de3c2ef86c426c95c1af0b6879522563030")
+    var h4097 = crypto::b3_new()
+    h4097.update(tv(4097).slice(0, 1024))
+    h4097.update(tv(4097).slice(1024, 2048))
+    h4097.update(tv(4097).slice(2048, 3072))
+    h4097.update(tv(4097).slice(3072, 4096))
+    h4097.update(tv(4097).slice(4096, 4097))
+    eq("stream len 4097", h4097.hex(), "9b4052b38f1c5fc8b1f9ff7ac7b27cd242487b3d890d15c96a1c25b8aa0fb995")
+    var h8192 = crypto::b3_new()
+    h8192.update(tv(8192).slice(0, 63))
+    h8192.update(tv(8192).slice(63, 64))
+    h8192.update(tv(8192).slice(64, 1024))
+    h8192.update(tv(8192).slice(1024, 5120))
+    h8192.update(tv(8192).slice(5120, 8192))
+    eq("stream len 8192", h8192.hex(), "aae792484c8efe4f19e2ca7d371d8c467ffb10748d8a5a1ae579948f718a2a63")
+    var h1025 = crypto::b3_new()
+    h1025.update(tv(1025).slice(0, 1024))
+    h1025.update(tv(1025).slice(1024, 1025))
+    eq("stream len 1025", h1025.hex(), "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444")
+    var h1024 = crypto::b3_new()
+    h1024.update(tv(1024).slice(0, 1))
+    h1024.update(tv(1024).slice(1, 2))
+    h1024.update(tv(1024).slice(2, 1024))
+    eq("stream len 1024", h1024.hex(), "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7")
+    var h0 = crypto::b3_new()
+    eq("stream len 0", h0.hex(), "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
+    var h3072 = crypto::b3_new()
+    h3072.update(tv(3072).slice(0, 1536))
+    h3072.update(tv(3072).slice(1536, 3072))
+    eq("stream len 3072", h3072.hex(), "b98cb0ff3623be03326b373de6b9095218513e64f1ee2edd2525c7ad1e5cffd2")
+}
+
+// Two real exported scene files whose
+// 64-byte header carries, at offset 20, the BLAKE3-256 digest of the payload, written by the
+// Rust `blake3` crate at export time. Reproducing
+// these is evidence against a real third-party implementation over real data, not
+// self-consistency. The payload bytes are embedded below, so no external file is needed.
+fn test_blake3_real_scene_headers() {
+    // first scene file, payload = bytes 64..616 (552 bytes), header digest at offset 20
+    var p_vox = "000000000000000000000000000000000112000000000000000000000000c03f00002041000000000000000000000000"
+    p_vox = (p_vox + "0000803f0000803f0000803f0000803f000000000000000000000000ffffffff00000000000000000000000000000000")
+    p_vox = (p_vox + "0000000000000000000000000000000000000000000000000000000000007042cdcccc3d0000fa4301000000ffffffff")
+    p_vox = (p_vox + "010000000000000000000000010100000000803f000000000000000000000000000000000000003f0000003f0000003f")
+    p_vox = (p_vox + "0000003f3333333f000000000000803fffffffffffffffff40420f000000000000000000000000000706000000000000")
+    p_vox = (p_vox + "52556cc38bb25742d6d5c9c30000000000000000000000000000803f0000803f0000803f0000803f0200000003000000")
+    p_vox = (p_vox + "00000000ffffffff00000000000000000000000000000000000000000000000000000000000000000000000000000000")
+    p_vox = (p_vox + "0000000000007042cdcccc3d0000fa43ffffffffffffffff010000000000000000000000010100000000803f00000000")
+    p_vox = (p_vox + "0000000000000000000000000000003f0000003f0000003f0000003f3333333f000000000000803fffffffffffffffff")
+    p_vox = (p_vox + "4d61696e2043616d6572616173736574732f766f78656c5f6173736574732f63686573742e72766f780000008b000000")
+    p_vox = (p_vox + "d4ffffff6669786564ffffff6368657374ffffff9e000000c7ffffff69736c616e64fffffcfdffff02000000d0ffffff")
+    p_vox = (p_vox + "050000000000000000000000ffffffff0100000004000000")
+    eq("scene 1 payload", crypto::blake3(unhex(p_vox)), "43025d275bde29067a667436ffc9352408201e64d5c9f8d0a6b51e32ed05768e")
+
+    // second scene file, payload = bytes 64..264 (200 bytes), header digest at offset 20
+    var p_castlevenia = "000000000000000000000000000000000112000000000000000000000000c03f00002041000000000000000000000000"
+    p_castlevenia = (p_castlevenia + "0000803f0000803f0000803f0000803f000000000000000000000000ffffffff00000000000000000000000000000000")
+    p_castlevenia = (p_castlevenia + "0000000000000000000000000000000000000000000000000000000000007042cdcccc3d0000fa430100000000000000")
+    p_castlevenia = (p_castlevenia + "4d61696e2043616d657261008b000000f4ffffff6669786564ffffff54ffffff01000000e8ffffff0200000000000000")
+    p_castlevenia = (p_castlevenia + "00000000ffffffff")
+    eq("scene 2 payload", crypto::blake3(unhex(p_castlevenia)), "8341caa0e98c8ac3cd83e6aa169672e1b2cbeca00f9da0d3f76d2786238031fa")
+
+}
+
+// The API's edges, which the vector tables do not reach: `xof` takes `self` by value rather than
+// `inout`, so reading a digest must leave the hasher able to keep absorbing; an output length
+// below one block and one spanning five blocks must both truncate at exactly the right byte; and
+// `derive_key` must be able to emit more than 32 bytes, which is the case that actually runs its
+// second-pass XOF past one block.
+fn test_blake3_api_edges() {
+    var h = crypto::b3_new()
+    h.update(tv(700))
+    eq("digest then keep going (part 1)", h.hex(), "40f2bd0b346f2cb1a67c54928867bff9faaafe70de09e61315844520e5f7f915")
+    h.update(tv(1500).slice(700, 1500))
+    eq("digest then keep going (part 2)", h.hex(), "e71e67e776854018461734062301034d08f1be79d8fa59ae1daf61eda2c65318")
+
+    eq("xof 1 byte", tohex(crypto::blake3_xof(tv(1025), 1)), "d0")
+    eq("xof 300 bytes", tohex(crypto::blake3_xof(tv(1025), 300)), "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444f4c4a22b4b399155358a994e52bf255de60035742ec71bd08ac275a1b51cc6bfe332b0ef84b409108cda080e6269ed4b3e2c3f7d722aa4cdc98d16deb554e5627be8f955c98e1d5f9565a9194cad0c4285f93700062d9595adb992ae68ff12800ab67afea516f221cf7d1f8434fc36d8f6fbdf38d445c44d96ba3bb1d4a2e2ae9a53fd46d39307628a47f890cab6ac333aad48c0c11edf69e2a6437e8abf42d335327eeeb329bbc9c3a16b0618a6f70ed4eb6e8a3d00f80018492cfb93ccca0a32a9b463125ee90ad2e2c6cfa5b3fd9c1096a2b636429a83b85d49ff05464de2db6b87785f39798deaecac5fd5ee86b85810c43950c6d07f8066640fc1f873dbef23fb2b9b624a360f460402")
+    eq("derive_key 64 bytes", tohex(crypto::blake3_derive_key(tv_ctx(), tv(2049), 64)), "2ea477c5515cc3dd606512ee72bb3e0e758cfae7232826f35fb98ca1bcbdf27316d8e9e79081a80b046b60f6a263616f33ca464bd78d79fa18200d06c7fc9bff")
+    eq("xof 0 bytes", crypto::blake3_xof(tv(10), 0), "")
+
+    // a wrong-length key is refused outright rather than stretched: two callers with keys that
+    // differ only past the truncation point must not produce the same MAC.
+    eq("short key refused", crypto::blake3_keyed("shortkey", "x"), "")
+}

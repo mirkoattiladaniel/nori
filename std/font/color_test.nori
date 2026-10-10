@@ -1,0 +1,200 @@
+// Native tests for std/font's color glyphs (CBDT bitmaps, COLR v0 layers): run with
+//   noric --test std/font/color_test.nori compiler/runtime.nori --import-root .
+//
+// testdata/color_expected.txt.zst is FreeType's FT_LOAD_COLOR output (oracle/ftcolor.c): the emoji
+// subset's CBDT glyphs at their strike, and a synthetic COLR v0 font's layered glyphs.
+import "std/font" as font
+import "std/strutil" as su
+import "std/archive" as ar
+
+fn hexval(h: Str) -> Int {
+    var v = 0
+    var k = 0
+    while k < h.len() {
+        let c = ord(h.at(k))
+        var n = 0
+        if c >= 48 && c <= 57 { n = c - 48 } else if c >= 97 && c <= 102 { n = c - 87 } else if c >= 65 && c <= 70 { n = c - 55 }
+        v = v * 16 + n
+        k = k + 1
+    }
+    return v
+}
+
+fn test_emoji_font_loads() {
+    let fr = font::font_load(read_file("std/font/assets/NotoColorEmoji-subset.ttf"))
+    assert_true(fr.ok)
+    let f = fr.font
+    assert_true(font::font_has_color(f))
+    let g = font::font_glyph_index(f, 128512)                         // 😀
+    assert_true(g > 0)
+    assert_true(font::glyph_is_color(f, g))
+    // no outline: the glyph exists only as a bitmap
+    assert_eq(font::outline_num_contours(font::font_outline(f, g)), 0)
+    // scaled to text size: the box shrinks with the scale and the ink stays
+    let cb = font::rasterize_color(f, g, 20.0, 255)
+    assert_true(cb.w >= 20 && cb.w <= 28)
+    assert_true(cb.h >= 18 && cb.h <= 26)
+    var opaque = 0
+    var i = 0
+    while i < cb.w * cb.h { if (cb.rgba[i] & 255) > 200 { opaque = opaque + 1 }  i = i + 1 }
+    assert_true(opaque > cb.w * cb.h / 3)
+}
+
+// against FreeType: CBDT at the strike is the same PNG decoded and premultiplied alike, so it must
+// match exactly; COLR layers are anti-aliased by two different rasterizers, so per channel within
+// a tolerance, summed: the absolute difference is a small fraction of the ink.
+fn test_color_matches_freetype() {
+    let lines = su::split(ar::zstd_decompress(read_file("std/font/testdata/color_expected.txt.zst")), "\n")
+    var i = 0
+    var cases = 0
+    var worst = 0
+    while i < lines.len() {
+        let ln = lines[i]
+        if su::starts_with(ln, "color ") {
+            let p = su::split(ln, " ")
+            let f = font::font_load_index(read_file(p[1]), parse_int(p[2])).font
+            let gid = parse_int(p[3])
+            let size = parse_int(p[4])
+            let fw = parse_int(p[5])
+            let fh = parse_int(p[6])
+            let fl = parse_int(p[7])
+            let ft = parse_int(p[8])
+            let cb = font::rasterize_color(f, gid, to_float(size), 255)   // opaque black foreground, as FreeType's default
+            let bitmap = su::ends_with(p[1], "Emoji-subset.ttf")
+            if bitmap {
+                assert_eq(cb.w, fw)
+                assert_eq(cb.h, fh)
+                assert_eq(cb.left, fl)
+                assert_eq(cb.top, ft)
+            }
+            var diff = 0
+            var ink = 0
+            var x0 = fl  if cb.left < x0 { x0 = cb.left }
+            var y0 = ft  if cb.top > y0 { y0 = cb.top }
+            var x1 = fl + fw  if cb.left + cb.w > x1 { x1 = cb.left + cb.w }
+            var y1 = ft - fh  if cb.top - cb.h < y1 { y1 = cb.top - cb.h }
+            var py = y0
+            while py > y1 {
+                var px = x0
+                while px < x1 {
+                    var a = 0
+                    let fx = px - fl
+                    let fy = ft - py
+                    if fx >= 0 && fx < fw && fy >= 0 && fy < fh { a = hexval(lines[i + 1 + fy].slice(4 + fx * 8, 12 + fx * 8)) }
+                    let b = font::color_at(cb, px - cb.left, cb.top - py)
+                    var ch = 0
+                    while ch < 4 {
+                        var dd = ((a >> (ch * 8)) & 255) - ((b >> (ch * 8)) & 255)
+                        if dd < 0 { dd = 0 - dd }
+                        diff = diff + dd
+                        ch = ch + 1
+                    }
+                    ink = ink + (a & 255)
+                    px = px + 1
+                }
+                py = py - 1
+            }
+            var pm = 0
+            if ink > 0 { pm = diff * 1000 / (ink * 4) }
+            if pm > worst { worst = pm }
+            if bitmap { assert_eq(diff, 0) }
+            else {
+                if pm > 60 { printl("color mismatch ${p[1]} gid ${gid} @${size}: ${pm} per mille") }
+                assert_true(pm <= 60)
+            }
+            cases = cases + 1
+            i = i + 1 + fh
+        } else { i = i + 1 }
+    }
+    printl("color cases ${cases}, worst ${worst} per mille")
+    assert_true(cases >= 6)
+}
+
+fn test_colr_layers() {
+    let f = font::font_load(read_file("std/font/assets/ColrTest.ttf")).font
+    let ga = font::font_glyph_index(f, 65)
+    let gb = font::font_glyph_index(f, 66)
+    let la = font::colr_layers(f, ga, 255)
+    assert_eq(la.len(), 4)                                            // two layers: (glyph, color) x 2
+    assert_eq(la[0], ga)
+    assert_eq(la[1], 3760201983)                                      // 0xE02020FF: CPAL stores B,G,R,A = 20 20 E0 FF
+    let lb = font::colr_layers(f, gb, 287454020)                      // foreground 0x11223344
+    assert_eq(lb.len(), 2)
+    assert_eq(lb[1], 287454020)
+    assert_true(font::glyph_is_color(f, ga))
+    assert_true(!font::glyph_is_color(f, font::font_glyph_index(f, 67)))
+}
+
+fn test_atlas_holds_color_and_coverage() {
+    let emoji = font::font_load(read_file("std/font/assets/NotoColorEmoji-subset.ttf")).font
+    let latin = font::font_load(read_file("std/font/assets/NotoSans-subset.ttf")).font
+    var at = font::atlas_new(256, 256)
+    let a = font::atlas_glyph(at, latin, font::font_glyph_index(latin, 65), 24.0)
+    assert_true(!a.color)
+    assert_true(!at.has_color)
+    let e = font::atlas_glyph(at, emoji, font::font_glyph_index(emoji, 128512), 24.0)
+    assert_true(e.color)
+    assert_true(at.has_color)
+    assert_true(e.w > 10)
+    // the color plane holds the emoji's pixels; the coverage plane its alpha
+    let p = at.rgba[(e.uy + e.h / 2) * at.w + e.ux + e.w / 2]
+    assert_true((p & 255) > 200)
+    assert_eq(at.pix[(e.uy + e.h / 2) * at.w + e.ux + e.w / 2], p & 255)
+    // the coverage glyph and the color glyph do not overlap
+    assert_true(e.ux >= a.ux + a.w || e.uy >= a.uy + a.h)
+    // and a second request is a hit
+    let e2 = font::atlas_glyph(at, emoji, font::font_glyph_index(emoji, 128512), 24.0)
+    assert_eq(e2.ux, e.ux)
+    assert_eq(font::atlas_count(at), 2)
+    // the span cache hands back the same pixels as a fresh rasterization
+    let sp = font::rasterize_color_span(emoji, font::font_glyph_index(emoji, 128512), 24.0, 255)
+    let cb = font::rasterize_color(emoji, font::font_glyph_index(emoji, 128512), 24.0, 255)
+    assert_eq(sp.w, cb.w)
+    assert_eq(font::color_span_at(sp, cb.w * (cb.h / 2) + cb.w / 2), cb.rgba[cb.w * (cb.h / 2) + cb.w / 2])
+}
+
+// the color glyph cache's budget: with a tiny budget every new span overflows and drops the store,
+// the spans handed back stay correct through the drops, and the refilled cache still serves hits;
+// all of it is visible in color_cache_stats.
+fn test_color_cache_budget() {
+    let emoji = font::font_load(read_file("std/font/assets/NotoColorEmoji-subset.ttf")).font
+    font::color_cache_clear()
+    let base = font::color_cache_stats()                     // [hits, misses, resets, pixels]
+    font::color_cache_set_budget(64)                         // every emoji strike (>= 380 px) overflows
+    var gids: Vec<Int> = vec()
+    gids.push(1)  gids.push(6)  gids.push(10)  gids.push(20)
+    var sizes: Vec<Float> = vec()
+    sizes.push(16.0)  sizes.push(24.0)  sizes.push(32.0)
+    var n = 0
+    var g = 0
+    while g < gids.len() {
+        var s = 0
+        while s < sizes.len() {
+            let sp = font::rasterize_color_span(emoji, gids[g], sizes[s], 255)
+            let cb = font::rasterize_color(emoji, gids[g], sizes[s], 255)
+            assert_eq(sp.w, cb.w)
+            assert_eq(sp.h, cb.h)
+            // the span handed back is valid even when this very insert dropped and refilled the store
+            let mid = cb.w * (cb.h / 2) + cb.w / 2
+            assert_eq(font::color_span_at(sp, mid), cb.rgba[mid])
+            n = n + 1
+            s = s + 1
+        }
+        g = g + 1
+    }
+    let st = font::color_cache_stats()
+    assert_eq(st[0], base[0])                                // nothing hit
+    assert_eq(st[1], base[1] + n)                            // every request was a miss
+    assert_eq(st[2], base[2] + n)                            // ... and every miss overflowed the budget
+    assert_true(st[3] > 0 && st[3] < 4096)                   // the store holds only the last glyph's pixels
+    // the refilled cache is a real cache: the same key is found again without a new miss or reset
+    let before = font::color_cache_stats()
+    let sp2 = font::rasterize_color_span(emoji, gids[gids.len() - 1], sizes[sizes.len() - 1], 255)
+    let after = font::color_cache_stats()
+    assert_eq(after[0], before[0] + 1)
+    assert_eq(after[1], before[1])
+    assert_eq(after[2], before[2])
+    assert_true(sp2.w > 0)
+    // restore the default budget for any later test
+    font::color_cache_set_budget(2097152)
+}

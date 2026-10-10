@@ -1,0 +1,861 @@
+// Native .nori tests for layout/dsl_input.nori, run with
+//   noric --test std/nori_ui/layout/dsl_input_test.nori compiler/runtime.nori --import-root .
+// Driven through the public ui::layout:: API (the generated test module does not share
+// the layout directory's scope, so the private parser fns are reached via dsl_parse_document).
+import "std/nori_ui" as ui
+
+// ---- helpers (must not be named test_*) ----
+
+/// parse `body` as the single child of a bare column and return the child node.
+fn din_parse(body: Str) -> ui::layout::UiNode {
+    var r = ui::layout::dsl_parse_document(("column { padding: 0 " + (body + " }")))
+    assert_true(r.ok)
+    if !r.ok { return ui::layout::ui_node_blank(ui::layout::nk_column()) }
+    return sink r.doc.tree.children[0]
+}
+/// the parse error message for `body` inside a column (asserts the parse failed).
+fn din_err(body: Str) -> Str {
+    var r = ui::layout::dsl_parse_document(("column { padding: 0 " + (body + " }")))
+    assert_false(r.ok)
+    return sink r.emsg
+}
+/// lay one node out alone in a viewport and return the overlay.
+fn din_layout(node: ui::layout::UiNode, w: Float, h: Float) -> ui::layout::ComputedOverlay {
+    var mine = ui::layout::ui_node_dup(node)             // layout mutates the tree; the caller keeps its own
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(w, h))
+    return ui::layout::layout_overlay(mine, vp)
+}
+/// the first hit whose on_click starts with `prefix`, or "" when there is none.
+fn din_hit_with(ov: ui::layout::ComputedOverlay, prefix: Str) -> Str {
+    var i = 0
+    while i < ov.hits.len() {
+        var s = ov.hits[i].on_click
+        if s.len() >= prefix.len() && (s.slice(0, prefix.len()) == prefix) { return copy s }
+        i = i + 1
+    }
+    return ""
+}
+fn din_q() -> Str { return ("" + chr(34)) }
+
+// =========================== number / drag_value ===========================
+
+fn test_dsl_number_minimal_and_defaults() {
+    var n = din_parse("number { id: speed }")
+    assert_eq(n.kind, ui::layout::nk_number())
+    assert_streq(n.id, "speed")
+    assert_streq(n.text, "")                       // label defaults to ""
+    assert_feq(n.value_f, 0.0, 0.0001)
+    assert_feq(n.vmin, 0.0, 0.0001)
+    assert_feq(n.vmax, 1.0, 0.0001)                // max defaults to 1.0, not 0.0
+    assert_false(n.has_step)
+    assert_false(n.has_precision)
+    assert_streq(n.suffix, "")
+    assert_true(n.fill_w)                          // fill_w defaults true
+    assert_eq(n.h.unit, 0)
+    assert_feq(n.h.value, 28.0, 0.0001)            // height defaults to 28px
+    assert_eq(n.classes.len(), 0)
+    assert_false(n.has_tab_index)
+    assert_false(n.has_align_self)
+    assert_streq(ui::layout::ui_kind_tag(n.kind), "number")
+}
+
+fn test_dsl_number_every_attribute() {
+    var q = din_q()
+    var src = "number { bind: b1 bind_visible: bv bind_disabled: bd id: gain label: " + q
+    src = src + ("Gain" + (q + " value: 3.5 min: -2 max: 10 step: 0.25 suffix: " + (q + ("dB" + (q + " precision: 2")))))
+    src = src + " classes: [a, b] height: 40 fill_w: false align_self: center tab_index: 7 }"
+    var n = din_parse(src)
+    assert_streq(n.bind, "b1")
+    assert_streq(n.bind_visible, "bv")
+    assert_streq(n.bind_disabled, "bd")
+    assert_streq(n.id, "gain")
+    assert_streq(n.text, "Gain")
+    assert_feq(n.value_f, 3.5, 0.0001)
+    assert_feq(n.vmin, 0.0 - 2.0, 0.0001)
+    assert_feq(n.vmax, 10.0, 0.0001)
+    assert_true(n.has_step)
+    assert_feq(n.step, 0.25, 0.0001)
+    assert_streq(n.suffix, "dB")
+    assert_true(n.has_precision)
+    assert_eq(n.precision, 2)
+    assert_eq(n.classes.len(), 2)
+    assert_streq(n.classes[1], "b")
+    assert_feq(n.h.value, 40.0, 0.0001)
+    assert_false(n.fill_w)
+    assert_true(n.has_align_self)
+    assert_eq(n.align_self, ui::layout::cross_center())
+    assert_true(n.has_tab_index)
+    assert_eq(n.tab_index, 7)
+    // aliases: lo/hi/h/focus_order/class
+    var m = din_parse("number { id: x lo: 5 hi: 6 h: 12 focus_order: 3 class: solo }")
+    assert_feq(m.vmin, 5.0, 0.0001)
+    assert_feq(m.vmax, 6.0, 0.0001)
+    assert_feq(m.h.value, 12.0, 0.0001)
+    assert_eq(m.tab_index, 3)
+    assert_eq(m.classes.len(), 1)
+    assert_streq(m.classes[0], "solo")
+}
+
+fn test_dsl_number_precision_clamp_and_round() {
+    // clamp low end
+    var a = din_parse("number { id: x precision: -4 }")
+    assert_eq(a.precision, 0)
+    // clamp high end
+    var b = din_parse("number { id: x precision: 99 }")
+    assert_eq(b.precision, 6)
+    // round half away from zero
+    var c = din_parse("number { id: x precision: 2.5 }")
+    assert_eq(c.precision, 3)
+    var d = din_parse("number { id: x precision: 2.4 }")
+    assert_eq(d.precision, 2)
+    var e = din_parse("number { id: x precision: 5.5 }")
+    assert_eq(e.precision, 6)                      // 5.5 -> 6, still inside the clamp
+}
+
+fn test_dsl_number_no_min_max_validation() {
+    // min > max is not rejected, and value is not clamped at parse time
+    var n = din_parse("number { id: x min: 10 max: 2 value: 99 }")
+    assert_feq(n.vmin, 10.0, 0.0001)
+    assert_feq(n.vmax, 2.0, 0.0001)
+    assert_feq(n.value_f, 99.0, 0.0001)
+}
+
+fn test_dsl_number_and_drag_value_identical() {
+    var a = din_parse("number { id: x label: L value: 2 min: 1 max: 9 step: 0.5 precision: 3 }")
+    var b = din_parse("drag_value { id: x label: L value: 2 min: 1 max: 9 step: 0.5 precision: 3 }")
+    assert_eq(a.kind, b.kind)
+    assert_streq(a.id, b.id)
+    assert_streq(a.text, b.text)
+    assert_feq(a.value_f, b.value_f, 0.0001)
+    assert_feq(a.vmin, b.vmin, 0.0001)
+    assert_feq(a.vmax, b.vmax, 0.0001)
+    assert_feq(a.step, b.step, 0.0001)
+    assert_eq(a.precision, b.precision)
+    assert_true(a.fill_w == b.fill_w)
+    assert_feq(a.h.value, b.h.value, 0.0001)
+}
+
+fn test_dsl_number_errors() {
+    // required id, exact message
+    assert_streq(din_err("number { value: 1 }"), "number requires id:")
+    // drag_value still says "number"
+    assert_streq(din_err("drag_value { value: 1 }"), "number requires id:")
+    // unknown attribute, exact message (double quotes are part of it)
+    assert_streq(din_err("number { id: x foo: 1 }"), "unknown number field \"foo\"")
+    assert_streq(din_err("drag_value { id: x foo: 1 }"), "unknown number field \"foo\"")
+    // wrong value type
+    assert_streq(din_err("number { id: x value: yes }"), "value must be a number")
+    assert_streq(din_err("number { id: 3 }"), "number id must be string or ident")
+    assert_streq(din_err("number { id: x label: 3 }"), "number label must be string or ident")
+    assert_streq(din_err("number { id: x fill_w: nope }"), "fill_w must be true or false")
+    // Style B `:` enforcement
+    assert_streq(din_err("number { id x }"), "expected ':', found 'x'")
+    assert_streq(din_err("number { id { } }"), "expected ':', found '{'")
+    var r = ui::layout::dsl_parse_document("column { number { id")
+    assert_false(r.ok)
+    assert_streq(r.emsg, "expected ':', found end of file")
+}
+
+fn test_dsl_number_layout_geometry() {
+    var n = din_parse("number { id: gain label: Gain value: 0.5 min: 0 max: 2 step: 0.1 precision: 2 h: 30 }")
+    var ov = din_layout(n, 200.0, 30.0)
+    // label text + field rect + value text
+    var texts = 0
+    var rects = 0
+    var i = 0
+    while i < ov.prims.len() { if ov.prims[i].kind == 2 { texts = texts + 1 } else { rects = rects + 1 }  i = i + 1 }
+    assert_eq(texts, 2)
+    assert_eq(rects, 1)
+    // geometry: lab_w = len("Gain")*7 + 10 = 38
+    var field = ov.prims[1].rect
+    assert_feq(field.min.x, 38.0, 0.01)
+    assert_feq(field.width(), 162.0, 0.01)
+    assert_feq(field.height(), 30.0, 0.01)
+    // two hits: whole-rect drag first, value field second (front-most last)
+    assert_eq(ov.hits.len(), 2)
+    assert_feq(ov.hits[0].rect.width(), 200.0, 0.01)
+    assert_feq(ov.hits[1].rect.width(), 162.0, 0.01)
+    assert_streq(ov.hits[0].on_click, "number:gain:0.500000:0.000000:2.000000:0.100000")
+    assert_streq(ov.hits[1].on_click, "number_edit:gain:0.500000:0.000000:2.000000:0.100000:0.5")
+    // measure resolves the explicit height
+    var ctx = ui::layout::length_context_root(200.0, 30.0)
+    assert_feq(ui::layout::ui_measure(n, ctx).y, 30.0, 0.01)
+}
+
+fn test_dsl_number_default_drag_step() {
+    // no step: (hi-lo).abs()/200 with a 1e-6 floor
+    var n = din_parse("number { id: x min: 0 max: 2 }")
+    var ov = din_layout(n, 100.0, 28.0)
+    assert_streq(din_hit_with(ov, "number:"), "number:x:0.000000:0.000000:2.000000:0.010000")
+    // degenerate range floors at 0.000001
+    var m = din_parse("number { id: y min: 4 max: 4 value: 9 }")
+    var ov2 = din_layout(m, 100.0, 28.0)
+    assert_streq(din_hit_with(ov2, "number:"), "number:y:4.000000:4.000000:4.000000:0.000001")
+}
+
+// ================================ text_input ================================
+
+fn test_dsl_text_input_minimal_and_defaults() {
+    var n = din_parse("text_input { id: name }")
+    assert_eq(n.kind, ui::layout::nk_text_input())
+    assert_streq(n.id, "name")
+    assert_streq(n.text, "")
+    assert_streq(n.value_s, "")
+    assert_true(n.fill_w)
+    assert_feq(n.h.value, 28.0, 0.0001)
+    assert_eq(n.classes.len(), 0)
+    assert_false(n.has_tab_index)
+    assert_streq(ui::layout::ui_kind_tag(n.kind), "text_input")
+}
+
+fn test_dsl_text_input_every_attribute() {
+    var q = din_q()
+    var src = "text_input { bind: b bind_visible: bv bind_disabled: bd id: name label: " + q
+    src = src + ("Name" + (q + " value: " + (q + ("Ada" + (q + " classes: [x, y] height: 33 fill_w: false align_self: end tab_index: 2 }")))))
+    var n = din_parse(src)
+    assert_streq(n.bind, "b")
+    assert_streq(n.bind_visible, "bv")
+    assert_streq(n.bind_disabled, "bd")
+    assert_streq(n.id, "name")
+    assert_streq(n.text, "Name")
+    assert_streq(n.value_s, "Ada")
+    assert_eq(n.classes.len(), 2)
+    assert_feq(n.h.value, 33.0, 0.0001)
+    assert_false(n.fill_w)
+    assert_true(n.has_align_self)
+    assert_eq(n.align_self, ui::layout::cross_end())
+    assert_eq(n.tab_index, 2)
+    // aliases
+    var m = din_parse("text_input { id: x h: 11 focus_order: 4 class: c1 }")
+    assert_feq(m.h.value, 11.0, 0.0001)
+    assert_eq(m.tab_index, 4)
+    assert_eq(m.classes.len(), 1)
+    assert_streq(m.classes[0], "c1")
+}
+
+fn test_dsl_text_input_errors() {
+    assert_streq(din_err("text_input { value: v }"), "text_input requires id:")
+    assert_streq(din_err("text_input { id: x nope: 1 }"), "unknown text_input field \"nope\"")
+    assert_streq(din_err("text_input { id: x value: 3 }"), "value must be string or ident")
+    assert_streq(din_err("text_input { id: x height: nope }"), "height must be a number")
+    assert_streq(din_err("text_input { id: x classes: 3 }"), "classes must be [...]")
+    assert_streq(din_err("text_input { id: x classes: [3] }"), "class names must be strings or identifiers")
+    assert_streq(din_err("text_input { id: x align_self: sideways }"), "unknown cross_align \"sideways\"")
+    assert_streq(din_err("text_input { id: x align_self: 3 }"), "cross_align must be stretch, center, or end")
+    assert_streq(din_err("text_input { id, x }"), "expected ':', found ','")
+    // text_input has no fill_h
+    assert_streq(din_err("text_input { id: x fill_h: true }"), "unknown text_input field \"fill_h\"")
+}
+
+fn test_dsl_text_input_layout_geometry() {
+    var q = din_q()
+    var n = din_parse("text_input { id: name label: Name value: " + (q + ("Ada" + (q + " h: 28 }"))))
+    var ov = din_layout(n, 300.0, 28.0)
+    // label text + field rect + value text
+    var texts = 0
+    var rects = 0
+    var i = 0
+    while i < ov.prims.len() { if ov.prims[i].kind == 2 { texts = texts + 1 } else { rects = rects + 1 }  i = i + 1 }
+    assert_eq(texts, 2)
+    assert_eq(rects, 1)
+    // label_w = clamp(300*0.34, 80, 150) = 102; field_h = 28-4 = 24
+    var field = ov.prims[1].rect
+    assert_feq(field.min.x, 110.0, 0.01)
+    assert_feq(field.width(), 190.0, 0.01)
+    assert_feq(field.height(), 24.0, 0.01)
+    assert_feq(field.min.y, 2.0, 0.01)
+    // default text_input field bg [18,18,22,255]
+    assert_eq(ov.prims[1].color.r, 18)
+    assert_eq(ov.prims[1].color.b, 22)
+    // the value text is drawn 8px inside the field
+    assert_feq(ov.prims[2].pos.x, 118.0, 0.01)
+    assert_streq(ov.prims[2].text, "Ada")
+    // one hit on the field, event string as emitted (size_px default 14 -> @px=14.000)
+    assert_eq(ov.hits.len(), 1)
+    assert_streq(ov.hits[0].on_click, "text_edit:name:@px=14.000:Ada")
+    assert_feq(ov.hits[0].rect.width(), 190.0, 0.01)
+    // label_w clamps at 80 on a narrow row
+    var ov2 = din_layout(n, 120.0, 28.0)
+    assert_feq(ov2.prims[1].rect.min.x, 88.0, 0.01)
+}
+
+// ================================= picker ==================================
+
+fn test_dsl_picker_minimal_and_defaults() {
+    var n = din_parse("picker { id: file }")
+    assert_eq(n.kind, ui::layout::nk_picker())
+    assert_streq(n.id, "file")
+    assert_streq(n.text, "")
+    assert_streq(n.value_s, "")
+    assert_true(n.fill_w)
+    assert_feq(n.h.value, 28.0, 0.0001)
+    assert_streq(ui::layout::ui_kind_tag(n.kind), "picker")
+}
+
+fn test_dsl_picker_every_attribute_matches_text_input() {
+    var q = din_q()
+    var tail = " id: f label: " + (q + ("Pick" + (q + " value: " + (q + ("a.png" + (q + " classes: [k] height: 44 fill_w: false align_self: start tab_index: 9 bind: b bind_visible: bv bind_disabled: bd }"))))))
+    var p = din_parse("picker {" + tail)
+    var t = din_parse("text_input {" + tail)
+    assert_streq(p.id, t.id)
+    assert_streq(p.text, t.text)
+    assert_streq(p.value_s, t.value_s)
+    assert_eq(p.classes.len(), t.classes.len())
+    assert_feq(p.h.value, t.h.value, 0.0001)
+    assert_true(p.fill_w == t.fill_w)
+    assert_eq(p.align_self, t.align_self)
+    assert_eq(p.tab_index, t.tab_index)
+    assert_streq(p.bind, t.bind)
+    assert_streq(p.bind_visible, t.bind_visible)
+    assert_streq(p.bind_disabled, t.bind_disabled)
+    assert_ne(p.kind, t.kind)
+}
+
+fn test_dsl_picker_errors() {
+    assert_streq(din_err("picker { label: L }"), "picker requires id:")
+    assert_streq(din_err("picker { id: x bogus: 1 }"), "unknown picker field \"bogus\"")
+    assert_streq(din_err("picker { id: x value: 5 }"), "value must be string or ident")
+    assert_streq(din_err("picker { id: 5 }"), "picker id must be string or ident")
+    assert_streq(din_err("picker { id: x label: 5 }"), "picker label must be string or ident")
+    assert_streq(din_err("picker { id x }"), "expected ':', found 'x'")
+}
+
+fn test_dsl_picker_layout_browse_placeholder() {
+    var n = din_parse("picker { id: file label: File h: 28 }")
+    var ov = din_layout(n, 300.0, 28.0)
+    // empty value renders the literal "Browse..."
+    assert_streq(ov.prims[2].text, "Browse...")
+    assert_eq(ov.hits.len(), 1)
+    assert_streq(ov.hits[0].on_click, "picker:file")
+    var q = din_q()
+    var m = din_parse("picker { id: file label: File value: " + (q + ("a.png" + (q + " h: 28 }"))))
+    var ov2 = din_layout(m, 300.0, 28.0)
+    assert_streq(ov2.prims[2].text, "a.png")
+    assert_streq(ov2.hits[0].on_click, "picker:file")
+}
+
+// ================================ text_area ================================
+
+fn test_dsl_text_area_minimal_and_defaults() {
+    var n = din_parse("text_area { id: notes }")
+    assert_eq(n.kind, ui::layout::nk_text_area())
+    assert_streq(n.id, "notes")
+    assert_streq(n.value_s, "")
+    assert_true(n.fill_w)
+    assert_false(n.fill_h)
+    assert_false(n.read_only)
+    assert_eq(n.tab_size, 4)
+    assert_false(n.hard_tabs)
+    assert_true(n.word_wrap)                       // word_wrap defaults true
+    assert_feq(n.h.value, 0.0, 0.0001)             // height is intrinsic when unset
+    assert_streq(ui::layout::ui_kind_tag(n.kind), "text_area")
+}
+
+fn test_dsl_text_area_every_attribute() {
+    var q = din_q()
+    var src = "text_area { bind: b bind_visible: bv bind_disabled: bd id: notes value: " + q
+    src = src + ("hi" + (q + " classes: [c] height: 90 fill_w: false fill_h: true read_only: true tab_size: 2 hard_tabs: true word_wrap: false align_self: stretch tab_index: 5 }"))
+    var n = din_parse(src)
+    assert_streq(n.bind, "b")
+    assert_streq(n.bind_visible, "bv")
+    assert_streq(n.bind_disabled, "bd")
+    assert_streq(n.id, "notes")
+    assert_streq(n.value_s, "hi")
+    assert_eq(n.classes.len(), 1)
+    assert_feq(n.h.value, 90.0, 0.0001)
+    assert_false(n.fill_w)
+    assert_true(n.fill_h)
+    assert_true(n.read_only)
+    assert_eq(n.tab_size, 2)
+    assert_true(n.hard_tabs)
+    assert_false(n.word_wrap)
+    assert_true(n.has_align_self)
+    assert_eq(n.align_self, ui::layout::cross_stretch())
+    assert_eq(n.tab_index, 5)
+}
+
+fn test_dsl_text_area_tab_size_floor() {
+    assert_eq(din_parse("text_area { id: x tab_size: 0 }").tab_size, 1)
+    assert_eq(din_parse("text_area { id: x tab_size: -5 }").tab_size, 1)   // as u32 saturates to 0, then max(1)
+    assert_eq(din_parse("text_area { id: x tab_size: 8 }").tab_size, 8)
+}
+
+fn test_dsl_text_area_errors() {
+    assert_streq(din_err("text_area { value: v }"), "text_area requires id:")
+    assert_streq(din_err("text_area { id: x zap: 1 }"), "unknown text_area field \"zap\"")
+    // there is no `label` attribute on text_area
+    assert_streq(din_err("text_area { id: x label: L }"), "unknown text_area field \"label\"")
+    assert_streq(din_err("text_area { id: x value: 3 }"), "value must be string or ident")
+    assert_streq(din_err("text_area { id: x read_only: maybe }"), "read_only must be true or false")
+    assert_streq(din_err("text_area { id: x tab_size: wide }"), "tab_size must be a number")
+    assert_streq(din_err("text_area { id: x zz }"), "expected ':', found '}'")
+}
+
+fn test_dsl_text_area_intrinsic_height_and_layout() {
+    var nl = ("" + chr(10))
+    var q = din_q()
+    // intrinsic height: max(lines, min_rows) * text_line_height(size_px) + pad_y*2
+    //                  = 3 * (14+5) + 8*2 = 73 for a short value.
+    //
+    // The constant behind this must be `text_line_height(node.size_px)`, the same number
+    // `di_layout_text_area` paints its lines at: `size_px` defaults to 14, so a three-line
+    // text_area reserves 73px and draws 73px of content. The measure and the paint read the
+    // same number, the node's.
+    var n = din_parse("text_area { id: notes value: " + (q + ("hi" + (q + " }"))))
+    var ctx = ui::layout::length_context_root(300.0, 400.0)
+    assert_feq(ui::layout::ui_measure(n, ctx).y, 73.0, 0.01)
+    // five lines: 5*19+16 = 111
+    var five = "a" + (nl + ("b" + (nl + ("c" + (nl + ("d" + (nl + "e")))))))
+    var m = din_parse("text_area { id: notes value: " + (q + (five + (q + " }"))))
+    assert_feq(ui::layout::ui_measure(m, ctx).y, 111.0, 0.01)
+    // an explicit height wins
+    var e = din_parse("text_area { id: notes height: 40 }")
+    assert_feq(ui::layout::ui_measure(e, ctx).y, 40.0, 0.01)
+    // paint: field bg [11,11,13,255] then one text prim per non-empty line
+    var ov = din_layout(m, 300.0, 101.0)
+    assert_eq(ov.prims[0].kind, 0)
+    assert_eq(ov.prims[0].color.r, 11)
+    assert_eq(ov.prims[0].color.b, 13)
+    var texts = 0
+    var i = 0
+    while i < ov.prims.len() { if ov.prims[i].kind == 2 { texts = texts + 1 }  i = i + 1 }
+    assert_eq(texts, 5)
+    // hit: editable by default
+    assert_eq(ov.hits.len(), 1)
+    assert_streq(ov.hits[0].on_click, "text_area_edit:notes")
+    assert_feq(ov.hits[0].rect.width(), 300.0, 0.01)
+}
+
+fn test_dsl_text_area_read_only_hit() {
+    var ov = din_layout(din_parse("text_area { id: notes read_only: true height: 40 }"), 200.0, 40.0)
+    assert_eq(ov.hits.len(), 1)
+    assert_streq(ov.hits[0].on_click, "text_area_view:notes")
+}
+
+// ============================ cross-kind checks ============================
+
+fn test_dsl_input_no_children_allowed() {
+    // none of the four take child elements; the `{` trips Style B's `:` error
+    assert_streq(din_err("number { id: x rect { } }"), "expected ':', found '{'")
+    assert_streq(din_err("text_input { id: x rect { } }"), "expected ':', found '{'")
+    assert_streq(din_err("text_area { id: x rect { } }"), "expected ':', found '{'")
+    assert_streq(din_err("picker { id: x rect { } }"), "expected ':', found '{'")
+}
+
+fn test_dsl_input_focusable_by_kind() {
+    var r = ui::layout::dsl_parse_document("column { padding: 0 number { id: a } text_input { id: b } text_area { id: c } picker { id: d } }")
+    assert_true(r.ok)
+    var f = ui::layout::collect_overlay_focusables(r.doc.tree)
+    assert_eq(f.len(), 4)
+    assert_streq(f[0].id, "a")
+    assert_streq(f[3].id, "d")
+}
+
+// ====================== picker: the colour popup ==========================
+// Which picker this is: the `.ui` `picker` node is a generic browse field whose click
+// emits `picker:{id}` for the host to answer, and that half is covered above. A picker whose
+// `value` is a colour literal is additionally the colour picker of widget.nori: it grows a
+// swatch, and while it carries the runtime `focused` class it opens the popup.
+
+/// a picker source with the given attribute tail, quoting `value`.
+fn din_pick(val: Str, extra: Str) -> Str {
+    var q = din_q()
+    return ("picker { id: file label: Fill h: 28 value: " + (q + (val + (q + (" " + (extra + " }"))))))
+}
+/// count the hits whose on_click is exactly `want`.
+fn din_hits_named(ov: ui::layout::ComputedOverlay, want: Str) -> Int {
+    var n = 0
+    var i = 0
+    while i < ov.hits.len() { if (ov.hits[i].on_click == want) { n = n + 1 }  i = i + 1 }
+    return n
+}
+/// the rect of the first hit whose on_click is exactly `want` (asserts there is one).
+fn din_hit_rect(ov: ui::layout::ComputedOverlay, want: Str) -> ui::core::Rect {
+    var i = 0
+    while i < ov.hits.len() { if (ov.hits[i].on_click == want) { return ui::layout::rect_dup(ov.hits[i].rect) }  i = i + 1 }
+    assert_true(false)
+    return ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2_zero())
+}
+
+fn test_dsl_picker_colour_swatch_only_for_colour_values() {
+    // #RRGGBB -> a swatch at the right end of the field, on top of the browse chrome
+    var col = din_layout(din_parse(din_pick("#3366cc", "")), 300.0, 28.0)
+    var found = false
+    var i = 0
+    while i < col.prims.len() {
+        var pr = col.prims[i]
+        if pr.kind == 0 && pr.color.r == 51 && pr.color.g == 102 && pr.color.b == 204 { found = true }
+        i = i + 1
+    }
+    assert_true(found)
+    // a path value is not a colour: no swatch, and the field is the plain browse field
+    var path = din_layout(din_parse(din_pick("a.png", "")), 300.0, 28.0)
+    assert_eq(path.prims.len(), 3)                     // field bg + label + value text
+    assert_eq(path.hits.len(), 1)
+    assert_streq(path.hits[0].on_click, "picker:file")
+    // a string that is the right length but not hex is not a colour either
+    var fake = din_layout(din_parse(din_pick("#zzggcc", "")), 300.0, 28.0)
+    assert_eq(fake.prims.len(), 3)
+    // #RGB shorthand expands (F -> FF)
+    var shrt = din_layout(din_parse(din_pick("#f00", "")), 300.0, 28.0)
+    var red = false
+    var j = 0
+    while j < shrt.prims.len() {
+        if shrt.prims[j].kind == 0 && shrt.prims[j].color.r == 255 && shrt.prims[j].color.g == 0 && shrt.prims[j].color.b == 0 { red = true }
+        j = j + 1
+    }
+    assert_true(red)
+}
+
+fn test_dsl_picker_colour_popup_opens_only_when_focused() {
+    // unfocused: the swatch, but no popup, one hit, the ordinary browse click
+    var shut = din_layout(din_parse(din_pick("#3366cc", "")), 300.0, 28.0)
+    assert_eq(shut.hits.len(), 1)
+    assert_eq(din_hits_named(shut, "picker_sv:file"), 0)
+    // focused: the two popup regions, appended after the field's own hit
+    var ov = din_layout(din_parse(din_pick("#3366cc", "classes: [focused]")), 300.0, 28.0)
+    assert_eq(ov.hits.len(), 3)
+    assert_streq(ov.hits[0].on_click, "picker:file")
+    assert_streq(ov.hits[1].on_click, "picker_sv:file")
+    assert_streq(ov.hits[2].on_click, "picker_hue:file")
+    assert_streq(ov.hits[2].id, "file")
+    // a focused picker whose value is not a colour opens nothing
+    var browse = din_layout(din_parse(din_pick("a.png", "classes: [focused]")), 300.0, 28.0)
+    assert_eq(browse.hits.len(), 1)
+    // ...and neither does a focused text_input with a colour-looking value
+    var q = din_q()
+    var ti = din_layout(din_parse("text_input { id: t label: T h: 28 classes: [focused] value: " + (q + ("#3366cc" + (q + " }")))), 300.0, 28.0)
+    assert_eq(din_hits_named(ti, "picker_sv:t"), 0)
+}
+
+fn test_dsl_picker_colour_popup_geometry() {
+    var ov = din_layout(din_parse(din_pick("#3366cc", "classes: [focused]")), 300.0, 28.0)
+    // the field: label column clamp(300*0.34, 80, 150) = 102, + 8 gap; height 28-4 = 24 centred
+    // the popup hangs 2px below it, at the field's left edge
+    var sq = din_hit_rect(ov, "picker_sv:file")
+    assert_feq(sq.min.x, 118.0, 0.01)                  // 110 (field x) + 8 (popup padding)
+    assert_feq(sq.min.y, 36.0, 0.01)                   // 26 (field bottom) + 2 (gap) + 8 (padding)
+    assert_feq(sq.width(), 120.0, 0.01)                // picker_square_size()
+    assert_feq(sq.height(), 120.0, 0.01)
+    var hu = din_hit_rect(ov, "picker_hue:file")
+    assert_feq(hu.min.x, 242.0, 0.01)                  // square right + picker_popup_gap()
+    assert_feq(hu.width(), 16.0, 0.01)                 // picker_hue_bar_width()
+    assert_feq(hu.min.y, sq.min.y, 0.01)
+    assert_feq(hu.height(), 120.0, 0.01)
+    // the panel behind them is opaque and covers both
+    var panel = ov.prims[ov.prims.len() - 1]
+    var pi = 0
+    var pminy = 1000000.0
+    while pi < ov.prims.len() {
+        if ov.prims[pi].kind == 0 && ov.prims[pi].rect.min.y > 26.001 && ov.prims[pi].rect.min.y < pminy { pminy = ov.prims[pi].rect.min.y  panel = ov.prims[pi] }
+        pi = pi + 1
+    }
+    assert_feq(panel.rect.min.y, 28.0, 0.01)
+    assert_feq(panel.rect.width(), 156.0, 0.01)        // 8*2 + 120 + 4 + 16
+    assert_feq(panel.rect.height(), 136.0, 0.01)       // 8*2 + 120
+    assert_eq(panel.color.a, 255)
+}
+
+fn test_dsl_picker_colour_popup_escapes_a_scroll_viewport_and_wins_the_hit() {
+    // the picker sits inside a 40px scroll viewport, so all but the first 14px of the popup falls
+    // outside it; the popup layer must come through whole and unclipped, and its regions must beat
+    // both the field underneath and whatever else the pane holds.
+    var q = din_q()
+    var src = "scroll_column { id: sc h: 40 picker { id: file label: Fill h: 28 classes: [focused] value: " + (q + ("#3366cc" + (q + " } button { id: b label: " + (q + ("Under" + (q + " h: 300 on_click: pressed } }"))))))
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(300.0, 400.0))
+    var ov = ui::layout::layout_overlay(r.doc.tree, vp)
+    var sq = din_hit_rect(ov, "picker_sv:file")
+    assert_feq(sq.max.y, 156.0, 0.01)                  // 36 + 120: the whole square survived
+    // no popup primitive carries a clip rect, and the panel is not intersected
+    var i = 0
+    var panel_h = 0.0
+    while i < ov.prims.len() {
+        var pr = ov.prims[i]
+        if pr.kind == 0 && pr.rect.min.y > 26.001 && pr.rect.width() > 155.0 && pr.rect.width() < 157.0 { panel_h = pr.rect.height()  assert_false(pr.has_clip) }
+        i = i + 1
+    }
+    assert_feq(panel_h, 136.0, 0.01)
+    // the button beneath the popup loses every point they share, and wins again past its edge
+    assert_streq(ui::layout::overlay_hit_test(ov, ui::core::vec2(150.0, 100.0)).on_click, "picker_sv:file")
+    assert_streq(ui::layout::overlay_hit_test(ov, ui::core::vec2(250.0, 100.0)).on_click, "picker_hue:file")
+    assert_streq(ui::layout::overlay_hit_test(ov, ui::core::vec2(150.0, 300.0)).on_click, "pressed")
+}
+
+// ================================ code_editor ================================
+// text_area's sibling: the gutter-and-colours widget. What is asserted here is the half that is
+// not shared: the language, the three caller-owned state attributes, and the distinct hit action.
+
+fn test_dsl_code_editor_minimal_and_defaults() {
+    var n = din_parse("code_editor { id: source }")
+    assert_eq(n.kind, ui::layout::nk_code_editor())
+    assert_streq(n.id, "source")
+    assert_streq(n.value_s, "")
+    assert_streq(n.language, "")                   // no language = plain text, not an error
+    assert_eq(n.caret, 0)
+    assert_eq(n.sel_anchor, 0)
+    assert_feq(n.scroll_y, 0.0, 0.0001)
+    assert_true(n.fill_w)
+    assert_eq(n.tab_size, 4)
+    assert_feq(n.h.value, 0.0, 0.0001)             // height is intrinsic when unset, like text_area
+    assert_streq(ui::layout::ui_kind_tag(n.kind), "code_editor")
+}
+
+fn test_dsl_code_editor_every_attribute() {
+    var q = din_q()
+    var src = "code_editor { id: source language: " + (q + ("nori" + (q + " value: " + (q + ("fn main" + (q + " caret: 7 sel_anchor: 3 scroll_y: 48 tab_size: 2 read_only: true word_wrap: false hard_tabs: true fill_h: true classes: [focused] }"))))))
+    var n = din_parse(src)
+    assert_streq(n.language, "nori")
+    assert_streq(n.value_s, "fn main")
+    assert_eq(n.caret, 7)
+    assert_eq(n.sel_anchor, 3)
+    assert_feq(n.scroll_y, 48.0, 0.0001)
+    assert_eq(n.tab_size, 2)
+    assert_true(n.read_only)
+    assert_false(n.word_wrap)
+    assert_true(n.hard_tabs)
+    assert_true(n.fill_h)
+}
+
+fn test_dsl_code_editor_clamps_negative_state() {
+    // offsets into a buffer cannot be negative; clamping at parse keeps the paint free of validation
+    var n = din_parse("code_editor { id: s caret: -4 sel_anchor: -1 scroll_y: -20 }")
+    assert_eq(n.caret, 0)
+    assert_eq(n.sel_anchor, 0)
+    assert_feq(n.scroll_y, 0.0, 0.0001)
+}
+
+fn test_dsl_code_editor_rejects_an_unknown_field() {
+    var r = ui::layout::dsl_parse_document("code_editor { id: s wobble: 13 }")
+    assert_false(r.ok)
+}
+
+fn test_code_editor_rows_are_lines_until_wrapping() {
+    var st = ui::layout::multiline_edit_new("aa" + ("\n" + ("bb" + ("\n" + "cc"))))
+    // unwrapped: one row per logical line, whatever the width
+    var flat = ui::layout::code_editor_rows(st, 10.0, 14.0, false)
+    assert_eq(flat.len(), 3)
+    assert_eq(flat[1].line, 1)
+    // wrapped, but wide enough that nothing has to break
+    var wide = ui::layout::code_editor_rows(st, 500.0, 14.0, true)
+    assert_eq(wide.len(), 3)
+}
+
+fn test_code_editor_rows_wrap_at_a_space_and_keep_the_line_number() {
+    // one logical line, far too wide for the content: it must become several rows, and every one of
+    // them must still report line 0, which is what lets the gutter number the line once.
+    var st = ui::layout::multiline_edit_new("alpha beta gamma delta epsilon zeta eta theta")
+    var rows = ui::layout::code_editor_rows(st, 60.0, 14.0, true)
+    assert_true(rows.len() > 3)
+    var i = 0
+    while i < rows.len() { assert_eq(rows[i].line, 0)  i = i + 1 }
+    // the rows tile the line: each starts where the last ended, and together they cover it
+    assert_eq(rows[0].start, 0)
+    assert_eq(rows[rows.len() - 1].end, st.text.len())
+    i = 1
+    while i < rows.len() { assert_eq(rows[i].start, rows[i - 1].end)  i = i + 1 }
+}
+
+fn test_code_editor_rows_break_a_word_with_no_space_in_it() {
+    // a long path or a base64 blob has nowhere to break, and a wrap mode that sometimes refuses to
+    // wrap is worse than one that splits a token
+    var st = ui::layout::multiline_edit_new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    var rows = ui::layout::code_editor_rows(st, 40.0, 14.0, true)
+    assert_true(rows.len() > 1)
+    assert_eq(rows[rows.len() - 1].end, st.text.len())
+}
+
+fn test_code_editor_hit_test_follows_a_wrapped_row() {
+    // click on the second visual row of a single logical line: the offset must come from that row's
+    // slice, not from counting columns along the whole line
+    var st = ui::layout::multiline_edit_new("alpha beta gamma delta epsilon zeta")
+    let w = 120.0
+    let hgt = 200.0
+    let sz = 14.0
+    var rect = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(w, hgt))
+    var content = ui::layout::code_editor_content_rect(st, rect, sz, true)
+    var rows = ui::layout::code_editor_rows(st, content.width(), sz, true)
+    assert_true(rows.len() > 1)
+    var style = ui::layout::text_measure_style(sz)
+    var lh = ui::layout::text_measure_line(style, "").line_height
+    // the very start of row 1, nudged inside its line box
+    var hit = ui::layout::code_editor_caret_at(st, w, hgt, sz, true, true, content.min.x + 1.0, content.min.y + lh + 2.0)
+    assert_eq(hit, rows[1].start)
+}
+
+fn test_dsl_code_editor_defaults_to_no_wrap() {
+    // the rest of the input family defaults word_wrap true; source is read by column
+    assert_false(din_parse("code_editor { id: s }").word_wrap)
+    assert_true(din_parse("code_editor { id: s word_wrap: true }").word_wrap)
+    assert_true(din_parse("text_area { id: t }").word_wrap)
+}
+
+fn test_dsl_code_editor_takes_a_horizontal_scroll() {
+    assert_feq(din_parse("code_editor { id: s }").scroll_x, 0.0, 0.0001)
+    assert_feq(din_parse("code_editor { id: s scroll_x: 120 }").scroll_x, 120.0, 0.0001)
+    assert_feq(din_parse("code_editor { id: s scroll_x: -30 }").scroll_x, 0.0, 0.0001)
+}
+
+fn test_dsl_code_editor_takes_a_text_size() {
+    // the only input node that does. A caller has to know the size to hit-test a click back to a
+    // caret (code_editor_caret_at takes it), so it cannot be left to the node default.
+    assert_feq(din_parse("code_editor { id: s }").size_px, 14.0, 0.0001)
+    assert_feq(din_parse("code_editor { id: s size_px: 18 }").size_px, 18.0, 0.0001)
+    // a nonsense size is ignored rather than accepted: a zero or negative size divides by zero in
+    // the line-height maths and would take the whole frame down
+    assert_feq(din_parse("code_editor { id: s size_px: 0 }").size_px, 14.0, 0.0001)
+    assert_feq(din_parse("code_editor { id: s size_px: -5 }").size_px, 14.0, 0.0001)
+}
+
+fn test_code_editor_caret_at_is_the_inverse_of_the_paint() {
+    // click where a caret is drawn, get that caret back. This is the round trip a mouse click makes,
+    // and it holds only because the hit test and the paint share code_editor_content_rect.
+    var q = din_q()
+    var st = ui::layout::multiline_edit_new("fn main() {" + ("\n" + ("    let x = 1" + ("\n" + "}"))))
+    let w = 400.0
+    let hgt = 200.0
+    let sz = 14.0
+    var rect = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(w, hgt))
+    var content = ui::layout::code_editor_content_rect(st, rect, sz, true)
+    // put the caret in the middle of line 2, ask where it is, then hit-test that exact point
+    st.caret = ui::layout::me_line_start(st.text, 1) + 8
+    var pos = ui::layout::code_editor_caret_pos(st, rect, sz, true, false)
+    var back = ui::layout::code_editor_caret_at(st, w, hgt, sz, true, false, pos.x, pos.y + 2.0)
+    assert_eq(back, st.caret)
+}
+
+fn test_code_editor_content_rect_leaves_room_for_the_gutter() {
+    var st = ui::layout::multiline_edit_new("a")
+    var rect = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(400.0, 200.0))
+    var withg = ui::layout::code_editor_content_rect(st, rect, 14.0, true)
+    var without = ui::layout::code_editor_content_rect(st, rect, 14.0, false)
+    // the gutter costs horizontal room and nothing else
+    assert_true(withg.min.x > without.min.x)
+    assert_feq(withg.min.y, without.min.y, 0.0001)
+}
+
+fn test_dsl_code_editor_hit_action_is_its_own() {
+    // edit vs view, and neither is text_area's; the shell keys focus off these strings
+    var q = din_q()
+    var a = ui::layout::dsl_parse_document("code_editor { id: src value: " + (q + ("ab" + (q + " h: 60 }"))))
+    assert_true(a.ok)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(300.0, 200.0))
+    var ov = ui::layout::layout_overlay(a.doc.tree, vp)
+    assert_streq(ui::layout::overlay_hit_test(ov, ui::core::vec2(20.0, 20.0)).on_click, "code_editor_edit:src")
+
+    var b = ui::layout::dsl_parse_document("code_editor { id: src read_only: true value: " + (q + ("ab" + (q + " h: 60 }"))))
+    assert_true(b.ok)
+    var ov2 = ui::layout::layout_overlay(b.doc.tree, vp)
+    assert_streq(ui::layout::overlay_hit_test(ov2, ui::core::vec2(20.0, 20.0)).on_click, "code_editor_view:src")
+}
+
+fn test_dsl_code_editor_draws_a_gutter_that_text_area_does_not() {
+    // The difference between the two widgets, asserted as primitives: same value, same rect, and
+    // the code_editor emits strictly more text runs because of the line numbers.
+    var q = din_q()
+    // the DSL source for a three-line value: a backslash-n escape, not a real newline
+    var nl = "\\n"
+    var body = "a" + (nl + ("b" + (nl + "c")))
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(300.0, 200.0))
+    var ta = ui::layout::dsl_parse_document("text_area { id: t h: 120 value: " + (q + (body + (q + " }"))))
+    var ce = ui::layout::dsl_parse_document("code_editor { id: c h: 120 value: " + (q + (body + (q + " }"))))
+    assert_true(ta.ok)
+    assert_true(ce.ok)
+    var ota = ui::layout::layout_overlay(ta.doc.tree, vp)
+    var oce = ui::layout::layout_overlay(ce.doc.tree, vp)
+    assert_true(oce.prims.len() > ota.prims.len())
+}
+
+// ---- the Nori lexer ----
+
+fn test_nori_line_spans_classifies_the_basics() {
+    var sp = ui::layout::nori_line_spans("fn add(a: Int) -> Int { return 42 }")
+    // `fn` is a keyword at 0..2
+    assert_true(sp.len() > 0)
+    assert_eq(sp[0].start_col, 0)
+    assert_eq(sp[0].end_col, 2)
+    assert_streq(sp[0].cls, "keyword")
+    // somewhere in there: a call, a type and a number
+    var saw_fn = false
+    var saw_ty = false
+    var saw_num = false
+    var i = 0
+    while i < sp.len() {
+        if (sp[i].cls == "function") { saw_fn = true }
+        if (sp[i].cls == "type") { saw_ty = true }
+        if (sp[i].cls == "number") { saw_num = true }
+        i = i + 1
+    }
+    assert_true(saw_fn)                            // add(
+    assert_true(saw_ty)                            // Int
+    assert_true(saw_num)                           // 42
+}
+
+fn test_nori_line_spans_comment_swallows_the_rest() {
+    var sp = ui::layout::nori_line_spans("let x = 1 // fn Int 42")
+    // the comment is the last span and reaches end of line; nothing is classified after it
+    assert_true(sp.len() > 0)
+    var last = sp[sp.len() - 1]
+    assert_streq(last.cls, "comment")
+    assert_eq(last.end_col, 22)
+    assert_eq(last.start_col, 10)
+}
+
+fn test_nori_line_spans_string_with_escaped_quote() {
+    var q = din_q()
+    // let s = "a\"b": the escaped quote must not end the string early
+    var line = "let s = " + (q + ("a" + ("\\" + (q + ("b" + q)))))
+    var sp = ui::layout::nori_line_spans(line)
+    var saw = false
+    var i = 0
+    while i < sp.len() {
+        if (sp[i].cls == "string") {
+            saw = true
+            assert_eq(sp[i].end_col, line.len())    // ran to the real closing quote
+        }
+        i = i + 1
+    }
+    assert_true(saw)
+}
+
+fn test_nori_line_spans_double_slash_beats_the_divide_operator() {
+    var sp = ui::layout::nori_line_spans("a / b")
+    var ops = 0
+    var i = 0
+    while i < sp.len() { if (sp[i].cls == "operator") { ops = ops + 1 }  i = i + 1 }
+    assert_eq(ops, 1)
+    var sp2 = ui::layout::nori_line_spans("a // b")
+    assert_eq(sp2.len(), 1)
+    assert_streq(sp2[0].cls, "comment")
+}
+
+fn test_language_line_spans_unknown_language_is_plain() {
+    assert_eq(ui::layout::language_line_spans("", "fn x").len(), 0)
+    assert_eq(ui::layout::language_line_spans("python", "fn x").len(), 0)
+    assert_true(ui::layout::language_line_spans("nori", "fn x").len() > 0)
+}
+
+// `min_rows` / `max_rows` / `padding_y`: an input bar's three numbers.
+fn test_dsl_text_area_min_and_max_rows() {
+    var ctx = ui::layout::length_context_root(300.0, 400.0)
+    // the floor is three rows unless asked otherwise
+    var dflt = din_parse("text_area { id: a }")
+    assert_feq(ui::layout::ui_measure(dflt, ctx).y, 3.0 * 19.0 + 16.0, 0.01)
+    // an input bar starts at one line…
+    var bar = din_parse("text_area { id: a min_rows: 1 padding_y: 4 }")
+    assert_feq(ui::layout::ui_measure(bar, ctx).y, 19.0 + 8.0, 0.01)
+    // …and stops growing where it is told to
+    var nl = ("" + chr(10))
+    var q = din_q()
+    var many = "a" + (nl + ("b" + (nl + ("c" + (nl + ("d" + (nl + "e")))))))
+    var capped = din_parse("text_area { id: a min_rows: 1 max_rows: 2 value: " + (q + (many + (q + " }"))))
+    assert_feq(ui::layout::ui_measure(capped, ctx).y, 2.0 * 19.0 + 16.0, 0.01)
+}
+
+fn test_dsl_text_area_takes_the_editing_state() {
+    var n = din_parse("text_area { id: a caret: 5 sel_anchor: 2 scroll_y: 12 }")
+    assert_eq(n.caret, 5)
+    assert_eq(n.sel_anchor, 2)
+    assert_feq(n.scroll_y, 12.0, 0.01)
+}

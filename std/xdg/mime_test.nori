@@ -1,0 +1,188 @@
+// Native .nori tests for std/xdg's MIME half (mime.nori): run with
+//   noric --test std/xdg/mime_test.nori compiler/runtime.nori --import-root .
+//
+// The fixture database under testdata/mime (lo: the main one, hi: a more important directory) and the
+// associations under testdata/mime/{config,apps}. The rules checked are the Shared MIME-info Database
+// specification's (0.21) and the MIME Applications Associations specification's (1.0.1), quoted beside them.
+import "std/xdg" as xdg
+import "std/os" as os
+
+fn fx(p: Str) -> Str { return os::cwd() + "/std/xdg/testdata/mime/" + p }
+
+fn db2() -> xdg::MimeDb {
+    var d: Vec<Str> = vec()
+    d.push(fx("hi/mime"))
+    d.push(fx("lo/mime"))
+    d.push(fx("nowhere/mime"))
+    return xdg::mime_db_load_dirs(d)
+}
+
+fn one(db: xdg::MimeDb, name: Str) -> Str {
+    let v = xdg::mime_by_name(db, name)
+    if v.len() == 0 { return "" }
+    var s = copy v[0]
+    var i = 1
+    while i < v.len() { s = s + "," + v[i]  i = i + 1 }
+    return s
+}
+
+fn test_globs() {
+    let db = db2()
+    assert_true(db.ok)
+    assert_eq(db.dirs.len(), 2)
+    // suffix globs, case-insensitive by default: "*.png" matches "SHOT.PNG"
+    assert_streq(one(db, "shot.png"), "image/png")
+    assert_streq(one(db, "SHOT.PNG"), "image/png")
+    // "Keep only globs with the biggest weight": *.tar.gz (55) over *.gz (50)
+    assert_streq(one(db, "a.tar.gz"), "application/x-compressed-tar")
+    assert_streq(one(db, "a.gz"), "application/gzip")
+    // the cs flag: "*.C" is C++ only in upper case; "*.c" (no flag) takes both cases
+    assert_streq(one(db, "x.C"), "text/x-c++src")
+    assert_streq(one(db, "x.c"), "text/x-csrc")
+    // literal names before the patterns; full globs with brackets and a trailing star
+    assert_streq(one(db, "Makefile"), "text/x-makefile")
+    assert_streq(one(db, "README.md"), "text/x-readme")
+    assert_streq(one(db, "syslog.3"), "text/x-log")
+    assert_streq(one(db, "syslog.x"), "")
+    // two types of the same weight and length both stay
+    assert_streq(one(db, "letter.doc"), "application/msword,text/x-doc")
+    // "__NOGLOBS__ ... the globs from directories with lower priority are ignored for this type"
+    assert_streq(one(db, "a.old"), "application/x-new")
+    assert_streq(one(db, "nothing"), "")
+}
+
+fn test_glob_match() {
+    assert_true(xdg::mime_glob_match("*.[ch]", "a.h"))
+    assert_true(!xdg::mime_glob_match("*.[ch]", "a.x"))
+    assert_true(xdg::mime_glob_match("*.[!ch]", "a.x"))
+    assert_true(xdg::mime_glob_match("a?c", "abc"))
+    assert_true(!xdg::mime_glob_match("a?c", "ac"))
+    assert_true(xdg::mime_glob_match("*", ""))
+    assert_true(xdg::mime_glob_match("x*y*z", "x12y34z"))
+}
+
+fn test_magic() {
+    let db = db2()
+    let png = chr(137) + "PNG" + chr(13) + chr(10)
+    assert_streq(xdg::mime_by_data(db, png), "image/png")
+    // a nested matchlet: MZ at 0, then "PE\0\0" somewhere in 64..263 (a range)
+    var exe = "MZ"
+    while exe.len() < 100 { exe = exe + chr(0) }
+    exe = exe + "PE" + chr(0) + chr(0)
+    assert_streq(xdg::mime_by_data(db, exe), "application/x-exe")
+    // "MZ" without its PE header: the nested line fails, so the rule does
+    assert_streq(xdg::mime_by_data(db, "MZ just text"), "")
+    // the mask: 0x1F 0x2E & 0xF0 0xF0 is 0x10 0x20
+    assert_streq(xdg::mime_by_data(db, "" + chr(31) + chr(46)), "application/x-masked")
+    // ~2: the value is written big-endian, compared as a little-endian 16-bit word: bytes 0x34 0x12
+    assert_streq(xdg::mime_by_data(db, "" + chr(52) + chr(18)), "application/x-word")
+    assert_streq(xdg::mime_by_data(db, "0123456789abcdefgHELLO"), "application/x-later")
+    // "The highest priority ... first": OLE (80) over nothing else; priorities sorted
+    assert_eq(db.magic[0].prio, 80)
+    assert_streq(xdg::mime_by_data(db, ""), "")
+}
+
+fn test_guess() {
+    let db = db2()
+    let ole = "" + chr(208) + chr(207) + chr(17) + chr(224) + "rest"
+    // one glob type wins outright, whatever the content
+    assert_streq(xdg::mime_guess(db, "a.png", "plain text"), "image/png")
+    // conflicting globs: the one that is the magic's type or a subclass of it; MS Word is an OLE storage
+    assert_streq(xdg::mime_guess(db, "letter.doc", ole), "application/msword")
+    assert_streq(xdg::mime_guess(db, "letter.doc", "hello"), "application/msword")
+    // no glob: the magic's type; no magic either: text or binary by the first bytes
+    assert_streq(xdg::mime_guess(db, "noext", chr(137) + "PNG"), "image/png")
+    assert_streq(xdg::mime_guess(db, "noext", "just some words\n"), "text/plain")
+    assert_streq(xdg::mime_guess(db, "noext", "bin" + chr(0) + chr(1)), "application/octet-stream")
+    // aliases: the canonical name is the answer
+    assert_streq(xdg::mime_unalias(db, "image/jpg"), "image/jpeg")
+    assert_true(xdg::mime_looks_text("héllo" + chr(10)))
+    assert_true(!xdg::mime_looks_text("a" + chr(0)))
+}
+
+fn test_is_a() {
+    let db = db2()
+    assert_true(xdg::mime_is_a(db, "application/msword", "application/x-ole-storage"))
+    assert_true(xdg::mime_is_a(db, "image/x-special", "image/png"))
+    // "all text/* types are subclasses of text/plain", "all streamable types ... of application/octet-stream"
+    assert_true(xdg::mime_is_a(db, "text/x-csrc", "text/plain"))
+    assert_true(xdg::mime_is_a(db, "image/png", "application/octet-stream"))
+    assert_true(!xdg::mime_is_a(db, "inode/directory", "application/octet-stream"))
+    assert_true(!xdg::mime_is_a(db, "image/png", "image/jpeg"))
+    assert_true(xdg::mime_is_a(db, "image/jpg", "image/jpeg"))
+}
+
+fn test_icons_and_comments() {
+    let db = db2()
+    let a = xdg::mime_icon_names(db, "image/png")
+    assert_eq(a.len(), 3)
+    assert_streq(a[0], "nori-png")
+    assert_streq(a[1], "image-png")
+    assert_streq(a[2], "image-x-generic")
+    let b = xdg::mime_icon_names(db, "application/msword")
+    assert_streq(b[0], "application-msword")
+    assert_streq(b[1], "x-office-document")
+    assert_streq(xdg::mime_comment(db, "image/png", "C"), "PNG image")
+    assert_streq(xdg::mime_comment(db, "image/png", "hu_HU.UTF-8"), "PNG kép")
+    assert_streq(xdg::mime_comment(db, "image/png", "pt_BR"), "Imagem PNG")
+    assert_streq(xdg::mime_comment(db, "image/png", "x"), "a & b")
+    assert_streq(xdg::mime_comment(db, "image/png", "de_DE"), "PNG image")
+    assert_streq(xdg::mime_comment(db, "image/nope", ""), "")
+}
+
+fn apps() -> Vec<xdg::App> {
+    os::set_env("XDG_DATA_HOME", fx("apps"))
+    os::set_env("XDG_DATA_DIRS", fx("nowhere"))
+    return xdg::list_apps()
+}
+
+fn ids(v: Vec<Str>) -> Str {
+    var s = ""
+    foreach x in v { if s.len() > 0 { s = s + "," }  s = s + x }
+    return s
+}
+
+fn test_mimeapps() {
+    let al = apps()
+    assert_eq(al.len(), 5)
+    var dk: Vec<Str> = vec()
+    dk.push("nori")
+    os::set_env("XDG_CONFIG_HOME", fx("config"))
+    os::set_env("XDG_CONFIG_DIRS", fx("nowhere"))
+    let files = xdg::mimeapps_files(dk)
+    // the spec's order: $XDG_CONFIG_HOME/$desktop-mimeapps.list first, then mimeapps.list there, ...
+    assert_streq(files[0], fx("config") + "/nori-mimeapps.list")
+    assert_streq(files[1], fx("config") + "/mimeapps.list")
+    let ma = xdg::mimeapps_load_files(files)
+    assert_eq(ma.files.len(), 3)
+    let db = db2()
+    // image/png: the default (gone.desktop is not installed: skipped, editor next), the added association of
+    // the desktop's file (its removal is in a less important file, so it stays), then MimeType= in file order
+    assert_streq(ids(xdg::apps_for_mime(ma, db, al, "image/png")), "editor,paint,viewer")
+    assert_streq(xdg::default_app_for_mime(ma, db, al, "image/png"), "editor")
+    // image/jpeg: viewer removed; paint's MimeType names the alias image/jpg; texted added; then the parent
+    // application/octet-stream is not image/jpeg's parent in this database (no subclasses line), so none more
+    assert_streq(ids(xdg::apps_for_mime(ma, db, al, "image/jpeg")), "texted,paint")
+    // a text type falls back to its parents: text/x-csrc -> text/plain's application
+    assert_streq(ids(xdg::apps_for_mime(ma, db, al, "text/x-csrc")), "texted")
+    // set_default writes a file the next load reads first
+    let p = os::temp_path("nori-mimeapps-test.list")
+    let _w = write_file(p, "[Added Associations]\nimage/png=x.desktop;\n")
+    assert_true(xdg::mimeapps_set_default(p, "image/png", "viewer.desktop"))
+    assert_true(xdg::mimeapps_set_default(p, "image/png", "hexed"))
+    let t = read_file(p)
+    assert_streq(t, "[Added Associations]\nimage/png=x.desktop;\n[Default Applications]\nimage/png=hexed.desktop;\n")
+    var one2: Vec<Str> = vec()
+    one2.push(p)
+    let ma2 = xdg::mimeapps_load_files(one2)
+    assert_streq(xdg::default_app_for_mime(ma2, db, al, "image/png"), "hexed")
+}
+
+fn test_host_database() {
+    // a cross-check on this machine's own database, when it has one
+    let db = xdg::mime_db_load()
+    if !db.ok { return }
+    assert_streq(xdg::mime_guess(db, "x.png", ""), "image/png")
+    assert_streq(xdg::mime_guess(db, "x.JPG", ""), "image/jpeg")
+    assert_streq(xdg::mime_guess(db, "noname", chr(137) + "PNG" + chr(13) + chr(10) + chr(26) + chr(10)), "image/png")
+}

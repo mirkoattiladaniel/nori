@@ -1,0 +1,1029 @@
+//! std/image: image decoding. Decodes a PNG to a straight RGBA8 pixel buffer (byte order
+//! R,G,B,A) that a renderer can blit into a panel (see std/nori_ui/render::image / paint_cpu::image).
+//! Reuses std/archive's DEFLATE inflate for the IDAT zlib stream: no libpng, no C.
+//!   import "std/image" as image
+//!   var im = image::load_png(read_file("logo.png"))
+//!   if image::ok(im) { render::image(r, rect, im) }
+//!   image::dispose(im)
+//! Supported: 8-bit non-interlaced PNG, color types 0 (gray), 2 (RGB), 3 (palette+tRNS),
+//! 4 (gray+alpha), 6 (RGBA). Unsupported inputs return an image with ok()==false.
+import "std/archive" as ar
+
+extern fn malloc(Int) -> Int
+extern fn free(Int)
+
+/// a decoded image: `w` x `h` straight RGBA8 at `pixels` (w*h*4 bytes, byte0=R..byte3=A).
+pub struct Image { w: Int, h: Int, px: Int, okf: Int }
+/// did decoding succeed?
+pub fn ok(im: Image) -> Bool { return im.okf == 1 }
+/// width in pixels.
+pub fn width(im: Image) -> Int { return im.w }
+/// height in pixels.
+pub fn height(im: Image) -> Int { return im.h }
+/// raw RGBA8 buffer pointer (w*h*4 bytes).
+pub fn pixels(im: Image) -> Int { return im.px }
+/// one pixel packed as R<<24 | G<<16 | B<<8 | A (for tests / sampling).
+pub fn pixel_rgba(im: Image, x: Int, y: Int) -> Int {
+    if x < 0 || y < 0 || x >= im.w || y >= im.h { return 0 }
+    let o = (y * im.w + x) * 4
+    var r = 0  var g = 0  var b = 0  var a = 0
+    unsafe { r = peek8(im.px + o)  g = peek8(im.px + o + 1)  b = peek8(im.px + o + 2)  a = peek8(im.px + o + 3) }
+    return r * 16777216 + g * 65536 + b * 256 + a
+}
+/// release the pixel buffer.
+pub fn dispose(inout im: Image) { if im.px != 0 { unsafe { free(im.px) }  im.px = 0  im.okf = 0 } }
+
+/// a fresh w*h transparent (all-zero RGBA8) image whose buffer a renderer (e.g. std/svg) fills in place.
+pub fn image_new(w: Int, h: Int) -> Image {
+    if w <= 0 || h <= 0 { return bad() }
+    var px = 0
+    unsafe { px = malloc(w * h * 4) }
+    let total = w * h * 4
+    var i = 0
+    unsafe { while i < total { poke8(px + i, 0)  i = i + 1 } }
+    return Image { w: w, h: h, px: px, okf: 1 }
+}
+
+/// resize `im` to `nw` x `nh` using box-average sampling (nice for downscaling thumbnails; upscaling
+/// falls back to nearest). Returns a fresh RGBA8 image the caller must `dispose`; ok()==false if `im`
+/// is bad or the target dims are non-positive.
+pub fn resize(im: Image, nw: Int, nh: Int) -> Image {
+    if im.okf != 1 || nw <= 0 || nh <= 0 { return bad() }
+    let dst = image_new(nw, nh)
+    if dst.okf != 1 { return dst }
+    let sw = im.w
+    let sh = im.h
+    var dy = 0
+    while dy < nh {
+        let sy0 = (dy * sh) / nh
+        var sy1 = ((dy + 1) * sh) / nh
+        if sy1 <= sy0 { sy1 = sy0 + 1 }
+        var dx = 0
+        while dx < nw {
+            let sx0 = (dx * sw) / nw
+            var sx1 = ((dx + 1) * sw) / nw
+            if sx1 <= sx0 { sx1 = sx0 + 1 }
+            var rs = 0
+            var gs = 0
+            var bs = 0
+            var al = 0
+            var cnt = 0
+            unsafe {
+                var yy = sy0
+                while yy < sy1 {
+                    var xx = sx0
+                    while xx < sx1 {
+                        let o = (yy * sw + xx) * 4
+                        rs = rs + peek8(im.px + o)
+                        gs = gs + peek8(im.px + o + 1)
+                        bs = bs + peek8(im.px + o + 2)
+                        al = al + peek8(im.px + o + 3)
+                        cnt = cnt + 1
+                        xx = xx + 1
+                    }
+                    yy = yy + 1
+                }
+                let od = (dy * nw + dx) * 4
+                poke8(dst.px + od, rs / cnt)
+                poke8(dst.px + od + 1, gs / cnt)
+                poke8(dst.px + od + 2, bs / cnt)
+                poke8(dst.px + od + 3, al / cnt)
+            }
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+    return dst
+}
+
+fn bad() -> Image { return Image { w: 0, h: 0, px: 0, okf: 0 } }
+// Past the end reads as zero: a PNG is input (a font's color glyphs are PNGs inside the font), and a
+// chunk length that runs past the data, or a truncated IHDR, must make the image fail to decode,
+// not trap. A zero is what the parser below already rejects or inflates to an error.
+fn u8(d: Str, i: Int) -> Int { if i < 0 || i >= d.len() { return 0 }  return ord(d.at(i)) }
+fn be32(d: Str, i: Int) -> Int { return u8(d, i) * 16777216 + u8(d, i + 1) * 65536 + u8(d, i + 2) * 256 + u8(d, i + 3) }
+fn fourcc(a: Int, b: Int, c: Int, e: Int) -> Int { return a * 16777216 + b * 65536 + c * 256 + e }
+
+fn paeth(a: Int, b: Int, c: Int) -> Int {
+    let p = a + b - c
+    var pa = p - a  if pa < 0 { pa = 0 - pa }
+    var pb = p - b  if pb < 0 { pb = 0 - pb }
+    var pc = p - c  if pc < 0 { pc = 0 - pc }
+    if pa <= pb && pa <= pc { return a }
+    if pb <= pc { return b }
+    return c
+}
+
+/// decode a PNG (from read_file bytes). Returns ok()==false on malformed / unsupported input.
+pub fn load_png(data: Str) -> Image {
+    let n = data.len()
+    if n < 8 { return bad() }
+    if u8(data, 0) != 137 || u8(data, 1) != 80 || u8(data, 2) != 78 || u8(data, 3) != 71 { return bad() }
+
+    var w = 0  var h = 0  var bitdepth = 0  var colortype = 0  var interlace = 0
+    var idat_total = 0
+    var plte = 0
+    var trns = 0  var trns_n = 0
+    let IHDR = fourcc(73, 72, 68, 82)
+    let IDAT = fourcc(73, 68, 65, 84)
+    let PLTE = fourcc(80, 76, 84, 69)
+    let TRNS = fourcc(116, 82, 78, 83)
+    let IEND = fourcc(73, 69, 78, 68)
+
+    // pass 1: read IHDR, tally IDAT length, locate PLTE/tRNS. A critical chunk (IHDR, PLTE, IDAT)
+    // that runs past the data or fails its CRC makes the image bad, as it does for libpng; the
+    // inflater below then checks the stream itself (a PNG is often from anywhere: a font's emoji, a
+    // page's image).
+    let crct = ipng_crc_table()
+    var pos = 8
+    var done = false
+    while !done && pos + 8 <= n {
+        let clen = be32(data, pos)
+        let ctype = be32(data, pos + 4)
+        let dstart = pos + 8
+        if ctype == IHDR || ctype == PLTE || ctype == IDAT {
+            if dstart + clen + 4 > n { return bad() }
+            if ipng_crc_str(crct, data.slice(pos + 4, dstart + clen)) != be32(data, dstart + clen) { return bad() }
+        }
+        if ctype == IHDR {
+            w = be32(data, dstart)  h = be32(data, dstart + 4)
+            bitdepth = u8(data, dstart + 8)  colortype = u8(data, dstart + 9)  interlace = u8(data, dstart + 12)
+        }
+        if ctype == IDAT { idat_total = idat_total + clen }
+        if ctype == PLTE { plte = dstart }
+        if ctype == TRNS { trns = dstart  trns_n = clen }
+        if ctype == IEND { done = true }
+        pos = dstart + clen + 4
+    }
+    if w <= 0 || h <= 0 || idat_total == 0 { return bad() }
+    // no real image is 16 million pixels on a side, and past that w * h * 4 can overflow
+    if w > 16777216 || h > 16777216 || idat_total > n { return bad() }
+    if interlace != 0 { return bad() }                          // no Adam7 (rare for UI assets)
+    if bitdepth != 8 && bitdepth != 16 { return bad() }         // 8- or 16-bit channels
+    if colortype == 3 && bitdepth != 8 { return bad() }         // palette indices only handled at 8-bit
+
+    var ch = 0
+    if colortype == 0 { ch = 1 }
+    if colortype == 2 { ch = 3 }
+    if colortype == 3 { ch = 1 }
+    if colortype == 4 { ch = 2 }
+    if colortype == 6 { ch = 4 }
+    if ch == 0 { return bad() }
+
+    // pass 2: concatenate the IDAT chunks into one contiguous zlib stream.
+    var comp = 0
+    unsafe { comp = malloc(idat_total) }
+    var off = 0
+    pos = 8  done = false
+    while !done && pos + 8 <= n {
+        let clen = be32(data, pos)
+        let ctype = be32(data, pos + 4)
+        let dstart = pos + 8
+        if ctype == IDAT {
+            var i = 0
+            unsafe { while i < clen { poke8(comp + off + i, u8(data, dstart + i))  i = i + 1 } }
+            off = off + clen
+        }
+        if ctype == IEND { done = true }
+        pos = dstart + clen + 4
+    }
+    var cstr = ""
+    unsafe { cstr = str_from_buf(comp, idat_total) }
+    unsafe { free(comp) }
+    return png_pixels(cstr, w, h, colortype, bitdepth, data, plte, trns, trns_n)
+}
+
+/// a PNG image's pixels from its zlib stream (the IDAT data, or an APNG frame's fdAT data): inflated, the
+/// scanlines unfiltered and expanded to straight RGBA8. `plte`/`trns` are offsets into `data` (palette images).
+fn png_pixels(cstr: Str, w: Int, h: Int, colortype: Int, bitdepth: Int, data: Str, plte: Int, trns: Int, trns_n: Int) -> Image {
+    var ch = 0
+    if colortype == 0 { ch = 1 }
+    if colortype == 2 { ch = 3 }
+    if colortype == 3 { ch = 1 }
+    if colortype == 4 { ch = 2 }
+    if colortype == 6 { ch = 4 }
+    if ch == 0 { return bad() }
+    let bps = bitdepth / 8
+    let bpp = ch * bps
+    let stride = w * bpp
+    // checked: a damaged stream (or one claiming more pixels than IHDR) is a bad image, not a crash;
+    // the cap is the scanlines IHDR describes, so a hostile stream cannot inflate past them
+    let ir = ar::inflate_zlib_checked(cstr, h * (stride + 1))
+    let raw = ir.data
+    if !ir.ok { ar::inflated_free(raw)  return bad() }
+    let rp = ar::inflated_ptr(raw)
+    let rlen = ar::inflated_len(raw)
+    if rlen < h * (stride + 1) { ar::inflated_free(raw)  return bad() }
+
+    // un-filter scanlines into `recon` (h*stride bytes, straight channel data). The filter type is
+    // constant per scanline, so it is hoisted out of the inner loop into a specialized loop; row base
+    // pointers are precomputed to keep a multiply out of the hot path.
+    var recon = 0
+    unsafe { recon = malloc(h * stride) }
+    var inpos = 0
+    var y = 0
+    while y < h {
+        var ftype = 0
+        unsafe { ftype = peek8(rp + inpos) }
+        inpos = inpos + 1
+        let row = recon + y * stride
+        let prev = recon + (y - 1) * stride        // only read when y > 0
+        let src = rp + inpos
+        unsafe {
+            if ftype == 0 {
+                var x = 0
+                while x < stride { poke8(row + x, peek8(src + x))  x = x + 1 }
+            } else { if ftype == 1 {
+                var x = 0
+                while x < bpp { poke8(row + x, peek8(src + x) & 255)  x = x + 1 }
+                while x < stride { poke8(row + x, (peek8(src + x) + peek8(row + x - bpp)) & 255)  x = x + 1 }
+            } else { if ftype == 2 {
+                if y == 0 {
+                    var x = 0
+                    while x < stride { poke8(row + x, peek8(src + x) & 255)  x = x + 1 }
+                } else {
+                    var x = 0
+                    while x < stride { poke8(row + x, (peek8(src + x) + peek8(prev + x)) & 255)  x = x + 1 }
+                }
+            } else { if ftype == 3 {
+                var x = 0
+                while x < stride {
+                    var a = 0  var b = 0
+                    if x >= bpp { a = peek8(row + x - bpp) }
+                    if y > 0 { b = peek8(prev + x) }
+                    poke8(row + x, (peek8(src + x) + (a + b) / 2) & 255)
+                    x = x + 1
+                }
+            } else {
+                var x = 0
+                while x < stride {
+                    var a = 0  var b = 0  var c = 0
+                    if x >= bpp { a = peek8(row + x - bpp) }
+                    if y > 0 { b = peek8(prev + x)  if x >= bpp { c = peek8(prev + x - bpp) } }
+                    poke8(row + x, (peek8(src + x) + paeth(a, b, c)) & 255)
+                    x = x + 1
+                }
+            } } } }
+        }
+        inpos = inpos + stride
+        y = y + 1
+    }
+    ar::inflated_free(raw)
+
+    // 8-bit RGBA is already straight RGBA8: `recon` is the pixel buffer; hand it over, skip the copy.
+    if colortype == 6 && bps == 1 { return Image { w: w, h: h, px: recon, okf: 1 } }
+
+    // otherwise expand to straight RGBA8. colortype is constant, so branch once and run a tight loop.
+    var px = 0
+    unsafe { px = malloc(w * h * 4) }
+    let count = w * h
+    unsafe {
+        if colortype == 6 {                                   // 16-bit RGBA -> downsample (high byte first)
+            var i = 0
+            while i < count { let base = i * bpp  poke8(px + i * 4, peek8(recon + base))  poke8(px + i * 4 + 1, peek8(recon + base + bps))  poke8(px + i * 4 + 2, peek8(recon + base + 2 * bps))  poke8(px + i * 4 + 3, peek8(recon + base + 3 * bps))  i = i + 1 }
+        }
+        if colortype == 2 {                                   // RGB -> RGBA (opaque)
+            var i = 0
+            while i < count { let base = i * bpp  poke8(px + i * 4, peek8(recon + base))  poke8(px + i * 4 + 1, peek8(recon + base + bps))  poke8(px + i * 4 + 2, peek8(recon + base + 2 * bps))  poke8(px + i * 4 + 3, 255)  i = i + 1 }
+        }
+        if colortype == 0 {                                   // grayscale -> RGBA
+            var i = 0
+            while i < count { let v = peek8(recon + i * bpp)  poke8(px + i * 4, v)  poke8(px + i * 4 + 1, v)  poke8(px + i * 4 + 2, v)  poke8(px + i * 4 + 3, 255)  i = i + 1 }
+        }
+        if colortype == 4 {                                   // gray + alpha -> RGBA
+            var i = 0
+            while i < count { let base = i * bpp  let v = peek8(recon + base)  poke8(px + i * 4, v)  poke8(px + i * 4 + 1, v)  poke8(px + i * 4 + 2, v)  poke8(px + i * 4 + 3, peek8(recon + base + bps))  i = i + 1 }
+        }
+        if colortype == 3 {                                   // palette -> RGBA (+ tRNS)
+            var i = 0
+            while i < count {
+                let idx = peek8(recon + i * bpp)
+                var al = 255
+                if idx < trns_n { al = u8(data, trns + idx) }
+                poke8(px + i * 4, u8(data, plte + idx * 3))  poke8(px + i * 4 + 1, u8(data, plte + idx * 3 + 1))  poke8(px + i * 4 + 2, u8(data, plte + idx * 3 + 2))  poke8(px + i * 4 + 3, al)
+                i = i + 1
+            }
+        }
+    }
+    unsafe { free(recon) }
+    return Image { w: w, h: h, px: px, okf: 1 }
+}
+
+// ── baseline JPEG (JFIF) decoder ────────────────────────────────────────────────────────────────────
+// Baseline (SOF0/SOF1, Huffman) JPEG decode: DQT/DHT/SOFn/DRI/SOS marker parse, per-MCU
+// Huffman + run-length coefficient decode, dequantize, separable inverse DCT, chroma upsample (block
+// replication) and YCbCr->RGB. Grayscale (1 component) and YCbCr (3 components) only. Progressive
+// (SOF2), lossless and arithmetic-coded JPEGs return ok()==false (host draws a placeholder). Restart
+// markers (DRI/RSTn) are honored. No libjpeg, no C.
+
+fn be16(d: Str, i: Int) -> Int { return u8(d, i) * 256 + u8(d, i + 1) }
+fn clampb(v: Int) -> Int { if v < 0 { return 0 }  if v > 255 { return 255 }  return v }
+
+// a built Huffman table (JPEG Annex F canonical form): mincode/maxcode/valptr indexed by code length 1..16.
+struct JHuff { mincode: Vec<Int>, maxcode: Vec<Int>, valptr: Vec<Int>, vals: Vec<Int> }
+
+fn build_huff(counts: Vec<Int>, inout vals: Vec<Int>) -> JHuff {
+    var mincode: Vec<Int> = vec()
+    var maxcode: Vec<Int> = vec()
+    var valptr: Vec<Int> = vec()
+    var l = 0
+    while l <= 16 { mincode.push(0)  maxcode.push(0 - 1)  valptr.push(0)  l = l + 1 }
+    var code = 0
+    var k = 0
+    l = 1
+    while l <= 16 {
+        let c = counts[l]
+        if c > 0 { valptr[l] = k  mincode[l] = code  code = code + c  maxcode[l] = code - 1  k = k + c }
+        code = (code << 1)
+        l = l + 1
+    }
+    return JHuff { mincode: mincode, maxcode: maxcode, valptr: valptr, vals: copy vals }
+}
+fn empty_huff() -> JHuff { var c: Vec<Int> = vec()  var i = 0  while i <= 16 { c.push(0)  i = i + 1 }  var v: Vec<Int> = vec()  return build_huff(c, v) }
+
+// zigzag order: ZZ[k] = natural 8x8 index (row*8+col) of the k-th coefficient in the coded stream.
+fn jz() -> Vec<Int> {
+    var z: Vec<Int> = vec()
+    z.push(0)   z.push(1)   z.push(8)   z.push(16)  z.push(9)   z.push(2)   z.push(3)   z.push(10)
+    z.push(17)  z.push(24)  z.push(32)  z.push(25)  z.push(18)  z.push(11)  z.push(4)   z.push(5)
+    z.push(12)  z.push(19)  z.push(26)  z.push(33)  z.push(40)  z.push(48)  z.push(41)  z.push(34)
+    z.push(27)  z.push(20)  z.push(13)  z.push(6)   z.push(7)   z.push(14)  z.push(21)  z.push(28)
+    z.push(35)  z.push(42)  z.push(49)  z.push(56)  z.push(57)  z.push(50)  z.push(43)  z.push(36)
+    z.push(29)  z.push(22)  z.push(15)  z.push(23)  z.push(30)  z.push(37)  z.push(44)  z.push(51)
+    z.push(58)  z.push(59)  z.push(52)  z.push(45)  z.push(38)  z.push(31)  z.push(39)  z.push(46)
+    z.push(53)  z.push(60)  z.push(61)  z.push(54)  z.push(47)  z.push(55)  z.push(62)  z.push(63)
+    return z
+}
+// IDCT basis: basis[u*8 + x] = c(u) * cos((2x+1)*u*pi/16), c(0)=1/sqrt2 else 1.
+fn idct_basis() -> Vec<Float> {
+    let m: Vec<Float> = vec()
+    m.push(0.7071067812)
+    m.push(0.7071067812)
+    m.push(0.7071067812)
+    m.push(0.7071067812)
+    m.push(0.7071067812)
+    m.push(0.7071067812)
+    m.push(0.7071067812)
+    m.push(0.7071067812)
+    m.push(0.9807852804)
+    m.push(0.8314696123)
+    m.push(0.5555702330)
+    m.push(0.1950903220)
+    m.push(-0.1950903220)
+    m.push(-0.5555702330)
+    m.push(-0.8314696123)
+    m.push(-0.9807852804)
+    m.push(0.9238795325)
+    m.push(0.3826834324)
+    m.push(-0.3826834324)
+    m.push(-0.9238795325)
+    m.push(-0.9238795325)
+    m.push(-0.3826834324)
+    m.push(0.3826834324)
+    m.push(0.9238795325)
+    m.push(0.8314696123)
+    m.push(-0.1950903220)
+    m.push(-0.9807852804)
+    m.push(-0.5555702330)
+    m.push(0.5555702330)
+    m.push(0.9807852804)
+    m.push(0.1950903220)
+    m.push(-0.8314696123)
+    m.push(0.7071067812)
+    m.push(-0.7071067812)
+    m.push(-0.7071067812)
+    m.push(0.7071067812)
+    m.push(0.7071067812)
+    m.push(-0.7071067812)
+    m.push(-0.7071067812)
+    m.push(0.7071067812)
+    m.push(0.5555702330)
+    m.push(-0.9807852804)
+    m.push(0.1950903220)
+    m.push(0.8314696123)
+    m.push(-0.8314696123)
+    m.push(-0.1950903220)
+    m.push(0.9807852804)
+    m.push(-0.5555702330)
+    m.push(0.3826834324)
+    m.push(-0.9238795325)
+    m.push(0.9238795325)
+    m.push(-0.3826834324)
+    m.push(-0.3826834324)
+    m.push(0.9238795325)
+    m.push(-0.9238795325)
+    m.push(0.3826834324)
+    m.push(0.1950903220)
+    m.push(-0.5555702330)
+    m.push(0.8314696123)
+    m.push(-0.9807852804)
+    m.push(0.9807852804)
+    m.push(-0.8314696123)
+    m.push(0.5555702330)
+    m.push(-0.1950903220)
+    return m
+}
+
+// entropy-stream bit reader over `st` = [bytePos, byteBuf, bitsLeft, markerLatched]; handles 0xFF00 byte
+// stuffing (a stuffed 0xFF is data). A real marker (0xFF Dn / D9) latches and thereafter feeds zero bits.
+fn jbit(data: Str, n: Int, inout st: Vec<Int>) -> Int {
+    var cnt = st[2]
+    if cnt == 0 {
+        var p = st[0]
+        var b = 0
+        if p < n {
+            b = u8(data, p)  p = p + 1
+            if b == 255 {
+                var nb = 0
+                if p < n { nb = u8(data, p) }
+                if nb == 0 { p = p + 1 }                    // stuffed 0xFF -> literal data byte
+                else { st[3] = nb  b = 0  p = p - 1 }   // marker: leave p on the 0xFF, feed zeros
+            }
+        }
+        st[0] = p  st[1] = b  cnt = 8
+    }
+    cnt = cnt - 1
+    st[2] = cnt
+    return ((st[1] >> cnt) & 1)
+}
+fn jrecv(data: Str, n: Int, inout st: Vec<Int>, s: Int) -> Int { var v = 0  var i = 0  while i < s { v = ((v << 1) | jbit(data, n, st))  i = i + 1 }  return v }
+fn jext(v: Int, t: Int) -> Int { if t == 0 { return 0 }  if v < (1 << t - 1) { return v - (1 << t) + 1 }  return v }
+fn jdecode(data: Str, n: Int, inout st: Vec<Int>, h: JHuff) -> Int {
+    var code = 0
+    var l = 1
+    while l <= 16 {
+        code = ((code << 1) | jbit(data, n, st))
+        if h.maxcode[l] >= 0 && code <= h.maxcode[l] { return h.vals[h.valptr[l] + code - h.mincode[l]] }
+        l = l + 1
+    }
+    return 0
+}
+// realign to the next RSTn marker and reset DC predictors (called at each restart interval).
+fn jpeg_restart(data: Str, n: Int, inout st: Vec<Int>, inout dcpred: Vec<Int>, nc: Int) {
+    st[2] = 0  st[1] = 0
+    var p = st[0]
+    while p + 1 < n && !(u8(data, p) == 255 && u8(data, p + 1) >= 208 && u8(data, p + 1) <= 215) { p = p + 1 }
+    if p + 1 < n { p = p + 2 }
+    st[0] = p  st[3] = 0
+    var i = 0  while i < nc { dcpred[i] = 0  i = i + 1 }
+}
+
+// decode one 8x8 block: Huffman DC+AC, dequantize (zigzag), separable IDCT, level-shift, write to `plane`.
+fn jblock(data: Str, n: Int, inout st: Vec<Int>, dc: JHuff, ac: JHuff, quant: Vec<Int>, inout dcpred: Vec<Int>, ci: Int, ZZ: Vec<Int>, basis: Vec<Float>, plane: Int, cw: Int, x0: Int, y0: Int) {
+    var F: Vec<Float> = vec()
+    var i = 0  while i < 64 { F.push(0.0)  i = i + 1 }
+    let t = jdecode(data, n, st, dc)
+    var diff = 0
+    if t > 0 { diff = jext(jrecv(data, n, st, t), t) }
+    let d0 = dcpred[ci] + diff
+    dcpred[ci] = d0
+    F[0] = to_float(d0 * quant[0])
+    var k = 1
+    while k < 64 {
+        let rs = jdecode(data, n, st, ac)
+        let r = (rs >> 4)
+        let s = (rs & 15)
+        if s == 0 {
+            if r == 15 { k = k + 16 } else { k = 64 }        // ZRL (skip 16 zeros) vs EOB
+        } else {
+            k = k + r
+            if k < 64 { F[ZZ[k]] = to_float(jext(jrecv(data, n, st, s), s) * quant[k])  k = k + 1 } else { k = 64 }
+        }
+    }
+    // separable inverse DCT: columns (over u) then rows (over v).
+    var tmp: Vec<Float> = vec()
+    i = 0  while i < 64 { tmp.push(0.0)  i = i + 1 }
+    var v = 0
+    while v < 8 {
+        var x = 0
+        while x < 8 {
+            var sum = 0.0
+            var u = 0
+            while u < 8 { sum = sum + basis[u * 8 + x] * F[v * 8 + u]  u = u + 1 }
+            tmp[v * 8 + x] = sum * 0.5
+            x = x + 1
+        }
+        v = v + 1
+    }
+    var y = 0
+    while y < 8 {
+        var x = 0
+        while x < 8 {
+            var sum = 0.0
+            var vv = 0
+            while vv < 8 { sum = sum + basis[vv * 8 + y] * tmp[vv * 8 + x]  vv = vv + 1 }
+            let iv = clampb(to_int(sum * 0.5 + 128.5))
+            unsafe { poke8(plane + (y0 + y) * cw + (x0 + x), iv) }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+/// decode a baseline JPEG (from read_file bytes). Returns ok()==false on malformed / progressive /
+/// arithmetic / unsupported input.
+pub fn load_jpeg(data: Str) -> Image {
+    let n = data.len()
+    if n < 4 || u8(data, 0) != 255 || u8(data, 1) != 216 { return bad() }
+
+    var W = 0  var H = 0  var nc = 0  var ri = 0
+    var sosPos = 0 - 1
+    var haveFrame = false
+    var qtab: Vec<Vec<Int>> = vec()
+    var dcTab: Vec<JHuff> = vec()
+    var acTab: Vec<JHuff> = vec()
+    var qi = 0  while qi < 4 { var e: Vec<Int> = vec()  qtab.push(e)  dcTab.push(empty_huff())  acTab.push(empty_huff())  qi = qi + 1 }
+    var cid: Vec<Int> = vec()  var chs: Vec<Int> = vec()  var cvs: Vec<Int> = vec()  var ctq: Vec<Int> = vec()
+    var ctd: Vec<Int> = vec()  var cta: Vec<Int> = vec()
+
+    var pos = 2
+    var stop = false
+    while !stop && pos + 1 < n {
+        if u8(data, pos) != 255 { pos = pos + 1 }
+        else {
+            var m = u8(data, pos + 1)
+            while m == 255 && pos + 2 < n { pos = pos + 1  m = u8(data, pos + 1) }   // skip fill 0xFFs
+            pos = pos + 2
+            if m == 217 { stop = true }                                              // EOI
+            else if m == 1 || (m >= 208 && m <= 215) { }                             // TEM / RSTn: no payload
+            else if m == 194 || m == 195 || m == 197 || m == 198 || m == 199 || m == 201 || m == 202 || m == 203 || m == 205 || m == 206 || m == 207 {
+                return bad()                                                         // progressive / lossless / differential / arithmetic SOF
+            } else if pos + 2 <= n {
+                let seg = be16(data, pos)
+                let dstart = pos + 2
+                let dend = pos + seg
+                if m == 219 {                                                        // DQT
+                    var q = dstart
+                    while q < dend {
+                        let pqtq = u8(data, q)  q = q + 1
+                        let pq = (pqtq >> 4)
+                        let tq = (pqtq & 15)
+                        var t: Vec<Int> = vec()
+                        var j = 0
+                        while j < 64 { if pq == 0 { t.push(u8(data, q))  q = q + 1 } else { t.push(be16(data, q))  q = q + 2 }  j = j + 1 }
+                        if tq >= 0 && tq < 4 { qtab[tq] = t }
+                    }
+                } else if m == 196 {                                                // DHT
+                    var q = dstart
+                    while q < dend {
+                        let tcth = u8(data, q)  q = q + 1
+                        let tc = (tcth >> 4)
+                        let th = (tcth & 15)
+                        var counts: Vec<Int> = vec()  counts.push(0)
+                        var total = 0
+                        var j = 1
+                        while j <= 16 { let c = u8(data, q)  q = q + 1  counts.push(c)  total = total + c  j = j + 1 }
+                        var vals: Vec<Int> = vec()
+                        j = 0
+                        while j < total { vals.push(u8(data, q))  q = q + 1  j = j + 1 }
+                        let hh = build_huff(counts, vals)
+                        if th >= 0 && th < 4 { if tc == 0 { dcTab[th] = hh } else { acTab[th] = hh } }
+                    }
+                } else if m == 192 || m == 193 {                                    // SOF0 / SOF1 (baseline / extended sequential)
+                    H = be16(data, dstart + 1)
+                    W = be16(data, dstart + 3)
+                    nc = u8(data, dstart + 5)
+                    var j = 0
+                    while j < nc {
+                        let b = dstart + 6 + j * 3
+                        cid.push(u8(data, b))
+                        let hv = u8(data, b + 1)
+                        chs.push((hv >> 4))  cvs.push((hv & 15))  ctq.push(u8(data, b + 2))
+                        ctd.push(0)  cta.push(0)
+                        j = j + 1
+                    }
+                    haveFrame = true
+                } else if m == 221 {                                                // DRI
+                    ri = be16(data, dstart)
+                } else if m == 218 {                                                // SOS
+                    let ns = u8(data, dstart)
+                    var j = 0
+                    while j < ns {
+                        let cs = u8(data, dstart + 1 + j * 2)
+                        let tt = u8(data, dstart + 2 + j * 2)
+                        var c = 0
+                        while c < nc { if cid[c] == cs { ctd[c] = (tt >> 4)  cta[c] = (tt & 15) }  c = c + 1 }
+                        j = j + 1
+                    }
+                    sosPos = dend                                                   // entropy-coded data begins right after the header
+                    stop = true
+                }
+                pos = dend
+            } else { stop = true }
+        }
+    }
+
+    if !haveFrame || sosPos < 0 || W <= 0 || H <= 0 { return bad() }
+    if nc != 1 && nc != 3 { return bad() }
+
+    var Hmax = 1  var Vmax = 1
+    var ci = 0
+    while ci < nc { if chs[ci] > Hmax { Hmax = chs[ci] }  if cvs[ci] > Vmax { Vmax = cvs[ci] }  ci = ci + 1 }
+    let mcuW = 8 * Hmax
+    let mcuH = 8 * Vmax
+    let mcx = (W + mcuW - 1) / mcuW
+    let mcy = (H + mcuH - 1) / mcuH
+
+    var cplane: Vec<Int> = vec()  var ccw: Vec<Int> = vec()  var cch: Vec<Int> = vec()  var dcpred: Vec<Int> = vec()
+    ci = 0
+    while ci < nc {
+        let cw = mcx * chs[ci] * 8
+        let ch = mcy * cvs[ci] * 8
+        var pl = 0
+        unsafe { pl = malloc(cw * ch) }
+        cplane.push(pl)  ccw.push(cw)  cch.push(ch)  dcpred.push(0)
+        ci = ci + 1
+    }
+
+    let ZZ = jz()
+    let basis = idct_basis()
+    var st: Vec<Int> = vec()  st.push(sosPos)  st.push(0)  st.push(0)  st.push(0)
+    let total = mcx * mcy
+    var mcuCount = 0
+    var my = 0
+    while my < mcy {
+        var mx = 0
+        while mx < mcx {
+            var c = 0
+            while c < nc {
+                let hs = chs[c]  let vs = cvs[c]
+                var by = 0
+                while by < vs {
+                    var bx = 0
+                    while bx < hs {
+                        jblock(data, n, st, dcTab[ctd[c]], acTab[cta[c]], qtab[ctq[c]], dcpred, c, ZZ, basis, cplane[c], ccw[c], (mx * hs + bx) * 8, (my * vs + by) * 8)
+                        bx = bx + 1
+                    }
+                    by = by + 1
+                }
+                c = c + 1
+            }
+            mcuCount = mcuCount + 1
+            if ri > 0 && mcuCount % ri == 0 && mcuCount < total { jpeg_restart(data, n, st, dcpred, nc) }
+            mx = mx + 1
+        }
+        my = my + 1
+    }
+
+    // upsample (nearest / block replication) + color convert into straight RGBA8.
+    var px = 0
+    unsafe { px = malloc(W * H * 4) }
+    var y = 0
+    while y < H {
+        var x = 0
+        while x < W {
+            let o = (y * W + x) * 4
+            var r = 0  var g = 0  var b = 0
+            if nc == 1 {
+                var yy = 0
+                unsafe { yy = peek8(cplane[0] + (y * cvs[0] / Vmax) * ccw[0] + (x * chs[0] / Hmax)) }
+                r = yy  g = yy  b = yy
+            } else {
+                var Y = 0  var Cb = 0  var Cr = 0
+                let y0 = (y * cvs[0] / Vmax) * ccw[0] + (x * chs[0] / Hmax)
+                let y1 = (y * cvs[1] / Vmax) * ccw[1] + (x * chs[1] / Hmax)
+                let y2 = (y * cvs[2] / Vmax) * ccw[2] + (x * chs[2] / Hmax)
+                unsafe { Y = peek8(cplane[0] + y0)  Cb = peek8(cplane[1] + y1)  Cr = peek8(cplane[2] + y2) }
+                let yf = to_float(Y)
+                let cbf = to_float(Cb - 128)
+                let crf = to_float(Cr - 128)
+                r = clampb(to_int(yf + 1.402 * crf + 0.5))
+                g = clampb(to_int(yf - 0.344136 * cbf - 0.714136 * crf + 0.5))
+                b = clampb(to_int(yf + 1.772 * cbf + 0.5))
+            }
+            unsafe { poke8(px + o, r)  poke8(px + o + 1, g)  poke8(px + o + 2, b)  poke8(px + o + 3, 255) }
+            x = x + 1
+        }
+        y = y + 1
+    }
+
+    ci = 0
+    while ci < nc { unsafe { free(cplane[ci]) }  ci = ci + 1 }
+    return Image { w: W, h: H, px: px, okf: 1 }
+}
+
+// ── GIF, animated PNG and WebP as one picture ─────────────────────────────────────────────────────────
+// The animated decoders (anim.nori: gif.nori, apng.nori, webp.nori) are the only ones: a picture is their first
+// frame, composed onto the canvas as a browser paints it before the timer starts.
+fn first_frame(data: Str) -> Image {
+    var a = anim_open(copy data)
+    if !anim_ok(a) || !anim_next(a) { anim_close(a)  return bad() }
+    let im = Image { w: a.w, h: a.h, px: a.canvas, okf: 1 }
+    a.canvas = 0
+    anim_close(a)
+    return im
+}
+/// decode a GIF (87a/89a) into RGBA8. Animated files give up their first frame, composed onto a
+/// transparent canvas at its own left/top offset: what a browser paints before the timer starts.
+/// Interlacing and the transparent index are honored; `ok(im)` reports whether it decoded.
+pub fn load_gif(data: Str) -> Image {
+    if data.len() < 13 { return bad() }
+    if !(u8(data, 0) == 71 && u8(data, 1) == 73 && u8(data, 2) == 70 && u8(data, 3) == 56) { return bad() }   // "GIF8"
+    return first_frame(data)
+}
+/// decode a WebP (lossy, lossless, with alpha, or animated: its first frame) into RGBA8.
+pub fn load_webp(data: Str) -> Image {
+    if data.len() < 12 || !(u8(data, 0) == 82 && u8(data, 1) == 73 && u8(data, 2) == 70 && u8(data, 3) == 70) { return bad() }
+    return first_frame(data)
+}
+
+/// decode an image by sniffing its magic bytes: JPEG (FF D8), GIF ("GIF8"), WebP ("RIFF"...."WEBP"), else PNG.
+/// An animation gives its first frame (`anim_open` plays it).
+pub fn load(data: Str) -> Image {
+    if data.len() >= 2 && u8(data, 0) == 255 && u8(data, 1) == 216 { return load_jpeg(data) }
+    if data.len() >= 4 && u8(data, 0) == 71 && u8(data, 1) == 73 && u8(data, 2) == 70 && u8(data, 3) == 56 { return load_gif(data) }
+    if data.len() >= 12 && u8(data, 8) == 87 && u8(data, 9) == 69 && u8(data, 10) == 66 && u8(data, 11) == 80 { return load_webp(data) }
+    return load_png(data)
+}
+
+// ── PNG encoding ─────────────────────────────────────────────────────────────────────────────────
+// The write side of load_png.
+// Everything load_png can read at 8 bits it can also write: colour types 0 (greyscale), 2
+// (truecolour), 3 (palette, caller-supplied), 4 (greyscale+alpha) and 6 (truecolour+alpha),
+// non-interlaced, one IDAT, deflated by std/archive::deflate_zlib.
+//
+// Sixteen bits is not written. load_png accepts 16-bit samples but downsamples them to 8 on the way
+// into `Image`, so an `Image` never holds more than 8 bits per channel and writing 16 would be
+// inventing precision that is not there. A 16-bit PNG read by this module and written back comes out
+// 8-bit, which is exactly what survived the read.
+//
+// No colour quantiser. Palette output takes the palette from the caller and looks each pixel up in
+// it exactly; a pixel that is not in the palette is an error (encode returns ""), not a nearest-match
+// guess. Choosing a palette for an arbitrary image is a different problem, and doing it badly and
+// silently inside a "save" call would be worse than not doing it.
+
+/// colour type 0: 8-bit greyscale. The red channel is written (an `Image` decoded from greyscale has R=G=B).
+pub fn png_gray() -> Int { return 0 }
+/// colour type 2: 8-bit truecolour RGB. Alpha is dropped.
+pub fn png_rgb() -> Int { return 2 }
+/// colour type 3: 8-bit palette indices. Only via `encode_png_paletted` / `save_png_paletted`.
+pub fn png_palette() -> Int { return 3 }
+/// colour type 4: 8-bit greyscale + alpha.
+pub fn png_gray_alpha() -> Int { return 4 }
+/// colour type 6: 8-bit truecolour + alpha. Lossless for any `Image`.
+pub fn png_rgba() -> Int { return 6 }
+
+/// the CRC-32 (IEEE 802.3, reflected) table every PNG chunk is checked with.
+fn ipng_crc_table() -> Vec<Int> {
+    var t: Vec<Int> = vec()
+    var n = 0
+    while n < 256 {
+        var c = n
+        var k = 0
+        while k < 8 {
+            if (c & 1) == 1 { c = 3988292384 ^ (c >> 1) } else { c = (c >> 1) }
+            k = k + 1
+        }
+        t.push(c & 4294967295)
+        n = n + 1
+    }
+    return t
+}
+fn ipng_crc_str(t: Vec<Int>, s: Str) -> Int {
+    var c = 4294967295
+    var i = 0
+    let n = s.len()
+    while i < n { c = t[(c ^ ord(s.at(i))) & 255] ^ (c >> 8)  i = i + 1 }
+    return (c ^ 4294967295) & 4294967295
+}
+fn ipng_be32s(v: Int) -> Str {
+    return (((("" + chr((v >> 24) & 255)) + chr((v >> 16) & 255)) + chr((v >> 8) & 255)) + chr(v & 255))
+}
+/// one PNG chunk: length, 4-character tag, data, CRC-32 over tag+data.
+fn ipng_chunk(t: Vec<Int>, tag: Str, data: Str) -> Str {
+    let body = tag + data
+    return (ipng_be32s(body.len() - 4) + body) + ipng_be32s(ipng_crc_str(t, body))
+}
+
+/// one source pixel as R<<24 | G<<16 | B<<8 | A. `layout` 0 = straight RGBA8 bytes (an `Image`'s
+/// buffer), 1 = little-endian 0x00RRGGBB words (what `gpu_readback` and `paint_cpu` hand back).
+fn ipng_get(src: Int, layout: Int, i: Int) -> Int {
+    var v = 0
+    if layout == 1 {
+        unsafe { v = peek32(src + i * 4) }
+        return (v & 16777215) * 256 + 255
+    }
+    var r = 0  var g = 0  var b = 0  var a = 0
+    unsafe { r = peek8(src + i * 4)  g = peek8(src + i * 4 + 1)  b = peek8(src + i * 4 + 2)  a = peek8(src + i * 4 + 3) }
+    return r * 16777216 + g * 65536 + b * 256 + a
+}
+fn ipng_channels(ctype: Int) -> Int {
+    if ctype == 0 { return 1 }
+    if ctype == 2 { return 3 }
+    if ctype == 3 { return 1 }
+    if ctype == 4 { return 2 }
+    if ctype == 6 { return 4 }
+    return 0
+}
+/// the byte filter `f` would produce at `x` (RFC 2083 §6). `row`/`prev` are unfiltered scanlines.
+fn ipng_fbyte(f: Int, row: Int, prev: Int, x: Int, bpp: Int, hasprev: Int) -> Int {
+    var cur = 0  var a = 0  var b = 0  var c = 0
+    unsafe {
+        cur = peek8(row + x)
+        if x >= bpp { a = peek8(row + x - bpp) }
+        if hasprev == 1 { b = peek8(prev + x)  if x >= bpp { c = peek8(prev + x - bpp) } }
+    }
+    if f == 0 { return cur }
+    if f == 1 { return (cur - a) & 255 }
+    if f == 2 { return (cur - b) & 255 }
+    if f == 3 { return (cur - (a + b) / 2) & 255 }
+    return (cur - paeth(a, b, c)) & 255
+}
+
+/// encode `w` x `h` pixels at `src` as a PNG. Returns "" if the request cannot be honoured.
+/// `pal` is R<<24|G<<16|B<<8|A entries and is only consulted for colour type 3.
+fn ipng_encode_core(w: Int, h: Int, src: Int, layout: Int, ctype: Int, pal: Vec<Int>, fast: Bool) -> Str {
+    if w <= 0 || h <= 0 || src == 0 { return "" }
+    let nch = ipng_channels(ctype)
+    if nch == 0 { return "" }
+    let npal = pal.len()
+    if ctype == 3 && (npal < 1 || npal > 256) { return "" }
+    let stride = w * nch
+    let count = w * h
+
+    // 1. the unfiltered scanlines, straight PNG samples, h*stride bytes.
+    var rows = 0
+    unsafe { rows = malloc(h * stride) }
+    if rows == 0 { return "" }
+    var miss = 0
+    var last = 0                                        // palette lookups repeat; remembering the last hit
+    var i = 0                                           // turns runs of one colour into one comparison
+    while i < count {
+        let p = ipng_get(src, layout, i)
+        let r = (p >> 24) & 255
+        let g = (p >> 16) & 255
+        let b = (p >> 8) & 255
+        let a = p & 255
+        unsafe {
+            if ctype == 0 { poke8(rows + i, r) }
+            if ctype == 2 { poke8(rows + i * 3, r)  poke8(rows + i * 3 + 1, g)  poke8(rows + i * 3 + 2, b) }
+            if ctype == 4 { poke8(rows + i * 2, r)  poke8(rows + i * 2 + 1, a) }
+            if ctype == 6 { poke8(rows + i * 4, r)  poke8(rows + i * 4 + 1, g)  poke8(rows + i * 4 + 2, b)  poke8(rows + i * 4 + 3, a) }
+        }
+        if ctype == 3 {
+            var idx = 0 - 1
+            if pal[last] == p { idx = last }
+            else {
+                var k = 0
+                while k < npal { if pal[k] == p { idx = k  k = npal } else { k = k + 1 } }
+            }
+            if idx < 0 { miss = 1  i = count } else { last = idx  unsafe { poke8(rows + i, idx) }  i = i + 1 }
+        } else { i = i + 1 }
+    }
+    if miss == 1 { unsafe { free(rows) }  return "" }
+
+    // 2. filter each scanline, picking the filter with the smallest sum of absolute differences over
+    //    the filtered bytes read as signed. This is the standard heuristic and it is where a PNG's
+    //    compression actually comes from: deflate sees a near-flat byte stream instead of gradients.
+    let bpp = nch
+    var raw = 0
+    unsafe { raw = malloc(h * (stride + 1)) }
+    if raw == 0 { unsafe { free(rows) }  return "" }
+    var y = 0
+    while y < h {
+        let row = rows + y * stride
+        let prev = rows + (y - 1) * stride
+        var hasprev = 0
+        if y > 0 { hasprev = 1 }
+        var s0 = 0  var s1 = 0  var s2 = 0  var s3 = 0  var s4 = 0
+        var x = 0
+        if fast { x = stride }                              // no filter is chosen, so none is scored
+        while x < stride {
+            var cur = 0  var a = 0  var b = 0  var c = 0
+            unsafe {
+                cur = peek8(row + x)
+                if x >= bpp { a = peek8(row + x - bpp) }
+                if hasprev == 1 { b = peek8(prev + x)  if x >= bpp { c = peek8(prev + x - bpp) } }
+            }
+            s0 = s0 + ipng_absb(cur)
+            s1 = s1 + ipng_absb((cur - a) & 255)
+            s2 = s2 + ipng_absb((cur - b) & 255)
+            s3 = s3 + ipng_absb((cur - (a + b) / 2) & 255)
+            s4 = s4 + ipng_absb((cur - paeth(a, b, c)) & 255)
+            x = x + 1
+        }
+        var best = 0
+        var bs = s0
+        if s1 < bs { best = 1  bs = s1 }
+        if s2 < bs { best = 2  bs = s2 }
+        if s3 < bs { best = 3  bs = s3 }
+        if s4 < bs { best = 4  bs = s4 }
+        let o = y * (stride + 1)
+        unsafe { poke8(raw + o, best) }
+        x = 0
+        while x < stride {
+            unsafe { poke8(raw + o + 1 + x, ipng_fbyte(best, row, prev, x, bpp, hasprev)) }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    unsafe { free(rows) }
+    var rawstr = ""
+    unsafe { rawstr = str_from_buf(raw, h * (stride + 1)) }
+    unsafe { free(raw) }
+    var idat = ""
+    if fast { idat = ar::deflate_zlib_stored(rawstr) } else { idat = ar::deflate_zlib(rawstr) }
+
+    // 3. the chunks.
+    let t = ipng_crc_table()
+    var out = ((((("" + chr(137)) + chr(80)) + chr(78)) + chr(71)) + chr(13)) + chr(10)
+    out = (out + chr(26)) + chr(10)
+    var ihdr = ipng_be32s(w) + ipng_be32s(h)
+    ihdr = (((ihdr + chr(8)) + chr(ctype)) + chr(0)) + chr(0)     // bit depth 8, deflate, adaptive filtering
+    ihdr = ihdr + chr(0)                                          // no interlace
+    out = out + ipng_chunk(t, "IHDR", ihdr)
+    if ctype == 3 {
+        var plte = ""
+        var k = 0
+        while k < npal { plte = ((plte + chr((pal[k] >> 24) & 255)) + chr((pal[k] >> 16) & 255)) + chr((pal[k] >> 8) & 255)  k = k + 1 }
+        out = out + ipng_chunk(t, "PLTE", plte)
+        var lastt = 0 - 1
+        k = 0
+        while k < npal { if (pal[k] & 255) != 255 { lastt = k }  k = k + 1 }
+        if lastt >= 0 {
+            var trns = ""
+            k = 0
+            while k <= lastt { trns = trns + chr(pal[k] & 255)  k = k + 1 }
+            out = out + ipng_chunk(t, "tRNS", trns)
+        }
+    }
+    out = out + ipng_chunk(t, "IDAT", idat)
+    out = out + ipng_chunk(t, "IEND", "")
+    return out
+}
+/// a filtered byte's magnitude read as a signed char: the weight in the minimum-sum heuristic.
+fn ipng_absb(v: Int) -> Int { if v < 128 { return v }  return 256 - v }
+
+/// encode `im` as a PNG at colour type `ctype` (`png_gray`, `png_rgb`, `png_gray_alpha`, `png_rgba`).
+/// Returns "" if `im` is bad or `ctype` is not one of those: palette output is `encode_png_paletted`.
+///
+/// `png_rgba` is the only lossless choice for an arbitrary `Image`: `png_rgb` and `png_gray` drop
+/// alpha, and `png_gray`/`png_gray_alpha` write the red channel as the grey level.
+pub fn encode_png(im: Image, ctype: Int) -> Str {
+    if im.okf != 1 { return "" }
+    if ctype == 3 { return "" }
+    var pal: Vec<Int> = vec()
+    return ipng_encode_core(im.w, im.h, im.px, 0, ctype, pal, false)
+}
+
+/// encode `im` as a colour-type-3 PNG against the caller's `pal` (R<<24|G<<16|B<<8|A entries, 1..256
+/// of them; a tRNS chunk is written when any entry is not opaque).
+///
+/// There is no quantiser here: every pixel must already be one of the palette's colours exactly, and
+/// a pixel that is not returns "". Pick the palette from the image you are about to write, or write
+/// `png_rgba` instead.
+pub fn encode_png_paletted(im: Image, pal: Vec<Int>) -> Str {
+    if im.okf != 1 { return "" }
+    return ipng_encode_core(im.w, im.h, im.px, 0, 3, pal, false)
+}
+
+/// write `im` to `path` as a PNG at colour type `ctype`. false if it could not be encoded.
+pub fn save_png(im: Image, path: Str, ctype: Int) -> Bool {
+    let d = encode_png(im, ctype)
+    if d.len() == 0 { return false }
+    write_file(path, d)
+    return true
+}
+
+/// write `im` to `path` as a colour-type-3 PNG against `pal`. false if it could not be encoded.
+pub fn save_png_paletted(im: Image, path: Str, pal: Vec<Int>) -> Bool {
+    let d = encode_png_paletted(im, pal)
+    if d.len() == 0 { return false }
+    write_file(path, d)
+    return true
+}
+
+/// encode a `w` x `h` framebuffer of little-endian 0x00RRGGBB words at `px` (the layout
+/// `std/nori_ui/paint_gpu::gpu_readback` and `paint_cpu` produce), as a truecolour PNG.
+///
+/// This is the raw-pointer door into the same encoder. A readback buffer is not an `Image` and
+/// copying three megabytes into one only to have the encoder read it back out again is work for
+/// nothing, so the pixel walk is parameterised on the layout instead.
+pub fn encode_png_readback(px: Int, w: Int, h: Int) -> Str {
+    var pal: Vec<Int> = vec()
+    return ipng_encode_core(w, h, px, 1, 2, pal, false)
+}
+
+/// `encode_png_readback`, fast: every scanline unfiltered and the image data stored, not compressed.
+/// The same pixels, a file several times larger, in a fraction of the time: for a screenshot that
+/// is read once and deleted.
+pub fn encode_png_readback_fast(px: Int, w: Int, h: Int) -> Str {
+    var pal: Vec<Int> = vec()
+    return ipng_encode_core(w, h, px, 1, 2, pal, true)
+}
+
+/// `save_png_readback`, fast: see `encode_png_readback_fast`.
+pub fn save_png_readback_fast(path: Str, px: Int, w: Int, h: Int) -> Bool {
+    let d = encode_png_readback_fast(px, w, h)
+    if d.len() == 0 { return false }
+    write_file(path, d)
+    return true
+}
+
+/// write a `w` x `h` readback buffer (little-endian 0x00RRGGBB words) to `path` as a truecolour PNG.
+pub fn save_png_readback(path: Str, px: Int, w: Int, h: Int) -> Bool {
+    let d = encode_png_readback(px, w, h)
+    if d.len() == 0 { return false }
+    write_file(path, d)
+    return true
+}

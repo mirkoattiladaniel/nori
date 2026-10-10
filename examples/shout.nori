@@ -1,0 +1,35 @@
+// A small command-line tool: arguments, reading a file, writing a file, an exit code.
+//
+//   shout IN OUT      copies IN to OUT in upper case and reports the sizes
+//
+// Exit code: 0 on success, 2 for a wrong argument count, 1 when IN is missing or OUT cannot be written.
+fn upper(s: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        let c = ord(s.at(i))
+        if c >= 97 && c <= 122 { out = out + chr(c - 32) } else { out = out + s.slice(i, i + 1) }
+        i = i + 1
+    }
+    return out
+}
+
+fn main() -> Int {
+    if argc() != 2 {
+        printl("usage: shout IN OUT")
+        return 2
+    }
+    let src = arg(0)
+    let dst = arg(1)
+    if !is_file(src) {
+        printl("shout: no such file: ${src}")
+        return 1
+    }
+    let text = read_file(src)
+    if write_file(dst, upper(text)) != 0 {
+        printl("shout: cannot write ${dst}")
+        return 1
+    }
+    printl("shout: ${text.len()} bytes from ${src} to ${dst}")
+    return 0
+}

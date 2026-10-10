@@ -1,0 +1,8 @@
+shout: 25 bytes from DIR/in.txt to DIR/out.txt
+exit: 0
+HELLO, FILES
+SECOND LINE
+usage: shout IN OUT
+exit: 2
+shout: no such file: DIR/missing
+exit: 1

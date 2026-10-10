@@ -1,0 +1,204 @@
+//! std/result: recoverable errors, so a failure can be handled instead of trapping the program.
+//!
+//! `Option<T>` is "a value, or nothing"; `Result<T, E>` is "a value, or an error". The success case
+//! is the first variant (Some / Ok), which `try` relies on: `try e` unwraps Some/Ok, or propagates
+//! None/Err out of the enclosing function.
+//!
+//! These wrappers are non-trapping alternatives to the trapping builtins (read_file, parse_int,
+//! lookup, v[i], a/b): they return Ok/Err or Some/None, which you then `match`, `try`, or feed to a
+//! `*_or` helper.
+
+extern fn malloc(Int) -> Int
+extern fn free(Int)
+extern fn access(Int, Int) -> I32          // POSIX: int access(const char* path, int mode); F_OK = 0
+cfg(linux) { extern fn stat(Int, Int) -> I32 }      // POSIX: int stat(const char* path, struct stat*)
+cfg(macos) { extern fn stat(Int, Int) -> I32 }
+cfg(bare) { extern fn stat(Int, Int) -> I32 }
+cfg(windows) { extern fn _stat64(Int, Int) -> I32 } // int _stat64(const char* path, struct _stat64*)
+
+// ---- the two core types live in std/prelude (auto-injected everywhere); a flat import shares the same scope ----
+import "std/prelude"
+
+
+// ---- non-trapping checks (used to guard the trapping builtins) ----
+
+/// can `s` be parsed as an integer? (optional leading '-', then digits)
+pub fn is_int(s: Str) -> Bool {
+    var n = s.len()
+    if n == 0 { return false }
+    var i = 0
+    if s.at(0) == '-' { if n == 1 { return false }  i = 1 }
+    while i < n {
+        var c = s.at(i)
+        if c < '0' { return false }
+        if c > '9' { return false }
+        i = i + 1
+    }
+    return true
+}
+
+/// a NUL-terminated C string for `s` (caller frees).
+fn res_cstr(s: Str) -> Int {
+    let n = s.len()
+    var c = 0  unsafe { c = malloc(n + 1) }
+    var i = 0  while i < n { unsafe { poke8(c + i, ord(s.at(i))) }  i = i + 1 }
+    unsafe { poke8(c + n, 0) }
+    return c
+}
+
+/// does a file exist at `path`? (libc `access` with F_OK)
+pub fn file_exists(path: Str) -> Bool {
+    let c = res_cstr(path)
+    var ok = 0  unsafe { ok = to_int(access(c, 0)) }
+    unsafe { free(c) }
+    return ok == 0
+}
+
+// the st_mode of a stat call into `st`, or 0 when it fails: `struct stat`'s 4-byte st_mode at 24 on
+// Linux x86-64, `struct _stat64`'s 2-byte one at 6 on Windows, and at 4 on macOS
+cfg(windows) {
+    fn res_stat_mode(c: Int, st: Int) -> Int { unsafe { if to_int(_stat64(c, st)) == 0 { return peek(st + 6) & 0xFFFF } }  return 0 }
+}
+cfg(macos) {
+    fn res_stat_mode(c: Int, st: Int) -> Int { unsafe { if to_int(stat(c, st)) == 0 { return peek(st + 4) & 0xFFFF } }  return 0 }
+}
+cfg(linux) {
+    fn res_stat_mode(c: Int, st: Int) -> Int { unsafe { if to_int(stat(c, st)) == 0 { return peek(st + 24) & 0xFFFFFFFF } }  return 0 }
+}
+cfg(bare) {
+    fn res_stat_mode(c: Int, st: Int) -> Int { unsafe { if to_int(stat(c, st)) == 0 { return peek(st + 24) & 0xFFFFFFFF } }  return 0 }
+}
+
+/// the raw st_mode of `path`, or 0 when it cannot be stat'd.
+fn path_mode(path: Str) -> Int {
+    let c = res_cstr(path)
+    var md = 0
+    unsafe {
+        let st = malloc(144)
+        md = res_stat_mode(c, st)
+        free(st)
+        free(c)
+    }
+    return md
+}
+
+/// is `path` a regular file, which is what read_file can read?
+///
+/// Existence is not enough. `access` succeeds on a directory, so a wrapper that only checks
+/// existence hands the path to read_file and the "non-trapping" call traps after all. S_IFREG.
+pub fn is_regular_file(path: Str) -> Bool { return (path_mode(path) & 0xF000) == 0x8000 }
+
+/// is `path` an existing directory? S_IFDIR.
+pub fn is_directory(path: Str) -> Bool { return (path_mode(path) & 0xF000) == 0x4000 }
+
+/// the directory part of `path` ("." when it names no directory).
+fn parent_dir(path: Str) -> Str {
+    var i = path.len() - 1
+    while i >= 0 {
+        if ord(path.at(i)) == 47 {                     // '/'
+            if i == 0 { return "/" }
+            return path.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+// ---- safe operations: return a Result/Option instead of trapping ----
+
+/// parse `s` as an Int, returning Ok(value) or Err(message) instead of trapping. Use this when the
+/// caller needs to know why it failed; when a fallback is enough, the `parse_int_or(s, dflt)` builtin
+/// is cheaper: it scans once, where this validates and then parses again, and allocates a `Result`.
+pub fn try_parse_int(s: Str) -> Result<Int> {
+    if is_int(s) { return Result::Ok(parse_int(s)) }
+    return Result::Err(("not an integer: " + s))
+}
+
+/// read the file at `path`, returning Ok(contents) or Err(message) instead of trapping.
+///
+/// Checks that the path is a regular file, not merely that something exists there: `access` is happy
+/// with a directory and read_file is not, so testing existence alone would trap on a directory.
+pub fn try_read_file(path: Str) -> Result<Str> {
+    if !file_exists(path) { return Result::Err(("cannot read file: " + path + " — no such file")) }
+    if is_directory(path) { return Result::Err(("cannot read file: " + path + " — it is a directory")) }
+    if !is_regular_file(path) { return Result::Err(("cannot read file: " + path + " — not a regular file")) }
+    return Result::Ok(read_file(path))
+}
+
+/// write `content` to `path`, returning Ok(path) or Err(message) instead of trapping.
+///
+/// Catches what can be known before writing: a destination that is a directory, a parent directory
+/// that does not exist or refuses writes. A failure during the write itself (a full disk, an
+/// exceeded quota, an I/O error) cannot be known in advance and still traps, with the cause
+/// named, so write_file never reports success for a write that did not happen.
+pub fn try_write_file(path: Str, content: Str) -> Result<Str> {
+    if is_directory(path) { return Result::Err(("cannot write file: " + path + " — it is a directory")) }
+    let dir = parent_dir(path)
+    if !file_exists(dir) { return Result::Err(("cannot write file: " + path + " — the directory " + dir + " does not exist")) }
+    var w = 0
+    let dc = res_cstr(dir)
+    unsafe { w = to_int(access(dc, 2)) }                       // W_OK
+    unsafe { free(dc) }
+    if w != 0 { return Result::Err(("cannot write file: " + path + " — the directory " + dir + " is not writable")) }
+    write_file(path, content)
+    return Result::Ok(copy path)
+}
+
+/// safe element access: None when out of range (never traps), for a Vec of any element type
+pub fn vget<T>(v: Vec<T>, i: Int) -> Option<T> {
+    if i < 0 { return Option::None }
+    if i >= v.len() { return Option::None }
+    return Option::Some(copy v[i])
+}
+
+/// safe map lookup: None when the key is absent, for a Map of any value type
+pub fn mget<V>(m: Map<Str, V>, key: Str) -> Option<V> {
+    if m.has(key) { return Option::Some(copy m.get(key)) }
+    return Option::None
+}
+
+/// the value at `key`, or `dflt` when it is absent: a non-trapping read that costs nothing extra.
+/// Prefer this over `mget` on a hot path: an `Option` is a heap object (both variants allocate), so
+/// `mget(...) else d` pays an allocation per read where this pays none.
+pub fn lookup_or<V>(m: Map<Str, V>, key: Str, sink dflt: V) -> V {
+    if m.has(key) { return copy m.get(key) }
+    return dflt
+}
+
+/// safe integer division: Err on divide-by-zero
+pub fn try_div(a: Int, b: Int) -> Result<Int> {
+    if b == 0 { return Result::Err("division by zero") }
+    return Result::Ok(a / b)
+}
+
+// ---- helpers: get the value out, with a fallback or a query ----
+
+/// the Some value, or `default` on None
+pub fn unwrap_or<T>(sink o: Option<T>, sink default: T) -> T {
+    match sink o {
+        Option::Some(x) => { return x }
+        Option::None    => { return default }
+    }
+}
+/// true if the Option is Some.
+pub fn is_some<T>(o: Option<T>) -> Bool {
+    match o {
+        Option::Some(x) => { return true }
+        Option::None    => { return false }
+    }
+}
+
+/// the Ok value, or `default` on Err
+pub fn ok_or<T>(sink r: Result<T>, sink default: T) -> T {
+    match sink r {
+        Result::Ok(x)  => { return x }
+        Result::Err(e) => { return default }
+    }
+}
+/// true if the Result is Ok.
+pub fn is_ok<T>(r: Result<T>) -> Bool {
+    match r {
+        Result::Ok(x)  => { return true }
+        Result::Err(e) => { return false }
+    }
+}

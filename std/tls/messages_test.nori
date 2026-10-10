@@ -1,0 +1,146 @@
+// .nori tests for TLS 1.3 handshake message parsing, run with
+//   noric --test std/tls/messages_test.nori compiler/runtime.nori --import-root .
+//
+// Every value below is copied out of RFC 8448, "TLS 1.3 Traces", which publishes five complete
+// handshakes byte for byte: every secret, every label, every derived key at every step. Nothing
+// here was produced by the code it tests, and nothing here is a round-trip.
+//
+// The values were extracted from the RFC text by a script rather than typed by hand.
+import "std/tls" as tls
+
+fn hexv(c: Byte) -> Int {
+    let o = ord(c)
+    if o >= 97 { return (o - 87) }
+    if o >= 65 { return (o - 55) }
+    return (o - 48)
+}
+fn unhex(h: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < h.len() { out = (out + chr(((hexv(h.at(i)) << 4) | hexv(h.at(i + 1)))))  i = i + 2 }
+    return out
+}
+fn tohex(s: Str) -> Str {
+    let d = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < s.len() { let b = ord(s.at(i))  out = ((out + d.at((b >> 4))) + d.at((b & 15)))  i = i + 1 }
+    return out
+}
+
+fn rep(b: Int, n: Int) -> Str {
+    var out = ""
+    var i = 0
+    while i < n { out = (out + chr(b))  i = i + 1 }
+    return out
+}
+
+// Every ServerHello RFC 8448 contains, parsed. The negotiated version must come from the
+// supported_versions extension and never from legacy_version, which always says TLS 1.2.
+// Reading the wrong one is how a client believes it negotiated 1.2 and proceeds anyway.
+fn test_parse_server_hello() {
+    let m0 = tls::parse_handshake(unhex("020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304"))
+    assert_eq(m0.htype, 2)
+    assert_eq(m0.total, 90)
+    let s0 = tls::parse_server_hello(m0.body)
+    assert_true(!s0.is_hrr)   // section 3
+    assert_streq(s0.err, "")
+    assert_eq(s0.version, 0x0304)
+    assert_eq(s0.key_share.len(), 32)
+    let m1 = tls::parse_handshake(unhex("0200005c03033ccfd2dec890222763472ae8136777c9d7358777bb66e91ea5122495f559ea2d00130100003400290002000000330024001d0020121761ee42c333e1b9e77b60dd57c2053cd94512ab47f115e86eff50942cea31002b00020304"))
+    assert_eq(m1.htype, 2)
+    assert_eq(m1.total, 96)
+    let s1 = tls::parse_server_hello(m1.body)
+    assert_true(!s1.is_hrr)   // section 4
+    assert_streq(s1.err, "")
+    assert_eq(s1.version, 0x0304)
+    assert_eq(s1.key_share.len(), 32)
+    let m2 = tls::parse_handshake(unhex("020000ac0303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c001301000084003300020017002c0074007271dcd04bb88bc3189119398a00000000eefafc76c146b823b096f8aacad365dd0030953f4edf625636e5f21bb2e23fcc654b1b5b40318d10d137abcbb87574e36e8a1f025f7dfa5d6e50781b5eda4aa15b0c8be778257d16aa3030e9e7841dd9e4c0342267e8ca0caf571fb2b7cff0f934b0002b00020304"))
+    assert_eq(m2.htype, 2)
+    assert_eq(m2.total, 176)
+    let s2 = tls::parse_server_hello(m2.body)
+    assert_true(s2.is_hrr)   // section 5
+    assert_streq(s2.err, "")
+    assert_eq(s2.version, 0x0304)
+    let m3 = tls::parse_handshake(unhex("020000770303bb341d847fd789c47c387172dc0c9bf147fccacb5043d86ca4c598d3ff571b9800130100004f003300450017004104583e054b7a66672ae020ad9d2686fcc85b5ad41a134a0f03ee72b893052bd85b4c8de6776f5b04ac07d83540eab3e3d9c547bc6528c4317d294686093a6cad7d002b00020304"))
+    assert_eq(m3.htype, 2)
+    assert_eq(m3.total, 123)
+    let s3 = tls::parse_server_hello(m3.body)
+    assert_true(!s3.is_hrr)   // section 5
+    assert_streq(s3.err, "server selected a group that was not offered")   // group 0x0017
+    let m4 = tls::parse_handshake(unhex("0200005603033b50fdf1c3d572e40e68953e7fff4e2758459c59afa0582c0ea032874255fe6e00130100002e00330024001d00206c2e50e865919a6b5a12dfaf918f92b442567b0f89bc54478c6921366658f062002b00020304"))
+    assert_eq(m4.htype, 2)
+    assert_eq(m4.total, 90)
+    let s4 = tls::parse_server_hello(m4.body)
+    assert_true(!s4.is_hrr)   // section 6
+    assert_streq(s4.err, "")
+    assert_eq(s4.version, 0x0304)
+    assert_eq(s4.key_share.len(), 32)
+    let m5 = tls::parse_handshake(unhex("020000760303e5dd5948c435f7a38f0f0130708dc322d9df09abd4838117c183a7bb6d994f2c20a80c165581a8e0d06c0018d54d3a06dd32cfd4051eb026fad3fd0ba99269e6ef130100002e00330024001d00203e30f0f4ba551afd62768341175f5265e4daf0c8841617aa4fafdd2142320c22002b00020304"))
+    assert_eq(m5.htype, 2)
+    assert_eq(m5.total, 122)
+    let s5 = tls::parse_server_hello(m5.body)
+    assert_true(!s5.is_hrr)   // section 7
+    assert_streq(s5.err, "")
+    assert_eq(s5.version, 0x0304)
+    assert_eq(s5.key_share.len(), 32)
+}
+
+// Certificate messages. The chain must come out leaf-first with each entry the exact DER the
+// server sent: chain validation can only verify these if nothing was lost here.
+fn test_parse_certificate() {
+    let c0 = tls::parse_certificate(tls::parse_handshake(unhex("0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de10000")).body)
+    assert_eq(c0.len(), 1)   // section 3
+    assert_eq(c0[0].len(), 432)
+    let c1 = tls::parse_certificate(tls::parse_handshake(unhex("0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de10000")).body)
+    assert_eq(c1.len(), 1)   // section 5
+    assert_eq(c1[0].len(), 432)
+    let c2 = tls::parse_certificate(tls::parse_handshake(unhex("0b00013b000001370001323082012e3081d5a003020102020107300a06082a8648ce3d04030230133111300f060355040313086563647361323536301e170d3136303733303031323430305a170d3236303733303031323430305a30133111300f0603550403130865636473613235363059301306072a8648ce3d020106082a8648ce3d0301070342000408d530161575f4cfe7f154ee3448180086001e88431a79ee62ee6e2f83ef38ba61e9fb37f34e007a7df4d2f5b56d1f04ece45d621f468406f5c3a15158948dd0a31a301830090603551d1304023000300b0603551d0f040403020780300a06082a8648ce3d0403020348003045022100df30fd4507f5edd22c1a6ff86db479ca693feeca3b71b3f9ef556b2937c0594d022062e2a47250d320fea83c7e2dcb5b76a50e0200c09adbd13fee946e513e011d110000")).body)
+    assert_eq(c2.len(), 1)   // section 6
+    assert_eq(c2[0].len(), 306)
+    let c3 = tls::parse_certificate(tls::parse_handshake(unhex("0b0001bf000001bb0001b6308201b23082011ba003020102020101300d06092a864886f70d01010b05003011310f300d06035504031306636c69656e74301e170d3136303733303031323335395a170d3236303733303031323335395a3011310f300d06035504031306636c69656e7430819f300d06092a864886f70d010101050003818d0030818902818100c38175e004a68d093f823b9c379d201fbc0bb7a1c791905e3fbf76847e44e751ebbcd360bd945c81e5222bcc8846d3a8a0f93e9bf5bebabd92edf1de1ff19021703e7ab6c0901513f97e39b111f09c9348971c7b211984a754cd45fe095af0ea4236829bccf7a7fe9b2888e78ab477690a5b9e1ccbe91c6a4a0f97a7e02842010203010001a31a301830090603551d1304023000300b0603551d0f040403020780300d06092a864886f70d01010b0500038181001a7a5a018532b022af0767d486160cff2d167a1915d23835b54594916dc680be5d2e626076c5d52722ebcc775d7d99f980be2fc94d34acf6cc00ba90cbcfb0608aa1e7e3971ef0c07a41d47ad8345d1f81fe418a1cf41054429fd217bd777dc1cf08f05df90799c659361e0f1a8ee4ac0f7897420bdbc823da80a2f2ba23081c0000")).body)
+    assert_eq(c3.len(), 1)   // section 6
+    assert_eq(c3[0].len(), 438)
+    let c4 = tls::parse_certificate(tls::parse_handshake(unhex("0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de10000")).body)
+    assert_eq(c4.len(), 1)   // section 7
+    assert_eq(c4[0].len(), 432)
+}
+
+// CertificateVerify: the signature algorithm and the signature itself. These tests only read
+// them; checking the signature is the job of x509.nori.
+fn test_parse_certificate_verify() {
+    let v0 = tls::parse_certificate_verify(tls::parse_handshake(unhex("0f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea20d53dfacd42f74f3")).body)
+    assert_streq(v0.err, "")
+    assert_eq(v0.algorithm, 0x0804)   // section 3
+    assert_eq(v0.signature.len(), 128)
+    let v1 = tls::parse_certificate_verify(tls::parse_handshake(unhex("0f0000840804008033ab13d4462707231b5dcae6c8190b63d1dabc74f28c395370da0b07e5b83066d0246a31acd95df475bfd799a4a70d33ad93d3a317a9b2c0d237a5685b219e774112e391a247607d1aeff1bbd0a39f382ee1a5fe88ae99ec59228e6497e45d48ce275a6d5ef40d169fb6f9d33b052ed3dcdd6b5a48baafffbcb290128415bd38")).body)
+    assert_streq(v1.err, "")
+    assert_eq(v1.algorithm, 0x0804)   // section 5
+    assert_eq(v1.signature.len(), 128)
+    let v2 = tls::parse_certificate_verify(tls::parse_handshake(unhex("0f00004b040300473045022100d7a4d34bd54f55fee1a89625678c3dd5e5f60dac73ec940c5c7b9304a02084a90220289f595ed488b9ac689a3d192b1a8bb38f34af7874c059c9806a1f38269353e8")).body)
+    assert_streq(v2.err, "")
+    assert_eq(v2.algorithm, 0x0403)   // section 6
+    assert_eq(v2.signature.len(), 71)
+    let v3 = tls::parse_certificate_verify(tls::parse_handshake(unhex("0f00008408040080186b2223b503a759c35dba0e9721b4b579138d5f0f5e6ec7feaaf27f3ad7f386c2c7bd7cb2be52fbf5ed8393f406ee79369692ec7ac695651d858219e672a8eb7b2a677b640b46ab630edc5f3f2f8272b9c0d906f81f84ddc5b8c7bcf955c78a3cf99e5016f73e04eb7dfcb28833f13e8f75ec2ff3581e2f098ad4157fd6d6ad")).body)
+    assert_streq(v3.err, "")
+    assert_eq(v3.algorithm, 0x0804)   // section 6
+    assert_eq(v3.signature.len(), 128)
+    let v4 = tls::parse_certificate_verify(tls::parse_handshake(unhex("0f00008408040080a2301a68dd1ceee6938fe9d40c46b9201b34d59952a37e06523a39cf8ba6c9c8b68ae94492af780516ed7b73c82812e99dd3fabea45e09d9c6848721c2808c61501b0c75e7fcaba5f78bef68a2c2b69b19558b3e40387eea93d25c7781c1cc00e9f519f7e2e4adb73e76d66089000a2dc866c2ed30bba50a0d457f19dc6eb9f3")).body)
+    assert_streq(v4.err, "")
+    assert_eq(v4.algorithm, 0x0804)   // section 7
+    assert_eq(v4.signature.len(), 128)
+}
+
+// A ClientHello this client builds must parse as one, and carry the extensions a TLS 1.3
+// server needs to answer at all.
+fn test_client_hello_roundtrip() {
+    let ch = tls::client_hello("example.com", rep(1, 32), rep(2, 32), rep(3, 32))
+    let m = tls::parse_handshake(ch)
+    assert_eq(m.htype, 1)
+    assert_eq(m.total, ch.len())
+    assert_true(ch.len() > 100)
+    // the wrong-sized arguments produce nothing rather than a malformed hello
+    assert_streq(tls::client_hello("example.com", rep(1, 31), rep(2, 32), rep(3, 32)), "")
+    assert_streq(tls::client_hello("example.com", rep(1, 32), rep(2, 32), rep(3, 31)), "")
+    assert_streq(tls::client_hello("example.com", rep(1, 32), rep(2, 33), rep(3, 32)), "")
+}

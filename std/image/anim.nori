@@ -1,0 +1,273 @@
+// std/image: animated pictures, streamed: GIF89a (gif.nori), animated PNG (apng.nori) and animated WebP
+// (webp.nori), one frame decoded at a time onto one canvas.
+//
+//   var a = image::anim_open(read_file("loop.gif"))
+//   if image::anim_ok(a) {
+//       while image::anim_next(a) {                       // false at the end of the animation
+//           show(image::anim_pixels(a), image::anim_width(a), image::anim_height(a))
+//           wait(image::anim_delay_ms(a))
+//       }
+//       image::anim_rewind(a)                             // and again (image::anim_loops(a): 0 = for ever)
+//   }
+//   image::anim_close(a)
+//
+// The canvas. Every format here describes an animation the same way: a canvas of a fixed size, and frames that
+// are rectangles laid onto it, each with a delay, and with what happens to its rectangle before the next frame
+// is laid down (its disposal: nothing, cleared, or put back as it was before the frame). So one decoder state
+// serves all three: the canvas (straight RGBA8, w*h*4 bytes; the same layout as `Image`), and, only for a file
+// that asks for the "previous" disposal, a second canvas holding what is put back. Nothing else is decoded ahead:
+// the file's bytes stay compressed, and `anim_next` decodes the next frame when it is wanted.
+//
+// A still picture opens too (a PNG without acTL, a JPEG, a still WebP, a GIF with one frame): one frame with no
+// delay, so a caller that plays whatever it is given needs no second path.
+//
+// Limits. A file says its sizes and they are believed only so far: a canvas is at most 16384 on a side and
+// ANIM_MAX_PX() pixels in all (the allocation a hostile header can ask for is bounded, not the header's to
+// decide), a frame's rectangle is clipped to the canvas (GIF) or refused when it does not fit (APNG and WebP
+// say it must), and a frame whose data runs out is an error, not a read past the end.
+
+/// the most pixels a canvas may have (64 Mpx: 256 MB of RGBA). A file asking for more is refused.
+pub fn ANIM_MAX_PX() -> Int { return 67108864 }
+
+/// the formats `anim_kind` names.
+pub fn ANIM_NONE() -> Int { return 0 }
+pub fn ANIM_GIF() -> Int { return 1 }
+pub fn ANIM_PNG() -> Int { return 2 }
+pub fn ANIM_WEBP() -> Int { return 3 }
+pub fn ANIM_STILL() -> Int { return 4 }
+
+/// an animation being played: the file's bytes, the canvas, and where the next frame starts.
+pub struct Anim {
+    kind: Int,
+    data: Str,
+    dp: Int,              // the bytes' address (nori_str_ptr), dn of them
+    dn: Int,
+    w: Int,
+    h: Int,
+    canvas: Int,          // w*h*4 straight RGBA8
+    prev: Int,            // the canvas as it was before a frame whose disposal is "previous" (0 until one needs it)
+    pos: Int,             // the byte offset of the next frame's data
+    first: Int,           // the first frame's offset (rewind)
+    index: Int,           // the frame `anim_next` decodes next
+    frames: Int,          // how many frames the file has
+    loops: Int,           // how many times it plays (0: for ever)
+    delay: Int,           // the last decoded frame's delay, ms
+    // what the last frame asks to happen to its rectangle before the next one: 0 nothing, 1 cleared, 2 put back
+    disp: Int,
+    dx: Int,
+    dy: Int,
+    dw: Int,
+    dh: Int,
+    // GIF: the global colour table (offset, entries)
+    gct: Int,
+    gctn: Int,
+    lzw: Int,             // the LZW tables and stack, made on first use (4096 * 2 + 4096 + 4097 bytes)
+    // PNG: IHDR
+    pct: Int,
+    pbd: Int,
+    plte: Int,
+    plten: Int,
+    trns: Int,
+    trnsn: Int,
+    pdefault: Bool,       // the IDAT image is the first frame
+    // WebP: the background colour from ANIM (ARGB as stored), and whether the file is a still image
+    bg: Int,
+    err: Str
+}
+
+extern fn malloc(Int) -> Int
+extern fn calloc(Int, Int) -> Int
+extern fn free(Int)
+extern fn memset(Int, Int, Int) -> Int
+extern fn memcpy(Int, Int, Int) -> Int
+extern fn nori_str_ptr(Str) -> Int
+
+fn anim_blank() -> Anim {
+    return Anim { kind: 0, data: "", dp: 0, dn: 0, w: 0, h: 0, canvas: 0, prev: 0, pos: 0, first: 0, index: 0, frames: 0,
+                  loops: 0, delay: 0, disp: 0, dx: 0, dy: 0, dw: 0, dh: 0, gct: 0, gctn: 0, lzw: 0, pct: 0, pbd: 0,
+                  plte: 0, plten: 0, trns: 0, trnsn: 0, pdefault: false, bg: 0, err: "" }
+}
+
+/// open an animated (or still) picture from its bytes: GIF, PNG/APNG, WebP, or anything `load` reads. The
+/// canvas is made; no frame is decoded until `anim_next`. `anim_ok` says whether it opened, `anim_error` why not.
+pub fn anim_open(sink data: Str) -> Anim {
+    var a = anim_blank()
+    a.data = sink data
+    a.dn = a.data.len()
+    if a.dn > 0 { unsafe { a.dp = nori_str_ptr(a.data) } }
+    if a.dn >= 6 && ab(a, 0) == 71 && ab(a, 1) == 73 && ab(a, 2) == 70 && ab(a, 3) == 56 { gif_open(a) }
+    else if a.dn >= 8 && ab(a, 0) == 137 && ab(a, 1) == 80 && ab(a, 2) == 78 && ab(a, 3) == 71 { apng_open(a) }
+    else if a.dn >= 12 && ab(a, 0) == 82 && ab(a, 1) == 73 && ab(a, 2) == 70 && ab(a, 3) == 70 &&
+            ab(a, 8) == 87 && ab(a, 9) == 69 && ab(a, 10) == 66 && ab(a, 11) == 80 { webp_open(a) }
+    else { still_open(a) }
+    if a.kind == 0 && a.err.len() == 0 { a.err = "not a picture this decoder reads" }
+    return a
+}
+
+/// did it open?
+pub fn anim_ok(a: Anim) -> Bool { return a.kind != 0 }
+/// why it did not open, or why the last frame did not decode ("" when all is well).
+pub fn anim_error(a: Anim) -> Str { return copy a.err }
+/// which format: ANIM_GIF, ANIM_PNG, ANIM_WEBP, or ANIM_STILL (a picture with one frame read by `load`).
+pub fn anim_kind(a: Anim) -> Int { return a.kind }
+/// the canvas's width.
+pub fn anim_width(a: Anim) -> Int { return a.w }
+/// the canvas's height.
+pub fn anim_height(a: Anim) -> Int { return a.h }
+/// the canvas: w*h*4 bytes of straight RGBA8, the last decoded frame as it is shown.
+pub fn anim_pixels(a: Anim) -> Int { return a.canvas }
+/// how many frames the file has.
+pub fn anim_frames(a: Anim) -> Int { return a.frames }
+/// how many times the file asks to be played (0: for ever).
+pub fn anim_loops(a: Anim) -> Int { return a.loops }
+/// the delay of the last decoded frame, in milliseconds, as the file says it (0 for a still picture).
+pub fn anim_delay_ms(a: Anim) -> Int { return a.delay }
+/// the index of the frame `anim_next` decodes next (0 after `anim_rewind`).
+pub fn anim_index(a: Anim) -> Int { return a.index }
+/// does it move? (more than one frame)
+pub fn anim_moves(a: Anim) -> Bool { return a.frames > 1 }
+
+/// decode the next frame onto the canvas. false at the end of the animation (the canvas keeps the last frame)
+/// or when the frame does not decode (`anim_error` says why).
+pub fn anim_next(inout a: Anim) -> Bool {
+    if a.kind == 0 || a.index >= a.frames { return false }
+    var good = false
+    if a.kind == ANIM_GIF() { good = gif_next(a) }
+    else if a.kind == ANIM_PNG() { good = apng_next(a) }
+    else if a.kind == ANIM_WEBP() { good = webp_next(a) }
+    else { good = a.index == 0 }
+    if !good { if a.err.len() == 0 { a.err = "frame " + to_str(a.index) + " does not decode" }  a.index = a.frames  return false }
+    a.index = a.index + 1
+    return true
+}
+
+/// back to the start: the canvas cleared, the next `anim_next` decodes the first frame.
+pub fn anim_rewind(inout a: Anim) {
+    if a.kind == 0 { return }
+    if a.kind == ANIM_STILL() { a.index = 0  return }
+    unsafe { memset(a.canvas, 0, a.w * a.h * 4) }
+    a.pos = a.first
+    a.index = 0
+    a.disp = 0
+    a.err = ""
+}
+
+/// let go of the canvas, the tables and the bytes.
+pub fn anim_close(inout a: Anim) {
+    unsafe {
+        if a.canvas != 0 { free(a.canvas) }
+        if a.prev != 0 { free(a.prev) }
+        if a.lzw != 0 { free(a.lzw) }
+    }
+    a.canvas = 0  a.prev = 0  a.lzw = 0  a.kind = 0  a.dp = 0  a.dn = 0
+    a.data = ""
+}
+
+/// the canvas as an `Image` of its own (a copy): the frame now shown, to keep or to save.
+pub fn anim_image(a: Anim) -> Image {
+    if a.canvas == 0 { return bad() }
+    var im = image_new(a.w, a.h)
+    if im.okf != 1 { return im }
+    unsafe { memcpy(im.px, a.canvas, a.w * a.h * 4) }
+    return im
+}
+
+// ---- shared helpers ------------------------------------------------------------------------------------------
+
+/// an arithmetic shift right (Nori's `>>` is logical): floor(v / 2^n) for a negative `v` too, |v| < 2^62
+fn sar(v: Int, n: Int) -> Int { return ((v + 4611686018427387904) >> n) - (4611686018427387904 >> n) }
+
+/// a byte of the file, 0 past its end
+fn ab(a: Anim, i: Int) -> Int {
+    if i < 0 || i >= a.dn { return 0 }
+    var v = 0
+    unsafe { v = peek8(a.dp + i) }
+    return v
+}
+fn ale16(a: Anim, i: Int) -> Int { return ab(a, i) + ab(a, i + 1) * 256 }
+fn ale24(a: Anim, i: Int) -> Int { return ab(a, i) + ab(a, i + 1) * 256 + ab(a, i + 2) * 65536 }
+fn ale32(a: Anim, i: Int) -> Int { return ale16(a, i) + ale16(a, i + 2) * 65536 }
+fn abe16(a: Anim, i: Int) -> Int { return ab(a, i) * 256 + ab(a, i + 1) }
+fn abe32(a: Anim, i: Int) -> Int { return abe16(a, i) * 65536 + abe16(a, i + 2) }
+
+/// the canvas made for w x h, or an error said: false when the size is refused
+fn anim_canvas(inout a: Anim, w: Int, h: Int) -> Bool {
+    if w <= 0 || h <= 0 { a.err = "no size"  return false }
+    if w > 16384 || h > 16384 || w * h > ANIM_MAX_PX() { a.err = "too large: " + to_str(w) + "x" + to_str(h)  return false }
+    var c = 0
+    unsafe { c = calloc(w * h, 4) }
+    if c == 0 { a.err = "no memory for " + to_str(w) + "x" + to_str(h)  return false }
+    a.w = w
+    a.h = h
+    a.canvas = c
+    return true
+}
+
+/// before a frame: what the last one asked for its rectangle (cleared, or put back from the saved canvas)
+fn anim_dispose(inout a: Anim) {
+    if a.disp == 0 { return }
+    var y = a.dy
+    let x0 = a.dx * 4
+    let n = a.dw * 4
+    unsafe {
+        while y < a.dy + a.dh {
+            let o = y * a.w * 4 + x0
+            if a.disp == 1 { memset(a.canvas + o, 0, n) } else if a.prev != 0 { memcpy(a.canvas + o, a.prev + o, n) }
+            y = y + 1
+        }
+    }
+    a.disp = 0
+}
+
+/// a frame that will be put back afterwards: the canvas saved first (the second canvas made the first time)
+fn anim_save(inout a: Anim) -> Bool {
+    unsafe {
+        if a.prev == 0 { a.prev = malloc(a.w * a.h * 4) }
+        if a.prev == 0 { a.err = "no memory for the previous canvas"  return false }
+        memcpy(a.prev, a.canvas, a.w * a.h * 4)
+    }
+    return true
+}
+
+/// the rectangle (clipped to the canvas) whose disposal `kind` (0 none, 1 clear, 2 previous) is done before the next frame
+fn anim_after(inout a: Anim, kind: Int, x: Int, y: Int, w: Int, h: Int) {
+    var x0 = x  var y0 = y  var x1 = x + w  var y1 = y + h
+    if x0 < 0 { x0 = 0 }
+    if y0 < 0 { y0 = 0 }
+    if x1 > a.w { x1 = a.w }
+    if y1 > a.h { y1 = a.h }
+    if x1 <= x0 || y1 <= y0 { a.disp = 0  return }
+    a.disp = kind
+    a.dx = x0  a.dy = y0  a.dw = x1 - x0  a.dh = y1 - y0
+}
+
+/// a still picture `load` reads: one frame, the canvas is the decoded picture
+fn still_open(inout a: Anim) {
+    var im = load(a.data)
+    if !ok(im) { a.err = "not a picture this decoder reads"  return }
+    a.w = im.w
+    a.h = im.h
+    a.canvas = im.px
+    im.px = 0
+    a.frames = 1
+    a.kind = ANIM_STILL()
+}
+
+/// one pixel `src` (straight RGBA, r g b a) laid over the canvas pixel at `p` ("over", straight alpha)
+fn blend_over(p: Int, r: Int, g: Int, b: Int, al: Int) {
+    if al == 255 { unsafe { poke8(p, r)  poke8(p + 1, g)  poke8(p + 2, b)  poke8(p + 3, 255) }  return }
+    if al == 0 { return }
+    var dr = 0  var dg = 0  var db = 0  var da = 0
+    unsafe { dr = peek8(p)  dg = peek8(p + 1)  db = peek8(p + 2)  da = peek8(p + 3) }
+    if da == 0 { unsafe { poke8(p, r)  poke8(p + 1, g)  poke8(p + 2, b)  poke8(p + 3, al) }  return }
+    // out alpha = a + da*(255-a)/255; colour = (c*a*255 + d*da*(255-a)) / (oa*255)
+    let ida = da * (255 - al)
+    let oa255 = al * 255 + ida
+    let oa = (oa255 + 127) / 255
+    unsafe {
+        poke8(p, (r * al * 255 + dr * ida + oa255 / 2) / oa255)
+        poke8(p + 1, (g * al * 255 + dg * ida + oa255 / 2) / oa255)
+        poke8(p + 2, (b * al * 255 + db * ida + oa255 / 2) / oa255)
+        poke8(p + 3, oa)
+    }
+}

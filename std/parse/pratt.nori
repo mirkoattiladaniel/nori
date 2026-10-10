@@ -1,0 +1,29 @@
+// ── Layer 4, Pratt: precedence-climbing expression parsing. Implement PrattGrammar on your own type
+// (which can carry your AST arena + the Parser), then call pratt_expr(g, ps, 0). ─────────────────────
+pub trait PrattGrammar {
+    // parse a prefix/atom at the current token; may recurse via pratt_expr(self, ps, 0). Returns a node.
+    fn prefix(self, inout ps: Parser) -> Int
+    // combine infix op `op` (a token kind) with parsed left/right nodes -> a node.
+    fn infix(self, op: Int, left: Int, right: Int) -> Int
+    // left binding power of infix op `op` (return 0 when `op` is not an infix operator -> stop climbing).
+    fn lbp(self, op: Int) -> Int
+    // right binding power for the right operand (== lbp for left-assoc; lbp - 1 for right-assoc).
+    fn rbp(self, op: Int) -> Int
+}
+/// precedence-climbing driver: parse an expression binding tighter than `min_bp` (start at 0). Nodes are
+/// opaque Ints (your AST handle or an evaluated value; the driver never inspects them).
+pub fn pratt_expr<G: PrattGrammar>(g: G, inout ps: Parser, min_bp: Int) -> Int {
+    var left = g.prefix(ps)
+    var go = true
+    while go {
+        let op = ps.peek_kind()
+        let lbp = g.lbp(op)
+        if lbp <= min_bp { go = false }
+        else {
+            ps.advance_tok()
+            let right = pratt_expr(g, ps, g.rbp(op))
+            left = g.infix(op, left, right)
+        }
+    }
+    return left
+}

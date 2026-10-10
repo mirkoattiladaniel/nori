@@ -1,0 +1,199 @@
+// roll: terminal output: colour (only on a TTY, honouring NO_COLOR), the verb/label line every command
+// prints, elapsed times, and the usage screen.
+//
+// One directory module of roll (see src/main.nori for the layout). It reaches the others through
+// their aliases below, and only what another module uses is `pub`. The modules import each other
+// freely (`cmds` and `deps` call in both directions); cycles between directory modules are fine.
+
+import "std/os" as os
+import "../ext" as ext
+import "../manifest" as manifest
+
+use ext::*
+use manifest::*
+
+pub fn roll_version() -> Str {
+    return "1.0.0"
+}
+
+// write a line to stderr. roll's status and timing go here, keeping a built program's stdout clean
+// when launched via `roll run`. Uses libc `write(2, …)` and the malloc/free that std/os already declares.
+extern fn write(Int, Int, Int) -> I32
+pub fn eprintl(s: Str) {
+    let n = s.len()
+    unsafe {
+        let b = malloc(n + 1)
+        var i = 0
+        while i < n {
+            poke8(b + i, s.at(i))
+            i = i + 1
+        }
+        poke8(b + n, 10) // trailing newline
+        to_int(write(2, b, n + 1)) // fd 2 = stderr
+        free(b)
+    }
+}
+// a human elapsed time: "845ms" under a second, else "1.74s" (two-decimal seconds).
+pub fn fmt_ms(ms: Int) -> Str {
+    if ms < 1000 {
+        return(to_str(ms) + "ms")
+    }
+    let s = ms / 1000
+    let cs = (ms - (s * 1000)) / 10 // centiseconds (2 digits)
+    var fs = to_str(cs)
+    if cs < 10 {
+        fs = ("0" + fs)
+    }
+    return(to_str(s) + ("." + (fs + "s")))
+}
+
+// ---------- pretty output (colour only on a TTY, honouring NO_COLOR) ----------
+fn use_color() -> Bool {
+    if !(os::env("NO_COLOR") == "") {
+        return false
+    }
+    return os::is_tty()
+}
+pub fn col(code: Str, s: Str) -> Str {
+    if !use_color() {
+        return copy s
+    }
+    return(chr(27) + ("[" + (code + ("m" + (s + (chr(27) + "[0m"))))))
+}
+pub fn dim(s: Str) -> Str {
+    return col("2", s)
+}
+// a status verb (Compiling / Finished / …) right-aligned to column 12 and coloured.
+pub fn verb(label: Str, code: Str) -> Str {
+    var pad = ""
+    var n = 12 - label.len()
+    while n > 0 {
+        pad = (pad + " ")
+        n = n - 1
+    }
+    return(pad + col(code, label))
+}
+// "<name> v<ver>  (<detail>)" with the version + detail dimmed.
+pub fn proj_label(name: Str, ver: Str, detail: Str) -> Str {
+    var s = name
+    if !(ver == "") {
+        s = (s + (" " + dim(("v" + ver))))
+    }
+    return(s + ("  " + dim(("(" + (detail + ")")))))
+}
+// short summary of a profile's enabled optimisations, e.g. "overflow-checks, opt 1, lto".
+//
+// `auto-free` is not a profile key. The ownership tree frees every owner at the end of its scope in
+// every build, so there is no per-profile choice to report. Building without those frees is a
+// compiler flag, `noric --no-auto-free`, for targets whose runtime has no free entry points.
+pub fn profile_summary(mf: Str, prof: Str) -> Str {
+    let sect = ("profile." + prof)
+    var parts = ""
+    if(section_get(mf, sect, "overflow-checks") == "true") {
+        parts = (parts + "overflow-checks, ")
+    }
+    if(section_get(mf, sect, "auto-order") == "true") {
+        parts = (parts + "auto-order, ")
+    }
+    if(section_get(mf, sect, "auto-parallel") == "true") {
+        parts = (parts + "auto-parallel, ")
+    }
+    if(section_get(mf, sect, "simd") == "true") {
+        parts = (parts + "simd, ")
+    }
+    let op = section_get(mf, sect, "opt")
+    if !(op == "") {
+        parts = (parts + ("opt " + (op + ", ")))
+    }
+    if(section_get(mf, sect, "lto") == "true") {
+        parts = (parts + "lto, ")
+    }
+    if(section_get(mf, sect, "lto") == "thin") {
+        parts = (parts + "thin-lto, ")
+    }
+    if(section_get(mf, sect, "incremental") == "true") {
+        parts = (parts + "incremental, ")
+    }
+    // `debug` is part of the line too: it has the most visible runtime effect (backtraces on a
+    // trap), so the summary should show whether it was applied.
+    if(section_get(mf, sect, "debug") == "true") {
+        parts = (parts + "debug, ")
+    }
+    let n = parts.len()
+    if n >= 2 {
+        return parts.slice(0, n - 2)
+    }
+    // strip trailing ", "
+    return parts
+}
+
+/// the usage text, one line each: `roll help` and `roll --help` print it all, `roll CMD --help` the lines of CMD
+pub fn usage_lines() -> Vec<Str> {
+    var v: Vec<Str> = vec()
+    v.push("roll — the Nori project tool")
+    v.push("")
+    v.push("  roll init [NAME] [--lib]                             scaffold a project (here, or in NAME/)")
+    v.push("  roll build [PATH] [--release | --profile P] [--target T]   compile (--target <triple> cross-compiles)")
+    v.push("  roll build --separate                                compile deps once into cached objects + interfaces, then link")
+    v.push("  roll build [--whole]                                 a dev build on the LLVM pipeline compiles std ONCE (cached lib DAG); --whole opts out")
+    v.push("  roll build --profile P --state-from OLD.state        build to take over from the build whose state manifest OLD is (a kernel's live update)")
+    v.push("  roll build [--llvm]                                  build through LLVM instead of the native back end (manifest: [build] backend = llvm)")
+    v.push("  roll run   [--release | --profile P] [-- A..]        build, then run")
+    v.push("  roll check [PATH]                                    type-check only (PATH: a file, a module folder, or another project)")
+    v.push("  roll fmt [PATH…]                                     canonical-format in place (default: the whole project)")
+    v.push("  roll lsp                                             run the Nori language server (for editors)")
+    v.push("  roll test                                            run native .nori tests (tests/*.nori, fn test_*)")
+    v.push("  roll law [FILE]                                      fuzz `law` properties (random+adversarial inputs, shrinks counterexamples; caches held laws)")
+    v.push("  roll law prove <name> [--discharged]                 scaffold a Lean proof obligation for a law (or stamp it proven)")
+    v.push("  roll shadow [--sample N] [-- ARGS]                   build with `--shadow`, run, and tally each `shadows` rewrite's divergences from the original")
+    v.push("  roll bench [--try-schedules] [--runs N]              time the app; --try-schedules searches parallel/vectorize schedules for `named` loops and proposes the fastest")
+    v.push("  roll build --evidence  /  roll verify                embed a proof-carrying evidence section (caps/laws/contracts), then read it back")
+    v.push("  roll doc [SYMBOL] [--all]                            list the package API, or show one symbol's docs (go-doc style; --all = internals too)")
+    v.push("  roll clean                                           remove build/")
+    v.push("  roll add <name> <git-url>[@ref] [^x.y.z]             add a git dependency (auto-pins latest tag)")
+    v.push("  roll add <name> --path <dir>                         add a local-path dependency")
+    v.push("  roll remove <name>                                   remove a dependency (alias: rm)")
+    v.push("  roll vendor                                          copy deps into vendor/ for offline builds")
+    v.push("  roll list [--sort used|downloaded|name]              list cached dependencies")
+    v.push("  roll prune [--older-than N] [--yes]                  remove dependencies unused for 90+ days")
+    v.push("  roll xray                                            annotated report: lifelines + optimizations + auto-par verdicts (build/xray/)")
+    v.push("  roll db [IMAGE]                                      what a persisted image holds: shape on disk, and load / migrate / refuse")
+    v.push("  roll todo                                            list TODO markers in the source")
+    v.push("  roll fixme                                           list FIXME markers in the source")
+    v.push("  roll unsafe [--summary]                              audit unsafe blocks / extern items / cstructs (project + std + deps)")
+    v.push("  roll last [FILTER] [--diff]                          the previous run's printl/trap records (filter by text or file:line)")
+    v.push("  roll caps [--summary]                                classify the tree's capabilities; [caps] NAME = net,exec denies them per dep")
+    v.push("  roll learn [check|list|next|prev|reset]              interactive tutorial: lecture -> task -> verify your code")
+    v.push("  roll <ext> [ARGS...]                                 run an extension: a roll-<ext> binary on PATH or in $NORI_HOME/bin")
+    v.push("  roll install <ver|stable|latest>                     install a nori version + select it")
+    v.push("  roll use <ver>                                       switch the active nori version")
+    v.push("  roll update <nori | deps [NAME..] | tools | all>    update the compiler / dependencies (all or named) / extensions")
+    v.push("  roll toolchain <list|default|remove|which>           manage installed compiler versions")
+    v.push("")
+    return v
+}
+
+pub fn usage() {
+    let v = usage_lines()
+    var i = 0
+    while i < v.len() { printl(v[i])  i = i + 1 }
+    list_externals()
+}
+
+/// `roll CMD --help`: the usage lines of CMD ("  roll CMD ..."), or all of it when none names it
+pub fn usage_for(cmd: Str) {
+    let v = usage_lines()
+    var n = 0
+    var i = 0
+    while i < v.len() {
+        let l = v[i]
+        let pre = "  roll " + cmd
+        if l.len() >= pre.len() && l.slice(0, pre.len()) == pre && (l.len() == pre.len() || l.at(pre.len()) == ' ') {
+            if n == 0 { printl(v[0])  printl("") }
+            printl(l)
+            n = n + 1
+        }
+        i = i + 1
+    }
+    if n == 0 { usage() }
+}

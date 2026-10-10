@@ -1,0 +1,986 @@
+// std/font: applying GSUB and GPOS lookups to a buffer.
+//
+// The model is HarfBuzz's hb_ot_apply_context_t, because "the same output as HarfBuzz" is the
+// specification here: the skipping iterator (lookup flags, mark filtering sets, default ignorables
+// and the ZWJ/ZWNJ rules), the ligature-component bookkeeping marks need to attach to the right
+// part of a ligature, nested lookups in contextual rules with the match positions they shift, and
+// the attachment chains GPOS leaves for the final offset pass.
+
+struct Ctx {
+    table: Int,                 // 0 GSUB, 1 GPOS
+    lookup_index: Int,
+    lookup_props: Int,
+    lookup_mask: Int,
+    auto_zwj: Bool,
+    auto_zwnj: Bool,
+    random: Bool,
+    per_syllable: Bool,
+    nesting: Int,               // nesting levels left
+    last_base: Int,
+    last_base_until: Int,
+    rtl: Bool,                  // the run's direction (GPOS cursive and mark offsets)
+    has_glyph_classes: Bool,
+    random_state: Int,
+    ops: Int                    // operations left (a bound against pathological fonts)
+}
+
+fn ctx_new(table: Int, rtl: Bool, has_classes: Bool) -> Ctx {
+    return Ctx { table: table, lookup_index: 0, lookup_props: 0, lookup_mask: 1, auto_zwj: true, auto_zwnj: true,
+        random: false, per_syllable: false, nesting: 64, last_base: 0 - 1, last_base_until: 0, rtl: rtl,
+        has_glyph_classes: has_classes, random_state: 1, ops: 1000000 }
+}
+
+// ── glyph property checks ────────────────────────────────────────────────────────────────────────
+
+// does a glyph with props `gp` survive lookup props `props` (HarfBuzz's check_glyph_property)?
+fn check_glyph_property(f: Font, gid: Int, gp: Int, props: Int) -> Bool {
+    if (gp & props & 14) != 0 { return false }                           // IgnoreBaseGlyphs|Ligatures|Marks
+    if (gp & GP_MARK()) != 0 {
+        if (props & 16) != 0 { return gdef_mark_set_covers(f, props >> 16, gid) }      // UseMarkFilteringSet
+        if (props & 65280) != 0 { return (props & 65280) == (gp & 65280) }            // MarkAttachmentType
+    }
+    return true
+}
+
+// ── the skipping iterator ────────────────────────────────────────────────────────────────────────
+
+fn SKIP_NO() -> Int { return 0 }
+fn SKIP_YES() -> Int { return 1 }
+fn SKIP_MAYBE() -> Int { return 2 }
+fn M_NONE() -> Int { return 0 }     // no match function: anything that is not skipped matches
+fn M_GLYPH() -> Int { return 1 }    // u16 glyph ids at mdata
+fn M_CLASS() -> Int { return 2 }    // u16 class values at mdata, classes from the ClassDef at mbase
+fn M_COVERAGE() -> Int { return 3 } // u16 Coverage offsets (from mbase) at mdata
+
+struct Iter {
+    idx: Int,
+    end: Int,
+    props: Int,
+    mask: Int,
+    ign_zwnj: Bool,
+    ign_zwj: Bool,
+    ign_hidden: Bool,
+    per_syllable: Bool,
+    syllable: Int,
+    mkind: Int,
+    mdata: Int,
+    mbase: Int
+}
+
+// an iterator for matching input (context_match=false) or context (true), as HarfBuzz's init
+fn iter_new(c: Ctx, b: Buf, context_match: Bool) -> Iter {
+    var mask = c.lookup_mask
+    if context_match { mask = 0 - 1 }
+    return Iter { idx: 0, end: b.len, props: c.lookup_props, mask: mask,
+        ign_zwnj: c.table == 1 || (context_match && c.auto_zwnj),
+        ign_zwj: context_match || c.auto_zwj,
+        ign_hidden: c.table == 1,
+        per_syllable: c.table == 0 && c.per_syllable,
+        syllable: 0, mkind: M_NONE(), mdata: 0, mbase: 0 }
+}
+fn iter_reset(inout it: Iter, b: Buf, start: Int) {
+    it.idx = start
+    it.end = b.len
+    if start == b.idx && b.idx < b.len { it.syllable = cur(b, F_SYL()) } else { it.syllable = 0 }
+}
+
+// may_skip on a glyph record (from info, or from out when `from_out`)
+fn may_skip(f: Font, it: Iter, b: Buf, i: Int, from_out: Bool) -> Int {
+    var gid = 0  var gp = 0  var up = 0
+    if from_out { gid = bprev(b, i, F_CP())  gp = bprev(b, i, F_GP())  up = bprev(b, i, F_UP()) }
+    else { gid = bi(b, i, F_CP())  gp = bi(b, i, F_GP())  up = bi(b, i, F_UP()) }
+    if !check_glyph_property(f, gid, gp, it.props) { return SKIP_YES() }
+    let ignorable = (up & UP_IGNORABLE()) != 0 && (gp & GP_SUBSTITUTED()) == 0
+    if ignorable && (it.ign_zwnj || (up & UP_ZWNJ()) == 0) && (it.ign_zwj || (up & UP_ZWJ()) == 0)
+        && (it.ign_hidden || (up & UP_HIDDEN()) == 0) {
+        return SKIP_MAYBE()
+    }
+    return SKIP_NO()
+}
+// may_match: 0 no, 1 yes, 2 maybe
+fn may_match(f: Font, it: Iter, b: Buf, i: Int, from_out: Bool) -> Int {
+    var gid = 0  var mask = 0  var syl = 0
+    if from_out { gid = bprev(b, i, F_CP())  mask = bprev(b, i, F_MASK())  syl = bprev(b, i, F_SYL()) }
+    else { gid = bi(b, i, F_CP())  mask = bi(b, i, F_MASK())  syl = bi(b, i, F_SYL()) }
+    if (mask & it.mask) == 0 { return 0 }
+    if it.per_syllable && it.syllable != 0 && it.syllable != syl { return 0 }
+    if it.mkind == M_NONE() { return 2 }
+    let d = f.d
+    let v = rd_u16(d, it.mdata)
+    var ok = false
+    if it.mkind == M_GLYPH() { ok = gid == v }
+    else if it.mkind == M_CLASS() { ok = ot_class(d, it.mbase, gid) == v }
+    else { ok = ot_coverage(d, it.mbase + v, gid) >= 0 }
+    if ok { return 1 }
+    return 0
+}
+// match: 0 MATCH, 1 NOT_MATCH, 2 SKIP
+fn iter_match(f: Font, it: Iter, b: Buf, i: Int, from_out: Bool) -> Int {
+    let sk = may_skip(f, it, b, i, from_out)
+    if sk == SKIP_YES() { return 2 }
+    let m = may_match(f, it, b, i, from_out)
+    if m == 1 || (m == 2 && sk == SKIP_NO()) { return 0 }
+    if sk == SKIP_NO() { return 1 }
+    return 2
+}
+// advance to the next matching glyph in info; false when none (or a non-skippable mismatch)
+fn iter_next(f: Font, inout it: Iter, b: Buf) -> Bool {
+    let stop = it.end - 1
+    while it.idx < stop {
+        it.idx = it.idx + 1
+        let m = iter_match(f, it, b, it.idx, false)
+        if m == 0 { if it.mkind != M_NONE() { it.mdata = it.mdata + 2 }  return true }
+        if m == 1 { return false }
+    }
+    return false
+}
+// step back to the previous matching glyph in the output (backtrack)
+fn iter_prev(f: Font, inout it: Iter, b: Buf) -> Bool {
+    while it.idx > 0 {
+        it.idx = it.idx - 1
+        let m = iter_match(f, it, b, it.idx, true)
+        if m == 0 { if it.mkind != M_NONE() { it.mdata = it.mdata + 2 }  return true }
+        if m == 1 { return false }
+    }
+    return false
+}
+
+fn backtrack_len(b: Buf) -> Int { if b.have_output { return b.out_len }  return b.idx }
+fn lookahead_len(b: Buf) -> Int { return b.len - b.idx }
+
+// ── match_input / ligate_input ──────────────────────────────────────────────────────────────────
+
+// match `count` glyphs starting at the current one (the first is not matched), `mkind`/`mdata`
+// describing glyphs 2..count. On success `pos` holds the match positions (in info), and pos_out[0]
+// the match end, pos_out[1] the total component count.
+fn match_input(f: Font, c: Ctx, b: Buf, count: Int, mkind: Int, mdata: Int, mbase: Int, inout pos: Vec<Int>, inout res: Vec<Int>) -> Bool {
+    while res.len() < 2 { res.push(0) }
+    while pos.len() > 0 { pos.pop() }
+    pos.push(b.idx)
+    var it = iter_new(c, b, false)
+    iter_reset(it, b, b.idx)
+    it.mkind = mkind
+    it.mdata = mdata
+    it.mbase = mbase
+    var total = 0
+    let first_lp = cur(b, F_LIG())
+    let first_id = lig_id_of(first_lp)
+    let first_comp = lig_comp_of(first_lp)
+    var ligbase = 0                                                       // 0 not checked, 1 may not skip, 2 may skip
+    var i = 1
+    while i < count {
+        if !iter_next(f, it, b) { res[0] = it.idx + 1  return false }
+        pos.push(it.idx)
+        let lp = bi(b, it.idx, F_LIG())
+        let this_id = lig_id_of(lp)
+        let this_comp = lig_comp_of(lp)
+        if first_id != 0 && first_comp != 0 {
+            if first_id != this_id || first_comp != this_comp {
+                if ligbase == 0 {
+                    var found = false
+                    var j = b.out_len
+                    if !b.have_output { j = b.idx }
+                    while j > 0 && lig_id_of(bprev(b, j - 1, F_LIG())) == first_id {
+                        if lig_comp_of(bprev(b, j - 1, F_LIG())) == 0 { j = j - 1  found = true  break }
+                        j = j - 1
+                    }
+                    if found && may_skip(f, it, b, j, true) == SKIP_YES() { ligbase = 2 } else { ligbase = 1 }
+                }
+                if ligbase == 1 { return false }
+            }
+        } else {
+            if this_id != 0 && this_comp != 0 && this_id != first_id { return false }
+        }
+        total = total + lig_num_comps(bi(b, it.idx, F_GP()), lp)
+        i = i + 1
+    }
+    res[0] = it.idx + 1
+    res[1] = total + lig_num_comps(cur(b, F_GP()), first_lp)
+    return true
+}
+
+// set the glyph props of the current glyph for a substitution (HarfBuzz's _set_glyph_class)
+fn set_glyph_class(f: Font, c: Ctx, inout b: Buf, g: Int, class_guess: Int, ligature: Bool, component: Bool) {
+    var props = cur(b, F_GP())
+    props = props | GP_SUBSTITUTED()
+    if ligature {
+        props = props | GP_LIGATED()
+        props = props & (0 - 1 - GP_MULTIPLIED())
+    }
+    if component { props = props | GP_MULTIPLIED() }
+    if c.has_glyph_classes {
+        props = props & GP_PRESERVE()
+        cur_set(b, F_GP(), props | gdef_glyph_props(f, g))
+    } else if class_guess != 0 {
+        props = props & GP_PRESERVE()
+        cur_set(b, F_GP(), props | class_guess)
+    } else {
+        cur_set(b, F_GP(), props)
+    }
+}
+fn ctx_replace_glyph(f: Font, c: Ctx, inout b: Buf, g: Int) {
+    set_glyph_class(f, c, b, g, 0, false, false)
+    replace_glyph(b, g)
+}
+
+fn ligate_input(f: Font, c: Ctx, inout b: Buf, count: Int, pos: Vec<Int>, match_end: Int, lig_glyph: Int, total: Int) {
+    merge_clusters(b, b.idx, match_end)
+    var is_base_lig = gp_is_base(bi(b, pos[0], F_GP()))
+    var is_mark_lig = gp_is_mark(bi(b, pos[0], F_GP()))
+    var i = 1
+    while i < count {
+        if !gp_is_mark(bi(b, pos[i], F_GP())) { is_base_lig = false  is_mark_lig = false  break }
+        i = i + 1
+    }
+    let is_lig = !is_base_lig && !is_mark_lig
+    var klass = 0
+    var lig_id = 0
+    if is_lig { klass = GP_LIGATURE()  lig_id = alloc_lig_id(b) }
+    var last_lig_id = lig_id_of(cur(b, F_LIG()))
+    var last_num = lig_num_comps(cur(b, F_GP()), cur(b, F_LIG()))
+    var so_far = last_num
+    if is_lig {
+        cur_set(b, F_LIG(), lig_props_for_ligature(lig_id, total))
+        let up = cur(b, F_UP())
+        if up_gc(up) == GC_Mn() { cur_set(b, F_UP(), (up - (up & 31)) | GC_Lo()) }
+    }
+    set_glyph_class(f, c, b, lig_glyph, klass, true, false)
+    replace_glyph(b, lig_glyph)
+    i = 1
+    while i < count {
+        while b.idx < pos[i] {
+            if is_lig {
+                var this_comp = lig_comp_of(cur(b, F_LIG()))
+                if this_comp == 0 { this_comp = last_num }
+                var m = this_comp
+                if last_num < m { m = last_num }
+                cur_set(b, F_LIG(), lig_props_for_mark(lig_id, so_far - last_num + m))
+            }
+            next_glyph(b)
+        }
+        last_lig_id = lig_id_of(cur(b, F_LIG()))
+        last_num = lig_num_comps(cur(b, F_GP()), cur(b, F_LIG()))
+        so_far = so_far + last_num
+        b.idx = b.idx + 1                                                 // skip the base glyph
+        i = i + 1
+    }
+    if !is_mark_lig && last_lig_id != 0 {
+        var k = b.idx
+        while k < b.len {
+            if last_lig_id != lig_id_of(bi(b, k, F_LIG())) { break }
+            let this_comp = lig_comp_of(bi(b, k, F_LIG()))
+            if this_comp == 0 { break }
+            var m = this_comp
+            if last_num < m { m = last_num }
+            bset(b, k, F_LIG(), lig_props_for_mark(lig_id, so_far - last_num + m))
+            k = k + 1
+        }
+    }
+}
+
+// ── backtrack / lookahead ────────────────────────────────────────────────────────────────────────
+fn match_backtrack(f: Font, c: Ctx, b: Buf, count: Int, mkind: Int, mdata: Int, mbase: Int) -> Bool {
+    var it = iter_new(c, b, true)
+    iter_reset(it, b, backtrack_len(b))
+    it.mkind = mkind  it.mdata = mdata  it.mbase = mbase
+    var i = 0
+    while i < count { if !iter_prev(f, it, b) { return false }  i = i + 1 }
+    return true
+}
+fn match_lookahead(f: Font, c: Ctx, b: Buf, count: Int, mkind: Int, mdata: Int, mbase: Int, start: Int) -> Bool {
+    var it = iter_new(c, b, true)
+    iter_reset(it, b, start - 1)
+    it.mkind = mkind  it.mdata = mdata  it.mbase = mbase
+    var i = 0
+    while i < count { if !iter_next(f, it, b) { return false }  i = i + 1 }
+    return true
+}
+
+// ── nested lookups ───────────────────────────────────────────────────────────────────────────────
+
+// apply the LookupRecords (seqIndex u16, lookupIndex u16, `nrec` of them at `recs`) at the matched
+// positions (HarfBuzz's apply_lookup)
+fn apply_nested(f: Font, inout c: Ctx, inout b: Buf, count0: Int, inout pos: Vec<Int>, nrec: Int, recs: Int, match_end: Int) {
+    let d = f.d
+    var count = count0
+    let bl = backtrack_len(b)
+    var end = bl + match_end - b.idx
+    let delta0 = bl - b.idx
+    var j = 0
+    while j < count { pos[j] = pos[j] + delta0  j = j + 1 }
+    var i = 0
+    while i < nrec {
+        let idx = rd_u16(d, recs + i * 4)
+        let li = rd_u16(d, recs + i * 4 + 2)
+        i = i + 1
+        if idx >= count { continue }
+        let orig_len = backtrack_len(b) + lookahead_len(b)
+        if pos[idx] >= orig_len { continue }
+        buf_move_to(b, pos[idx])
+        if c.ops <= 0 { break }
+        if !ctx_recurse(f, c, b, li) { continue }
+        let new_len = backtrack_len(b) + lookahead_len(b)
+        var delta = new_len - orig_len
+        if delta == 0 { continue }
+        end = end + delta
+        if end < pos[idx] {
+            delta = delta + pos[idx] - end
+            end = pos[idx]
+        }
+        var next = idx + 1
+        if delta > 0 {
+            if delta + count > 64 { break }
+            while pos.len() < count + delta { pos.push(0) }
+        } else {
+            if delta < next - count { delta = next - count }
+            next = next - delta
+        }
+        // shift pos[next..count) by delta
+        if delta > 0 {
+            var k = count - 1
+            while k >= next { pos[k + delta] = pos[k]  k = k - 1 }
+        } else if delta < 0 {
+            var k = next
+            while k < count { pos[k + delta] = pos[k]  k = k + 1 }
+        }
+        next = next + delta
+        count = count + delta
+        var q = idx + 1
+        while q < next { pos[q] = pos[q - 1] + 1  q = q + 1 }
+        while next < count { pos[next] = pos[next] + delta  next = next + 1 }
+    }
+    buf_move_to(b, end)
+}
+
+// apply lookup `li` once at the current position (a nested lookup)
+fn ctx_recurse(f: Font, inout c: Ctx, inout b: Buf, li: Int) -> Bool {
+    if c.nesting <= 0 || c.ops <= 0 { return false }
+    c.ops = c.ops - 1
+    let t = otl_table(f, c.table)
+    let lk = otl_lookup(f.d, t, li)
+    if lk < 0 { return false }
+    let saved_props = c.lookup_props
+    let saved_index = c.lookup_index
+    c.lookup_index = li
+    c.lookup_props = otl_lookup_props(f.d, lk)
+    c.nesting = c.nesting - 1
+    let ret = lookup_apply_once(f, c, b, lk)
+    c.nesting = c.nesting + 1
+    c.lookup_index = saved_index
+    c.lookup_props = saved_props
+    return ret
+}
+
+// try each subtable of the Lookup at `lk` at the current position
+fn lookup_apply_once(f: Font, inout c: Ctx, inout b: Buf, lk: Int) -> Bool {
+    let d = f.d
+    let typ = rd_u16(d, lk)
+    let n = rd_u16(d, lk + 4)
+    var i = 0
+    while i < n {
+        var st = lk + rd_u16(d, lk + 6 + i * 2)
+        var t = typ
+        if (c.table == 0 && t == 7) || (c.table == 1 && t == 9) {        // extension
+            t = rd_u16(d, st + 2)
+            st = st + rd_u32(d, st + 4)
+        }
+        var ok = false
+        if c.table == 0 { ok = gsub_apply_subtable(f, c, b, t, st) } else { ok = gpos_apply_subtable(f, c, b, t, st) }
+        if ok { return true }
+        i = i + 1
+    }
+    return false
+}
+fn lookup_type_of(f: Font, table: Int, lk: Int) -> Int {
+    let d = f.d
+    let t = rd_u16(d, lk)
+    if (table == 0 && t == 7) || (table == 1 && t == 9) {
+        if rd_u16(d, lk + 4) > 0 { return rd_u16(d, lk + rd_u16(d, lk + 6) + 2) }
+    }
+    return t
+}
+
+// ── contextual subtables (GSUB 5/6, GPOS 7/8) ───────────────────────────────────────────────────
+
+// SequenceContext: format 1 (glyphs), 2 (classes), 3 (coverages)
+fn context_apply(f: Font, inout c: Ctx, inout b: Buf, st: Int) -> Bool {
+    let d = f.d
+    let fmt = rd_u16(d, st)
+    let g = cur(b, F_CP())
+    var pos: Vec<Int> = vec()
+    var res: Vec<Int> = vec()
+    if fmt == 1 || fmt == 2 {
+        let ci = ot_coverage(d, st + rd_u16(d, st + 2), g)
+        if ci < 0 { return false }
+        var setno = ci
+        var cdef = 0
+        var nsets = 0
+        var sets = 0
+        if fmt == 1 { nsets = rd_u16(d, st + 4)  sets = st + 6 }
+        else { cdef = st + rd_u16(d, st + 4)  setno = ot_class(d, cdef, g)  nsets = rd_u16(d, st + 6)  sets = st + 8 }
+        if setno >= nsets { return false }
+        let so = rd_u16(d, sets + setno * 2)
+        if so == 0 { return false }
+        let rs = st + so
+        let nr = rd_u16(d, rs)
+        var r = 0
+        while r < nr {
+            let rule = rs + rd_u16(d, rs + 2 + r * 2)
+            let gc = rd_u16(d, rule)
+            let lc = rd_u16(d, rule + 2)
+            var kind = M_GLYPH()
+            if fmt == 2 { kind = M_CLASS() }
+            if gc >= 1 && match_input(f, c, b, gc, kind, rule + 4, cdef, pos, res) {
+                apply_nested(f, c, b, gc, pos, lc, rule + 4 + (gc - 1) * 2, res[0])
+                return true
+            }
+            r = r + 1
+        }
+        return false
+    }
+    if fmt == 3 {
+        let gc = rd_u16(d, st + 2)
+        let lc = rd_u16(d, st + 4)
+        if gc < 1 { return false }
+        if ot_coverage(d, st + rd_u16(d, st + 6), g) < 0 { return false }
+        if match_input(f, c, b, gc, M_COVERAGE(), st + 8, st, pos, res) {
+            apply_nested(f, c, b, gc, pos, lc, st + 6 + gc * 2, res[0])
+            return true
+        }
+        return false
+    }
+    return false
+}
+
+// ChainedSequenceContext: format 1, 2, 3
+fn chain_context_apply(f: Font, inout c: Ctx, inout b: Buf, st: Int) -> Bool {
+    let d = f.d
+    let fmt = rd_u16(d, st)
+    let g = cur(b, F_CP())
+    var pos: Vec<Int> = vec()
+    var res: Vec<Int> = vec()
+    if fmt == 1 || fmt == 2 {
+        let ci = ot_coverage(d, st + rd_u16(d, st + 2), g)
+        if ci < 0 { return false }
+        var setno = ci
+        var bcd = 0  var icd = 0  var lcd = 0
+        var nsets = 0
+        var sets = 0
+        if fmt == 1 { nsets = rd_u16(d, st + 4)  sets = st + 6 }
+        else {
+            bcd = st + rd_u16(d, st + 4)  icd = st + rd_u16(d, st + 6)  lcd = st + rd_u16(d, st + 8)
+            if rd_u16(d, st + 4) == 0 { bcd = 0 }
+            if rd_u16(d, st + 8) == 0 { lcd = 0 }
+            setno = ot_class(d, icd, g)
+            nsets = rd_u16(d, st + 10)
+            sets = st + 12
+        }
+        if setno >= nsets { return false }
+        let so = rd_u16(d, sets + setno * 2)
+        if so == 0 { return false }
+        let rs = st + so
+        let nr = rd_u16(d, rs)
+        var kind = M_GLYPH()
+        if fmt == 2 { kind = M_CLASS() }
+        var r = 0
+        while r < nr {
+            let rule = rs + rd_u16(d, rs + 2 + r * 2)
+            let bc = rd_u16(d, rule)
+            let inp = rule + 2 + bc * 2
+            let ic = rd_u16(d, inp)
+            let la = inp + 2 + (ic - 1) * 2
+            let lac = rd_u16(d, la)
+            let lr = la + 2 + lac * 2
+            let lc = rd_u16(d, lr)
+            if ic >= 1 && chain_match(f, c, b, kind, bc, rule + 2, bcd, ic, inp + 2, icd, lac, la + 2, lcd, pos, res) {
+                apply_nested(f, c, b, ic, pos, lc, lr + 2, res[0])
+                return true
+            }
+            r = r + 1
+        }
+        return false
+    }
+    if fmt == 3 {
+        let bc = rd_u16(d, st + 2)
+        let inp = st + 4 + bc * 2
+        let ic = rd_u16(d, inp)
+        if ic < 1 { return false }
+        let la = inp + 2 + ic * 2
+        let lac = rd_u16(d, la)
+        let lr = la + 2 + lac * 2
+        let lc = rd_u16(d, lr)
+        if ot_coverage(d, st + rd_u16(d, inp + 2), g) < 0 { return false }
+        if chain_match(f, c, b, M_COVERAGE(), bc, st + 4, st, ic, inp + 4, st, lac, la + 2, st, pos, res) {
+            apply_nested(f, c, b, ic, pos, lc, lr + 2, res[0])
+            return true
+        }
+        return false
+    }
+    return false
+}
+// input, then lookahead, then backtrack: HarfBuzz's order
+fn chain_match(f: Font, c: Ctx, b: Buf, kind: Int, bc: Int, bdata: Int, bbase: Int, ic: Int, idata: Int, ibase: Int,
+               lac: Int, ldata: Int, lbase: Int, inout pos: Vec<Int>, inout res: Vec<Int>) -> Bool {
+    if !match_input(f, c, b, ic, kind, idata, ibase, pos, res) { return false }
+    if !match_lookahead(f, c, b, lac, kind, ldata, lbase, res[0]) { return false }
+    if !match_backtrack(f, c, b, bc, kind, bdata, bbase) { return false }
+    return true
+}
+
+// ── GSUB ─────────────────────────────────────────────────────────────────────────────────────────
+
+fn gsub_apply_subtable(f: Font, inout c: Ctx, inout b: Buf, t: Int, st: Int) -> Bool {
+    let d = f.d
+    let g = cur(b, F_CP())
+    if t == 1 {                                                           // single
+        let fmt = rd_u16(d, st)
+        let ci = ot_coverage(d, st + rd_u16(d, st + 2), g)
+        if ci < 0 { return false }
+        var ng = 0
+        if fmt == 1 { ng = (g + rd_u16(d, st + 4)) & 65535 }
+        else if fmt == 2 { if ci >= rd_u16(d, st + 4) { return false }  ng = rd_u16(d, st + 6 + ci * 2) }
+        else { return false }
+        if b.have_output { ctx_replace_glyph(f, c, b, ng) }
+        else { set_glyph_class(f, c, b, ng, 0, false, false)  cur_set(b, F_CP(), ng) }
+        return true
+    }
+    if t == 2 {                                                           // multiple
+        let ci = ot_coverage(d, st + rd_u16(d, st + 2), g)
+        if ci < 0 || ci >= rd_u16(d, st + 4) { return false }
+        let seq = st + rd_u16(d, st + 6 + ci * 2)
+        let n = rd_u16(d, seq)
+        if n == 1 { ctx_replace_glyph(f, c, b, rd_u16(d, seq + 2))  return true }
+        if n == 0 { delete_glyph(b)  return true }
+        var klass = 0
+        if gp_is_ligature(cur(b, F_GP())) { klass = GP_BASE() }
+        let lig_id = lig_id_of(cur(b, F_LIG()))
+        var i = 0
+        while i < n {
+            if lig_id == 0 { cur_set(b, F_LIG(), lig_props_for_mark(0, i)) }
+            let ng = rd_u16(d, seq + 2 + i * 2)
+            set_glyph_class(f, c, b, ng, klass, false, true)
+            output_glyph(b, ng)
+            i = i + 1
+        }
+        skip_glyph(b)
+        return true
+    }
+    if t == 3 {                                                           // alternate
+        let ci = ot_coverage(d, st + rd_u16(d, st + 2), g)
+        if ci < 0 || ci >= rd_u16(d, st + 4) { return false }
+        let aset = st + rd_u16(d, st + 6 + ci * 2)
+        let n = rd_u16(d, aset)
+        if n == 0 { return false }
+        let gmask = cur(b, F_MASK())
+        var shift = 0
+        while shift < 63 && ((c.lookup_mask >> shift) & 1) == 0 { shift = shift + 1 }
+        var alt = (c.lookup_mask & gmask) >> shift
+        if alt == MAX_VALUE() && c.random {
+            c.random_state = (c.random_state * 48271) % 2147483647
+            alt = c.random_state % n + 1
+        }
+        if alt > n || alt == 0 { return false }
+        ctx_replace_glyph(f, c, b, rd_u16(d, aset + 2 + (alt - 1) * 2))
+        return true
+    }
+    if t == 4 {                                                           // ligature
+        let ci = ot_coverage(d, st + rd_u16(d, st + 2), g)
+        if ci < 0 || ci >= rd_u16(d, st + 4) { return false }
+        let aset = st + rd_u16(d, st + 6 + ci * 2)
+        let n = rd_u16(d, aset)
+        var pos: Vec<Int> = vec()
+        var res: Vec<Int> = vec()
+        var i = 0
+        while i < n {
+            let lig = aset + rd_u16(d, aset + 2 + i * 2)
+            let lg = rd_u16(d, lig)
+            let cc = rd_u16(d, lig + 2)
+            if cc == 1 { ctx_replace_glyph(f, c, b, lg)  return true }
+            if cc > 1 && match_input(f, c, b, cc, M_GLYPH(), lig + 4, 0, pos, res) {
+                ligate_input(f, c, b, cc, pos, res[0], lg, res[1])
+                return true
+            }
+            i = i + 1
+        }
+        return false
+    }
+    if t == 5 { return context_apply(f, c, b, st) }
+    if t == 6 { return chain_context_apply(f, c, b, st) }
+    if t == 8 {                                                           // reverse chaining single
+        let ci = ot_coverage(d, st + rd_u16(d, st + 2), g)
+        if ci < 0 { return false }
+        if c.nesting != 64 { return false }                              // no chaining to this type
+        let bc = rd_u16(d, st + 4)
+        let la = st + 6 + bc * 2
+        let lac = rd_u16(d, la)
+        let sb = la + 2 + lac * 2
+        let ns = rd_u16(d, sb)
+        if ci >= ns { return false }
+        if match_backtrack(f, c, b, bc, M_COVERAGE(), st + 6, st) && match_lookahead(f, c, b, lac, M_COVERAGE(), la + 2, st, b.idx + 1) {
+            let ng = rd_u16(d, sb + 2 + ci * 2)
+            set_glyph_class(f, c, b, ng, 0, false, false)
+            cur_set(b, F_CP(), ng)
+            return true
+        }
+        return false
+    }
+    return false
+}
+
+// ── GPOS ─────────────────────────────────────────────────────────────────────────────────────────
+
+fn value_len(fmt: Int) -> Int {
+    var n = 0
+    var k = 0
+    while k < 8 { if ((fmt >> k) & 1) != 0 { n = n + 1 }  k = k + 1 }
+    return n * 2
+}
+// apply a ValueRecord at `v` to glyph `i`'s position (device tables are for hinting at a ppem, which
+// unscaled shaping does not have); true when any value is non-zero.
+fn apply_value(f: Font, inout b: Buf, fmt: Int, v: Int, i: Int) -> Bool {
+    let d = f.d
+    var p = v
+    var any = false
+    if (fmt & 1) != 0 { let x = rd_i16(d, p)  bpadd(b, i, P_XO(), x)  if x != 0 { any = true }  p = p + 2 }
+    if (fmt & 2) != 0 { let x = rd_i16(d, p)  bpadd(b, i, P_YO(), x)  if x != 0 { any = true }  p = p + 2 }
+    if (fmt & 4) != 0 { let x = rd_i16(d, p)  bpadd(b, i, P_XA(), x)  if x != 0 { any = true }  p = p + 2 }
+    if (fmt & 8) != 0 { let x = rd_i16(d, p)  if x != 0 { any = true }  p = p + 2 }    // y advance: vertical only
+    return any
+}
+fn anchor_xy(d: Str, a: Int, inout xy: Vec<Int>) {
+    while xy.len() < 2 { xy.push(0) }
+    xy[0] = rd_i16(d, a + 2)
+    xy[1] = rd_i16(d, a + 4)
+}
+fn ATTACH_MARK() -> Int { return 1 }
+fn ATTACH_CURSIVE() -> Int { return 2 }
+
+// MarkArray::apply; attach the current mark to glyph `gpos` with anchor matrix `anchors` (row = `row`)
+fn mark_array_apply(f: Font, inout b: Buf, marks: Int, mark_index: Int, anchors: Int, row: Int, class_count: Int, gpos: Int) -> Bool {
+    let d = f.d
+    let rec = marks + 2 + mark_index * 4
+    let mclass = rd_u16(d, rec)
+    let mao = rd_u16(d, rec + 2)
+    let rows = rd_u16(d, anchors)
+    if row >= rows || mclass >= class_count { return false }
+    let off = rd_u16(d, anchors + 2 + (row * class_count + mclass) * 2)
+    if off == 0 { return false }
+    var mxy: Vec<Int> = vec()
+    var bxy: Vec<Int> = vec()
+    anchor_xy(d, marks + mao, mxy)
+    anchor_xy(d, anchors + off, bxy)
+    bpset(b, b.idx, P_XO(), bxy[0] - mxy[0])
+    bpset(b, b.idx, P_YO(), bxy[1] - mxy[1])
+    bpset(b, b.idx, P_ATYPE(), ATTACH_MARK())
+    bpset(b, b.idx, P_CHAIN(), gpos - b.idx)
+    b.scratch = b.scratch | SF_HAS_GPOS_ATTACHMENT()
+    b.idx = b.idx + 1
+    return true
+}
+// LigatureAttach is an AnchorMatrix with component rows; the same reader with a different base
+fn lig_attach_apply(f: Font, inout b: Buf, marks: Int, mark_index: Int, la: Int, comp: Int, class_count: Int, gpos: Int) -> Bool {
+    return mark_array_apply(f, b, marks, mark_index, la, comp, class_count, gpos)
+}
+
+// MarkBasePos: we only want to attach to the first glyph of a multiple substitution
+fn markbase_accept(b: Buf, i: Int) -> Bool {
+    let gp = bi(b, i, F_GP())
+    let lp = bi(b, i, F_LIG())
+    if (gp & GP_MULTIPLIED()) == 0 || lig_comp_of(lp) == 0 { return true }
+    if i == 0 { return true }
+    let gp0 = bi(b, i - 1, F_GP())
+    let lp0 = bi(b, i - 1, F_LIG())
+    return gp_is_mark(gp0) || (gp0 & GP_MULTIPLIED()) == 0 || lig_id_of(lp) != lig_id_of(lp0) || lig_comp_of(lp) != lig_comp_of(lp0) + 1
+}
+
+fn gpos_apply_subtable(f: Font, inout c: Ctx, inout b: Buf, t: Int, st: Int) -> Bool {
+    let d = f.d
+    let g = cur(b, F_CP())
+    if t == 1 {                                                           // single adjustment
+        let fmt = rd_u16(d, st)
+        let ci = ot_coverage(d, st + rd_u16(d, st + 2), g)
+        if ci < 0 { return false }
+        let vf = rd_u16(d, st + 4)
+        if fmt == 1 { apply_value(f, b, vf, st + 6, b.idx) }
+        else if fmt == 2 {
+            if ci >= rd_u16(d, st + 6) { return false }
+            apply_value(f, b, vf, st + 8 + ci * value_len(vf), b.idx)
+        } else { return false }
+        b.idx = b.idx + 1
+        return true
+    }
+    if t == 2 {                                                           // pair adjustment
+        let fmt = rd_u16(d, st)
+        let ci = ot_coverage(d, st + rd_u16(d, st + 2), g)
+        if ci < 0 { return false }
+        var it = iter_new(c, b, false)
+        iter_reset(it, b, b.idx)
+        if !iter_next(f, it, b) { return false }
+        let j = it.idx
+        let vf1 = rd_u16(d, st + 4)
+        let vf2 = rd_u16(d, st + 6)
+        let l1 = value_len(vf1)
+        let l2 = value_len(vf2)
+        if fmt == 1 {
+            if ci >= rd_u16(d, st + 8) { return false }
+            let ps = st + rd_u16(d, st + 10 + ci * 2)
+            let n = rd_u16(d, ps)
+            let rsz = 2 + l1 + l2
+            let g2 = bi(b, j, F_CP())
+            var lo = 0
+            var hi = n - 1
+            while lo <= hi {
+                let mid = (lo + hi) / 2
+                let r = ps + 2 + mid * rsz
+                let sg = rd_u16(d, r)
+                if sg == g2 {
+                    apply_value(f, b, vf1, r + 2, b.idx)
+                    apply_value(f, b, vf2, r + 2 + l1, j)
+                    var np = j
+                    if l2 > 0 { np = j + 1 }
+                    b.idx = np
+                    return true
+                }
+                if sg < g2 { lo = mid + 1 } else { hi = mid - 1 }
+            }
+            return false
+        }
+        if fmt == 2 {
+            let cd1 = st + rd_u16(d, st + 8)
+            let cd2 = st + rd_u16(d, st + 10)
+            let c1n = rd_u16(d, st + 12)
+            let c2n = rd_u16(d, st + 14)
+            let k1 = ot_class(d, cd1, g)
+            let k2 = ot_class(d, cd2, bi(b, j, F_CP()))
+            if k1 >= c1n || k2 >= c2n { return false }
+            let v = st + 16 + (k1 * c2n + k2) * (l1 + l2)
+            if l1 > 0 { apply_value(f, b, vf1, v, b.idx) }
+            if l2 > 0 { apply_value(f, b, vf2, v + l1, j) }
+            var np = j
+            if l2 > 0 { np = j + 1 }
+            b.idx = np
+            return true
+        }
+        return false
+    }
+    if t == 3 {                                                           // cursive
+        let cov = st + rd_u16(d, st + 2)
+        let n = rd_u16(d, st + 4)
+        let ci = ot_coverage(d, cov, g)
+        if ci < 0 || ci >= n { return false }
+        let entry = rd_u16(d, st + 6 + ci * 4)
+        if entry == 0 { return false }
+        var it = iter_new(c, b, false)
+        iter_reset(it, b, b.idx)
+        if !iter_prev_info(f, it, b) { return false }
+        let i = it.idx
+        let pi = ot_coverage(d, cov, bi(b, i, F_CP()))
+        if pi < 0 || pi >= n { return false }
+        let exit = rd_u16(d, st + 6 + pi * 4 + 2)
+        if exit == 0 { return false }
+        let j = b.idx
+        var exy: Vec<Int> = vec()
+        var nxy: Vec<Int> = vec()
+        anchor_xy(d, st + exit, exy)
+        anchor_xy(d, st + entry, nxy)
+        let exit_x = exy[0]  let exit_y = exy[1]
+        let entry_x = nxy[0]  let entry_y = nxy[1]
+        if !c.rtl {
+            bpset(b, i, P_XA(), exit_x + bp(b, i, P_XO()))
+            let dd = entry_x + bp(b, j, P_XO())
+            bpadd(b, j, P_XA(), 0 - dd)
+            bpadd(b, j, P_XO(), 0 - dd)
+        } else {
+            let dd = exit_x + bp(b, i, P_XO())
+            bpadd(b, i, P_XA(), 0 - dd)
+            bpadd(b, i, P_XO(), 0 - dd)
+            bpset(b, j, P_XA(), entry_x + bp(b, j, P_XO()))
+        }
+        var child = i
+        var parent = j
+        var yoff = entry_y - exit_y
+        if (c.lookup_props & 1) == 0 {                                    // not RightToLeft
+            child = j
+            parent = i
+            yoff = 0 - yoff
+        }
+        reverse_cursive_minor_offset(b, child, parent)
+        bpset(b, child, P_ATYPE(), ATTACH_CURSIVE())
+        bpset(b, child, P_CHAIN(), parent - child)
+        b.scratch = b.scratch | SF_HAS_GPOS_ATTACHMENT()
+        bpset(b, child, P_YO(), yoff)
+        if bp(b, parent, P_CHAIN()) == 0 - bp(b, child, P_CHAIN()) {
+            bpset(b, parent, P_CHAIN(), 0)
+            bpset(b, parent, P_YO(), 0)
+        }
+        b.idx = b.idx + 1
+        return true
+    }
+    if t == 4 || t == 5 {                                                 // mark-to-base / mark-to-ligature
+        let mi = ot_coverage(d, st + rd_u16(d, st + 2), g)
+        if mi < 0 { return false }
+        let class_count = rd_u16(d, st + 6)
+        let marks = st + rd_u16(d, st + 8)
+        let bases = st + rd_u16(d, st + 10)
+        let bcov = st + rd_u16(d, st + 4)
+        var it = iter_new(c, b, false)
+        it.props = 8                                                      // IgnoreMarks
+        if c.last_base_until > b.idx { c.last_base_until = 0  c.last_base = 0 - 1 }
+        var j = b.idx
+        while j > c.last_base_until {
+            var m = iter_match(f, it, b, j - 1, false)
+            if m == 0 && t == 4 {
+                if !markbase_accept(b, j - 1) && ot_coverage(d, bcov, bi(b, j - 1, F_CP())) < 0 { m = 2 }
+            }
+            if m == 0 { c.last_base = j - 1  break }
+            j = j - 1
+        }
+        c.last_base_until = b.idx
+        if c.last_base == 0 - 1 { return false }
+        let idx = c.last_base
+        let bi2 = ot_coverage(d, bcov, bi(b, idx, F_CP()))
+        if bi2 < 0 { return false }
+        if t == 4 {
+            if bi2 >= rd_u16(d, bases) { return false }
+            // BaseArray is an AnchorMatrix: rows of classCount offsets
+            return mark_array_apply(f, b, marks, mi, bases, bi2, class_count, idx)
+        }
+        if bi2 >= rd_u16(d, bases) { return false }
+        let la = bases + rd_u16(d, bases + 2 + bi2 * 2)
+        let comp_count = rd_u16(d, la)
+        if comp_count == 0 { return false }
+        let lig_id = lig_id_of(bi(b, idx, F_LIG()))
+        let mark_id = lig_id_of(cur(b, F_LIG()))
+        let mark_comp = lig_comp_of(cur(b, F_LIG()))
+        var comp = comp_count - 1
+        if lig_id != 0 && lig_id == mark_id && mark_comp > 0 {
+            var mc = mark_comp
+            if comp_count < mc { mc = comp_count }
+            comp = mc - 1
+        }
+        return lig_attach_apply(f, b, marks, mi, la, comp, class_count, idx)
+    }
+    if t == 6 {                                                           // mark-to-mark
+        let mi = ot_coverage(d, st + rd_u16(d, st + 2), g)
+        if mi < 0 { return false }
+        var it = iter_new(c, b, false)
+        iter_reset(it, b, b.idx)
+        it.props = c.lookup_props & (0 - 1 - 14)
+        if !iter_prev_info(f, it, b) { return false }
+        let j = it.idx
+        if !gp_is_mark(bi(b, j, F_GP())) { return false }
+        let id1 = lig_id_of(cur(b, F_LIG()))
+        let id2 = lig_id_of(bi(b, j, F_LIG()))
+        let comp1 = lig_comp_of(cur(b, F_LIG()))
+        let comp2 = lig_comp_of(bi(b, j, F_LIG()))
+        var good = false
+        if id1 == id2 {
+            if id1 == 0 { good = true } else if comp1 == comp2 { good = true }
+        } else {
+            if (id1 > 0 && comp1 == 0) || (id2 > 0 && comp2 == 0) { good = true }
+        }
+        if !good { return false }
+        let m2 = ot_coverage(d, st + rd_u16(d, st + 4), bi(b, j, F_CP()))
+        if m2 < 0 { return false }
+        let class_count = rd_u16(d, st + 6)
+        let marks = st + rd_u16(d, st + 8)
+        let m2arr = st + rd_u16(d, st + 10)
+        if m2 >= rd_u16(d, m2arr) { return false }
+        return mark_array_apply(f, b, marks, mi, m2arr, m2, class_count, j)
+    }
+    if t == 7 { return context_apply(f, c, b, st) }
+    if t == 8 { return chain_context_apply(f, c, b, st) }
+    return false
+}
+// iter_prev over info (GPOS is in place: the "output" is the buffer itself)
+fn iter_prev_info(f: Font, inout it: Iter, b: Buf) -> Bool {
+    while it.idx > 0 {
+        it.idx = it.idx - 1
+        let m = iter_match(f, it, b, it.idx, false)
+        if m == 0 { return true }
+        if m == 1 { return false }
+    }
+    return false
+}
+
+fn reverse_cursive_minor_offset(inout b: Buf, i: Int, new_parent: Int) {
+    let chain = bp(b, i, P_CHAIN())
+    let typ = bp(b, i, P_ATYPE())
+    if chain == 0 || (typ & ATTACH_CURSIVE()) == 0 { return }
+    bpset(b, i, P_CHAIN(), 0)
+    let j = i + chain
+    if j == new_parent { return }
+    if j < 0 || j >= b.len { return }
+    reverse_cursive_minor_offset(b, j, new_parent)
+    bpset(b, j, P_YO(), 0 - bp(b, i, P_YO()))
+    bpset(b, j, P_CHAIN(), 0 - chain)
+    bpset(b, j, P_ATYPE(), typ)
+}
+
+fn propagate_attachment_offsets(inout b: Buf, i: Int, depth: Int) {
+    let chain = bp(b, i, P_CHAIN())
+    let typ = bp(b, i, P_ATYPE())
+    if chain == 0 { return }
+    bpset(b, i, P_CHAIN(), 0)
+    let j = i + chain
+    if j < 0 || j >= b.len || depth <= 0 { return }
+    propagate_attachment_offsets(b, j, depth - 1)
+    if (typ & ATTACH_CURSIVE()) != 0 {
+        bpadd(b, i, P_YO(), bp(b, j, P_YO()))
+    } else {
+        bpadd(b, i, P_XO(), bp(b, j, P_XO()))
+        bpadd(b, i, P_YO(), bp(b, j, P_YO()))
+        if j < i {
+            if !b.rtl {
+                var k = j
+                while k < i { bpadd(b, i, P_XO(), 0 - bp(b, k, P_XA()))  bpadd(b, i, P_YO(), 0 - bp(b, k, P_YA()))  k = k + 1 }
+            } else {
+                var k = j + 1
+                while k < i + 1 { bpadd(b, i, P_XO(), bp(b, k, P_XA()))  bpadd(b, i, P_YO(), bp(b, k, P_YA()))  k = k + 1 }
+            }
+        }
+    }
+}
+
+// ── running a table ──────────────────────────────────────────────────────────────────────────────
+
+// apply one lookup over the whole buffer (HarfBuzz's apply_string). `cov` is the lookup's coverage
+// set (lookup_coverage_set), or -1 for "could be anything".
+fn apply_string(f: Font, inout c: Ctx, inout b: Buf, li: Int, cov: Int) {
+    let t = otl_table(f, c.table)
+    let lk = otl_lookup(f.d, t, li)
+    if lk < 0 || b.len == 0 || c.lookup_mask == 0 { return }
+    // nothing in the buffer this lookup could start on: skip the pass (and its output copy)
+    var any = false
+    var q = 0
+    while q < b.len && !any { if lcov_has(cov, bi(b, q, F_CP())) { any = true }  q = q + 1 }
+    if !any { return }
+    c.lookup_index = li
+    c.lookup_props = otl_lookup_props(f.d, lk)
+    c.last_base = 0 - 1
+    c.last_base_until = 0
+    let typ = lookup_type_of(f, c.table, lk)
+    if c.table == 0 && typ == 8 {
+        // reverse chaining: in place, backward
+        b.idx = b.len - 1
+        while b.idx >= 0 {
+            if (cur(b, F_MASK()) & c.lookup_mask) != 0 && lcov_has(cov, cur(b, F_CP())) && check_glyph_property(f, cur(b, F_CP()), cur(b, F_GP()), c.lookup_props) {
+                lookup_apply_once(f, c, b, lk)
+            }
+            b.idx = b.idx - 1
+        }
+        b.idx = 0
+        return
+    }
+    if c.table == 0 { buf_clear_output(b) }
+    b.idx = 0
+    while b.idx < b.len {
+        var applied = false
+        if c.ops > 0 && (cur(b, F_MASK()) & c.lookup_mask) != 0 && lcov_has(cov, cur(b, F_CP())) && check_glyph_property(f, cur(b, F_CP()), cur(b, F_GP()), c.lookup_props) {
+            c.ops = c.ops - 1
+            applied = lookup_apply_once(f, c, b, lk)
+        }
+        if !applied { next_glyph(b) }
+    }
+    if c.table == 0 { buf_sync(b) }
+}

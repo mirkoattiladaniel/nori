@@ -1,0 +1,557 @@
+// std/window/__native_win32.nori: the `nori_win_*` seam of window.nori on Windows, in Nori, for a
+// program built with `noric --build --native --target x86_64-w64-mingw32`. It answers the calls
+// window_win32.c answers in an LLVM build, over user32, gdi32 and shell32.
+//
+// The window lives on a thread of its own, which creates it and receives its messages: a Win32 message
+// queue belongs to the thread that made the window, and the render loop above this seam runs on
+// whichever scheduler worker resumes it. The window thread pushes what each message means into a queue
+// any thread may read.
+//
+// Keys are reported as X11 keysyms and coordinates in logical pixels (physical ones scaled by 96/DPI),
+// the seam's contract on every platform.
+//
+// A window record, in 8-byte fields:
+//   0 hwnd  8 w  16 h  24 closed  32 px  40 py  48 btn  56 mid  64 lx  72 ly  80 tap_latch
+//   88 qhead  96 qtail  104 queue (128 events of 4 x 8 bytes)  112 drop text  120 scroll remainder
+//   128 locked  136 warp_x  144 warp_y  152 cursor shape  160 dpi  168 thread  176 ready event
+//   184 wake event  192 queue lock  200 start w  208 start h  216 title (UTF-16)
+
+extern fn malloc(Int) -> Int
+extern fn calloc(Int, Int) -> Int
+extern fn realloc(Int, Int) -> Int
+extern fn free(Int)
+extern fn memcpy(Int, Int, Int) -> Int
+extern fn strlen(Int) -> Int
+
+extern fn GetModuleHandleW(Int) -> Int from "kernel32.dll"
+extern fn CreateThread(Int, Int, Int, Int, Int, Int) -> Int from "kernel32.dll"
+extern fn CreateEventW(Int, Int, Int, Int) -> Int from "kernel32.dll"
+extern fn SetEvent(Int) -> Int from "kernel32.dll"
+extern fn WaitForSingleObject(Int, Int) -> Int from "kernel32.dll"
+extern fn CloseHandle(Int) -> Int from "kernel32.dll"
+extern fn AcquireSRWLockExclusive(Int) -> Int from "kernel32.dll"
+extern fn ReleaseSRWLockExclusive(Int) -> Int from "kernel32.dll"
+extern fn MultiByteToWideChar(Int, Int, Int, Int, Int, Int) -> Int from "kernel32.dll"
+extern fn WideCharToMultiByte(Int, Int, Int, Int, Int, Int, Int, Int) -> Int from "kernel32.dll"
+extern fn GlobalAlloc(Int, Int) -> Int from "kernel32.dll"
+extern fn GlobalLock(Int) -> Int from "kernel32.dll"
+extern fn GlobalUnlock(Int) -> Int from "kernel32.dll"
+extern fn GlobalFree(Int) -> Int from "kernel32.dll"
+extern fn SetProcessDpiAwarenessContext(Int) -> Int from "user32.dll"
+extern fn RegisterClassW(Int) -> Int from "user32.dll"
+extern fn AdjustWindowRect(Int, Int, Int) -> Int from "user32.dll"
+extern fn CreateWindowExW(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Int from "user32.dll"
+extern fn DefWindowProcW(Int, Int, Int, Int) -> Int from "user32.dll"
+extern fn GetWindowLongPtrW(Int, Int) -> Int from "user32.dll"
+extern fn SetWindowLongPtrW(Int, Int, Int) -> Int from "user32.dll"
+extern fn ShowWindow(Int, Int) -> Int from "user32.dll"
+extern fn UpdateWindow(Int) -> Int from "user32.dll"
+extern fn GetMessageW(Int, Int, Int, Int) -> Int from "user32.dll"
+extern fn TranslateMessage(Int) -> Int from "user32.dll"
+extern fn DispatchMessageW(Int) -> Int from "user32.dll"
+extern fn PostMessageW(Int, Int, Int, Int) -> Int from "user32.dll"
+extern fn GetDC(Int) -> Int from "user32.dll"
+extern fn ReleaseDC(Int, Int) -> Int from "user32.dll"
+extern fn LoadCursorW(Int, Int) -> Int from "user32.dll"
+extern fn SetCursor(Int) -> Int from "user32.dll"
+extern fn ShowCursor(Int) -> Int from "user32.dll"
+extern fn ClipCursor(Int) -> Int from "user32.dll"
+extern fn SetCursorPos(Int, Int) -> Int from "user32.dll"
+extern fn GetClientRect(Int, Int) -> Int from "user32.dll"
+extern fn ClientToScreen(Int, Int) -> Int from "user32.dll"
+extern fn GetKeyState(Int) -> Int from "user32.dll"
+extern fn GetKeyboardState(Int) -> Int from "user32.dll"
+extern fn ToUnicode(Int, Int, Int, Int, Int, Int) -> Int from "user32.dll"
+extern fn OpenClipboard(Int) -> Int from "user32.dll"
+extern fn CloseClipboard() -> Int from "user32.dll"
+extern fn EmptyClipboard() -> Int from "user32.dll"
+extern fn SetClipboardData(Int, Int) -> Int from "user32.dll"
+extern fn GetClipboardData(Int) -> Int from "user32.dll"
+extern fn IsClipboardFormatAvailable(Int) -> Int from "user32.dll"
+extern fn GetDeviceCaps(Int, Int) -> Int from "gdi32.dll"
+extern fn SetDIBitsToDevice(Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int) -> Int from "gdi32.dll"
+extern fn DragAcceptFiles(Int, Int) -> Int from "shell32.dll"
+extern fn DragQueryFileW(Int, Int, Int, Int) -> Int from "shell32.dll"
+extern fn DragFinish(Int) -> Int from "shell32.dll"
+extern fn nori_wincb__nw32_proc(Int, Int, Int, Int) -> Int
+extern fn nori_wincb__nw32_thread(Int) -> Int
+
+fn nw32_ok(r: Int) -> Bool { return (r & 4294967295) != 0 }
+fn nw32_s16(v: Int) -> Int { let x = v & 65535  if x >= 32768 { return x - 65536 }  return x }
+
+/// physical pixels to logical ones at this window's DPI
+fn nw32_lg(s: Int, v: Int) -> Int {
+    var dpi = peek(s + 160)
+    if dpi <= 0 { dpi = 96 }
+    if dpi == 96 { return v }
+    return to_int(to_float(v) * 96.0 / to_float(dpi) + 0.5)
+}
+
+fn nw32_cursor(shape: Int) -> Int {
+    var id = 32512                                          // IDC_ARROW
+    if shape == 1 { id = 32513 }                            // IDC_IBEAM
+    if shape == 2 { id = 32649 }                            // IDC_HAND
+    if shape == 3 { id = 32644 }                            // IDC_SIZEWE
+    if shape == 4 { id = 32645 }                            // IDC_SIZENS
+    if shape == 5 { id = 32646 }                            // IDC_SIZEALL
+    return LoadCursorW(0, id)
+}
+
+/// queue an event (written on the window thread, read by the render loop); a full queue drops the newest
+fn nw32_push3(s: Int, ty: Int, a: Int, b: Int, c: Int) {
+    AcquireSRWLockExclusive(s + 192)
+    let tail = peek(s + 96)
+    let n = (tail + 1) % 128
+    if n != peek(s + 88) {
+        let e = peek(s + 104) + tail * 32
+        poke(e, ty)  poke(e + 8, a)  poke(e + 16, b)  poke(e + 24, c)
+        poke(s + 96, n)
+    }
+    ReleaseSRWLockExclusive(s + 192)
+    let _e = SetEvent(peek(s + 184))
+}
+fn nw32_push(s: Int, ty: Int, a: Int, b: Int) { nw32_push3(s, ty, a, b, 0) }
+
+/// the X11 keysym of a key that is named rather than typed, or 0
+fn nw32_named_keysym(vk: Int) -> Int {
+    if vk == 27 { return 65307 }                            // Escape
+    if vk == 8 { return 65288 }                             // BackSpace
+    if vk == 46 { return 65535 }                            // Delete
+    if vk == 13 { return 65293 }                            // Return
+    if vk == 9 { return 65289 }                             // Tab
+    if vk == 37 { return 65361 }                            // Left
+    if vk == 38 { return 65362 }                            // Up
+    if vk == 39 { return 65363 }                            // Right
+    if vk == 40 { return 65364 }                            // Down
+    if vk == 36 { return 65360 }                            // Home
+    if vk == 35 { return 65367 }                            // End
+    if vk == 33 { return 65365 }                            // Prior
+    if vk == 34 { return 65366 }                            // Next
+    if vk == 45 { return 65379 }                            // Insert
+    if vk == 16 || vk == 160 { return 65505 }               // Shift_L
+    if vk == 161 { return 65506 }                           // Shift_R
+    if vk == 17 || vk == 162 { return 65507 }               // Control_L
+    if vk == 163 { return 65508 }                           // Control_R
+    if vk == 18 || vk == 164 { return 65513 }               // Alt_L
+    if vk == 165 { return 65514 }                           // Alt_R
+    if vk == 91 { return 65515 }                            // Super_L
+    if vk == 92 { return 65516 }                            // Super_R
+    return 0
+}
+
+fn nw32_mods() -> Int {
+    var m = 0
+    if (GetKeyState(16) & 32768) != 0 { m = m | 1 }
+    if (GetKeyState(17) & 32768) != 0 { m = m | 2 }
+    if (GetKeyState(18) & 32768) != 0 { m = m | 4 }
+    if ((GetKeyState(91) | GetKeyState(92)) & 32768) != 0 { m = m | 8 }
+    return m
+}
+
+/// the keysym of a printable key under the user's layout: its codepoint (below 256), else the
+/// 0x01000000 direct-Unicode form. Shift stays applied; Ctrl and Alt do not, the mask carries them.
+fn nw32_printable_keysym(vk: Int, lp: Int) -> Int {
+    let state = calloc(1, 256)
+    if !nw32_ok(GetKeyboardState(state)) { free(state)  return 0 }
+    poke8(state + 17, 0)  poke8(state + 162, 0)  poke8(state + 163, 0)
+    poke8(state + 18, 0)  poke8(state + 164, 0)  poke8(state + 165, 0)
+    let buf = calloc(1, 16)
+    let n = ToUnicode(vk, (lp >> 16) & 255, state, buf, 8, 0) & 4294967295
+    let cp = peek16(buf)
+    free(state)
+    free(buf)
+    if n == 0 || n > 2147483647 { return 0 }
+    if cp < 32 { return 0 }
+    if cp < 256 { return cp }
+    return 16777216 | cp
+}
+
+fn nw32_u8(w: Int) -> Int {
+    let n = WideCharToMultiByte(65001, 0, w, 0 - 1, 0, 0, 0, 0) & 4294967295
+    if n == 0 { return 0 }
+    let out = malloc(n)
+    let _c = WideCharToMultiByte(65001, 0, w, 0 - 1, out, n, 0, 0)
+    return out
+}
+
+fn nw32_xy(s: Int, lp: Int) {
+    poke(s + 32, nw32_lg(s, nw32_s16(lp)))
+    poke(s + 40, nw32_lg(s, nw32_s16(lp >> 16)))
+}
+
+/// the window procedure, reached through its callback thunk on the window thread
+fn nw32_proc(hwnd: Int, msg0: Int, wp: Int, lp: Int) -> Int {
+    let msg = msg0 & 4294967295
+    let s = GetWindowLongPtrW(hwnd, 0 - 21)                 // GWLP_USERDATA
+    if s == 0 { return DefWindowProcW(hwnd, msg, wp, lp) }
+    if msg == 32 {                                          // WM_SETCURSOR
+        if (lp & 65535) == 1 && peek(s + 128) == 0 { let _c = SetCursor(nw32_cursor(peek(s + 152)))  return 1 }
+        return DefWindowProcW(hwnd, msg, wp, lp)
+    }
+    if msg == 16 || msg == 2 { poke(s + 24, 1)  nw32_push(s, 1, 0, 0)  return 0 }   // WM_CLOSE, WM_DESTROY
+    if msg == 5 {                                           // WM_SIZE
+        let nw = nw32_lg(s, lp & 65535)
+        let nh = nw32_lg(s, (lp >> 16) & 65535)
+        if nw != peek(s + 8) || nh != peek(s + 16) { poke(s + 8, nw)  poke(s + 16, nh)  nw32_push(s, 2, nw, nh) }
+        return 0
+    }
+    if msg == 256 || msg == 260 || msg == 257 || msg == 261 {   // WM_(SYS)KEYDOWN / KEYUP
+        var ks = nw32_named_keysym(wp)
+        if ks == 0 { ks = nw32_printable_keysym(wp, lp) }
+        var ty = 3
+        if msg == 257 || msg == 261 { ty = 4 }
+        if ks != 0 { nw32_push(s, ty, ks, nw32_mods()) }
+        return 0
+    }
+    if msg == 512 { nw32_xy(s, lp)  return 0 }              // WM_MOUSEMOVE
+    if msg == 513 {                                         // WM_LBUTTONDOWN
+        poke(s + 48, 1)  nw32_xy(s, lp)
+        poke(s + 64, peek(s + 32))  poke(s + 72, peek(s + 40))  poke(s + 80, 1)
+        nw32_push3(s, 7, 1, peek(s + 32), peek(s + 40))
+        return 0
+    }
+    if msg == 514 { poke(s + 48, 0)  nw32_xy(s, lp)  nw32_push3(s, 8, 1, peek(s + 32), peek(s + 40))  return 0 }
+    if msg == 519 { poke(s + 56, 1)  nw32_xy(s, lp)  nw32_push3(s, 7, 2, peek(s + 32), peek(s + 40))  return 0 }
+    if msg == 520 { poke(s + 56, 0)  nw32_xy(s, lp)  nw32_push3(s, 8, 2, peek(s + 32), peek(s + 40))  return 0 }
+    if msg == 516 { nw32_xy(s, lp)  nw32_push3(s, 7, 3, peek(s + 32), peek(s + 40))  return 0 }
+    if msg == 517 { nw32_xy(s, lp)  nw32_push3(s, 8, 3, peek(s + 32), peek(s + 40))  return 0 }
+    if msg == 522 {                                         // WM_MOUSEWHEEL: down is positive, a notch is 120
+        var acc = peek(s + 120) - nw32_s16(wp >> 16)
+        let notches = acc / 120
+        if notches != 0 { acc = acc - notches * 120  nw32_push(s, 6, notches, 0) }
+        poke(s + 120, acc)
+        return 0
+    }
+    if msg == 563 {                                         // WM_DROPFILES: newline-separated file:// URIs
+        let n = DragQueryFileW(wp, 4294967295, 0, 0) & 4294967295
+        var text = ""
+        let path = malloc(1040)
+        var i = 0
+        while i < n {
+            if nw32_ok(DragQueryFileW(wp, i, path, 520)) {
+                let u = nw32_u8(path)
+                if u != 0 {
+                    var one = ""
+                    var k = 0
+                    while peek8(u + k) != 0 { one = one + chr(peek8(u + k))  k = k + 1 }
+                    free(u)
+                    text = text + "file://" + one + "\n"
+                }
+            }
+            i = i + 1
+        }
+        free(path)
+        let _f = DragFinish(wp)
+        let c = malloc(text.len() + 1)
+        var j = 0
+        while j < text.len() { poke8(c + j, ord(text.at(j)))  j = j + 1 }
+        poke8(c + text.len(), 0)
+        if peek(s + 112) != 0 { free(peek(s + 112)) }
+        poke(s + 112, c)
+        nw32_push(s, 5, 0, 0)
+        return 0
+    }
+    if msg == 20 { return 1 }                               // WM_ERASEBKGND: every pixel is painted
+    return DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+global nw32_class_name: Int = 0
+
+/// the window thread: make the window, then receive its messages until it goes
+fn nw32_thread(s: Int) -> Int {
+    let _d = SetProcessDpiAwarenessContext(0 - 4)          // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    let hi = GetModuleHandleW(0)
+    if nw32_class_name == 0 {
+        nw32_class_name = calloc(1, 64)
+        let nm = "NoriWindowClass"
+        var i = 0
+        while i < nm.len() { poke16(nw32_class_name + i * 2, ord(nm.at(i)))  i = i + 1 }
+    }
+    let wc = calloc(1, 72)
+    poke(wc + 8, fn_addr(nori_wincb__nw32_proc))
+    poke(wc + 24, hi)
+    poke(wc + 64, nw32_class_name)
+    let _r = RegisterClassW(wc)
+    free(wc)
+    let r = calloc(1, 16)
+    poke32(r + 8, peek(s + 200))  poke32(r + 12, peek(s + 208))
+    let _a = AdjustWindowRect(r, 13565952, 0)               // WS_OVERLAPPEDWINDOW
+    let ww = nw32_s32(peek32(r + 8)) - nw32_s32(peek32(r))
+    let wh = nw32_s32(peek32(r + 12)) - nw32_s32(peek32(r + 4))
+    free(r)
+    let hwnd = CreateWindowExW(0, nw32_class_name, peek(s + 216), 13565952, 2147483648, 2147483648, ww, wh, 0, 0, hi, 0)
+    if hwnd != 0 {
+        poke(s, hwnd)
+        let dc = GetDC(hwnd)
+        var dpi = 96
+        if dc != 0 { dpi = GetDeviceCaps(dc, 88) & 4294967295  let _rd = ReleaseDC(hwnd, dc) }
+        if dpi <= 0 { dpi = 96 }
+        poke(s + 160, dpi)
+        let _sw = SetWindowLongPtrW(hwnd, 0 - 21, s)
+        let _da = DragAcceptFiles(hwnd, 1)
+        let _sh = ShowWindow(hwnd, 5)                        // SW_SHOW
+        let _uw = UpdateWindow(hwnd)
+    } else { poke(s + 24, 1) }
+    let _e = SetEvent(peek(s + 176))
+    if hwnd == 0 { return 0 }
+    let msg = calloc(1, 48)
+    var go = true
+    while go {
+        let got = nw32_s32(GetMessageW(msg, 0, 0, 0) & 4294967295)
+        if got <= 0 { go = false }
+        else { let _t = TranslateMessage(msg)  let _p = DispatchMessageW(msg) }
+    }
+    free(msg)
+    poke(s + 24, 1)
+    let _w = SetEvent(peek(s + 184))
+    return 0
+}
+fn nw32_s32(v: Int) -> Int { let x = v & 4294967295  if x >= 2147483648 { return x - 4294967296 }  return x }
+
+fn nori_win_open(title: Int, w: Int, h: Int) -> Int {
+    let s = calloc(1, 224)
+    poke(s + 8, w)  poke(s + 16, h)  poke(s + 32, 0 - 1)  poke(s + 40, 0 - 1)  poke(s + 160, 96)
+    poke(s + 200, w)  poke(s + 208, h)
+    poke(s + 104, calloc(128, 32))
+    let t = calloc(512, 2)
+    if title != 0 { let _m = MultiByteToWideChar(65001, 0, title, 0 - 1, t, 511) }
+    poke(s + 216, t)
+    poke(s + 176, CreateEventW(0, 1, 0, 0))
+    poke(s + 184, CreateEventW(0, 0, 0, 0))
+    let th = CreateThread(0, 1048576, fn_addr(nori_wincb__nw32_thread), s, 0, 0)
+    if th == 0 { return 0 }
+    poke(s + 168, th)
+    let _w = WaitForSingleObject(peek(s + 176), 4294967295)
+    if peek(s) == 0 {
+        let _j = WaitForSingleObject(th, 1000)
+        let _c = CloseHandle(th)
+        return 0
+    }
+    return s
+}
+
+fn nori_win_backend(h: Int) -> Int { return 2 }
+
+/// dequeue one event: its type, with (a, b, c) into the three C ints at `out`
+fn nori_win_poll_event(s: Int, out: Int) -> Int {
+    if s == 0 { return 1 }
+    poke32(out, 0)  poke32(out + 4, 0)  poke32(out + 8, 0)
+    var ty = 0
+    AcquireSRWLockExclusive(s + 192)
+    let head = peek(s + 88)
+    if head != peek(s + 96) {
+        let e = peek(s + 104) + head * 32
+        ty = peek(e)
+        poke32(out, peek(e + 8))  poke32(out + 4, peek(e + 16))  poke32(out + 8, peek(e + 24))
+        poke(s + 88, (head + 1) % 128)
+    }
+    ReleaseSRWLockExclusive(s + 192)
+    return ty
+}
+
+// A press no polled read has seen is latched: a click shorter than a frame is reported once, where it
+// was pressed.
+fn nw32_take_down(s: Int) -> Int {
+    if peek(s + 48) != 0 { poke(s + 80, 0)  return 1 }
+    if peek(s + 80) != 0 { poke(s + 80, 0)  return 1 }
+    return 0
+}
+fn nw32_px(s: Int) -> Int { if peek(s + 80) != 0 { return peek(s + 64) }  return peek(s + 32) }
+fn nw32_py(s: Int) -> Int { if peek(s + 80) != 0 { return peek(s + 72) }  return peek(s + 40) }
+
+fn nori_win_mouse(s: Int, out: Int) -> Int {
+    if s == 0 { poke32(out, 4294967295)  poke32(out + 4, 4294967295)  return 0 }
+    poke32(out, nw32_px(s))  poke32(out + 4, nw32_py(s))
+    return nw32_take_down(s)
+}
+fn nw32_center_cursor(s: Int) {
+    poke(s + 136, peek(s + 8) / 2)  poke(s + 144, peek(s + 16) / 2)
+    let c = calloc(1, 8)
+    poke32(c, peek(s + 136))  poke32(c + 4, peek(s + 144))
+    let _t = ClientToScreen(peek(s), c)
+    let _p = SetCursorPos(nw32_s32(peek32(c)), nw32_s32(peek32(c + 4)))
+    free(c)
+    poke(s + 32, peek(s + 136))  poke(s + 40, peek(s + 144))
+}
+/// pointer lock: hide the cursor, confine it to the client area, and return it to the centre after each read
+fn nori_win_lock_pointer(s: Int, on: Int) -> Int {
+    if s == 0 || peek(s) == 0 { return 0 }
+    if on != 0 {
+        let r = calloc(1, 16)
+        if !nw32_ok(GetClientRect(peek(s), r)) { free(r)  return 0 }
+        let _a = ClientToScreen(peek(s), r)
+        let _b = ClientToScreen(peek(s), r + 8)
+        let _c = ClipCursor(r)
+        free(r)
+        if peek(s + 128) == 0 { let _h = ShowCursor(0) }
+        nw32_center_cursor(s)
+        poke(s + 128, 1)
+        return 1
+    }
+    if peek(s + 128) != 0 { let _u = ClipCursor(0)  let _v = ShowCursor(1)  poke(s + 128, 0) }
+    return 1
+}
+fn nori_win_inhibit_shortcuts(s: Int, on: Int) -> Int { return 0 }
+fn nori_win_pointer_locked(s: Int) -> Int { if s == 0 { return 0 }  return peek(s + 128) }
+fn nori_win_pointer_delta(s: Int, out: Int) -> Int {
+    if s == 0 || peek(s + 128) == 0 { poke32(out, 0)  poke32(out + 4, 0)  return 0 }
+    poke32(out, (peek(s + 32) - peek(s + 136)) * 256)
+    poke32(out + 4, (peek(s + 40) - peek(s + 144)) * 256)
+    nw32_center_cursor(s)
+    return 1
+}
+fn nori_win_mouse_x(s: Int) -> Int { if s == 0 { return 0 - 1 }  return nw32_px(s) }
+fn nori_win_mouse_y(s: Int) -> Int { if s == 0 { return 0 - 1 }  return nw32_py(s) }
+fn nori_win_pointer_x(s: Int) -> Int { return nori_win_mouse_x(s) }        // (no tap is latched here)
+fn nori_win_pointer_y(s: Int) -> Int { return nori_win_mouse_y(s) }
+fn nori_win_mouse_down(s: Int) -> Int { if s == 0 { return 0 }  return nw32_take_down(s) }
+fn nori_win_pointer_held(s: Int) -> Int { if s == 0 { return 0 }  return peek(s + 48) }
+fn nori_win_mouse_middle(s: Int) -> Int { if s == 0 { return 0 }  return peek(s + 56) }
+
+/// blit a top-down 0x00RRGGBB framebuffer, which a 32bpp BI_RGB DIB already is
+fn nori_win_shm_present(s: Int, pixels: Int, ww: Int, hh: Int) {
+    if s == 0 || pixels == 0 || ww <= 0 || hh <= 0 { return }
+    let bi = calloc(1, 44)
+    poke32(bi, 40)  poke32(bi + 4, ww)  poke32(bi + 8, 0 - hh)
+    poke16(bi + 12, 1)  poke16(bi + 14, 32)
+    let dc = GetDC(peek(s))
+    if dc != 0 {
+        let _b = SetDIBitsToDevice(dc, 0, 0, ww, hh, 0, 0, 0, hh, pixels, bi, 0)
+        let _r = ReleaseDC(peek(s), dc)
+    }
+    free(bi)
+}
+
+/// sleep up to the caller's budget, waking as soon as the window thread queues something
+fn nori_win_frame_wait(s: Int, ms: Int) {
+    if s == 0 || ms <= 0 { return }
+    AcquireSRWLockExclusive(s + 192)
+    let pending = peek(s + 88) != peek(s + 96)
+    ReleaseSRWLockExclusive(s + 192)
+    if pending { return }
+    let _w = WaitForSingleObject(peek(s + 184), ms)
+}
+
+fn nori_win_scale120(s: Int) -> Int {
+    if s == 0 { return 120 }
+    let dc = GetDC(peek(s))
+    if dc == 0 { return 120 }
+    let dpi = GetDeviceCaps(dc, 88) & 4294967295
+    let _r = ReleaseDC(peek(s), dc)
+    if dpi <= 0 || dpi > 100000 { return 120 }
+    poke(s + 160, dpi)
+    let v = to_int((to_float(dpi) / 96.0) * 120.0 + 0.5)
+    if v < 120 { return 120 }
+    return v
+}
+
+fn nori_win_closed(s: Int) -> Int { if s == 0 { return 1 }  return peek(s + 24) }
+fn nori_win_drawable(s: Int) -> Int { if s == 0 { return 0 }  if peek(s + 24) != 0 { return 0 }  return 1 }
+fn nori_win_w(s: Int) -> Int { if s == 0 { return 0 }  return peek(s + 8) }
+fn nori_win_h(s: Int) -> Int { if s == 0 { return 0 }  return peek(s + 16) }
+fn nori_win_display(s: Int) -> Int { return 0 }
+fn nori_win_surface(s: Int) -> Int { if s == 0 { return 0 }  return peek(s) }
+
+fn nori_win_clipboard_set(s: Int, text: Int) {
+    if s == 0 || text == 0 { return }
+    let n = MultiByteToWideChar(65001, 0, text, 0 - 1, 0, 0) & 4294967295
+    if n == 0 { return }
+    let g = GlobalAlloc(2, n * 2)                          // GMEM_MOVEABLE
+    if g == 0 { return }
+    let p = GlobalLock(g)
+    if p == 0 { let _f = GlobalFree(g)  return }
+    let _m = MultiByteToWideChar(65001, 0, text, 0 - 1, p, n)
+    let _u = GlobalUnlock(g)
+    if !nw32_ok(OpenClipboard(peek(s))) { let _f2 = GlobalFree(g)  return }
+    let _e = EmptyClipboard()
+    if SetClipboardData(13, g) == 0 { let _f3 = GlobalFree(g) }    // CF_UNICODETEXT; the clipboard owns it now
+    let _c = CloseClipboard()
+}
+fn nori_win_clipboard_get(s: Int) -> Int {
+    if s == 0 { return 0 }
+    if !nw32_ok(IsClipboardFormatAvailable(13)) { return 0 }
+    if !nw32_ok(OpenClipboard(peek(s))) { return 0 }
+    var out = 0
+    let g = GetClipboardData(13)
+    if g != 0 {
+        let p = GlobalLock(g)
+        if p != 0 { out = nw32_u8(p)  let _u = GlobalUnlock(g) }
+    }
+    let _c = CloseClipboard()
+    return out
+}
+fn nori_win_drop_text(s: Int) -> Int {
+    if s == 0 { return 0 }
+    let d = peek(s + 112)
+    poke(s + 112, 0)
+    return d
+}
+
+fn nori_win_inset_top(s: Int) -> Int { return 0 }
+fn nori_win_has_hover(s: Int) -> Int { return 1 }
+fn nori_win_scroll_unit_1000(s: Int) -> Int { return 4000 }
+fn nori_win_soft_keyboard(s: Int, show: Int) { }
+fn nori_win_catch_back(s: Int, on: Int) -> Int { return 0 }
+fn nori_win_set_cursor(s: Int, shape0: Int) -> Int {
+    if s == 0 || peek(s + 128) != 0 { return 0 }
+    var shape = shape0
+    if shape < 0 || shape > 5 { shape = 0 }
+    poke(s + 152, shape)
+    let _c = SetCursor(nw32_cursor(shape))
+    return 1
+}
+fn nori_win_apply_viewport(s: Int) { }
+fn nori_win_start_drag(s: Int, text: Int) { }
+fn nori_win_drag_finished(s: Int) -> Int { return 0 }
+fn nori_win_start_drag_files(s: Int, uris: Int, plain: Int) { }
+
+/// ask the window to close (only its own thread may destroy it) and wait for that thread to end
+fn nori_win_close(s: Int) {
+    if s == 0 { return }
+    if peek(s + 128) != 0 { let _u = ClipCursor(0)  let _v = ShowCursor(1)  poke(s + 128, 0) }
+    if peek(s) != 0 { let _p = PostMessageW(peek(s), 16, 0, 0) }
+    if peek(s + 168) != 0 { let _w = WaitForSingleObject(peek(s + 168), 2000)  let _c = CloseHandle(peek(s + 168)) }
+    let _r = CloseHandle(peek(s + 176))
+    let _k = CloseHandle(peek(s + 184))
+    if peek(s + 112) != 0 { free(peek(s + 112)) }
+    free(peek(s + 104))
+    free(peek(s + 216))
+    free(s)
+}
+
+// The desktop shell's half (window_shell.nori) is Wayland's: Windows has no layer surfaces or foreign-toplevel
+// list, so these answer "not available", and a window offers no descriptor to wait on.
+fn nori_win_fd(s: Int) -> Int { return 0 - 1 }
+// no descriptor to sleep on: a live window always says "poll it"
+fn nori_win_dispatch(s: Int) -> Int { if s == 0 { return 0 - 1 }  return 1 }
+fn nori_win_open_layer(ns: Int, spec: Int) -> Int { return 0 }
+fn nori_win_layer_keyboard(h: Int, mode: Int) { }
+fn nori_win_layer_size(h: Int, width: Int, height: Int) { }
+fn nori_win_input_none(h: Int, none: Int) { }
+fn nori_win_tl_open() -> Int { return 0 }
+fn nori_win_tl_caps(h: Int) -> Int { return 0 }
+fn nori_win_tl_fd(h: Int) -> Int { return 0 - 1 }
+fn nori_win_tl_dispatch(h: Int) -> Int { return 0 - 1 }
+fn nori_win_tl_count(h: Int) -> Int { return 0 }
+fn nori_win_tl_uid(h: Int, k: Int) -> Int { return 0 }
+fn nori_win_tl_state(h: Int, k: Int) -> Int { return 0 }
+fn nori_win_tl_str(h: Int, k: Int, which: Int) -> Int { return 0 }
+fn nori_win_tl_act(h: Int, uid: Int, act: Int) -> Int { return 0 }
+fn nori_win_tl_close(h: Int) { }
+fn nori_win_ws_count(h: Int) -> Int { return 0 }
+fn nori_win_ws_uid(h: Int, k: Int) -> Int { return 0 }
+fn nori_win_ws_state(h: Int, k: Int) -> Int { return 0 }
+fn nori_win_ws_str(h: Int, k: Int, which: Int) -> Int { return 0 }
+fn nori_win_ws_act(h: Int, uid: Int, act: Int) -> Int { return 0 }
+// a Win32 window: no translucent presentation through this seam, frames are not paced, the focus is not tracked
+fn nori_win_set_alpha(s: Int, on: Int) { }
+fn nori_win_frame_done(s: Int) -> Int { return 1 }
+fn nori_win_has_keyboard(s: Int) -> Int { if s == 0 { return 0 }  return 1 }
+fn nori_win_next_timeout_ms(s: Int) -> Int { return 0 - 1 }                    // Windows repeats keys itself
+fn nori_win_keymap_parse(p: Int, n: Int) -> Int { return 0 }                        // no Wayland keyboard here
+fn nori_win_keymap_keysym(km: Int, code: Int, mods: Int) -> Int { return 0 }
+fn nori_win_keymap_keysym_group(km: Int, code: Int, mods: Int, group: Int) -> Int { return 0 }
+fn nori_win_keymap_free(km: Int) { }
+fn nori_win_activation_token(s: Int, app_id: Int) -> Int { return 0 }
+fn nori_win_set_title(s: Int, title: Int) { }                                    // the title open gave it stays
+fn nori_win_set_app_id(s: Int, id: Int) { }                                      // Win32 has no application id here

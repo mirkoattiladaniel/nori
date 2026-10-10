@@ -1,0 +1,331 @@
+// std/image: GIF (87a and 89a), every frame, streamed (anim.nori's canvas). Written from the GIF89a
+// specification (W3C's copy of CompuServe's "Graphics Interchange Format Version 89a", 1990):
+//
+//   §17-18  the header and the Logical Screen Descriptor: the canvas, the global colour table (§19);
+//   §20     the Image Descriptor: a frame's rectangle, its local colour table (§21), interlace (rows in four
+//           passes: every 8th from 0, every 8th from 4, every 4th from 2, every 2nd from 1; Appendix E);
+//   §22     the table-based image data: LZW (Appendix F) with a code size from 3 (min code size + 1) to 12 bits,
+//           codes packed least significant bit first, in sub-blocks of at most 255 bytes;
+//   §23     the Graphic Control Extension: the delay (hundredths of a second), the transparent index, and the
+//           disposal method: 0 none, 1 leave in place, 2 restore to the background, 3 restore to previous;
+//   §26     the Application Extension, here NETSCAPE2.0's loop count (sub-block 1: 0 = for ever, else the
+//           repetitions after the first play: anim_loops says the plays, count + 1).
+//
+// Decisions. "Restore to the background" clears the rectangle to transparent, not to the background colour
+// index: what every browser and ImageMagick's -coalesce do, and the only thing that lets a GIF with a
+// transparent background animate over a page (the background index is an artefact of 1990 screens). A delay of 0
+// or 1 hundredth is shown as 100 ms, as browsers do (files made for them rely on it). A frame reaching past the
+// canvas is clipped to it. Codes that run out before the frame is full leave the rest of it as it was (a truncated
+// last frame, as browsers show it); a code that names an entry not yet in the table is an error.
+//
+// The LZW decoder writes the pixels straight onto the canvas row by row (no frame-sized index buffer); its tables
+// are three small arrays made once: the prefix of each code (16 bits), its last byte, and its first byte.
+
+fn gif_open(inout a: Anim) {
+    if a.dn < 13 { a.err = "GIF: truncated header"  return }
+    let cw = ale16(a, 6)
+    let chh = ale16(a, 8)
+    let lsdf = ab(a, 10)
+    var pos = 13
+    if (lsdf & 128) != 0 {
+        a.gctn = (2 << (lsdf & 7))
+        a.gct = pos
+        pos = pos + a.gctn * 3
+    }
+    if pos > a.dn { a.err = "GIF: truncated colour table"  return }
+    // a pass over the blocks: count the frames, find the loop count, check that each frame's data is there
+    a.first = pos
+    a.loops = 1
+    var frames = 0
+    var going = true
+    while going && pos < a.dn {
+        let b = ab(a, pos)
+        if b == 33 {
+            if pos + 2 > a.dn { going = false }
+            else {
+                let lbl = ab(a, pos + 1)
+                pos = pos + 2
+                // NETSCAPE2.0 (or ANIMEXTS1.0): 11 bytes of name, then the sub-block 3, 1, loop count
+                if lbl == 255 && ab(a, pos) == 11 && pos + 12 + 4 <= a.dn && gif_netscape(a, pos + 1) {
+                    if ab(a, pos + 12) == 3 && ab(a, pos + 13) == 1 {
+                        // the count is of repetitions after the first play (0: for ever), as browsers and
+                        // ImageMagick read it: plays = count + 1
+                        let rep = ale16(a, pos + 14)
+                        if rep == 0 { a.loops = 0 } else { a.loops = rep + 1 }
+                    }
+                }
+                pos = gif_skip(a, pos)
+                if pos < 0 { going = false }
+            }
+        } else if b == 44 {
+            if pos + 10 > a.dn { going = false }
+            else {
+                let idf = ab(a, pos + 9)
+                pos = pos + 10
+                if (idf & 128) != 0 { pos = pos + (2 << (idf & 7)) * 3 }
+                pos = pos + 1                                                  // the LZW minimum code size
+                let after = gif_skip(a, pos)
+                if after < 0 || pos > a.dn { going = false }
+                else { frames = frames + 1  pos = after }
+            }
+        } else if b == 59 { going = false }
+        else { pos = pos + 1 }                                                 // stray bytes between blocks: skipped
+    }
+    // a last frame cut off in its data still counts when its header is there (its rows so far are shown)
+    if frames == 0 && pos > a.first { frames = gif_partial(a) }
+    if frames == 0 { a.err = "GIF: no image in the file"  return }
+    // the canvas: a frame too large for its screen (old encoders wrote 0x0 screens) widens it, as browsers do
+    var w = cw
+    var h = chh
+    if w == 0 || h == 0 { gif_first_rect(a, w, h) }
+    if !anim_canvas(a, w, h) { a.err = "GIF: " + a.err  return }
+    a.frames = frames
+    a.pos = a.first
+    a.kind = ANIM_GIF()
+}
+
+/// is the application identifier at `p` NETSCAPE2.0 or ANIMEXTS1.0?
+fn gif_netscape(a: Anim, p: Int) -> Bool {
+    let ns = "NETSCAPE2.0"
+    let ax = "ANIMEXTS1.0"
+    var m1 = true
+    var m2 = true
+    var i = 0
+    while i < 11 {
+        let c = ab(a, p + i)
+        if c != ord(ns.at(i)) { m1 = false }
+        if c != ord(ax.at(i)) { m2 = false }
+        i = i + 1
+    }
+    return m1 || m2
+}
+
+/// past a run of sub-blocks starting at `p` (its terminator included); -1 when the data ends inside them
+fn gif_skip(a: Anim, p: Int) -> Int {
+    var q = p
+    while q < a.dn {
+        let n = ab(a, q)
+        if n == 0 { return q + 1 }
+        q = q + 1 + n
+    }
+    return 0 - 1
+}
+
+/// frames when the scan stopped inside the first image's data: 1 if its descriptor is whole
+fn gif_partial(a: Anim) -> Int {
+    var pos = a.first
+    while pos < a.dn {
+        let b = ab(a, pos)
+        if b == 44 { if pos + 11 <= a.dn { return 1 }  return 0 }
+        if b == 33 { pos = gif_skip(a, pos + 2)  if pos < 0 { return 0 } }
+        else if b == 59 { return 0 }
+        else { pos = pos + 1 }
+    }
+    return 0
+}
+
+/// a zero-sized screen: the first frame's own size
+fn gif_first_rect(a: Anim, inout w: Int, inout h: Int) {
+    var pos = a.first
+    while pos < a.dn {
+        let b = ab(a, pos)
+        if b == 44 { w = ale16(a, pos + 1) + ale16(a, pos + 5)  h = ale16(a, pos + 3) + ale16(a, pos + 7)  return }
+        if b == 33 { pos = gif_skip(a, pos + 2)  if pos < 0 { return } }
+        else if b == 59 { return }
+        else { pos = pos + 1 }
+    }
+}
+
+/// the next frame: its extensions read, the last frame's disposal done, its pixels laid onto the canvas
+fn gif_next(inout a: Anim) -> Bool {
+    var pos = a.pos
+    var trans = 0 - 1
+    var delay = 0
+    var disposal = 0
+    while pos < a.dn {
+        let b = ab(a, pos)
+        if b == 33 {
+            let lbl = ab(a, pos + 1)
+            pos = pos + 2
+            if lbl == 249 && ab(a, pos) >= 4 {                                 // Graphic Control Extension
+                let pk = ab(a, pos + 1)
+                disposal = (pk >> 2) & 7
+                delay = ale16(a, pos + 2)
+                if (pk & 1) != 0 { trans = ab(a, pos + 4) } else { trans = 0 - 1 }
+            }
+            pos = gif_skip(a, pos)
+            if pos < 0 { a.err = "GIF: an extension runs past the end"  return false }
+        } else if b == 44 {
+            if pos + 10 > a.dn { a.err = "GIF: a truncated image descriptor"  return false }
+            let fx = ale16(a, pos + 1)
+            let fy = ale16(a, pos + 3)
+            let fw = ale16(a, pos + 5)
+            let fh = ale16(a, pos + 7)
+            let idf = ab(a, pos + 9)
+            pos = pos + 10
+            var pal = a.gct
+            var paln = a.gctn
+            if (idf & 128) != 0 {
+                paln = (2 << (idf & 7))
+                pal = pos
+                pos = pos + paln * 3
+            }
+            if paln == 0 || pos + 1 > a.dn { a.err = "GIF: a frame without a colour table"  return false }
+            anim_dispose(a)
+            if disposal == 3 { if !anim_save(a) { return false } }
+            let end = gif_lzw(a, pos, fx, fy, fw, fh, (idf & 64) != 0, pal, paln, trans)
+            if end < 0 { return false }
+            a.pos = end
+            var d = disposal
+            if d == 1 { d = 0 }
+            if d == 2 { anim_after(a, 1, fx, fy, fw, fh) } else if d == 3 { anim_after(a, 2, fx, fy, fw, fh) } else { a.disp = 0 }
+            if delay <= 1 { a.delay = 100 } else { a.delay = delay * 10 }
+            return true
+        } else if b == 59 { a.err = "GIF: the trailer before frame " + to_str(a.index)  return false }
+        else { pos = pos + 1 }
+    }
+    a.err = "GIF: the file ends before frame " + to_str(a.index)
+    return false
+}
+
+/// LZW-decode one frame's data at `pos` (the minimum code size, then sub-blocks) straight onto the canvas at
+/// (fx, fy). Returns the offset past the data, or -1 (a.err said) when it is not GIF LZW.
+fn gif_lzw(inout a: Anim, start: Int, fx: Int, fy: Int, fw: Int, fh: Int, interlaced: Bool, pal: Int, paln: Int, trans: Int) -> Int {
+    var pos = start
+    let mincode = ab(a, pos)
+    pos = pos + 1
+    if mincode < 2 || mincode > 11 { a.err = "GIF: LZW minimum code size " + to_str(mincode)  return 0 - 1 }
+    unsafe { if a.lzw == 0 { a.lzw = malloc(4096 * 2 + 4096 + 4096 + 4097) } }
+    if a.lzw == 0 { a.err = "GIF: no memory"  return 0 - 1 }
+    let pre = a.lzw                       // u16 per code: the code it extends
+    let suf = a.lzw + 8192                // u8 per code: its last byte
+    let fst = a.lzw + 12288               // u8 per code: its first byte
+    let stk = a.lzw + 16384               // the bytes of one code, last first
+    let clear = (1 << mincode)
+    let endc = clear + 1
+    var i = 0
+    unsafe { while i < clear { poke16(pre + i * 2, 0)  poke8(suf + i, i)  poke8(fst + i, i)  i = i + 1 } }
+    var next = endc + 1
+    var size = mincode + 1
+    var prevc = 0 - 1
+    // the bit reader over the sub-blocks
+    var acc = 0
+    var nbits = 0
+    var blk = 0                           // bytes left in the current sub-block
+    var ended = false                     // the block terminator (or the file's end) was reached
+    // where pixels go: row `row` of the frame (in pass order when interlaced), column `col`
+    var row = 0
+    var col = 0
+    var pass = 0
+    var ystep = 1
+    if interlaced { ystep = 8 }
+    var y = 0
+    let total = fw * fh
+    var out = 0
+    var going = true
+    var bad = false
+    while going {
+        // fill the accumulator from the sub-blocks
+        while nbits < size && !ended {
+            if blk == 0 {
+                if pos >= a.dn { ended = true }
+                else {
+                    blk = ab(a, pos)
+                    pos = pos + 1
+                    if blk == 0 { ended = true }
+                }
+            } else {
+                if pos >= a.dn { ended = true  blk = 0 }
+                else {
+                    acc = acc | (ab(a, pos) << nbits)
+                    nbits = nbits + 8
+                    pos = pos + 1
+                    blk = blk - 1
+                }
+            }
+        }
+        if nbits < size { going = false }
+        else {
+            let code = acc & ((1 << size) - 1)
+            acc = acc >> size
+            nbits = nbits - size
+            if code == clear { next = endc + 1  size = mincode + 1  prevc = 0 - 1 }
+            else if code == endc { going = false }
+            else {
+                // the string of `code`, onto the stack last byte first
+                var sp = 0
+                var cur = code
+                var firstb = 0
+                if code < next {
+                    if code >= clear && code <= endc { bad = true  going = false }
+                    unsafe { firstb = peek8(fst + code) }
+                } else if code == next && prevc >= 0 {
+                    // the KwKwK case: the previous string and its own first byte
+                    unsafe { firstb = peek8(fst + prevc)  poke8(stk, firstb) }
+                    sp = 1
+                    cur = prevc
+                } else { bad = true  going = false }
+                if going {
+                    unsafe {
+                        while cur >= clear {
+                            poke8(stk + sp, peek8(suf + cur))
+                            sp = sp + 1
+                            cur = peek16(pre + cur * 2)
+                        }
+                        poke8(stk + sp, cur)
+                        sp = sp + 1
+                    }
+                    // a new table entry: the previous string and this one's first byte
+                    if prevc >= 0 && next < 4096 {
+                        unsafe { poke16(pre + next * 2, prevc)  poke8(suf + next, firstb)  poke8(fst + next, peek8(fst + prevc)) }
+                        next = next + 1
+                        if next == (1 << size) && size < 12 { size = size + 1 }
+                    }
+                    prevc = code
+                    // the bytes out, onto the canvas
+                    while sp > 0 && out < total {
+                        sp = sp - 1
+                        var ci = 0
+                        unsafe { ci = peek8(stk + sp) }
+                        let cx = fx + col
+                        let cy = fy + y
+                        if ci != trans && ci < paln && cx < a.w && cy < a.h {
+                            let po = pal + ci * 3
+                            unsafe {
+                                let p = a.canvas + (cy * a.w + cx) * 4
+                                poke8(p, peek8(a.dp + po))
+                                poke8(p + 1, peek8(a.dp + po + 1))
+                                poke8(p + 2, peek8(a.dp + po + 2))
+                                poke8(p + 3, 255)
+                            }
+                        }
+                        out = out + 1
+                        col = col + 1
+                        if col == fw {
+                            col = 0
+                            row = row + 1
+                            y = y + ystep
+                            if interlaced {
+                                while y >= fh && pass < 3 {
+                                    pass = pass + 1
+                                    if pass == 1 { y = 4  ystep = 8 } else if pass == 2 { y = 2  ystep = 4 } else { y = 1  ystep = 2 }
+                                }
+                            }
+                        }
+                    }
+                    if out >= total { going = false }
+                }
+            }
+        }
+    }
+    if bad { a.err = "GIF: a code not in the LZW table in frame " + to_str(a.index)  return 0 - 1 }
+    if out == 0 && total > 0 { a.err = "GIF: frame " + to_str(a.index) + " has no pixels"  return 0 - 1 }
+    // past the rest of the sub-blocks (an encoder may pad after the end code)
+    if !ended {
+        if blk > 0 { pos = pos + blk }
+        let after = gif_skip(a, pos)
+        if after < 0 { return a.dn }
+        return after
+    }
+    return pos
+}

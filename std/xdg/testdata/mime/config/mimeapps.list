@@ -1,0 +1,5 @@
+[Default Applications]
+image/png=gone.desktop;editor.desktop;
+
+[Removed Associations]
+image/jpeg=viewer.desktop;

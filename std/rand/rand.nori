@@ -1,0 +1,123 @@
+//! std/rand: a fast pseudo-random number generator: xoshiro256** seeded via splitmix64.
+//! All state is held in an `Rng` struct (four 64-bit words); each draw advances the state in place.
+//! Integers wrap mod 2^64 (two's complement).
+//!
+//!   import "std/rand" as rand
+//!   var r = rand::seeded(12345)       // deterministic: same seed -> same sequence
+//!   var x = r.next_u64()              // a raw 64-bit value
+//!   var d = r.below(6)                // uniform in [0, 6)
+//!   var n = r.between(10, 20)         // uniform in [10, 20)
+//!   var f = r.float01()               // a Float in [0, 1)
+//!   var b = r.flip()                  // a coin flip
+//!   r.shuffle(v)                      // Fisher-Yates shuffle a Vec<Int> in place
+//!   var e = r.pick(v)                 // a random element of a non-empty Vec<Int>
+//! For a clock-seeded (non-reproducible) generator use `rand::new()`.
+
+import "std/time" as time
+
+/// a xoshiro256** generator: four 64-bit state words. Construct via `seeded` or `new`.
+pub struct Rng { s0: Int, s1: Int, s2: Int, s3: Int }
+
+/// rotate the 64-bit value `x` left by `k` bits.
+pub fn rng_rotl(x: Int, k: Int) -> Int {
+    return ((x << k) | (x >> 64 - k))
+}
+
+/// one step of splitmix64 over the mutable seed cell held in a 1-element Vec.
+/// splitmix64 is defined on wraparound: the golden-ratio increment and the two mixing multiplies all
+/// overflow 64 bits, so they use `wrapping_*`. That keeps the sequence bit-identical
+/// while letting a build with `--overflow-checks` trap on accidental overflows elsewhere.
+pub fn rng_splitmix(inout state: Vec<Int>) -> Int {
+    let z0 = wrapping_add(state[0], 0x9E3779B97F4A7C15)
+    state[0] = z0
+    var z = z0
+    z = wrapping_mul((z ^ (z >> 30)), 0xBF58476D1CE4E5B9)
+    z = wrapping_mul((z ^ (z >> 27)), 0x94D049BB133111EB)
+    return (z ^ (z >> 31))
+}
+
+/// a generator deterministically seeded from `seed`: the four state words come from successive
+/// splitmix64 outputs, so the same seed always yields the same sequence.
+pub fn seeded(seed: Int) -> Rng {
+    var st: Vec<Int> = vec()
+    st.push(seed)
+    let a = rng_splitmix(st)
+    let b = rng_splitmix(st)
+    let c = rng_splitmix(st)
+    let d = rng_splitmix(st)
+    return Rng { s0: a, s1: b, s2: c, s3: d }
+}
+
+/// a generator seeded from the system clock (not reproducible across runs).
+pub fn new() -> Rng {
+    let w = time::unix_ns()
+    let m = time::now_ns()
+    return seeded((w ^ m))
+}
+
+impl Rng {
+    /// the next raw 64-bit value; the full state advances.
+    /// The `* 5` / `* 9` scrambler is defined on wraparound; like splitmix above it uses
+    /// `wrapping_mul`, so the sequence stays bit-identical while a `--overflow-checks` build keeps
+    /// trapping on accidental overflows elsewhere.
+    fn next_u64(inout self) -> Int {
+        let r0 = wrapping_mul(self.s1, 5)
+        let r1 = rng_rotl(r0, 7)
+        let result = wrapping_mul(r1, 9)
+        let t = (self.s1 << 17)
+        self.s2 = (self.s2 ^ self.s0)
+        self.s3 = (self.s3 ^ self.s1)
+        self.s1 = (self.s1 ^ self.s2)
+        self.s0 = (self.s0 ^ self.s3)
+        self.s2 = (self.s2 ^ t)
+        self.s3 = rng_rotl(self.s3, 45)
+        return result
+    }
+    /// the next raw value forced non-negative (sign bit cleared), in [0, 2^63).
+    fn next_nonneg(inout self) -> Int {
+        let x = self.next_u64()
+        return (x & 0x7FFFFFFFFFFFFFFF)
+    }
+    /// a uniform integer in [0, n); returns 0 if n <= 0.
+    fn below(inout self, n: Int) -> Int {
+        if n <= 0 { return 0 }
+        let x = self.next_nonneg()
+        return x % n
+    }
+    /// a uniform integer in [lo, hi); returns lo if hi <= lo.
+    fn between(inout self, lo: Int, hi: Int) -> Int {
+        if hi <= lo { return lo }
+        let span = hi - lo
+        let off = self.below(span)
+        return lo + off
+    }
+    /// a Float uniformly in [0, 1), built from the top 53 random bits.
+    fn float01(inout self) -> Float {
+        let x = self.next_u64()
+        let bits = ((x >> 11) & 0x7FFFFFFFFFFFFFFF)
+        let f = to_float(bits)
+        return f / 9007199254740992.0
+    }
+    /// a fair coin flip.
+    fn flip(inout self) -> Bool {
+        let x = self.next_nonneg()
+        return x % 2 == 1
+    }
+    /// shuffle `v` (a Vec<Int>) uniformly in place via Fisher-Yates; returns 0.
+    fn shuffle(inout self, inout v: Vec<Int>) -> Int {
+        var i = v.len() - 1
+        while i > 0 {
+            let j = self.below(i + 1)
+            let tmp = v[i]
+            v[i] = v[j]
+            v[j] = tmp
+            i = i - 1
+        }
+        return 0
+    }
+    /// a random element of the non-empty Vec<Int> `v`.
+    fn pick(inout self, v: Vec<Int>) -> Int {
+        let i = self.below(v.len())
+        return v[i]
+    }
+}

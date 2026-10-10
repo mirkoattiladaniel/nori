@@ -1,0 +1,213 @@
+// A DER reader (X.690), written to be total.
+//
+// This is the file a certificate parser stands on, and certificates are the one input a TLS client
+// accepts from a stranger before it has decided whether to trust them. Historically it is also
+// where TLS stacks get their CVEs, and almost always for the same reason: a length believed
+// without being checked against what is actually there.
+//
+// So the rules here are absolute rather than pragmatic.
+//
+//   - Nothing indexes the buffer without a bounds check first. In Nori an out-of-range `Str.at` is
+//     a trap, so a missing check is a remote crash and not a wrong answer.
+//   - Errors latch. Once a read has failed every later one returns a zero value and touches
+//     nothing, so a caller may parse a whole structure and test once at the end.
+//   - Nesting is depth-bounded. A certificate is a few levels deep; a hostile one is as deep as
+//     the attacker likes, and unbounded recursion is a stack overflow with a certificate for a
+//     payload.
+//   - DER, not BER. Indefinite lengths are refused, and so are non-minimal ones: a length written
+//     in more bytes than it needs is the same value spelled two ways, which is the
+//     malleability that lets two implementations disagree about what they just read.
+
+/// A cursor over a DER buffer, bounded to `[pos, end)` and carrying its nesting depth.
+pub struct Asn1 { data: view Str, pos: Int, end: Int, depth: Int, err: Str }
+
+/// One tag-length-value header, with the content it introduces located but not read.
+pub struct Tlv {
+    tag: Int,               // the tag number, without the class or constructed bits
+    cls: Int,               // 0 universal, 1 application, 2 context-specific, 3 private
+    constructed: Bool,
+    start: Int, end: Int,   // the content, as offsets into the original buffer
+    err: Str
+}
+
+/// how deep a certificate may nest before this refuses to follow. Real ones use about six levels;
+/// the limit is far above that and far below anything that could exhaust the stack.
+pub fn asn1_max_depth() -> Int { return 32 }
+
+/// universal tag 1: DER admits two encodings, 0x00 and 0xFF.
+pub fn tag_boolean() -> Int { return 1 }
+/// universal tag 2
+pub fn tag_integer() -> Int { return 2 }
+/// universal tag 3: its first content byte counts unused trailing bits.
+pub fn tag_bit_string() -> Int { return 3 }
+/// universal tag 4
+pub fn tag_octet_string() -> Int { return 4 }
+/// universal tag 5
+pub fn tag_null() -> Int { return 5 }
+/// universal tag 6
+pub fn tag_oid() -> Int { return 6 }
+/// universal tag 12
+pub fn tag_utf8string() -> Int { return 12 }
+/// universal tag 16, always constructed.
+pub fn tag_sequence() -> Int { return 16 }
+/// universal tag 17
+pub fn tag_set() -> Int { return 17 }
+/// universal tag 19
+pub fn tag_printablestring() -> Int { return 19 }
+/// universal tag 22, what a dNSName in a SAN is.
+pub fn tag_ia5string() -> Int { return 22 }
+/// universal tag 23: a two-digit year, windowed by RFC 5280.
+pub fn tag_utctime() -> Int { return 23 }
+/// universal tag 24: a four-digit year.
+pub fn tag_generalizedtime() -> Int { return 24 }
+
+/// A cursor over a whole buffer.
+pub fn asn1_new(data: Str) -> Asn1 {
+    return Asn1 { data: data, pos: 0, end: data.len(), depth: 0, err: "" }
+}
+/// A cursor over the content of `t`, one level deeper. Refuses past `asn1_max_depth`.
+pub fn asn1_inner(a: Asn1, t: Tlv) -> Asn1 {
+    if (a.depth + 1) > asn1_max_depth() {
+        return Asn1 { data: a.data, pos: 0, end: 0, depth: a.depth, err: "DER nested too deeply" }
+    }
+    return Asn1 { data: a.data, pos: t.start, end: t.end, depth: (a.depth + 1), err: "" }
+}
+/// how many bytes remain in this cursor's window
+pub fn asn1_left(a: Asn1) -> Int {
+    if a.err.len() != 0 { return 0 }
+    return (a.end - a.pos)
+}
+/// is this cursor exhausted, with nothing unread and nothing wrong?
+pub fn asn1_done(a: Asn1) -> Bool {
+    if a.err.len() != 0 { return false }
+    return a.pos >= a.end
+}
+
+fn a_fail(inout a: Asn1, sink why: Str) {
+    if a.err.len() == 0 { a.err = why }
+}
+fn bad_tlv(why: Str) -> Tlv {
+    return Tlv { tag: 0, cls: 0, constructed: false, start: 0, end: 0, err: copy why }
+}
+
+/// Read the next tag-length header, leaving the cursor after the value it introduces.
+///
+/// The length rules are where this is strict. An indefinite length (0x80) is BER and not DER, and
+/// carries no end: a parser that accepts one is reading until it finds something that looks like
+/// a terminator. A long form that could have been short, or one with leading zero bytes, is the
+/// same number written two ways. Both are refused.
+pub fn asn1_next(inout a: Asn1) -> Tlv {
+    if a.err.len() != 0 { return bad_tlv(a.err) }
+    if a.pos >= a.end { a_fail(a, "DER ended early")  return bad_tlv(a.err) }
+
+    let id = ord(a.data.at(a.pos))
+    a.pos = (a.pos + 1)
+    let cls = ((id >> 6) & 3)
+    let constructed = ((id & 0x20) != 0)
+    let tagnum = (id & 0x1f)
+    // The high-tag-number form (all five low bits set) encodes tags above 30 across further bytes.
+    // Nothing in a certificate uses one, and accepting the form would mean a parser for tags that
+    // can never legitimately appear.
+    if tagnum == 0x1f { a_fail(a, "DER high-tag-number form is not accepted")  return bad_tlv(a.err) }
+
+    if a.pos >= a.end { a_fail(a, "DER length byte missing")  return bad_tlv(a.err) }
+    let l0 = ord(a.data.at(a.pos))
+    a.pos = (a.pos + 1)
+    var len = 0
+    if l0 < 0x80 { len = l0 }
+    else {
+        let nbytes = (l0 & 0x7f)
+        if nbytes == 0 { a_fail(a, "DER indefinite length is not allowed")  return bad_tlv(a.err) }
+        // Eight bytes is already far more than any real length, and stopping here keeps the
+        // accumulation below inside an i64 rather than wrapping silently.
+        if nbytes > 8 { a_fail(a, "DER length is absurdly long")  return bad_tlv(a.err) }
+        if (a.pos + nbytes) > a.end { a_fail(a, "DER length runs past the buffer")  return bad_tlv(a.err) }
+        if ord(a.data.at(a.pos)) == 0 { a_fail(a, "DER length has a leading zero byte")  return bad_tlv(a.err) }
+        var i = 0
+        while i < nbytes {
+            len = ((len << 8) | ord(a.data.at((a.pos + i))))
+            i = i + 1
+        }
+        a.pos = (a.pos + nbytes)
+        if len < 0x80 { a_fail(a, "DER length used the long form for a short value")  return bad_tlv(a.err) }
+        if len < 0 { a_fail(a, "DER length overflowed")  return bad_tlv(a.err) }
+    }
+
+    if len > (a.end - a.pos) { a_fail(a, "DER value runs past its container")  return bad_tlv(a.err) }
+    let s = a.pos
+    a.pos = (a.pos + len)
+    return Tlv { tag: tagnum, cls: cls, constructed: constructed, start: s, end: (s + len), err: "" }
+}
+
+/// The next header, required to be a universal tag of a particular number. This is the form nearly
+/// every caller wants: reading a SEQUENCE where a SEQUENCE must be is a check, and reading
+/// "whatever is next" is not.
+pub fn asn1_expect(inout a: Asn1, tag: Int) -> Tlv {
+    let t = asn1_next(a)
+    if t.err.len() != 0 { return t }
+    if t.cls != 0 { a_fail(a, ("expected a universal tag, got class " + to_str(t.cls)))  return bad_tlv(a.err) }
+    if t.tag != tag { a_fail(a, ((("expected tag " + to_str(tag)) + " but found ") + to_str(t.tag)))  return bad_tlv(a.err) }
+    return t
+}
+
+/// The raw content bytes a header introduced.
+pub fn asn1_content(a: Asn1, t: Tlv) -> Str {
+    if t.err.len() != 0 { return "" }
+    if t.start < 0 { return "" }
+    if t.end > a.data.len() { return "" }
+    if t.end < t.start { return "" }
+    return a.data.slice(t.start, t.end)
+}
+/// The header AND its content: the bytes as they appeared, which is what a signature is
+/// computed over and so must never be reconstructed.
+pub fn asn1_raw(a: Asn1, t: Tlv, hdr_start: Int) -> Str {
+    if t.err.len() != 0 { return "" }
+    if hdr_start < 0 { return "" }
+    if t.end > a.data.len() { return "" }
+    return a.data.slice(hdr_start, t.end)
+}
+
+/// Where the header of the next value begins; capture it before `asn1_next` to recover the exact
+/// encoded bytes afterwards.
+pub fn asn1_mark(a: Asn1) -> Int { return a.pos }
+
+/// A DER INTEGER as an unsigned big-endian magnitude, with the sign byte removed.
+///
+/// "" for a negative integer rather than a magnitude: everything a certificate holds as an INTEGER
+/// and this code cares about (a modulus, an exponent, an ECDSA r and s) is positive, and
+/// silently taking the magnitude of a negative one would turn a malformed certificate into a
+/// plausible key.
+pub fn asn1_uint(a: Asn1, t: Tlv) -> Str {
+    let c = asn1_content(a, t)
+    if c.len() == 0 { return "" }
+    if (ord(c.at(0)) & 0x80) != 0 { return "" }            // negative
+    // DER requires the minimal encoding: a leading zero byte is present only to keep a
+    // high-bit-set value positive, and is never followed by a byte with its high bit clear.
+    if ord(c.at(0)) == 0 {
+        if c.len() == 1 { return c }                       // the integer zero
+        if (ord(c.at(1)) & 0x80) == 0 { return "" }        // a non-minimal leading zero
+        return c.slice(1, c.len())
+    }
+    return c
+}
+
+/// The bytes of a BIT STRING, requiring it to be a whole number of octets.
+///
+/// The first content byte counts unused trailing bits. Every bit string this code reads (a public
+/// key, a signature) is octet-aligned, so anything other than zero unused bits is malformed here
+/// rather than something to shift.
+pub fn asn1_bits(a: Asn1, t: Tlv) -> Str {
+    let c = asn1_content(a, t)
+    if c.len() < 1 { return "" }
+    if ord(c.at(0)) != 0 { return "" }
+    return c.slice(1, c.len())
+}
+
+/// Compare an OID's content bytes against a dotted-decimal spelling encoded the same way. OIDs are
+/// compared as encoded bytes rather than decoded numbers, because decoding is where a parser meets
+/// arbitrary-length integers it does not need.
+pub fn asn1_oid_is(a: Asn1, t: Tlv, want: Str) -> Bool {
+    if t.tag != tag_oid() { return false }
+    if t.cls != 0 { return false }
+    return asn1_content(a, t) == want
+}

@@ -1,0 +1,282 @@
+// std/font: OpenType layout common tables: tags, Coverage, ClassDef, GDEF, and the
+// ScriptList / FeatureList / LookupList of GSUB and GPOS.
+//
+// Everything here reads the font's bytes in place through the past-the-end-is-zero readers, so a
+// malformed table finds nothing rather than trapping: a coverage that says it is longer than the
+// file covers nothing beyond it, a lookup index past the list is absent.
+
+/// a 4-character OpenType tag ("kern", "latn", "dev2", "DFLT", "ENG ") as an Int.
+pub fn ot_tag(s: Str) -> Int {
+    var v = 0
+    var i = 0
+    while i < 4 {
+        var c = 32
+        if i < s.len() { c = ord(s.at(i)) }
+        v = (v << 8) | c
+        i = i + 1
+    }
+    return v
+}
+/// an Int tag back to its four characters.
+pub fn ot_tag_str(t: Int) -> Str {
+    return "" + chr((t >> 24) & 255) + chr((t >> 16) & 255) + chr((t >> 8) & 255) + chr(t & 255)
+}
+
+// ── Coverage and ClassDef ────────────────────────────────────────────────────────────────────────
+
+/// the coverage index of `gid` in the Coverage table at `off`, or -1 when not covered.
+pub fn ot_coverage(d: Str, off: Int, gid: Int) -> Int {
+    if off <= 0 { return 0 - 1 }
+    let fmt = rd_u16(d, off)
+    if fmt == 1 {
+        let n = rd_u16(d, off + 2)
+        var lo = 0
+        var hi = n - 1
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            let g = rd_u16(d, off + 4 + mid * 2)
+            if g == gid { return mid }
+            if g < gid { lo = mid + 1 } else { hi = mid - 1 }
+        }
+        return 0 - 1
+    }
+    if fmt == 2 {
+        let n = rd_u16(d, off + 2)
+        var lo = 0
+        var hi = n - 1
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            let r = off + 4 + mid * 6
+            let a = rd_u16(d, r)
+            let b = rd_u16(d, r + 2)
+            if gid < a { hi = mid - 1 }
+            else if gid > b { lo = mid + 1 }
+            else { return rd_u16(d, r + 4) + (gid - a) }
+        }
+        return 0 - 1
+    }
+    return 0 - 1
+}
+
+/// the class of `gid` in the ClassDef table at `off` (0 when absent or unlisted).
+pub fn ot_class(d: Str, off: Int, gid: Int) -> Int {
+    if off <= 0 { return 0 }
+    let fmt = rd_u16(d, off)
+    if fmt == 1 {
+        let start = rd_u16(d, off + 2)
+        let n = rd_u16(d, off + 4)
+        if gid < start || gid >= start + n { return 0 }
+        return rd_u16(d, off + 6 + (gid - start) * 2)
+    }
+    if fmt == 2 {
+        let n = rd_u16(d, off + 2)
+        var lo = 0
+        var hi = n - 1
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            let r = off + 4 + mid * 6
+            let a = rd_u16(d, r)
+            let b = rd_u16(d, r + 2)
+            if gid < a { hi = mid - 1 }
+            else if gid > b { lo = mid + 1 }
+            else { return rd_u16(d, r + 4) }
+        }
+    }
+    return 0
+}
+
+// ── GDEF ─────────────────────────────────────────────────────────────────────────────────────────
+
+// glyph property bits (HarfBuzz's): the low byte matches the lookup flags that ignore them.
+fn GP_BASE() -> Int { return 2 }
+fn GP_LIGATURE() -> Int { return 4 }
+fn GP_MARK() -> Int { return 8 }
+fn GP_SUBSTITUTED() -> Int { return 16 }
+fn GP_LIGATED() -> Int { return 32 }
+fn GP_MULTIPLIED() -> Int { return 64 }
+fn GP_PRESERVE() -> Int { return 112 }
+
+/// does the font classify its glyphs (GDEF GlyphClassDef)?
+pub fn font_has_glyph_classes(f: Font) -> Bool { return f.gdef_gcd > 0 }
+/// GDEF glyph class of `gid`: 1 base, 2 ligature, 3 mark, 4 component, 0 unclassified.
+pub fn font_glyph_class(f: Font, gid: Int) -> Int { return ot_class(f.d, f.gdef_gcd, gid) }
+// the glyph props GDEF gives a glyph: its class bit, and a mark's attachment class in bits 8..15.
+fn gdef_glyph_props(f: Font, gid: Int) -> Int {
+    let k = ot_class(f.d, f.gdef_gcd, gid)
+    if k == 1 { return GP_BASE() }
+    if k == 2 { return GP_LIGATURE() }
+    if k == 3 { return GP_MARK() | ((ot_class(f.d, f.gdef_macd, gid) & 255) << 8) }
+    return 0
+}
+// is `gid` in mark glyph set `set` (GDEF MarkGlyphSetsDef: format u16, count u16, u32 offsets)?
+fn gdef_mark_set_covers(f: Font, mset: Int, gid: Int) -> Bool {
+    let m = f.gdef_mgs
+    if m <= 0 { return false }
+    let n = rd_u16(f.d, m + 2)
+    if mset < 0 || mset >= n { return false }
+    let o = rd_u32(f.d, m + 4 + mset * 4)
+    if o == 0 { return false }
+    return ot_coverage(f.d, m + o, gid) >= 0
+}
+
+// ── GSUB / GPOS header ───────────────────────────────────────────────────────────────────────────
+// version u32, scriptList u16, featureList u16, lookupList u16 (offsets from the table start).
+
+fn otl_table(f: Font, table: Int) -> Int { if table == 0 { return f.gsub_off }  return f.gpos_off }
+fn otl_script_list(d: Str, t: Int) -> Int { if t < 0 { return 0 - 1 }  let o = rd_u16(d, t + 4)  if o == 0 { return 0 - 1 }  return t + o }
+fn otl_feature_list(d: Str, t: Int) -> Int { if t < 0 { return 0 - 1 }  let o = rd_u16(d, t + 6)  if o == 0 { return 0 - 1 }  return t + o }
+fn otl_lookup_list(d: Str, t: Int) -> Int { if t < 0 { return 0 - 1 }  let o = rd_u16(d, t + 8)  if o == 0 { return 0 - 1 }  return t + o }
+
+// the Script table for `tag` in the table at `t`, or -1.
+fn otl_find_script(d: Str, t: Int, tag: Int) -> Int {
+    let sl = otl_script_list(d, t)
+    if sl < 0 { return 0 - 1 }
+    let n = rd_u16(d, sl)
+    var i = 0
+    while i < n {
+        let r = sl + 2 + i * 6
+        if rd_u32(d, r) == tag { return sl + rd_u16(d, r + 4) }
+        i = i + 1
+    }
+    return 0 - 1
+}
+// the LangSys table for `tag` in Script `s`, or -1.
+fn otl_find_langsys(d: Str, s: Int, tag: Int) -> Int {
+    if s < 0 { return 0 - 1 }
+    let n = rd_u16(d, s + 2)
+    var i = 0
+    while i < n {
+        let r = s + 4 + i * 6
+        if rd_u32(d, r) == tag { return s + rd_u16(d, r + 4) }
+        i = i + 1
+    }
+    return 0 - 1
+}
+fn otl_default_langsys(d: Str, s: Int) -> Int {
+    if s < 0 { return 0 - 1 }
+    let o = rd_u16(d, s)
+    if o == 0 { return 0 - 1 }
+    return s + o
+}
+// the FeatureList index of the feature `tag` that LangSys `ls` lists, or -1.
+fn otl_langsys_find_feature(d: Str, t: Int, ls: Int, tag: Int) -> Int {
+    if ls < 0 { return 0 - 1 }
+    let fl = otl_feature_list(d, t)
+    let nf = rd_u16(d, fl)
+    let n = rd_u16(d, ls + 4)
+    var i = 0
+    while i < n {
+        let fi = rd_u16(d, ls + 6 + i * 2)
+        if fi < nf && rd_u32(d, fl + 2 + fi * 6) == tag { return fi }
+        i = i + 1
+    }
+    return 0 - 1
+}
+// the first feature `tag` anywhere in the FeatureList (HarfBuzz's F_GLOBAL_SEARCH), or -1.
+fn otl_table_find_feature(d: Str, t: Int, tag: Int) -> Int {
+    let fl = otl_feature_list(d, t)
+    if fl < 0 { return 0 - 1 }
+    let n = rd_u16(d, fl)
+    var i = 0
+    while i < n { if rd_u32(d, fl + 2 + i * 6) == tag { return i }  i = i + 1 }
+    return 0 - 1
+}
+// the required feature of LangSys `ls`, or -1.
+fn otl_langsys_required(d: Str, ls: Int) -> Int {
+    if ls < 0 { return 0 - 1 }
+    let r = rd_u16(d, ls + 2)
+    if r == 65535 { return 0 - 1 }
+    return r
+}
+// the tag of feature `fi`.
+fn otl_feature_tag(d: Str, t: Int, fi: Int) -> Int {
+    let fl = otl_feature_list(d, t)
+    return rd_u32(d, fl + 2 + fi * 6)
+}
+// the Feature table of feature index `fi`.
+fn otl_feature(d: Str, t: Int, fi: Int) -> Int {
+    let fl = otl_feature_list(d, t)
+    if fl < 0 || fi < 0 || fi >= rd_u16(d, fl) { return 0 - 1 }
+    return fl + rd_u16(d, fl + 2 + fi * 6 + 4)
+}
+fn otl_lookup_count(d: Str, t: Int) -> Int { let ll = otl_lookup_list(d, t)  if ll < 0 { return 0 }  return rd_u16(d, ll) }
+// the Lookup table at index `li`, or -1.
+fn otl_lookup(d: Str, t: Int, li: Int) -> Int {
+    let ll = otl_lookup_list(d, t)
+    if ll < 0 || li < 0 || li >= rd_u16(d, ll) { return 0 - 1 }
+    return ll + rd_u16(d, ll + 2 + li * 2)
+}
+// a lookup's props as HarfBuzz keeps them: the LookupFlag, with the mark filtering set in the high
+// half when UseMarkFilteringSet (0x10) is on.
+fn otl_lookup_props(d: Str, lk: Int) -> Int {
+    let flag = rd_u16(d, lk + 2)
+    var props = flag
+    if (flag & 16) != 0 {
+        let n = rd_u16(d, lk + 4)
+        props = props | (rd_u16(d, lk + 6 + n * 2) << 16)
+    }
+    return props
+}
+
+// ── script and language tags ─────────────────────────────────────────────────────────────────────
+
+// HarfBuzz's tags for a Unicode script: the new-style Indic tags ('dev3', 'dev2') first, then the
+// old tag (the ISO code lowercased, with a few exceptions). Appended to `out`.
+fn ot_script_tags(script: Int, inout out: Vec<Int>) {
+    let code = script_code(script)
+    var nw = ""
+    if code == "Beng" { nw = "bng2" } else if code == "Deva" { nw = "dev2" } else if code == "Gujr" { nw = "gjr2" }
+    else if code == "Guru" { nw = "gur2" } else if code == "Knda" { nw = "knd2" } else if code == "Mlym" { nw = "mlm2" }
+    else if code == "Orya" { nw = "ory2" } else if code == "Taml" { nw = "tml2" } else if code == "Telu" { nw = "tel2" }
+    else if code == "Mymr" { nw = "mym2" }
+    if nw.len() == 4 {
+        if !(nw == "mym2") { out.push(ot_tag(nw.slice(0, 3) + "3")) }
+        out.push(ot_tag(nw))
+    }
+    if code == "Zyyy" || code == "Zinh" || code == "Zzzz" { return }      // common/inherited: DFLT only
+    var old = ""
+    if code == "Hira" { old = "kana" } else if code == "Laoo" { old = "lao " } else if code == "Yiii" { old = "yi  " }
+    else if code == "Nkoo" { old = "nko " } else if code == "Vaii" { old = "vai " }
+    else { old = "" + chr(ord(code.at(0)) + 32) + code.slice(1, 4) }
+    out.push(ot_tag(old))
+}
+
+// BCP 47 language -> OpenType language system tags (the common ones; HarfBuzz's table is larger).
+// An unknown language uses the script's default language system, which is what most fonts want.
+fn ot_language_tags(lang: Str, inout out: Vec<Int>) {
+    var l = ""
+    var i = 0
+    while i < lang.len() && lang.at(i) != '-' && lang.at(i) != '_' {
+        var c = ord(lang.at(i))
+        if c >= 65 && c <= 90 { c = c + 32 }
+        l = l + chr(c)
+        i = i + 1
+    }
+    let tab = "en:ENG ,ar:ARA ,fa:FAR ,ur:URD ,he:IWR ,iw:IWR ,yi:JII ,hi:HIN ,mr:MAR ,ne:NEP ,sa:SAN ,"
+        + "bn:BEN ,gu:GUJ ,pa:PAN ,ta:TAM ,te:TEL ,kn:KAN ,ml:MAL ,or:ORI ,si:SNH ,th:THA ,lo:LAO ,"
+        + "ja:JAN ,zh:ZHS ,ko:KOR ,ru:RUS ,uk:UKR ,be:BEL ,bg:BGR ,sr:SRB ,mk:MKD ,el:ELL ,"
+        + "de:DEU ,fr:FRA ,es:ESP ,it:ITA ,pt:PTG ,nl:NLD ,sv:SVE ,da:DAN ,no:NOR ,nb:NOR ,nn:NYN ,fi:FIN ,"
+        + "is:ISL ,pl:PLK ,cs:CSY ,sk:SKY ,sl:SLV ,hr:HRV ,bs:BOS ,hu:HUN ,ro:ROM ,mo:MOL ,tr:TRK ,az:AZE ,"
+        + "crh:CRT ,tt:TAT ,ba:BSH ,kk:KAZ ,ky:KIR ,uz:UZB ,tk:TKM ,cv:CHU ,ca:CAT ,eu:EUQ ,gl:GAL ,"
+        + "ga:IRI ,gd:GAE ,cy:WEL ,lt:LTH ,lv:LVI ,et:ETI ,mt:MTS ,sq:SQI ,vi:VIT ,id:IND ,ms:MLY ,"
+        + "tl:TGL ,sw:SWK ,am:AMH ,ti:TGY ,ka:KAT ,hy:HYE ,mn:MNG ,bo:TIB ,dz:DZN ,km:KHM ,my:BRM ,"
+        + "ps:PAS ,sd:SND ,ks:KSH ,ug:UYG ,ku:KUR ,ckb:KUR ,syr:SYR ,"
+    var p = 0
+    while p < tab.len() {
+        var q = p
+        while q < tab.len() && tab.at(q) != ':' { q = q + 1 }
+        let key = tab.slice(p, q)
+        let tg = tab.slice(q + 1, q + 5)
+        if key == l {
+            if l == "zh" && (lang.len() > 2) {
+                // zh-Hant / zh-TW / zh-HK use the traditional tags
+                if lang.len() >= 7 && lang.slice(3, 7) == "Hant" { out.push(ot_tag("ZHT ")) }
+                else if lang.slice(3, lang.len()) == "TW" { out.push(ot_tag("ZHT ")) }
+                else if lang.slice(3, lang.len()) == "HK" { out.push(ot_tag("ZHH ")) }
+            }
+            out.push(ot_tag(tg))
+            return
+        }
+        p = q + 6
+    }
+}

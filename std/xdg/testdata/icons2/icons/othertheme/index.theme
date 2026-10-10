@@ -1,0 +1,7 @@
+[Icon Theme]
+Name=Other Test Theme (second data dir)
+Directories=24x24/apps;
+
+[24x24/apps]
+Size=24
+Type=Fixed

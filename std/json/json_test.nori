@@ -1,0 +1,188 @@
+import "std/json" as json
+
+fn doc() -> Str { return "{\"name\":\"nori\",\"n\":42,\"pi\":3.5,\"ok\":true,\"nil\":null,\"xs\":[1,2,3]}" }
+
+fn test_parse_scalars() {
+  var v = json::parse(doc())
+  assert_streq(json::as_str(json::field(v, "name")), "nori")
+  assert_feq(json::as_num(json::field(v, "n")), 42.0, 0.0001)
+  assert_feq(json::as_num(json::field(v, "pi")), 3.5, 0.0001)
+  assert_true(json::as_bool(json::field(v, "ok")))
+  assert_true(json::is_null(json::field(v, "nil")))
+}
+
+fn test_missing_key_is_null() {
+  var v = json::parse(doc())
+  assert_true(json::is_null(json::field(v, "nope")))
+  assert_streq(json::as_str(json::field(v, "nope")), "")
+}
+
+fn test_array() {
+  let d = json::parse(doc())
+  var xs = json::field(d, "xs")
+  assert_eq(json::jlen(xs), 3)
+  assert_feq(json::as_num(json::at(xs, 0)), 1.0, 0.0001)
+  assert_feq(json::as_num(json::at(xs, 2)), 3.0, 0.0001)
+  assert_true(json::is_null(json::at(xs, 9)))
+}
+
+fn test_nested() {
+  var v = json::parse("{\"a\":{\"b\":{\"c\":7}}}")
+  assert_feq(json::as_num(json::field(json::field(json::field(v, "a"), "b"), "c")), 7.0, 0.0001)
+}
+
+fn test_negative_and_exponent() {
+  var v = json::parse("[-2.5, 1e3, 2.5e-1]")
+  assert_feq(json::as_num(json::at(v, 0)), 0.0 - 2.5, 0.0001)
+  assert_feq(json::as_num(json::at(v, 1)), 1000.0, 0.001)
+  assert_feq(json::as_num(json::at(v, 2)), 0.25, 0.0001)
+}
+
+fn test_string_escapes() {
+  var v = json::parse("{\"s\":\"a\\tb\\nc\\\"d\"}")
+  var s = json::as_str(json::field(v, "s"))
+  assert_eq(s.len(), 7)                 // a <tab> b <nl> c " d  = 7 chars
+  assert_eq(ord(s.at(1)), 9)      // tab
+}
+
+fn test_roundtrip() {
+  assert_streq(json::stringify(json::parse("[1,2,{\"a\":true,\"b\":null},\"x\"]")), "[1,2,{\"a\":true,\"b\":null},\"x\"]")
+  assert_streq(json::stringify(json::parse("{}")), "{}")
+  assert_streq(json::stringify(json::parse("[]")), "[]")
+}
+
+fn test_stringify_escapes() {
+  var arr: Vec<Json> = vec()
+  arr.push(Json::JsStr("he said \"hi\""))
+  assert_streq(json::stringify(Json::JsArr(arr)), "[\"he said \\\"hi\\\"\"]")
+}
+
+// A parsed number must be the nearest double to the text, not merely close to it.
+//
+// Accumulating the fraction as `digit * scale` with `scale *= 0.1` goes wrong because 0.1 is not
+// representable: the error compounds and most non-dyadic values come out wrong in the last couple
+// of bits (0.75 -> 0.75000000000000016, 0.6 -> 0.60000000000000008, 0.35 -> 0.35000000000000004).
+// Comparing with `==` against the literal is the point here: a tolerance would let that through.
+fn test_number_is_the_nearest_double() {
+    assert_true(json::as_num(json::parse("0.75")) == 0.75)
+    assert_true(json::as_num(json::parse("0.6")) == 0.6)
+    assert_true(json::as_num(json::parse("0.35")) == 0.35)
+    assert_true(json::as_num(json::parse("0.01")) == 0.01)
+    assert_true(json::as_num(json::parse("1.75")) == 1.75)
+    assert_true(json::as_num(json::parse("0.1")) == 0.1)
+    assert_true(json::as_num(json::parse("0.2")) == 0.2)
+    assert_true(json::as_num(json::parse("100.001")) == 100.001)
+    assert_true(json::as_num(json::parse("3.14159265358979")) == 3.14159265358979)
+    // the dyadic ones are exact either way; they stay so a regression cannot hide behind them
+    assert_true(json::as_num(json::parse("0.5")) == 0.5)
+    assert_true(json::as_num(json::parse("0.25")) == 0.25)
+    assert_true(json::as_num(json::parse("2.0")) == 2.0)
+}
+
+fn test_number_signs_and_exponents() {
+    assert_true(json::as_num(json::parse("-0.75")) == -0.75)
+    assert_true(json::as_num(json::parse("1e3")) == 1000.0)
+    assert_true(json::as_num(json::parse("1E3")) == 1000.0)
+    assert_true(json::as_num(json::parse("1e+3")) == 1000.0)
+    assert_true(json::as_num(json::parse("1.5e2")) == 150.0)
+    assert_true(json::as_num(json::parse("-1.5e-2")) == -0.015)
+    assert_true(json::as_num(json::parse("2.5e-3")) == 0.0025)
+    assert_true(json::as_num(json::parse("0")) == 0.0)
+    assert_true(json::as_num(json::parse("-0")) == 0.0)
+    assert_true(json::as_num(json::parse("123456789")) == 123456789.0)
+    // outside the exact window (>15 digits) the fallback is approximate; assert only that it is close
+    assert_feq(json::as_num(json::parse("1.2345678901234567890123")), 1.2345678901234568, 0.000000000000001)
+}
+
+// the value must survive a parse -> render -> parse round trip
+fn test_number_round_trip() {
+    let vals = "[0.75,0.6,0.35,0.1,100.001,-1.5e-2]"
+    let a = json::parse(vals)
+    let text = json::stringify(a)
+    let b = json::parse(text)
+    var i = 0
+    while i < 6 { assert_true(json::as_num(json::at(a, i)) == json::as_num(json::at(b, i)))  i = i + 1 }
+}
+
+// ── the nearest-double guarantee ────────────────────────────────────────────────────────────────
+//
+// jp_number does not convert anything itself: it calls `parse::scan_float`, which does an exact
+// integer long division rather than any kind of scaled accumulation. These are literals that an
+// integer mantissa scaled once by an exact power of ten (Clinger's fast path) gets wrong, because
+// their mantissa is past 2^53 or their net power of ten is past +-22. Every assertion here is `==`
+// against the Nori literal, since a tolerance would let a near miss pass.
+fn test_number_beyond_the_fast_path() {
+    assert_true(json::as_num(json::parse("0.25882354378700256")) == 0.25882354378700256)
+    assert_true(json::as_num(json::parse("1.2345678901234567")) == 1.2345678901234567)
+    assert_true(json::as_num(json::parse("0.8500000238418579")) == 0.8500000238418579)
+    assert_true(json::as_num(json::parse("1.0000000000000002")) == 1.0000000000000002)
+    assert_true(json::as_num(json::parse("9007199254740993")) == 9007199254740993.0)
+    assert_true(json::as_num(json::parse("123456789012345678")) == 123456789012345678.0)
+    assert_true(json::as_num(json::parse("0.30000000000000004")) == 0.30000000000000004)
+    assert_true(json::as_num(json::parse("2.2204460492503131e-16")) == 2.2204460492503131e-16)
+}
+
+// magnitudes at both ends of the double range, including the smallest normal and the smallest
+// subnormal. Beyond a net decimal exponent of about +-26 the conversion stops being provably exact
+// (see std/parse/decimal.nori); everything asserted here is inside the range where it is.
+fn test_number_extreme_magnitudes() {
+    assert_true(json::as_num(json::parse("1e22")) == 1e22)
+    assert_true(json::as_num(json::parse("1e26")) == 1e26)
+    assert_true(json::as_num(json::parse("1e-22")) == 1e-22)
+    assert_true(json::as_num(json::parse("1e-26")) == 1e-26)
+    assert_true(json::as_num(json::parse("2.2250738585072014e-308")) == 2.2250738585072014e-308)
+    assert_true(json::as_num(json::parse("5e-324")) == 5e-324)
+    assert_true(json::as_num(json::parse("1e-400")) == 0.0)
+    assert_true(json::as_num(json::parse("1e400")) > 1.7976931348623157e308)
+}
+
+// zero, and the negative zero JSON can spell but a Nori literal cannot. `-0.0 == 0.0` is true in
+// IEEE-754, so the only way to see the sign is to divide into it.
+fn test_number_zero_and_negative_zero() {
+    assert_true(json::as_num(json::parse("0")) == 0.0)
+    assert_true(json::as_num(json::parse("0.0")) == 0.0)
+    assert_true(json::as_num(json::parse("-0")) == 0.0)
+    assert_true(json::as_num(json::parse("-0.0")) == 0.0)
+    assert_true(json::as_num(json::parse("-0.000e12")) == 0.0)
+    assert_true(1.0 / json::as_num(json::parse("0")) > 0.0)
+    assert_true(1.0 / json::as_num(json::parse("-0")) < 0.0)
+    assert_true(1.0 / json::as_num(json::parse("-0.0")) < 0.0)
+}
+
+// signs and exponents in both directions, both cases, with and without an explicit `+`
+fn test_number_exponent_forms() {
+    assert_true(json::as_num(json::parse("1.5E+2")) == 150.0)
+    assert_true(json::as_num(json::parse("1.5e+2")) == 150.0)
+    assert_true(json::as_num(json::parse("-1.5E-2")) == -0.015)
+    assert_true(json::as_num(json::parse("-1.5e2")) == -150.0)
+    assert_true(json::as_num(json::parse("25e-1")) == 2.5)
+    assert_true(json::as_num(json::parse("-25E-1")) == -2.5)
+    assert_true(json::as_num(json::parse("0.00025e4")) == 2.5)
+    assert_true(json::as_num(json::parse("2500000e-6")) == 2.5)
+}
+
+// parse -> stringify -> parse must be the identity on the value.
+//
+// The runtime's Float formatter is a six-significant-digit %g, which would render
+// 0.25882354378700256 as "0.258824" and lose the hard 17-digit cases below. `stringify` instead
+// renders numbers with `std/fmt`'s `float_shortest`, the counterpart of the correctly-rounded
+// reader on the way in. The hard literals are asserted here with `==` on the double, and the
+// rendered text is a fixed point.
+fn test_number_round_trip_hard() {
+    let src = "[0.75,0.6,0.1,0.2,100.001,-1.5e-2,1e22,2.5,0.0025,-0.015625," +
+              "0.25882354378700256,1.2345678901234567,0.30000000000000004,3.141592653589793]"
+    let a = json::parse(src)
+    let text = json::stringify(a)
+    let b = json::parse(text)
+    var i = 0
+    while i < 14 { assert_true(json::as_num(json::at(a, i)) == json::as_num(json::at(b, i)))  i = i + 1 }
+    // and the first hop landed on the literal, not merely somewhere stable
+    assert_true(json::as_num(json::at(a, 0)) == 0.75)
+    assert_true(json::as_num(json::at(a, 4)) == 100.001)
+    assert_true(json::as_num(json::at(a, 6)) == 1e22)
+    // the 17-digit literals are rendered in full, and rendering is idempotent
+    assert_streq(json::stringify(json::at(a, 10)), "0.25882354378700256")
+    assert_streq(json::stringify(json::at(a, 11)), "1.2345678901234567")
+    assert_streq(json::stringify(json::at(a, 12)), "0.30000000000000004")
+    assert_streq(json::stringify(b), text)
+}

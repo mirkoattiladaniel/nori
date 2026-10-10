@@ -1,0 +1,380 @@
+// An HTTP/1.1 client, in Nori, over Nori's own TLS.
+//
+// The HTTP layer is plain Nori over Nori's own TLS: no C library brings its own TLS stack,
+// its own certificate store logic or its own idea of where trust anchors live.
+//
+// The response reader is the part that has to be careful, because a response body's length is
+// decided by the server. Content-Length can lie, chunked encoding can announce a chunk larger than
+// it sends, and either can describe more data than a client should ever hold. So every length here
+// is checked against a cap before anything is allocated for it, and the cap is a parameter rather
+// than a constant so a caller can decide what it is willing to receive.
+
+// Distinct aliases from http.nori's. Every root file of a directory module shares
+// one scope, and importing std/net a second time under the same alias `net` makes its types
+// resolve to nothing, which surfaces as a field error on an unrelated line in the other file, a
+// long way from the cause.
+import "std/net" as hnet
+import "std/tls" as tls
+import "std/strutil" as hstr
+
+/// A parsed URL. `port` is filled in from the scheme when the URL omits it.
+pub struct Url { scheme: Str, host: Str, port: Int, path: Str, err: Str }
+
+/// A completed response. `err` is "" on success; `final_url` is where redirects landed.
+pub struct HttpResponse { status: Int, headers: Str, body: Str, final_url: Str, err: Str }
+
+/// The largest response this client will hold, unless a caller says otherwise (16 MiB).
+///
+/// A cap is not optional. Both Content-Length and chunked framing let a server announce a size,
+/// and a client that believes one allocates whatever it is told to.
+pub fn default_max_body() -> Int { return 16777216 }
+/// How many redirects to follow before giving up: enough for real sites, few enough that a
+/// redirect loop ends.
+pub fn max_redirects() -> Int { return 10 }
+
+/// Split a URL into its parts. Only http and https; anything else is refused by name rather than
+/// guessed at.
+pub fn parse_url(url: Str) -> Url {
+    var scheme = ""
+    var rest = ""
+    if url.len() > 8 { if url.slice(0, 8) == "https://" { scheme = "https"  rest = url.slice(8, url.len()) } }
+    if scheme.len() == 0 { if url.len() > 7 { if url.slice(0, 7) == "http://" { scheme = "http"  rest = url.slice(7, url.len()) } } }
+    if scheme.len() == 0 { return Url { scheme: "", host: "", port: 0, path: "", err: "unsupported URL scheme" } }
+
+    var hostport = rest
+    var path = "/"
+    var i = 0
+    while i < rest.len() {
+        let c = ord(rest.at(i))
+        if c == 47 { hostport = rest.slice(0, i)  path = rest.slice(i, rest.len())  i = rest.len() }
+        else { if c == 63 { hostport = rest.slice(0, i)  path = ("/" + rest.slice(i, rest.len()))  i = rest.len() }
+               else { i = i + 1 } }
+    }
+    // credentials in a URL are not supported, and are refused rather than ignored: ignoring them
+    // would send a request somewhere the caller did not name.
+    if hstr::contains(hostport, "@") { return Url { scheme: "", host: "", port: 0, path: "", err: "credentials in a URL are not supported" } }
+
+    var host = hostport
+    var port = 443
+    if scheme == "http" { port = 80 }
+    let colon = hstr::index_of(hostport, ":")
+    if colon >= 0 {
+        host = hostport.slice(0, colon)
+        let ps = hostport.slice((colon + 1), hostport.len())
+        port = parse_int_or(ps, 0)
+        if port <= 0 { return Url { scheme: "", host: "", port: 0, path: "", err: "bad port in URL" } }
+        if port > 65535 { return Url { scheme: "", host: "", port: 0, path: "", err: "bad port in URL" } }
+    }
+    if host.len() == 0 { return Url { scheme: "", host: "", port: 0, path: "", err: "no host in URL" } }
+    return Url { scheme: scheme, host: copy host, port: port, path: path, err: "" }
+}
+
+fn request_bytes(u: Url, method: Str, extra: Str) -> Str {
+    var r = (((method + " ") + u.path) + " HTTP/1.1\r\n")
+    // Host carries the port only when it is not the scheme's default, which is what servers and
+    // caches expect to see.
+    var hostline = u.host
+    if u.scheme == "https" { if u.port != 443 { hostline = ((u.host + ":") + to_str(u.port)) } }
+    if u.scheme == "http" { if u.port != 80 { hostline = ((u.host + ":") + to_str(u.port)) } }
+    r = (((r + "Host: ") + hostline) + "\r\n")
+    // A caller that put its own User-Agent in `extra` wins; two of the header is worse than either.
+    if hstr::index_of(lc(extra), "user-agent:") < 0 { r = (r + "User-Agent: nori-http/1.0\r\n") }
+    // identity encoding: this client has no decompressor, and asking for one it cannot read would
+    // produce a body it must then throw away.
+    r = (r + "Accept-Encoding: identity\r\n")
+    r = (r + "Accept: */*\r\n")
+    r = (r + "Connection: close\r\n")
+    r = ((r + extra) + "\r\n")
+    return r
+}
+
+// A lowercase copy. `strutil::to_lower` takes its argument by `sink` and so consumes it, which is
+// wrong here: the original headers must survive to have their value sliced out of them.
+fn lc(s: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        var c = ord(s.at(i))
+        if c >= 65 { if c <= 90 { c = (c + 32) } }
+        out = (out + chr(c))
+        i = i + 1
+    }
+    return out
+}
+
+// The value of a header, matched case-insensitively as HTTP requires. "" when absent.
+fn header_value(headers: Str, name: Str) -> Str {
+    let lower_h = lc(headers)
+    let want = (lc(name) + ":")
+    var pos = 0
+    while pos < lower_h.len() {
+        var line_end = hstr::index_of(lower_h.slice(pos, lower_h.len()), "\r\n")
+        if line_end < 0 { line_end = (lower_h.len() - pos) }
+        let line = lower_h.slice(pos, (pos + line_end))
+        if line.len() >= want.len() {
+            if line.slice(0, want.len()) == want {
+                return hstr::trim(headers.slice((pos + want.len()), (pos + line_end)))
+            }
+        }
+        pos = ((pos + line_end) + 2)
+    }
+    return ""
+}
+
+fn hexval(c: Int) -> Int {
+    if c >= 48 { if c <= 57 { return (c - 48) } }
+    if c >= 97 { if c <= 102 { return (c - 87) } }
+    if c >= 65 { if c <= 70 { return (c - 55) } }
+    return 0 - 1
+}
+
+/// Decode a chunked body (RFC 9112 §7.1). "" with `err` set if it is malformed.
+///
+/// Each chunk announces its own size in hex, and the sizes are a running total the server chooses,
+/// so `cap` bounds the decoded result and a body that exceeds it is refused mid-stream rather than
+/// after it has all been held.
+pub fn decode_chunked(body: Str, cap: Int) -> HttpResponse {
+    var out = ""
+    var p = 0
+    while true {
+        var eol = hstr::index_of(body.slice(p, body.len()), "\r\n")
+        if eol < 0 { return HttpResponse { status: 0, headers: "", body: "", final_url: "", err: "truncated chunk header" } }
+        let line = body.slice(p, (p + eol))
+        p = ((p + eol) + 2)
+        // a chunk extension follows a ';' and is ignored, but the size before it must be hex
+        var sizestr = line
+        let semi = hstr::index_of(line, ";")
+        if semi >= 0 { sizestr = line.slice(0, semi) }
+        sizestr = hstr::trim(sizestr)
+        if sizestr.len() == 0 { return HttpResponse { status: 0, headers: "", body: "", final_url: "", err: "empty chunk size" } }
+        var n = 0
+        var i = 0
+        while i < sizestr.len() {
+            let v = hexval(ord(sizestr.at(i)))
+            if v < 0 { return HttpResponse { status: 0, headers: "", body: "", final_url: "", err: "bad chunk size" } }
+            n = ((n * 16) + v)
+            if n > cap { return HttpResponse { status: 0, headers: "", body: "", final_url: "", err: "chunked body over the size limit" } }
+            i = i + 1
+        }
+        if n == 0 { return HttpResponse { status: 0, headers: "", body: out, final_url: "", err: "" } }
+        if (p + n) > body.len() { return HttpResponse { status: 0, headers: "", body: "", final_url: "", err: "truncated chunk" } }
+        out = (out + body.slice(p, (p + n)))
+        if out.len() > cap { return HttpResponse { status: 0, headers: "", body: "", final_url: "", err: "chunked body over the size limit" } }
+        p = ((p + n) + 2)                              // the CRLF that follows every chunk
+    }
+    return HttpResponse { status: 0, headers: "", body: out, final_url: "", err: "" }
+}
+
+// Read everything a connection will give, up to `cap`.
+fn read_all_tls(inout c: tls::Conn, cap: Int) -> RawRead {
+    var all = ""
+    var going = true
+    while going {
+        let chunk = tls::conn_recv(c, 65536)
+        if chunk.len() == 0 { going = false }
+        else {
+            all = (all + chunk)
+            if all.len() > cap { going = false }
+        }
+    }
+    return RawRead { data: all, err: "" }
+}
+// What a read loop stopped for. A connection that closed cleanly ends the body; a timeout or a socket
+// error does not: it leaves a body that merely looks finished. Without Content-Length or chunked
+// framing (an HTTP/1.0-style close-delimited response) nothing downstream can tell those apart, so the
+// reason has to travel with the bytes.
+struct RawRead { data: Str, err: Str }
+
+fn read_all_plain(fd: Int, cap: Int) -> RawRead {
+    var all = ""
+    var going = true
+    var err = ""
+    while going {
+        let ready = hnet::poll_read(fd, 30000)
+        if ready == 0 { err = "the server stopped responding (timed out waiting for more of the body)"  going = false }
+        else if ready < 0 { err = "the connection failed while reading the response"  going = false }
+        else {
+            let r = hnet::tcp_recv(fd, 65536)
+            if r.n < 0 { err = "the connection failed while reading the response"  going = false }
+            else if r.n == 0 { going = false }                      // clean close: the body ends here
+            else {
+                all = (all + r.data)
+                if all.len() > cap { going = false }
+            }
+        }
+    }
+    return RawRead { data: all, err: err }
+}
+fn send_all_plain(fd: Int, data: Str) -> Bool {
+    var off = 0
+    while off < data.len() {
+        let n = hnet::tcp_send(fd, data.slice(off, data.len()))
+        if n <= 0 { return false }
+        off = (off + n)
+    }
+    return true
+}
+
+fn fail(why: Str) -> HttpResponse {
+    return HttpResponse { status: 0, headers: "", body: "", final_url: "", err: copy why }
+}
+
+/// POST `body` to `url` with an optional `X-Nori-Token`. "" on success, otherwise the reason.
+///
+/// Does not follow redirects. A redirect on a POST is where a body gets replayed to
+/// somewhere the caller never named, and where, historically, clients have quietly turned it into
+/// a GET. If a report endpoint moves, the caller should be told rather than have its body forwarded.
+pub fn post(url: Str, token: Str, ctype: Str, body: Str) -> Str {
+    let u = parse_url(url)
+    if u.err.len() > 0 { return copy u.err }
+    var extra = ((("Content-Type: " + ctype) + "\r\n"))
+    extra = ((extra + "Content-Length: ") + to_str(body.len())) + "\r\n"
+    if token.len() > 0 { extra = ((extra + "X-Nori-Token: ") + token) + "\r\n" }
+    let r = fetch_with_body(url, "POST", extra, body, default_max_body())
+    if r.err.len() > 0 { return copy r.err }
+    if r.status < 200 { return ("unexpected status " + to_str(r.status)) }
+    if r.status >= 300 { return ("server said " + to_str(r.status)) }
+    return ""
+}
+
+/// POST a plain-text report.
+pub fn post_report(url: Str, token: Str, report: Str) -> Str {
+    return post(url, token, "text/plain; charset=utf-8", report)
+}
+
+/// One request, with no redirect following.
+pub fn fetch_once(url: Str, method: Str, extra_headers: Str, cap: Int) -> HttpResponse {
+    return fetch_with_body(url, method, extra_headers, "", cap)
+}
+
+/// One request that may carry a body. `fetch_once` is this with an empty one.
+pub fn fetch_with_body(url: Str, method: Str, extra_headers: Str, body: Str, cap: Int) -> HttpResponse {
+    let u = parse_url(url)
+    if u.err.len() > 0 { return fail(u.err) }
+    let fd = hnet::tcp_connect_host(u.host, u.port)
+    if fd < 0 { return fail(("could not connect to " + u.host)) }
+    let req = (request_bytes(u, method, extra_headers) + body)
+
+    var raw = ""
+    if u.scheme == "https" {
+        var c = tls::handshake(fd, u.host)
+        if c.err.len() > 0 {
+            let e = c.err
+            tls::conn_close(c)
+            return fail(e)
+        }
+        if tls::conn_send(c, req) != req.len() { tls::conn_close(c)  return fail("could not send the request") }
+        let rr = read_all_tls(c, cap)
+        tls::conn_close(c)
+        if rr.err.len() > 0 { return fail(rr.err) }
+        raw = copy rr.data
+    } else {
+        if !send_all_plain(fd, req) { hnet::sock_close(fd)  return fail("could not send the request") }
+        let rr = read_all_plain(fd, cap)
+        hnet::sock_close(fd)
+        if rr.err.len() > 0 { return fail(rr.err) }
+        raw = copy rr.data
+    }
+    if raw.len() == 0 { return fail("the server sent no response") }
+
+    let sep = hstr::index_of(raw, "\r\n\r\n")
+    if sep < 0 { return fail("no header terminator in the response") }
+    let head = raw.slice(0, sep)
+    var body = raw.slice((sep + 4), raw.len())
+
+    let first_eol = hstr::index_of(head, "\r\n")
+    var statusline = head
+    var headers = ""
+    if first_eol >= 0 {
+        statusline = head.slice(0, first_eol)
+        headers = head.slice((first_eol + 2), head.len())
+    }
+    // HTTP/1.1 200 OK
+    let sp1 = hstr::index_of(statusline, " ")
+    if sp1 < 0 { return fail("malformed status line") }
+    let after = statusline.slice((sp1 + 1), statusline.len())
+    let sp2 = hstr::index_of(after, " ")
+    var codestr = after
+    if sp2 >= 0 { codestr = after.slice(0, sp2) }
+    let status = parse_int_or(hstr::trim(codestr), 0)
+    if status < 100 { return fail("malformed status code") }
+    if status > 599 { return fail("malformed status code") }
+
+    let te = lc(header_value(headers, "Transfer-Encoding"))
+    if hstr::contains(te, "chunked") {
+        let d = decode_chunked(body, cap)
+        if d.err.len() > 0 { return fail(d.err) }
+        body = copy d.body
+    } else {
+        // Content-Length, when present and sane, decides where the body ends. A connection that
+        // closed early gives fewer bytes than promised, and that is a truncated response rather
+        // than a short one to be accepted quietly.
+        let cl = header_value(headers, "Content-Length")
+        if cl.len() > 0 {
+            let n = parse_int_or(cl, 0 - 1)
+            if n < 0 { return fail("bad Content-Length") }
+            if n > cap { return fail("response over the size limit") }
+            if body.len() < n { return fail("the response body is shorter than Content-Length") }
+            body = body.slice(0, n)
+        }
+    }
+    if body.len() > cap { return fail("response over the size limit") }
+    return HttpResponse { status: status, headers: headers, body: copy body, final_url: copy url, err: "" }
+}
+
+// Resolve a Location header against the URL it came from.
+fn resolve_location(base: Url, loc: Str) -> Str {
+    if loc.len() == 0 { return "" }
+    if loc.len() > 7 { if loc.slice(0, 7) == "http://" { return copy loc } }
+    if loc.len() > 8 { if loc.slice(0, 8) == "https://" { return copy loc } }
+    var origin = (((base.scheme + "://") + base.host))
+    if base.scheme == "https" { if base.port != 443 { origin = ((origin + ":") + to_str(base.port)) } }
+    if base.scheme == "http" { if base.port != 80 { origin = ((origin + ":") + to_str(base.port)) } }
+    if ord(loc.at(0)) == 47 { return (origin + loc) }       // an absolute path
+    // a relative path, against the directory of the current one
+    var dir = "/"
+    var i = base.path.len() - 1
+    while i >= 0 {
+        if ord(base.path.at(i)) == 47 { dir = base.path.slice(0, (i + 1))  i = 0 - 1 }
+        else { i = i - 1 }
+    }
+    return ((origin + dir) + loc)
+}
+
+/// Fetch a URL, following redirects. The response is the one that finally answered.
+pub fn fetch(url: Str, cap: Int) -> HttpResponse { return fetch_hdr(url, cap, "") }
+
+/// Fetch a URL with extra request headers (CRLF-terminated lines), following redirects.
+///
+/// What a site sends is decided before any of it is rendered: plenty of servers choose their mobile
+/// or desktop markup from the User-Agent alone, so a client naming itself honestly and unfamiliarly
+/// is handed the desktop page, or an "unsupported browser" notice, however well it draws. A
+/// `User-Agent:` line here replaces the default rather than joining it. The headers ride every hop,
+/// because a redirect that lands on the mobile host must be asked the same question as the first.
+pub fn fetch_hdr(url: Str, cap: Int, extra: Str) -> HttpResponse {
+    var current = url
+    var hops = 0
+    while hops <= max_redirects() {
+        let r = fetch_once(current, "GET", extra, cap)
+        if r.err.len() > 0 { return r }
+        var redirect = false
+        if r.status == 301 { redirect = true }
+        if r.status == 302 { redirect = true }
+        if r.status == 303 { redirect = true }
+        if r.status == 307 { redirect = true }
+        if r.status == 308 { redirect = true }
+        if !redirect { return HttpResponse { status: r.status, headers: copy r.headers, body: copy r.body, final_url: copy copy current, err: "" } }
+        let loc = header_value(r.headers, "Location")
+        if loc.len() == 0 { return fail("a redirect with no Location header") }
+        let base = parse_url(current)
+        if base.err.len() > 0 { return fail(base.err) }
+        let next = resolve_location(base, loc)
+        if next.len() == 0 { return fail("could not resolve the redirect target") }
+        // A redirect that leads back where it came from is a loop, and the hop count is what ends
+        // it, but saying so is more useful than counting to ten first.
+        if next == current { return fail("a redirect pointing at itself") }
+        current = copy next
+        hops = hops + 1
+    }
+    return fail("too many redirects")
+}

@@ -1,0 +1,92 @@
+// Tests for std/result. Run with
+//   noric --test std/result/result_test.nori compiler/runtime.nori --import-root .
+import "std/result" as r
+
+fn mkv() -> Vec<Int> { var v: Vec<Int> = vec()  v.push(10)  v.push(20)  v.push(30)  return v }
+
+fn test_is_int() {
+    assert_true(r::is_int("0"))
+    assert_true(r::is_int("12345"))
+    assert_true(r::is_int("-42"))
+    assert_false(r::is_int(""))
+    assert_false(r::is_int("-"))
+    assert_false(r::is_int("12a"))
+    assert_false(r::is_int("3.14"))
+    assert_false(r::is_int(" 5"))
+}
+
+fn test_try_parse_int() {
+    var ok = r::try_parse_int("123")
+    assert_true(r::is_ok(ok))
+    assert_eq(r::ok_or(copy ok, -1), 123)
+
+    var neg = r::try_parse_int("-7")
+    assert_true(r::is_ok(neg))
+    assert_eq(r::ok_or(neg, 0), -7)
+
+    var bad = r::try_parse_int("nope")
+    assert_false(r::is_ok(bad))
+    assert_eq(r::ok_or(bad, 999), 999)
+}
+
+fn test_try_div() {
+    var ok = r::try_div(20, 4)
+    assert_true(r::is_ok(ok))
+    assert_eq(r::ok_or(copy ok, -1), 5)
+
+    var zero = r::try_div(1, 0)
+    assert_false(r::is_ok(zero))
+    assert_eq(r::ok_or(zero, 42), 42)
+}
+
+fn test_vget() {
+    var v = mkv()
+    var hit = r::vget(v, 1)
+    assert_true(r::is_some(hit))
+    assert_eq(r::unwrap_or(hit, -1), 20)
+
+    var lo = r::vget(v, -1)
+    assert_false(r::is_some(lo))
+    assert_eq(r::unwrap_or(lo, 77), 77)
+
+    var hi = r::vget(v, 3)
+    assert_false(r::is_some(hi))
+    assert_eq(r::unwrap_or(hi, 88), 88)
+
+    var first = r::vget(v, 0)
+    assert_eq(r::unwrap_or(first, -1), 10)
+}
+
+fn test_mget() {
+    var mp: Map<Str, Int> = map()
+    mp.put("a", 1)
+    mp.put("b", 2)
+
+    var hit = r::mget(mp, "b")
+    assert_true(r::is_some(hit))
+    assert_eq(r::unwrap_or(hit, -1), 2)
+
+    var miss = r::mget(mp, "zzz")
+    assert_false(r::is_some(miss))
+    assert_eq(r::unwrap_or(miss, 55), 55)
+}
+
+fn test_unwrap_or_some_none() {
+    var some = Option::Some(7)
+    assert_eq(r::unwrap_or(copy some, 0), 7)
+    assert_true(r::is_some(some))
+
+    var none: Option<Int> = Option::None
+    assert_eq(r::unwrap_or(copy none, 99), 99)
+    assert_false(r::is_some(none))
+}
+
+fn test_ok_or_is_ok() {
+    var ok: Result<Int> = Result::Ok(5)
+    assert_eq(r::ok_or(copy ok, 0), 5)
+    assert_true(r::is_ok(ok))
+
+    var err: Result<Int> = Result::Err("boom")
+    assert_eq(r::ok_or(copy err, 100), 100)
+    assert_false(r::is_ok(err))
+}

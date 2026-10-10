@@ -1,0 +1,180 @@
+//! std/table: `Table<T>`, the query layer for `durable var`.
+//!
+//! A `Table<T>` is an ordered collection of rows with typed, closure-driven queries. It is an ordinary
+//! serializable struct, so `durable var users: Table<User>` persists with no glue: the compiler's
+//! type-directed serializer walks it like any other value.
+//!
+//! Predicates are plain closures (`users.where(|u| u.age > 18)`), so they are typed and checked at
+//! compile time, with no SQL string and no marshaling.
+//!
+//! `where` scans. For a repeated equality lookup, `index_get(name, key, keyfn)` keeps a keyed index and
+//! answers in O(1). The key function is passed at the call site rather than stored, because a closure
+//! cannot be serialized and a `Table` has to persist, so the index holds only data (key -> row
+//! positions) and is brought up to date lazily: a lookup indexes whatever rows were appended since the
+//! last one, which is O(new rows), not a full rebuild.
+//!
+//! You rarely write that yourself: an equality query on a field (`where`, `count_where`, `any` or
+//! `find` with a predicate like `|u| u.name == who`) is compiled into the matching index call, keyed
+//! on that field. The closure stays the API; the index is an implementation detail. The compiler leaves
+//! the scan in place when it cannot prove the two agree: a non-equality predicate, a key that is a call
+//! (a scan would evaluate it per row), a receiver whose type it cannot see, or a program that assigns
+//! that field name anywhere (a row mutated in place would leave a keyed index stale). `index_get` and
+//! friends stay public for the cases the rewrite declines, and for keys that are not a plain field.
+
+/// An ordered, persistable collection of rows. `next_id` makes ids monotonic even across deletions,
+/// so a stored id stays meaningful for the life of the table.
+pub struct Table<T> { rows: Vec<T>, ids: Vec<Int>, next_id: Int, transient idx: Map<Str, Vec<Int>>, transient idx_upto: Map<Str, Int> }
+
+/// an empty table. Use this rather than a struct literal: the index fields are implementation detail
+/// and may change; a `durable var` gets an empty table automatically and needs no constructor at all.
+pub fn new<T>() -> Table<T> {
+    return Table { rows: vec(), ids: vec(), next_id: 0, idx: map(), idx_upto: map() }
+}
+
+impl Table<T> {
+    /// number of rows.
+    fn count(self) -> Int { return self.rows.len() }
+
+    /// append `row`; returns its id (monotonic, never reused).
+    fn insert(inout self, sink row: T) -> Int {
+        let id = self.next_id
+        self.rows.push(row)
+        self.ids.push(id)
+        self.next_id = id + 1
+        return id
+    }
+
+    /// every row, in insertion order.
+    fn all(self) -> view Vec<T> { return self.rows }
+
+    /// the id of the row at position `i`.
+    fn id_at(self, i: Int) -> Int { return self.ids[i] }
+
+    /// rows matching `pred`, in insertion order. Scans.
+    fn where(self, pred: Fn) -> Vec<T> {
+        var out: Vec<T> = vec()
+        var i = 0
+        while i < self.rows.len() { if pred(self.rows[i]) { out.push(copy self.rows[i]) }  i = i + 1 }
+        return out
+    }
+
+    /// how many rows match `pred`.
+    fn count_where(self, pred: Fn) -> Int {
+        var n = 0
+        var i = 0
+        while i < self.rows.len() { if pred(self.rows[i]) { n = n + 1 }  i = i + 1 }
+        return n
+    }
+
+    /// true if any row matches.
+    fn any(self, pred: Fn) -> Bool {
+        var i = 0
+        while i < self.rows.len() { if pred(self.rows[i]) { return true }  i = i + 1 }
+        return false
+    }
+
+    /// position of the first matching row, or -1. Use with `at` to read it.
+    fn find(self, pred: Fn) -> Int {
+        var i = 0
+        while i < self.rows.len() { if pred(self.rows[i]) { return i }  i = i + 1 }
+        return 0 - 1
+    }
+
+    /// the row at position `i`.
+    fn at(self, i: Int) -> view T { return self.rows[i] }
+
+    /// position of the row with id `id`, or -1.
+    fn index_of_id(self, id: Int) -> Int {
+        var i = 0
+        while i < self.ids.len() { if self.ids[i] == id { return i }  i = i + 1 }
+        return 0 - 1
+    }
+
+    /// internal: bring index `name` up to date by applying `keyfn` to the rows appended since the last
+    /// sync. Rows are only ever appended (delete/clear reset the indexes), so an indexed row is never
+    /// revisited and the cost is O(new rows), not a rebuild.
+    fn index_sync(inout self, name: Str, keyfn: Fn(T)->Str) {
+        var from = 0
+        if self.idx_upto.has(name) { from = self.idx_upto.get(name) }
+        var i = from
+        while i < self.rows.len() {
+            let k = idx_key(name, keyfn(self.rows[i]))
+            if self.idx.has(k) { var ps = copy self.idx.get(k)  ps.push(i)  self.idx.put(k, sink ps) }
+            else { var ps2: Vec<Int> = vec()  ps2.push(i)  self.idx.put(k, ps2) }
+            i = i + 1
+        }
+        self.idx_upto.put(name, self.rows.len())
+    }
+
+    /// rows whose key equals `key`, using the index called `name`. `keyfn` maps a row to its key and is
+    /// applied only to rows not yet indexed, so the first call costs one scan and later calls are O(1).
+    /// Passing a different `keyfn` for the same `name` is a caller error, since the index is keyed by name.
+    fn index_get(inout self, name: Str, key: Str, keyfn: Fn(T)->Str) -> Vec<T> {
+        self.index_sync(name, keyfn)
+        var out: Vec<T> = vec()
+        let k = idx_key(name, key)
+        if self.idx.has(k) {
+            let ps = self.idx.get(k)
+            var i = 0
+            while i < ps.len() { out.push(copy self.rows[ps[i]])  i = i + 1 }
+        }
+        return out
+    }
+
+    /// how many rows have this key. Same indexing rules as `index_get`.
+    fn index_count(inout self, name: Str, key: Str, keyfn: Fn(T)->Str) -> Int {
+        self.index_sync(name, keyfn)
+        let k = idx_key(name, key)
+        if self.idx.has(k) { return self.idx.get(k).len() }
+        return 0
+    }
+
+    /// true if any row has this key.
+    fn index_has(inout self, name: Str, key: Str, keyfn: Fn(T)->Str) -> Bool {
+        return self.index_count(name, key, keyfn) > 0
+    }
+
+    /// position of the first row with this key, or -1: the indexed answer to `find`. Positions are
+    /// recorded in insertion order, so this is the same row a scan would stop at.
+    fn index_find(inout self, name: Str, key: Str, keyfn: Fn(T)->Str) -> Int {
+        self.index_sync(name, keyfn)
+        let k = idx_key(name, key)
+        if self.idx.has(k) { let ps = self.idx.get(k)  if ps.len() > 0 { return ps[0] } }
+        return 0 - 1
+    }
+
+    /// forget every index. They are derived data, so this only costs the next lookup a rescan.
+    fn index_reset(inout self) {
+        self.idx = map()
+        self.idx_upto = map()
+    }
+
+    /// delete every row matching `pred`; returns how many went. Order of the survivors is preserved.
+    fn delete_where(inout self, pred: Fn) -> Int {
+        var keep: Vec<T> = vec()
+        var keep_ids: Vec<Int> = vec()
+        var gone = 0
+        var i = 0
+        while i < self.rows.len() {
+            if pred(self.rows[i]) { gone = gone + 1 }
+            else { keep.push(copy self.rows[i])  keep_ids.push(self.ids[i]) }
+            i = i + 1
+        }
+        self.rows = keep
+        self.ids = keep_ids
+        self.index_reset()         // positions shifted: the indexes no longer point at the right rows
+        return gone
+    }
+
+    /// remove every row.
+    fn clear(inout self) {
+        self.rows = vec()
+        self.ids = vec()
+        self.index_reset()
+    }
+}
+
+// ---- index internals -------------------------------------------------------
+// One Map holds every index, so a table can carry several without nesting maps: the entry key is
+// "<index name>\u0001<row key>". A separate map tracks how many rows each index has already seen.
+fn idx_key(name: Str, key: Str) -> Str { return (name + ("\u0001" + key)) }

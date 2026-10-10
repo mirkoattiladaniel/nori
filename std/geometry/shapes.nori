@@ -1,0 +1,106 @@
+//! std/geometry, shapes.nori: the primitive shapes (Ray, Aabb, Plane, Sphere) and the queries
+//! that involve only one or two of them. The ray-vs-shape intersections live in `intersect.nori`
+//! and the view frustum in `frustum.nori`; the shared `RayHit`/`AabbHit`/`TriHit` result structs are
+//! declared in `geometry.nori`, this module's entry file.
+
+import "std/math" as m
+
+pub struct Ray { origin: m::Vec3, dir: m::Vec3 }
+pub struct Aabb { min: m::Vec3, max: m::Vec3 }
+/// a plane as `dot(normal, p) + d == 0`. `normal` is unit for every constructor here, which makes
+/// `plane_signed_distance` a true distance rather than a scaled one.
+pub struct Plane { normal: m::Vec3, d: Float }
+pub struct Sphere { center: m::Vec3, radius: Float }
+
+// ---------------- Ray ----------------
+/// a ray from an origin and a direction. `dir` is not normalized here; do it yourself if you want
+/// `t` to be a world distance.
+pub fn ray(origin: m::Vec3, dir: m::Vec3) -> Ray { return Ray { origin: copy origin, dir: copy dir } }
+/// a ray with a unit direction, so every `t` it produces is a world distance.
+pub fn ray_normalized(origin: m::Vec3, dir: m::Vec3) -> Ray { return Ray { origin: copy origin, dir: m::vec3_normalize(dir) } }
+/// the point at parameter `t`.
+pub fn ray_at(r: Ray, t: Float) -> m::Vec3 { return m::vec3_add(r.origin, m::vec3_scale(r.dir, t)) }
+
+// ---------------- Aabb ----------------
+/// a box from its two corners. They are not sorted; see `aabb_from_corners` if they might be swapped.
+pub fn aabb(min: m::Vec3, max: m::Vec3) -> Aabb { return Aabb { min: copy min, max: copy max } }
+/// a box from two arbitrary corners, sorted componentwise.
+pub fn aabb_from_corners(a: m::Vec3, b: m::Vec3) -> Aabb { return Aabb { min: m::vec3_min(a, b), max: m::vec3_max(a, b) } }
+/// a box from its centre and its half-extents.
+pub fn aabb_from_center_extents(c: m::Vec3, e: m::Vec3) -> Aabb { return Aabb { min: m::vec3_sub(c, e), max: m::vec3_add(c, e) } }
+/// the empty box: min at +infinity, max at -infinity, so merging any point into it gives that point.
+///
+/// This inversion is intentional: a box built by folding `aabb_merge_point` over a mesh needs a
+/// starting value that loses to everything, and a zero-sized box at the origin would instead pull
+/// every bound toward the origin.
+pub fn aabb_empty() -> Aabb { return Aabb { min: m::vec3_splat(1.0e300), max: m::vec3_splat(-1.0e300) } }
+/// true when the box holds no volume (any axis inverted), which is what `aabb_empty` returns.
+pub fn aabb_is_empty(a: Aabb) -> Bool { return a.min.x > a.max.x || a.min.y > a.max.y || a.min.z > a.max.z }
+/// the box's centre.
+pub fn aabb_center(a: Aabb) -> m::Vec3 { return m::vec3_scale(m::vec3_add(a.min, a.max), 0.5) }
+/// the box's half-extents: centre plus these is `max`.
+pub fn aabb_extents(a: Aabb) -> m::Vec3 { return m::vec3_scale(m::vec3_sub(a.max, a.min), 0.5) }
+/// the box's full size along each axis.
+pub fn aabb_size(a: Aabb) -> m::Vec3 { return m::vec3_sub(a.max, a.min) }
+/// the smallest box containing both.
+pub fn aabb_merge(a: Aabb, b: Aabb) -> Aabb { return Aabb { min: m::vec3_min(a.min, b.min), max: m::vec3_max(a.max, b.max) } }
+/// the smallest box containing `a` and the point `p`.
+pub fn aabb_merge_point(a: Aabb, p: m::Vec3) -> Aabb { return Aabb { min: m::vec3_min(a.min, p), max: m::vec3_max(a.max, p) } }
+/// the box grown by `k` on every side.
+pub fn aabb_expand(a: Aabb, k: Float) -> Aabb { return Aabb { min: m::vec3_sub(a.min, m::vec3_splat(k)), max: m::vec3_add(a.max, m::vec3_splat(k)) } }
+/// true when the point is inside or on the boundary.
+pub fn aabb_contains_point(a: Aabb, p: m::Vec3) -> Bool { return p.x >= a.min.x && p.x <= a.max.x && p.y >= a.min.y && p.y <= a.max.y && p.z >= a.min.z && p.z <= a.max.z }
+/// true when `b` lies entirely within `a`.
+pub fn aabb_contains_aabb(a: Aabb, b: Aabb) -> Bool { return aabb_contains_point(a, b.min) && aabb_contains_point(a, b.max) }
+/// true when the two boxes overlap (touching faces count).
+pub fn aabb_intersects_aabb(a: Aabb, b: Aabb) -> Bool { return a.min.x <= b.max.x && a.max.x >= b.min.x && a.min.y <= b.max.y && a.max.y >= b.min.y && a.min.z <= b.max.z && a.max.z >= b.min.z }
+/// the smallest axis-aligned box containing the transformed box.
+///
+/// The eight corners are never built: a box's half-extent along an axis after an affine map is the
+/// absolute-valued matrix applied to the old half-extents, which is three dot products instead of
+/// eight transforms and a fold.
+pub fn aabb_transform(a: Aabb, tm: m::Mat4) -> Aabb {
+    let c = m::mat4_transform_point3(tm, aabb_center(a))
+    let e = aabb_extents(a)
+    let b = m::mat3_from_mat4(tm)
+    let ex = m::fabs(b.x_axis.x) * e.x + m::fabs(b.y_axis.x) * e.y + m::fabs(b.z_axis.x) * e.z
+    let ey = m::fabs(b.x_axis.y) * e.x + m::fabs(b.y_axis.y) * e.y + m::fabs(b.z_axis.y) * e.z
+    let ez = m::fabs(b.x_axis.z) * e.x + m::fabs(b.y_axis.z) * e.y + m::fabs(b.z_axis.z) * e.z
+    return Aabb { min: m::vec3_sub(c, m::vec3(ex, ey, ez)), max: m::vec3_add(c, m::vec3(ex, ey, ez)) }
+}
+/// the point of the box nearest to `p` (`p` itself when it is inside).
+pub fn aabb_closest_point(a: Aabb, p: m::Vec3) -> m::Vec3 { return m::vec3_min(m::vec3_max(p, a.min), a.max) }
+
+// ---------------- Plane ----------------
+/// a plane through `p` with unit normal `n`.
+pub fn plane_from_point_normal(p: m::Vec3, n: m::Vec3) -> Plane {
+    let u = m::vec3_normalize(n)
+    let d = 0.0 - m::vec3_dot(u, p)
+    return Plane { normal: u, d: d }
+}
+/// the plane through three points, its normal following the right-hand rule around a, b, c.
+pub fn plane_from_points(a: m::Vec3, b: m::Vec3, c: m::Vec3) -> Plane { return plane_from_point_normal(a, m::vec3_cross(m::vec3_sub(b, a), m::vec3_sub(c, a))) }
+/// signed distance from the plane to `p`: positive on the normal's side.
+pub fn plane_signed_distance(pl: Plane, p: m::Vec3) -> Float { return m::vec3_dot(pl.normal, p) + pl.d }
+/// `p` projected perpendicularly onto the plane.
+pub fn plane_project_point(pl: Plane, p: m::Vec3) -> m::Vec3 { return m::vec3_sub(p, m::vec3_scale(pl.normal, plane_signed_distance(pl, p))) }
+/// the same plane with a unit normal (and `d` scaled to match).
+pub fn plane_normalize(pl: Plane) -> Plane {
+    let l = m::vec3_length(pl.normal)
+    if l <= 1.0e-30 { return Plane { normal: m::vec3_zero(), d: 0.0 } }
+    return Plane { normal: m::vec3_scale(pl.normal, 1.0 / l), d: pl.d / l }
+}
+
+// ---------------- Sphere ----------------
+/// a sphere from a centre and a radius.
+pub fn sphere(center: m::Vec3, radius: Float) -> Sphere { return Sphere { center: copy center, radius: radius } }
+/// true when `p` is inside or on the surface.
+pub fn sphere_contains_point(s: Sphere, p: m::Vec3) -> Bool { return m::vec3_distance_sq(s.center, p) <= s.radius * s.radius }
+/// true when the two spheres overlap.
+pub fn sphere_intersects_sphere(a: Sphere, b: Sphere) -> Bool {
+    let r = a.radius + b.radius
+    return m::vec3_distance_sq(a.center, b.center) <= r * r
+}
+/// true when the sphere and the box overlap: the box's nearest point is within the radius.
+pub fn sphere_intersects_aabb(s: Sphere, a: Aabb) -> Bool { return m::vec3_distance_sq(aabb_closest_point(a, s.center), s.center) <= s.radius * s.radius }
+

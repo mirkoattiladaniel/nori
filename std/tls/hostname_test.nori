@@ -1,0 +1,69 @@
+// Hostname matching (RFC 6125), run with
+//   noric --test std/tls/hostname_test.nori compiler/runtime.nori --import-root .
+//
+// This is a small function with a long history of being wrong, and every case below is a shape
+// that has been accepted somewhere it should not have been. A wildcard that spans a dot turns a
+// certificate for one subdomain into a certificate for the whole tree beneath it; a bare `*`
+// turns one into a certificate for the internet; and a NUL byte turns `evil.com\0good.com` into
+// two different names depending on who is reading it.
+import "std/tls" as tls
+
+fn test_exact_matches() {
+    assert_true(tls::name_matches("example.com", "example.com"))
+    assert_true(tls::name_matches("www.example.com", "www.example.com"))
+    // DNS is case-insensitive, and a certificate may be issued in any case
+    assert_true(tls::name_matches("EXAMPLE.com", "example.COM"))
+    assert_true(!tls::name_matches("example.com", "example.org"))
+    assert_true(!tls::name_matches("example.com", "www.example.com"))
+    assert_true(!tls::name_matches("www.example.com", "example.com"))
+    // a suffix is not a match: evil-example.com must not match example.com
+    assert_true(!tls::name_matches("example.com", "evil-example.com"))
+    assert_true(!tls::name_matches("example.com", "notexample.com"))
+}
+
+fn test_wildcards_cover_exactly_one_label() {
+    assert_true(tls::name_matches("*.example.com", "www.example.com"))
+    assert_true(tls::name_matches("*.example.com", "anything.example.com"))
+    // The classic failure: a wildcard must not span a dot
+    assert_true(!tls::name_matches("*.example.com", "a.b.example.com"))
+    // nor match the bare parent
+    assert_true(!tls::name_matches("*.example.com", "example.com"))
+    // nor an empty leftmost label
+    assert_true(!tls::name_matches("*.example.com", ".example.com"))
+}
+
+fn test_wildcards_only_as_a_whole_leftmost_label() {
+    // Partial wildcards are permitted by RFC 6125 and rejected by every browser, because
+    // `w*.example.com` also matches names the issuer never considered.
+    assert_true(!tls::name_matches("w*.example.com", "www.example.com"))
+    assert_true(!tls::name_matches("*w.example.com", "www.example.com"))
+    assert_true(!tls::name_matches("www.*.com", "www.example.com"))
+    assert_true(!tls::name_matches("www.example.*", "www.example.com"))
+    // a wildcard anywhere but the front is not a wildcard at all
+    assert_true(!tls::name_matches("www.*.example.com", "www.a.example.com"))
+}
+
+fn test_a_bare_or_too_broad_wildcard_matches_nothing() {
+    assert_true(!tls::name_matches("*", "example.com"))
+    assert_true(!tls::name_matches("*", "com"))
+    assert_true(!tls::name_matches("*.", "example."))
+    // `*.com` would be a certificate for every commercial domain
+    assert_true(!tls::name_matches("*.com", "example.com"))
+    assert_true(!tls::name_matches("*.org", "example.org"))
+    // two labels below the wildcard is the minimum
+    assert_true(tls::name_matches("*.example.com", "www.example.com"))
+    assert_true(tls::name_matches("*.co.uk", "example.co.uk"))
+}
+
+fn test_embedded_nul_never_matches() {
+    // "evil.com\0good.com" reads as one name to a length-counted string and another to a C string
+    assert_true(!tls::name_matches(("evil.com" + chr(0)) + "good.com", "good.com"))
+    assert_true(!tls::name_matches(("evil.com" + chr(0)) + "good.com", "evil.com"))
+    assert_true(!tls::name_matches(("*.evil.com" + chr(0)) + ".good.com", "x.good.com"))
+}
+
+fn test_empty_inputs_match_nothing() {
+    assert_true(!tls::name_matches("", "example.com"))
+    assert_true(!tls::name_matches("example.com", ""))
+    assert_true(!tls::name_matches("", ""))
+}

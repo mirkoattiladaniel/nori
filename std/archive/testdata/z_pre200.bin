@@ -1,0 +1,2 @@
+//! std/archive — a Brotli decoder (RFC 7932), for WOFF2 web fonts (which Brotli-compress the
+//! SFNT table data). Built up in layers: bit reader + prefix codes (here, unit-tested), then meta-block

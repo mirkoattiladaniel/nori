@@ -1,0 +1,128 @@
+// Snake: a small playable game in Nori, rendered with raylib.
+//
+// This example exercises Nori's C interop end to end:
+//   * namespaced bindgen -- `extern raylib "vendor/raylib.h"` binds the whole API under `raylib::`,
+//                           so library calls (raylib::DrawRectangle) read distinctly from your own
+//                           functions and the inline-C helpers (body_hit, each_cell, hud_label)
+//   * by-value structs   -- raylib::Color / raylib::Vector2 are passed to raylib by value
+//   * enums              -- raylib::KEY_RIGHT / raylib::KEY_W / ... come from raylib's `typedef enum`
+//   * floats             -- DrawCircleV takes a Vector2 and an F32 radius
+//   * strings            -- a Nori Str goes to DrawText as a `const char*`
+//   * inline C           -- `extern c { ... }` for game helpers, compiled and linked by the build
+//   * array marshalling  -- a Nori `Vec<I32>` is passed to C as an `int*` (the snake body)
+//   * callbacks          -- C calls back into a Nori closure to draw each body cell
+//   * a captured closure -- the draw closure captures the cell color (a Color struct)
+//   * string returns     -- an inline-C helper returns a `const char*`, marshalled to a Nori Str
+//
+// The executable links libraylib.so dynamically: `-Lvendor` points the build at vendor/ (where
+// build-raylib.sh leaves it), and the program records that directory, relative to itself, as its run
+// path, so `roll run` needs no LD_LIBRARY_PATH.
+
+extern raylib "vendor/raylib.h" link "-Lvendor raylib"
+
+// Game-logic helpers written directly in C and bound automatically (they stay bare: they are yours).
+extern c {
+    // self-collision: is (hx,hy) any of the n body cells? (Vec<I32> -> int* by copy)
+    int body_hit(int* xs, int* ys, int n, int hx, int hy) {
+        for (int i = 0; i < n; i++) if (xs[i] == hx && ys[i] == hy) return 1;
+        return 0;
+    }
+    // walk the body, calling back into Nori for each cell (array marshalling + a Nori callback)
+    void each_cell(int* xs, int* ys, int n, void (*cell)(int x, int y)) {
+        for (int i = 0; i < n; i++) cell(xs[i], ys[i]);
+    }
+    // HUD text built with snprintf (inline C + a const char* return -> Nori Str)
+    const char* hud_label(int score, int length) {
+        static char buf[64];
+        snprintf(buf, sizeof buf, "Score %d    Length %d    [arrows/WASD]  R: restart", score, length);
+        return buf;
+    }
+}
+
+global CELL: Int = 24                 // pixel size of one grid cell
+global COLS: Int = 26
+global ROWS: Int = 20
+
+fn main() -> Int {
+    let w = COLS * CELL
+    let h = ROWS * CELL + CELL          // extra row for the HUD
+    raylib::InitWindow(w, h, "Nori Snake")
+    raylib::SetTargetFPS(60)
+
+    // mutable game state
+    var xs: Vec<I32> = vec()            // body cells, index 0 = head
+    var ys: Vec<I32> = vec()
+    var dx: Int = 1
+    var dy: Int = 0
+    var fx: Int = 0
+    var fy: Int = 0
+    var score: Int = 0
+    var alive: Bool = true
+    var tick: Int = 0
+    var started: Bool = false
+
+    while !raylib::WindowShouldClose() {
+        // ---- (re)start ----
+        if !started || (!alive && raylib::IsKeyPressed(raylib::KEY_R)) {
+            var nxs: Vec<I32> = vec()  var nys: Vec<I32> = vec()
+            nxs.push(COLS / 2)  nys.push(ROWS / 2)
+            xs = sink nxs  ys = sink nys
+            dx = 1  dy = 0  score = 0  alive = true  tick = 0  started = true
+            fx = raylib::GetRandomValue(0, COLS - 1)
+            fy = raylib::GetRandomValue(0, ROWS - 1)
+        }
+
+        // ---- input: turn (no 180° reversal) ----
+        if alive {
+            if (raylib::IsKeyPressed(raylib::KEY_RIGHT) || raylib::IsKeyPressed(raylib::KEY_D)) && dx == 0 { dx = 1   dy = 0 }
+            if (raylib::IsKeyPressed(raylib::KEY_LEFT)  || raylib::IsKeyPressed(raylib::KEY_A)) && dx == 0 { dx = 0 - 1  dy = 0 }
+            if (raylib::IsKeyPressed(raylib::KEY_DOWN)  || raylib::IsKeyPressed(raylib::KEY_S)) && dy == 0 { dx = 0   dy = 1 }
+            if (raylib::IsKeyPressed(raylib::KEY_UP)    || raylib::IsKeyPressed(raylib::KEY_W)) && dy == 0 { dx = 0   dy = 0 - 1 }
+        }
+
+        // ---- step the snake every 8 frames ----
+        tick = tick + 1
+        if alive && tick >= 8 {
+            tick = 0
+            let nhx = xs[0] + dx
+            let nhy = ys[0] + dy
+            let n = xs.len()
+            if nhx < 0 || nhx >= COLS || nhy < 0 || nhy >= ROWS { alive = false }
+            else if body_hit(xs, ys, n, nhx, nhy) == 1 { alive = false }   // inline C + array marshalling
+            else {
+                // prepend new head
+                var hx: Vec<I32> = vec()  var hy: Vec<I32> = vec()
+                hx.push(nhx)  hy.push(nhy)
+                var i = 0
+                while i < n { hx.push(xs[i])  hy.push(ys[i])  i = i + 1 }
+                xs = sink hx  ys = sink hy
+                if nhx == fx && nhy == fy {                 // eat: grow (keep tail) + new food
+                    score = score + 1
+                    fx = raylib::GetRandomValue(0, COLS - 1)
+                    fy = raylib::GetRandomValue(0, ROWS - 1)
+                } else { xs.pop()  ys.pop() }                 // move: drop tail
+            }
+        }
+
+        // ---- draw ----
+        raylib::BeginDrawing()
+        raylib::ClearBackground(raylib::Color { r: 18, g: 18, b: 26, a: 255 })
+
+        // food as a circle: Vector2 + F32 radius (by-value struct + float)
+        let fcx = to_float(fx * CELL + CELL / 2)
+        let fcy = to_float(fy * CELL + CELL / 2)
+        raylib::DrawCircleV(raylib::Vector2 { x: fcx, y: fcy }, to_float(CELL) / 2.5, raylib::Color { r: 230, g: 80, b: 80, a: 255 })
+
+        // body via a C callback that calls back a Nori closure (capturing a Color)
+        let body = raylib::Color { r: 80, g: 220, b: 120, a: 255 }
+        each_cell(xs, ys, xs.len(), |cx: Int, cy: Int| raylib::DrawRectangle(cx * CELL + 1, cy * CELL + 1, CELL - 2, CELL - 2, body))
+
+        // HUD label from inline C (const char* -> Str)
+        raylib::DrawText(hud_label(score, xs.len()), 8, ROWS * CELL + 4, 18, raylib::Color { r: 200, g: 200, b: 210, a: 255 })
+        if !alive { raylib::DrawText("GAME OVER - press R", w / 2 - 140, h / 2 - 10, 24, raylib::Color { r: 240, g: 220, b: 80, a: 255 }) }
+
+        raylib::EndDrawing()
+    }
+    raylib::CloseWindow()
+    return 0
+}

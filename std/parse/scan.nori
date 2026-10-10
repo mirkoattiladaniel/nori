@@ -1,0 +1,195 @@
+//! std/parse: a parsing toolkit, built in layers so you write a fast hand-written parser on
+//! shared infrastructure instead of re-rolling a scanner/positions/diagnostics every time:
+//!   1. Scanner: a byte cursor over a string + char classes + source positions/diagnostics.
+//!   2. Token: a { kind, span } token, consumed by the parser layer.
+//!   3. Parser: recursive-descent helpers: peek/check/expect/accept + error recovery.
+//!   4. Pratt: a precedence-climbing expression driver over a PrattGrammar.
+//! Not included: parser combinators (a closure call per byte isn't inlined in Nori → slow) or a
+//! grammar generator. You keep your recursive descent; this removes the boilerplate under it.
+//!   import "std/parse" as parse
+//!   var s = parse::scanner(src)
+//!   while !s.at_end() { ... s.peek() ... s.advance() ... }
+
+// ── Scanner: an index-based cursor over `src` (bytes, no per-token allocation) ──────────────────────
+pub struct Scanner { src: view Str, pos: Int, len: Int }
+/// a scanner positioned at the start of `src`.
+pub fn scanner(src: Str) -> Scanner { return Scanner { src: src, pos: 0, len: src.len() } }
+
+// a half-open byte range [start, end) into the scanned source; slice it lazily with `span_text`.
+pub struct Span { start: Int, end: Int }
+/// a span covering the half-open byte range `[start, end)`.
+pub fn span(start: Int, end: Int) -> Span { return Span { start: start, end: end } }
+
+impl Scanner {
+    /// are we at (or past) the end of the input?
+    fn at_end(self) -> Bool { return self.pos >= self.len }
+    /// the current byte as an Int, or -1 at end. (Bytes, not Char, so end can be -1 on the hot path.)
+    fn peek(self) -> Int { if self.pos >= self.len { return -1 }  return ord(self.src.at(self.pos)) }
+    /// the byte `k` ahead (0 = current), or -1 past the end.
+    fn peek_at(self, k: Int) -> Int { let i = self.pos + k  if i < 0 || i >= self.len { return -1 }  return ord(self.src.at(i)) }
+    /// current byte offset.
+    fn at(self) -> Int { return self.pos }
+    /// consume and return the current byte (-1 at end, cursor unchanged).
+    fn advance(inout self) -> Int {
+        if self.pos >= self.len { return -1 }
+        let c = ord(self.src.at(self.pos))
+        self.pos = self.pos + 1
+        return c
+    }
+    /// jump the cursor to an absolute offset (clamped to [0, len]).
+    fn seek(inout self, p: Int) { if p < 0 { self.pos = 0 } else { if p > self.len { self.pos = self.len } else { self.pos = p } } }
+
+    /// consume `c` if it is the current byte; return whether it was.
+    fn eat(inout self, c: Int) -> Bool { if self.peek() == c { self.pos = self.pos + 1  return true }  return false }
+    /// does the input at the cursor start with `lit`?
+    fn looking_at(self, lit: Str) -> Bool {
+        let m = lit.len()
+        if self.pos + m > self.len { return false }
+        var i = 0
+        while i < m { if ord(self.src.at(self.pos + i)) != ord(lit.at(i)) { return false }  i = i + 1 }
+        return true
+    }
+    /// consume `lit` if the input starts with it here; return whether it did.
+    fn eat_str(inout self, lit: Str) -> Bool { if self.looking_at(lit) { self.pos = self.pos + lit.len()  return true }  return false }
+    /// next index of `needle` at/after the cursor, or -1. (Cursor unchanged.)
+    fn find(self, needle: Str) -> Int {
+        let m = needle.len()
+        if m == 0 { return self.pos }
+        var i = self.pos
+        while i + m <= self.len {
+            var j = 0
+            var ok = true
+            while j < m { if ord(self.src.at(i + j)) != ord(needle.at(j)) { ok = false  j = m } else { j = j + 1 } }
+            if ok { return i }
+            i = i + 1
+        }
+        return -1
+    }
+    /// case-insensitive `find` (ASCII); next index of `needle` at/after the cursor, or -1. Cursor unchanged.
+    fn find_ci(self, needle: Str) -> Int {
+        let m = needle.len()
+        if m == 0 { return self.pos }
+        var i = self.pos
+        while i + m <= self.len {
+            var j = 0
+            var ok = true
+            while j < m { if to_lower(ord(self.src.at(i + j))) != to_lower(ord(needle.at(j))) { ok = false  j = m } else { j = j + 1 } }
+            if ok { return i }
+            i = i + 1
+        }
+        return -1
+    }
+    /// the source text of a span taken from this scanner (no need to thread the source around).
+    fn text(inout self, sp: Span) -> Str { return self.src.slice(sp.start, sp.end) }
+    /// move the cursor to end-of-input.
+    fn to_end(inout self) { self.pos = self.len }
+
+    // ── span-consuming (zero-copy: return a Span; call `span_text` only if you keep the text) ─────────
+    /// skip spaces/tabs/newlines/CR/FF.
+    fn skip_ws(inout self) { while !self.at_end() && is_space(self.peek()) { self.pos = self.pos + 1 } }
+    /// skip to (but not past) the next newline.
+    fn skip_line(inout self) { while !self.at_end() && self.peek() != 10 { self.pos = self.pos + 1 } }
+    /// consume an identifier `[A-Za-z_][A-Za-z0-9_]*` and return its span (empty span if none here).
+    fn take_ident(inout self) -> Span {
+        let s0 = self.pos
+        if self.at_end() || !is_ident_start(self.peek()) { return span(s0, s0) }
+        self.pos = self.pos + 1
+        while !self.at_end() && is_ident_cont(self.peek()) { self.pos = self.pos + 1 }
+        return span(s0, self.pos)
+    }
+    /// consume a run of decimal digits and return its span.
+    fn take_digits(inout self) -> Span {
+        let s0 = self.pos
+        while !self.at_end() && is_digit(self.peek()) { self.pos = self.pos + 1 }
+        return span(s0, self.pos)
+    }
+    /// consume up to (not including) byte `c` (or end); return the span consumed.
+    fn take_until(inout self, c: Int) -> Span {
+        let s0 = self.pos
+        while !self.at_end() && self.peek() != c { self.pos = self.pos + 1 }
+        return span(s0, self.pos)
+    }
+    /// consume while `pred(byte)` holds; return the span. (Closure per byte; use the specialized
+    /// `take_ident`/`take_digits` on hot paths; this is for one-off custom classes.)
+    fn take_while(inout self, pred: Fn(Int)->Bool) -> Span {
+        let s0 = self.pos
+        while !self.at_end() && pred(self.peek()) { self.pos = self.pos + 1 }
+        return span(s0, self.pos)
+    }
+}
+
+/// the source text of a span.
+pub fn span_text(src: Str, sp: Span) -> Str { return src.slice(sp.start, sp.end) }
+/// how many bytes the span covers.
+pub fn span_len(sp: Span) -> Int { return sp.end - sp.start }
+/// does the span cover nothing? (True for a reversed one, which is how a failed scan reports.)
+pub fn span_empty(sp: Span) -> Bool { return sp.end <= sp.start }
+
+// ── char classes (bytes in). One home for what every hand-rolled lexer re-declares. ─────────────────
+/// `0`-`9`.
+pub fn is_digit(c: Int) -> Bool { return c >= 48 && c <= 57 }
+/// `a`-`z`.
+pub fn is_lower(c: Int) -> Bool { return c >= 97 && c <= 122 }
+/// `A`-`Z`.
+pub fn is_upper(c: Int) -> Bool { return c >= 65 && c <= 90 }
+/// an ASCII letter, either case.
+pub fn is_alpha(c: Int) -> Bool { return is_lower(c) || is_upper(c) }
+/// a letter or a digit.
+pub fn is_alnum(c: Int) -> Bool { return is_alpha(c) || is_digit(c) }
+/// space, tab, LF, CR or FF. (Not the Unicode spaces; this layer is bytes.)
+pub fn is_space(c: Int) -> Bool { return c == 32 || c == 9 || c == 10 || c == 13 || c == 12 }
+/// a hex digit, either case.
+pub fn is_hex(c: Int) -> Bool { return is_digit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70) }
+/// may `c` start an identifier: a letter or `_`.
+pub fn is_ident_start(c: Int) -> Bool { return is_alpha(c) || c == 95 }               // letter or '_'
+/// may `c` continue an identifier: a letter, digit or `_`.
+pub fn is_ident_cont(c: Int) -> Bool { return is_alnum(c) || c == 95 }
+/// ASCII-lowercase one byte, leaving anything else alone.
+pub fn to_lower(c: Int) -> Int { if is_upper(c) { return c + 32 }  return c }
+/// ASCII-uppercase one byte, leaving anything else alone.
+pub fn to_upper(c: Int) -> Int { if is_lower(c) { return c - 32 }  return c }
+/// the value of a hex digit, or -1 if `c` is not one, so a caller can test and convert at once.
+pub fn hex_val(c: Int) -> Int {
+    if is_digit(c) { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    return -1
+}
+
+// ── source positions + diagnostics (the other thing everyone redoes) ────────────────────────────────
+pub struct LineCol { line: Int, col: Int }
+/// 1-based line + column of a byte offset in `src`.
+pub fn line_col(src: Str, offset: Int) -> LineCol {
+    var line = 1
+    var col = 1
+    var i = 0
+    let n = src.len()
+    while i < n && i < offset {
+        if ord(src.at(i)) == 10 { line = line + 1  col = 1 } else { col = col + 1 }
+        i = i + 1
+    }
+    return LineCol { line: line, col: col }
+}
+// the source line containing `offset` (without its trailing newline).
+fn line_at(src: Str, offset: Int) -> Str {
+    let n = src.len()
+    var a = offset
+    if a > n { a = n }
+    while a > 0 && ord(src.at(a - 1)) != 10 { a = a - 1 }
+    var b = offset
+    while b < n && ord(src.at(b) ) != 10 { b = b + 1 }
+    return src.slice(a, b)
+}
+/// a caret-style diagnostic: `▲ msg\n  path:line:col\n    <source line>\n    <spaces>^\n  hint`.
+pub fn format_error(src: Str, path: Str, offset: Int, msg: Str, hint: Str) -> Str {
+    let lc = line_col(src, offset)
+    let ln = line_at(src, offset)
+    var caret = ""
+    var k = 1
+    while k < lc.col { caret = caret + " "  k = k + 1 }
+    caret = caret + "^"
+    var out = "▲ " + msg + "\n  " + path + ":" + to_str(lc.line) + ":" + to_str(lc.col) + "\n    " + ln + "\n    " + caret
+    if hint.len() > 0 { out = out + "\n  " + hint }
+    return out
+}
+

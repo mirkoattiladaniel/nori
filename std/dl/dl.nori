@@ -1,0 +1,206 @@
+//! std/dl: load a shared library at runtime and call into it.
+//!
+//!   import "std/dl" as dl
+//!   fn main() -> Int {
+//!     let h = dl::load("./demo.so")
+//!     if h == 0 { printl(dl::error())  return 1 }
+//!     let f = dl::sym(h, "nori_plugin_abi")
+//!     if f != 0 { printl(dl::call0(f)) }        // 1
+//!     dl::unload(h)
+//!     return 0
+//!   }
+//!
+//! Addresses, and any C string, are plain `Int`. A call goes through a `CFn` function pointer of the
+//! callee's signature, one of the `call*` functions below, so the same source serves an LLVM build and
+//! a `--native` one: on Linux the loader itself is imported from `libc.so.6`, which makes a native
+//! executable that loads a library a glibc-hosted one; on macOS from `libSystem.B.dylib`, and on Windows
+//! `LoadLibraryA`/`GetProcAddress`/`FreeLibrary` from `kernel32.dll`.
+//!
+//! A library loaded this way has its own copy of whatever runtime it was linked with, so a handle
+//! minted inside it (a `Str`, a `Vec`) means nothing out here. Only scalars and C strings may cross:
+//! convert with `os::os_cstr` / `os::os_from_cstr`.
+
+import "std/os" as os
+
+cfg(linux) {
+    extern fn dlopen(Int, Int) -> Int from "libc.so.6"
+    extern fn dlsym(Int, Int) -> Int from "libc.so.6"
+    extern fn dlclose(Int) -> Int from "libc.so.6"
+    extern fn dlerror() -> Int from "libc.so.6"
+    // RTLD_NOW | RTLD_LOCAL
+    fn nori_dl_open(p: Int) -> Int { var h = 0  unsafe { h = dlopen(p, 2) }  return h }
+    fn nori_dl_sym(h: Int, n: Int) -> Int { var f = 0  unsafe { f = dlsym(h, n) }  return f }
+    fn nori_dl_close(h: Int) -> Int { var r = 0  unsafe { r = dlclose(h) & 4294967295 }  return r }
+    fn nori_dl_error() -> Int { var p = 0  unsafe { p = dlerror() }  return p }
+}
+
+cfg(macos) {
+    extern fn dlopen(Int, Int) -> Int from "libSystem.B.dylib"
+    extern fn dlsym(Int, Int) -> Int from "libSystem.B.dylib"
+    extern fn dlclose(Int) -> Int from "libSystem.B.dylib"
+    extern fn dlerror() -> Int from "libSystem.B.dylib"
+    // RTLD_NOW | RTLD_LOCAL, which are 2 and 4 in Darwin's <dlfcn.h>
+    fn nori_dl_open(p: Int) -> Int { var h = 0  unsafe { h = dlopen(p, 6) }  return h }
+    fn nori_dl_sym(h: Int, n: Int) -> Int { var f = 0  unsafe { f = dlsym(h, n) }  return f }
+    fn nori_dl_close(h: Int) -> Int { var r = 0  unsafe { r = dlclose(h) & 4294967295 }  return r }
+    fn nori_dl_error() -> Int { var p = 0  unsafe { p = dlerror() }  return p }
+}
+
+cfg(windows) {
+    extern fn LoadLibraryA(Int) -> Int from "kernel32.dll"
+    extern fn GetProcAddress(Int, Int) -> Int from "kernel32.dll"
+    extern fn FreeLibrary(Int) -> Int from "kernel32.dll"
+    extern fn GetLastError() -> Int from "kernel32.dll"
+    extern fn FormatMessageA(Int, Int, Int, Int, Int, Int, Int) -> Int from "kernel32.dll"
+    fn nori_dl_open(p: Int) -> Int { var h = 0  unsafe { h = LoadLibraryA(p) }  return h }
+    fn nori_dl_sym(h: Int, n: Int) -> Int { var f = 0  unsafe { f = GetProcAddress(h, n) }  return f }
+    fn nori_dl_close(h: Int) -> Int { var r = 0  unsafe { r = FreeLibrary(h) & 4294967295 }  if r != 0 { return 0 }  return 1 }
+    // LoadLibrary has no dlerror: the message is formatted from GetLastError into one buffer, which the
+    // next failing call overwrites
+    global g_dl_err: Int = 0
+    fn nori_dl_error() -> Int {
+        unsafe {
+            if g_dl_err == 0 { g_dl_err = malloc(512) }
+            poke8(g_dl_err, 0)
+            let e = GetLastError() & 4294967295
+            if e != 0 { let _n = FormatMessageA(4608, 0, e, 0, g_dl_err, 512, 0) }   // FROM_SYSTEM | IGNORE_INSERTS
+        }
+        return g_dl_err
+    }
+}
+
+/// open a shared library by path. 0 = failed; call `error()` for why.
+/// Not `open`/`close`: those are the POSIX calls std/os declares as `extern`, and an extern name is
+/// never mangled, so a program that imports this module unaliased would collide with them.
+pub fn load(path: Str) -> Int {
+    let c = os::os_cstr(path)
+    var h = 0
+    unsafe { h = nori_dl_open(c) }
+    unsafe { free(c) }
+    return h
+}
+
+/// look up a symbol in an open library. 0 = not found.
+pub fn sym(h: Int, name: Str) -> Int {
+    if h == 0 { return 0 }
+    let c = os::os_cstr(name)
+    var f = 0
+    unsafe { f = nori_dl_sym(h, c) }
+    unsafe { free(c) }
+    return f
+}
+
+/// close an open library. true = closed.
+pub fn unload(h: Int) -> Bool {
+    if h == 0 { return false }
+    var r = 1
+    unsafe { r = nori_dl_close(h) }
+    return r == 0
+}
+
+/// the last loader error, or "" when there was none.
+pub fn error() -> Str {
+    var p = 0
+    unsafe { p = nori_dl_error() }
+    if p == 0 { return "" }
+    return os::os_from_cstr(p)
+}
+
+/// call `f()` -> Int.
+pub fn call0(f: Int) -> Int { var r = 0  unsafe { let g: CFn() -> Int = f  r = g() }  return r }
+/// call `f(a)` -> Int.
+pub fn call1(f: Int, a: Int) -> Int { var r = 0  unsafe { let g: CFn(Int) -> Int = f  r = g(a) }  return r }
+/// call `f(a, b)` -> Int.
+pub fn call2(f: Int, a: Int, b: Int) -> Int { var r = 0  unsafe { let g: CFn(Int, Int) -> Int = f  r = g(a, b) }  return r }
+/// call `f(a, b, c)` -> Int.
+pub fn call3(f: Int, a: Int, b: Int, c: Int) -> Int { var r = 0  unsafe { let g: CFn(Int, Int, Int) -> Int = f  r = g(a, b, c) }  return r }
+/// call `f(a, w, h)` where the last two are Floats -> Int.
+pub fn call_iff(f: Int, a: Int, w: Float, h: Float) -> Int { var r = 0  unsafe { let g: CFn(Int, F64, F64) -> Int = f  r = g(a, w, h) }  return r }
+/// call `f(x)` where `x` is a C **float** (32-bit), -> Int. The narrowing is required: a C float
+/// and a double travel in the same register in different formats, so the callee's 32-bit parameter
+/// must arrive as a float. A `void`-returning callee is fine; the Int result is then meaningless.
+pub fn call_f32(f: Int, a: Float) -> Int { var r = 0  unsafe { let g: CFn(F32) -> Int = f  r = g(a) }  return r }
+/// call `f(a, b, c, d, e)` -> Int. Five Ints is the widest fixed arity here. It serves the plugin
+/// surface entry point: `(id: cstr, device, queue, w, h) -> texture view`.
+pub fn call5(f: Int, a: Int, b: Int, c: Int, d: Int, e: Int) -> Int { var r = 0  unsafe { let g: CFn(Int, Int, Int, Int, Int) -> Int = f  r = g(a, b, c, d, e) }  return r }
+
+/// call `f()` and read the returned C string. "" when the call returns NULL.
+pub fn call0_str(f: Int) -> Str {
+    let p = call0(f)
+    if p == 0 { return "" }
+    return os::os_from_cstr(p)
+}
+
+/// call `f(s)` with `s` as a C string, and read the returned C string.
+pub fn call1_str(f: Int, s: Str) -> Str {
+    let c = os::os_cstr(s)
+    let p = call1(f, c)
+    unsafe { free(c) }
+    if p == 0 { return "" }
+    return os::os_from_cstr(p)
+}
+
+/// call `f(a, b)` with both args as C strings, returning the Int result.
+pub fn call2_str(f: Int, a: Str, b: Str) -> Int {
+    let ca = os::os_cstr(a)
+    let cb = os::os_cstr(b)
+    let r = call2(f, ca, cb)
+    unsafe { free(ca)  free(cb) }
+    return r
+}
+
+/// call `f(a, b)` with both args as C strings, and read the returned C string.
+///
+/// The two arguments belong to this side: allocated here, freed here, and the callee must copy them
+/// rather than keep them. The reply belongs to the callee: it is copied in immediately and never
+/// freed on this side, since a block allocated by another image's malloc cannot be returned to ours.
+pub fn call2_cstr(f: Int, a: Str, b: Str) -> Str {
+    let ca = os::os_cstr(a)
+    let cb = os::os_cstr(b)
+    let p = call2(f, ca, cb)
+    unsafe { free(ca)  free(cb) }
+    if p == 0 { return "" }
+    return os::os_from_cstr(p)
+}
+
+/// invoke a host callback address as `(key: cstr, arg: cstr) -> cstr`, the host-callback shape.
+///
+/// This is the plugin side of the host callback: a plugin that was handed an address by
+/// `nori_plugin_init` calls its host with `dl::host_call(addr, key, arg)` and gets JSON back. A
+/// null address or a null reply answers with the same `{"ok":false,"error":…}` shape a host uses for an
+/// unknown key, so a plugin has one shape to parse and never has to guard the call.
+pub fn host_call(f: Int, key: Str, arg: Str) -> Str {
+    if f == 0 { return "{\"ok\":false,\"error\":\"no host callback: the plugin was not init'd\"}" }
+    let r = call2_cstr(f, key, arg)
+    if r.len() == 0 { return "{\"ok\":false,\"error\":\"the host callback returned nothing\"}" }
+    return r
+}
+
+/// call `f(id, a, b, c, d)` with `id` as a C string and four Ints after it, returning the Int
+/// result. The string is allocated and freed here, so the callee must copy it rather than
+/// keep the pointer, as with every other C-string argument in this file.
+pub fn call_s4i(f: Int, id: Str, a: Int, b: Int, c: Int, d: Int) -> Int {
+    let cs = os::os_cstr(id)
+    let r = call5(f, cs, a, b, c, d)
+    unsafe { free(cs) }
+    return r
+}
+
+/// call `f(id, w, h)` with `id` as a C string, and read the returned C string.
+pub fn call_iff_str(f: Int, id: Str, w: Float, h: Float) -> Str {
+    let c = os::os_cstr(id)
+    let p = call_iff(f, c, w, h)
+    unsafe { free(c) }
+    if p == 0 { return "" }
+    return os::os_from_cstr(p)
+}
+
+/// the platform's shared-library extension, without the dot: `so`, `dylib`, or `dll`.
+pub fn ext() -> Str {
+    // one return for every target: a returning `cfg` block ahead of the common `return "so"` would
+    // give an "unreachable code" warning, pointing into std, in every Windows and macOS build.
+    var e = "so"
+    cfg(windows) { e = "dll" }
+    cfg(macos) { e = "dylib" }
+    return e
+}

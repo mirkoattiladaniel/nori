@@ -1,0 +1,85 @@
+import "std/sort" as sort
+import "std/iter" as it
+
+struct Person { age: Int, name: Str }
+impl sort::Ord for Person { fn cmp(self, o: Person) -> Int { return self.age - o.age } }
+
+fn people() -> Vec<Person> {
+  var v: Vec<Person> = vec()
+  v.push(Person { age: 30, name: "c" })  v.push(Person { age: 20, name: "a" })  v.push(Person { age: 25, name: "b" })
+  return v
+}
+
+fn test_generic_ord_sort() {
+  var s = sort::sort(people())
+  assert_streq(s[0].name, "a")
+  assert_streq(s[1].name, "b")
+  assert_streq(s[2].name, "c")
+  assert_eq(s[0].age, 20)
+}
+fn test_min_max() {
+  assert_eq(sort::min(people()).age, 20)
+  assert_eq(sort::max(people()).age, 30)
+}
+fn test_strcmp() {
+  assert_true(sort::strcmp("abc", "abd") < 0)
+  assert_eq(sort::strcmp("abc", "abc"), 0)
+  assert_true(sort::strcmp("abd", "abc") > 0)
+  assert_true(sort::strcmp("ab", "abc") < 0)
+}
+fn test_sort_str() {
+  var w: Vec<Str> = vec()  w.push("pear")  w.push("apple")  w.push("fig")
+  var s = sort::sort_str(w)
+  assert_streq(s[0], "apple")
+  assert_streq(s[1], "fig")
+  assert_streq(s[2], "pear")
+}
+fn test_sort_int() {
+  var n: Vec<Int> = vec()  n.push(5)  n.push(1)  n.push(3)  n.push(2)
+  var s = sort::sort_int(n)
+  assert_eq(s[0], 1)  assert_eq(s[3], 5)
+}
+fn test_iterator() {
+  assert_eq(it::isum(it::range(1, 5)), 10)        // 1+2+3+4
+  assert_eq(it::icount(it::range(0, 7)), 7)
+  assert_eq((it::icollect(it::range(10, 13))).len(), 3)
+  assert_eq(it::isum(it::range(3, 3)), 0)          // empty range
+}
+
+// A thousand elements and more, in every order that breaks a merge: the result is checked for
+// ordering, and stability is checked on a key that ties everywhere. The tests above only use
+// about five elements, which would not catch a bug in the merge step.
+struct Kv { k: Int, tag: Int }
+impl sort::Ord for Kv { fn cmp(self, o: Kv) -> Int { return self.k - o.k } }
+fn test_large_sorts() {
+    var ints: Vec<Int> = vec()
+    var strs: Vec<Str> = vec()
+    var kvs: Vec<Kv> = vec()
+    var x = 12345
+    var i = 0
+    while i < 1537 {
+        x = (x * 1103515245 + 12345) % 2147483648
+        ints.push(x % 1000)
+        strs.push("p" + to_str(x % 5000))
+        kvs.push(Kv { k: x % 7, tag: i })
+        i = i + 1
+    }
+    let si = sort::sort_int(ints)
+    let ss = sort::sort_str(strs)
+    let sk = sort::sort(kvs)
+    assert_eq(si.len(), 1537)
+    assert_eq(ss.len(), 1537)
+    assert_eq(sk.len(), 1537)
+    var j = 1
+    while j < 1537 {
+        assert_true(si[j - 1] <= si[j])
+        assert_true(sort::strcmp(ss[j - 1], ss[j]) <= 0)
+        assert_true(sk[j - 1].k <= sk[j].k)
+        if sk[j - 1].k == sk[j].k { assert_true(sk[j - 1].tag < sk[j].tag) }   // stable
+        j = j + 1
+    }
+    var tot0 = 0  var tot1 = 0
+    j = 0
+    while j < 1537 { tot0 = tot0 + ints[j]  tot1 = tot1 + si[j]  j = j + 1 }
+    assert_eq(tot0, tot1)
+}

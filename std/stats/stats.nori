@@ -1,0 +1,90 @@
+//! std/stats: summary statistics over a `Vec<Float>`. Every function is total: an empty input
+//! yields 0.0 (median/percentile too). Inputs are never mutated (median/percentile sort a copy).
+//!   import "std/stats" as stats
+//!   stats::mean(xs)            // arithmetic mean
+//!   stats::stddev(xs)          // population standard deviation
+//!   stats::percentile(xs, 90.0)
+
+/// sum of all elements.
+pub fn sum(v: Vec<Float>) -> Float {
+    var s = 0.0
+    var i = 0
+    while i < v.len() { s = s + v[i]  i = i + 1 }
+    return s
+}
+
+/// arithmetic mean (0.0 for an empty input).
+pub fn mean(v: Vec<Float>) -> Float {
+    if v.len() == 0 { return 0.0 }
+    return sum(v) / to_float(v.len())
+}
+
+/// smallest element (0.0 if empty).
+pub fn min(v: Vec<Float>) -> Float {
+    if v.len() == 0 { return 0.0 }
+    var m = v[0]
+    var i = 1
+    while i < v.len() { if v[i] < m { m = v[i] }  i = i + 1 }
+    return m
+}
+
+/// largest element (0.0 if empty).
+pub fn max(v: Vec<Float>) -> Float {
+    if v.len() == 0 { return 0.0 }
+    var m = v[0]
+    var i = 1
+    while i < v.len() { if v[i] > m { m = v[i] }  i = i + 1 }
+    return m
+}
+
+/// population variance (mean of squared deviations).
+pub fn variance(v: Vec<Float>) -> Float {
+    if v.len() == 0 { return 0.0 }
+    let mu = mean(v)
+    var acc = 0.0
+    var i = 0
+    while i < v.len() { let d = v[i] - mu  acc = acc + (d * d)  i = i + 1 }
+    return acc / to_float(v.len())
+}
+
+/// population standard deviation (sqrt of the variance).
+pub fn stddev(v: Vec<Float>) -> Float { return sqrt(variance(v)) }
+
+/// a sorted copy of `v` (ascending) by insertion sort; the input is untouched.
+fn sorted_copy(v: Vec<Float>) -> Vec<Float> {
+    var out: Vec<Float> = vec()
+    var i = 0
+    while i < v.len() { out.push(v[i])  i = i + 1 }
+    var a = 1
+    while a < out.len() {
+        let key = out[a]
+        var b = a - 1
+        while b >= 0 && out[b] > key { out[b + 1] = out[b]  b = b - 1 }
+        out[b + 1] = key
+        a = a + 1
+    }
+    return out
+}
+
+/// the value at rank fraction `q` in [0,1] of the sorted data, linearly interpolated.
+fn at_rank(sorted: Vec<Float>, q: Float) -> Float {
+    let n = sorted.len()
+    if n == 0 { return 0.0 }
+    if n == 1 { return sorted[0] }
+    let pos = q * to_float(n - 1)
+    let lo = to_int(pos)                                  // floor (pos >= 0)
+    let frac = pos - to_float(lo)
+    if lo + 1 >= n { return sorted[n - 1] }
+    return sorted[lo] + (sorted[lo + 1] - sorted[lo]) * frac
+}
+
+/// median (50th percentile): average of the two middle elements for an even count.
+pub fn median(v: Vec<Float>) -> Float { return at_rank(sorted_copy(v), 0.5) }
+
+/// the `p`-th percentile, `p` in [0,100] (linear interpolation between ranks).
+pub fn percentile(v: Vec<Float>, p: Float) -> Float {
+    var q = p / 100.0
+    if q < 0.0 { q = 0.0 }
+    if q > 1.0 { q = 1.0 }
+    return at_rank(sorted_copy(v), q)
+}

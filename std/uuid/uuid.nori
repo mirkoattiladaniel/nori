@@ -1,0 +1,63 @@
+//! std/uuid: RFC 4122 UUIDs, formatted canonically (8-4-4-4-12 lowercase hex). Two kinds:
+//!   * v4: fully random (from a std/rand `Rng` you pass in).
+//!   * v7: time-ordered: a 48-bit Unix-millisecond prefix (std/time) + random tail; sorts by creation time.
+//!   import "std/uuid" as uuid
+//!   import "std/rand" as rand
+//!   var r = rand::new()
+//!   uuid::v4(r)    // "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"
+import "std/rand" as rand
+import "std/time" as time
+
+/// one byte (0..255) as two lowercase hex digits.
+fn hx(n: Int) -> Str {
+    let H = "0123456789abcdef"
+    return (H.slice((n >> 4), (n >> 4) + 1) + H.slice((n & 15), (n & 15) + 1))
+}
+
+/// append the 8 big-endian bytes of a 64-bit value to `out`.
+fn u64_bytes(u: Int, inout out: Vec<Int>) {
+    var k = 56
+    while k >= 0 { out.push(((u >> k) & 255))  k = k - 8 }
+}
+
+/// format 16 bytes as canonical 8-4-4-4-12 hex.
+fn format16(b: Vec<Int>) -> Str {
+    var s = ""
+    var i = 0
+    while i < 16 {
+        if i == 4 || i == 6 || i == 8 || i == 10 { s = (s + "-") }
+        s = (s + hx(b[i]))
+        i = i + 1
+    }
+    return s
+}
+
+/// stamp the version (high nibble of byte 6) and the RFC-4122 variant (top bits of byte 8).
+fn stamp(inout b: Vec<Int>, version: Int) {
+    b[6] = ((b[6] & 15) | (version << 4))     // version in the high nibble
+    b[8] = ((b[8] & 63) | 128)                  // variant = 10xxxxxx
+}
+
+/// a random (v4) UUID, drawn from `r`.
+pub fn v4(inout r: rand::Rng) -> Str {
+    var b: Vec<Int> = vec()
+    u64_bytes(r.next_u64(), b)
+    u64_bytes(r.next_u64(), b)
+    stamp(b, 4)
+    return format16(b)
+}
+
+/// a time-ordered (v7) UUID: 48-bit Unix-ms prefix + random, drawn from `r`.
+pub fn v7(inout r: rand::Rng) -> Str {
+    var b: Vec<Int> = vec()
+    let ms = time::unix_ms()
+    var k = 40                                            // 48-bit big-endian millisecond timestamp -> bytes 0..5
+    while k >= 0 { b.push(((ms >> k) & 255))  k = k - 8 }
+    var rb: Vec<Int> = vec()                              // 10 random bytes -> bytes 6..15
+    u64_bytes(r.next_u64(), rb)
+    u64_bytes(r.next_u64(), rb)
+    var j = 0
+    while j < 10 { b.push(rb[j])  j = j + 1 }
+    stamp(b, 7)
+    return format16(b)
+}

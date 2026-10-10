@@ -1,0 +1,1304 @@
+// The preprocessor: the include stack, conditionals, macro definition and expansion. Its output is
+// one flat token list (`s.ot`, locations in `s.ol`) that the declaration parser reads.
+//
+// Expansion follows the C standard's rescanning model with hide sets: every token carries the set of
+// macro names it was produced by, and a name in its own token's hide set is not expanded again.
+// Expansions are pushed back in front of the input (`s.pk`), so rescanning is ordinary reading. A
+// token list expanded on its own (a macro argument, an `#if` line, a constant's body) is pushed
+// behind a sentinel token that reads as its end.
+
+// ── predefined macros ────────────────────────────────────────────────────────────────────────────
+
+fn cpp_predef_text() -> Str {
+    var v: Vec<Str> = vec()
+    v.push("#define __STDC__ 1")
+    v.push("#define __STDC_VERSION__ 201710L")
+    v.push("#define __STDC_HOSTED__ 1")
+    v.push("#define __STDC_UTF_16__ 1")
+    v.push("#define __STDC_UTF_32__ 1")
+    v.push("#define __STDC_IEC_559__ 1")
+    v.push("#define __STDC_IEC_559_COMPLEX__ 1")
+    v.push("#define __STDC_ISO_10646__ 201706L")
+    v.push("#define __GNUC__ 13")
+    v.push("#define __GNUC_MINOR__ 2")
+    v.push("#define __GNUC_PATCHLEVEL__ 0")
+    v.push("#define __GNUC_STDC_INLINE__ 1")
+    v.push("#define __VERSION__ \"13.2.0\"")
+    v.push("#define __x86_64__ 1")
+    v.push("#define __x86_64 1")
+    v.push("#define __amd64__ 1")
+    v.push("#define __amd64 1")
+    v.push("#define __linux__ 1")
+    v.push("#define __linux 1")
+    v.push("#define __gnu_linux__ 1")
+    v.push("#define __unix__ 1")
+    v.push("#define __unix 1")
+    v.push("#define __ELF__ 1")
+    v.push("#define __LP64__ 1")
+    v.push("#define _LP64 1")
+    v.push("#define __CHAR_BIT__ 8")
+    v.push("#define __SIZEOF_INT__ 4")
+    v.push("#define __SIZEOF_LONG__ 8")
+    v.push("#define __SIZEOF_LONG_LONG__ 8")
+    v.push("#define __SIZEOF_SHORT__ 2")
+    v.push("#define __SIZEOF_POINTER__ 8")
+    v.push("#define __SIZEOF_FLOAT__ 4")
+    v.push("#define __SIZEOF_DOUBLE__ 8")
+    v.push("#define __SIZEOF_LONG_DOUBLE__ 16")
+    v.push("#define __SIZEOF_SIZE_T__ 8")
+    v.push("#define __SIZEOF_WCHAR_T__ 4")
+    v.push("#define __SIZEOF_WINT_T__ 4")
+    v.push("#define __SIZEOF_PTRDIFF_T__ 8")
+    v.push("#define __SIZEOF_INT128__ 16")
+    v.push("#define __SIZEOF_FLOAT80__ 16")
+    v.push("#define __SIZEOF_FLOAT128__ 16")
+    v.push("#define __BIGGEST_ALIGNMENT__ 16")
+    v.push("#define __ORDER_LITTLE_ENDIAN__ 1234")
+    v.push("#define __ORDER_BIG_ENDIAN__ 4321")
+    v.push("#define __ORDER_PDP_ENDIAN__ 3412")
+    v.push("#define __BYTE_ORDER__ __ORDER_LITTLE_ENDIAN__")
+    v.push("#define __FLOAT_WORD_ORDER__ __ORDER_LITTLE_ENDIAN__")
+    v.push("#define __SCHAR_MAX__ 0x7f")
+    v.push("#define __SHRT_MAX__ 0x7fff")
+    v.push("#define __INT_MAX__ 0x7fffffff")
+    v.push("#define __LONG_MAX__ 0x7fffffffffffffffL")
+    v.push("#define __LONG_LONG_MAX__ 0x7fffffffffffffffLL")
+    v.push("#define __WCHAR_MAX__ 0x7fffffff")
+    v.push("#define __WCHAR_MIN__ (-__WCHAR_MAX__ - 1)")
+    v.push("#define __WINT_MAX__ 0xffffffffU")
+    v.push("#define __WINT_MIN__ 0U")
+    v.push("#define __PTRDIFF_MAX__ 0x7fffffffffffffffL")
+    v.push("#define __SIZE_MAX__ 0xffffffffffffffffUL")
+    v.push("#define __SCHAR_WIDTH__ 8")
+    v.push("#define __SHRT_WIDTH__ 16")
+    v.push("#define __INT_WIDTH__ 32")
+    v.push("#define __LONG_WIDTH__ 64")
+    v.push("#define __LONG_LONG_WIDTH__ 64")
+    v.push("#define __PTRDIFF_WIDTH__ 64")
+    v.push("#define __SIZE_WIDTH__ 64")
+    v.push("#define __WCHAR_WIDTH__ 32")
+    v.push("#define __WINT_WIDTH__ 32")
+    v.push("#define __INTMAX_WIDTH__ 64")
+    v.push("#define __INTPTR_WIDTH__ 64")
+    v.push("#define __SIZE_TYPE__ long unsigned int")
+    v.push("#define __PTRDIFF_TYPE__ long int")
+    v.push("#define __WCHAR_TYPE__ int")
+    v.push("#define __WINT_TYPE__ unsigned int")
+    v.push("#define __INTMAX_TYPE__ long int")
+    v.push("#define __UINTMAX_TYPE__ long unsigned int")
+    v.push("#define __CHAR8_TYPE__ unsigned char")
+    v.push("#define __CHAR16_TYPE__ short unsigned int")
+    v.push("#define __CHAR32_TYPE__ unsigned int")
+    v.push("#define __SIG_ATOMIC_TYPE__ int")
+    v.push("#define __INT8_TYPE__ signed char")
+    v.push("#define __INT16_TYPE__ short int")
+    v.push("#define __INT32_TYPE__ int")
+    v.push("#define __INT64_TYPE__ long int")
+    v.push("#define __UINT8_TYPE__ unsigned char")
+    v.push("#define __UINT16_TYPE__ short unsigned int")
+    v.push("#define __UINT32_TYPE__ unsigned int")
+    v.push("#define __UINT64_TYPE__ long unsigned int")
+    v.push("#define __INT_LEAST8_TYPE__ signed char")
+    v.push("#define __INT_LEAST16_TYPE__ short int")
+    v.push("#define __INT_LEAST32_TYPE__ int")
+    v.push("#define __INT_LEAST64_TYPE__ long int")
+    v.push("#define __UINT_LEAST8_TYPE__ unsigned char")
+    v.push("#define __UINT_LEAST16_TYPE__ short unsigned int")
+    v.push("#define __UINT_LEAST32_TYPE__ unsigned int")
+    v.push("#define __UINT_LEAST64_TYPE__ long unsigned int")
+    v.push("#define __INT_FAST8_TYPE__ signed char")
+    v.push("#define __INT_FAST16_TYPE__ long int")
+    v.push("#define __INT_FAST32_TYPE__ long int")
+    v.push("#define __INT_FAST64_TYPE__ long int")
+    v.push("#define __UINT_FAST8_TYPE__ unsigned char")
+    v.push("#define __UINT_FAST16_TYPE__ long unsigned int")
+    v.push("#define __UINT_FAST32_TYPE__ long unsigned int")
+    v.push("#define __UINT_FAST64_TYPE__ long unsigned int")
+    v.push("#define __INTPTR_TYPE__ long int")
+    v.push("#define __UINTPTR_TYPE__ long unsigned int")
+    v.push("#define __INT8_MAX__ 0x7f")
+    v.push("#define __INT16_MAX__ 0x7fff")
+    v.push("#define __INT32_MAX__ 0x7fffffff")
+    v.push("#define __INT64_MAX__ 0x7fffffffffffffffL")
+    v.push("#define __UINT8_MAX__ 0xff")
+    v.push("#define __UINT16_MAX__ 0xffff")
+    v.push("#define __UINT32_MAX__ 0xffffffffU")
+    v.push("#define __UINT64_MAX__ 0xffffffffffffffffUL")
+    v.push("#define __INTMAX_MAX__ 0x7fffffffffffffffL")
+    v.push("#define __UINTMAX_MAX__ 0xffffffffffffffffUL")
+    v.push("#define __INTPTR_MAX__ 0x7fffffffffffffffL")
+    v.push("#define __UINTPTR_MAX__ 0xffffffffffffffffUL")
+    v.push("#define __INT8_C(c) c")
+    v.push("#define __INT16_C(c) c")
+    v.push("#define __INT32_C(c) c")
+    v.push("#define __INT64_C(c) c ## L")
+    v.push("#define __UINT8_C(c) c")
+    v.push("#define __UINT16_C(c) c")
+    v.push("#define __UINT32_C(c) c ## U")
+    v.push("#define __UINT64_C(c) c ## UL")
+    v.push("#define __INTMAX_C(c) c ## L")
+    v.push("#define __UINTMAX_C(c) c ## UL")
+    v.push("#define __DEC_EVAL_METHOD__ 2")
+    v.push("#define __DBL_DECIMAL_DIG__ 17")
+    v.push("#define __DBL_DENORM_MIN__ ((double)4.94065645841246544176568792868221372e-324L)")
+    v.push("#define __DBL_DIG__ 15")
+    v.push("#define __DBL_EPSILON__ ((double)2.22044604925031308084726333618164062e-16L)")
+    v.push("#define __DBL_HAS_DENORM__ 1")
+    v.push("#define __DBL_HAS_INFINITY__ 1")
+    v.push("#define __DBL_HAS_QUIET_NAN__ 1")
+    v.push("#define __DBL_IS_IEC_60559__ 1")
+    v.push("#define __DBL_MANT_DIG__ 53")
+    v.push("#define __DBL_MAX_10_EXP__ 308")
+    v.push("#define __DBL_MAX__ ((double)1.79769313486231570814527423731704357e+308L)")
+    v.push("#define __DBL_MAX_EXP__ 1024")
+    v.push("#define __DBL_MIN_10_EXP__ (-307)")
+    v.push("#define __DBL_MIN__ ((double)2.22507385850720138309023271733240406e-308L)")
+    v.push("#define __DBL_MIN_EXP__ (-1021)")
+    v.push("#define __DBL_NORM_MAX__ ((double)1.79769313486231570814527423731704357e+308L)")
+    v.push("#define __FLT_DECIMAL_DIG__ 9")
+    v.push("#define __FLT_DENORM_MIN__ 1.40129846432481707092372958328991613e-45F")
+    v.push("#define __FLT_DIG__ 6")
+    v.push("#define __FLT_EPSILON__ 1.19209289550781250000000000000000000e-7F")
+    v.push("#define __FLT_EVAL_METHOD__ 0")
+    v.push("#define __FLT_EVAL_METHOD_TS_18661_3__ 0")
+    v.push("#define __FLT_HAS_DENORM__ 1")
+    v.push("#define __FLT_HAS_INFINITY__ 1")
+    v.push("#define __FLT_HAS_QUIET_NAN__ 1")
+    v.push("#define __FLT_IS_IEC_60559__ 1")
+    v.push("#define __FLT_MANT_DIG__ 24")
+    v.push("#define __FLT_MAX_10_EXP__ 38")
+    v.push("#define __FLT_MAX__ 3.40282346638528859811704183484516925e+38F")
+    v.push("#define __FLT_MAX_EXP__ 128")
+    v.push("#define __FLT_MIN_10_EXP__ (-37)")
+    v.push("#define __FLT_MIN__ 1.17549435082228750796873653722224568e-38F")
+    v.push("#define __FLT_MIN_EXP__ (-125)")
+    v.push("#define __FLT_NORM_MAX__ 3.40282346638528859811704183484516925e+38F")
+    v.push("#define __FLT_RADIX__ 2")
+    v.push("#define __LDBL_DECIMAL_DIG__ 21")
+    v.push("#define __LDBL_DENORM_MIN__ 3.64519953188247460252840593361941982e-4951L")
+    v.push("#define __LDBL_DIG__ 18")
+    v.push("#define __LDBL_EPSILON__ 1.08420217248550443400745280086994171e-19L")
+    v.push("#define __LDBL_HAS_DENORM__ 1")
+    v.push("#define __LDBL_HAS_INFINITY__ 1")
+    v.push("#define __LDBL_HAS_QUIET_NAN__ 1")
+    v.push("#define __LDBL_IS_IEC_60559__ 1")
+    v.push("#define __LDBL_MANT_DIG__ 64")
+    v.push("#define __LDBL_MAX_10_EXP__ 4932")
+    v.push("#define __LDBL_MAX__ 1.18973149535723176502126385303097021e+4932L")
+    v.push("#define __LDBL_MAX_EXP__ 16384")
+    v.push("#define __LDBL_MIN_10_EXP__ (-4931)")
+    v.push("#define __LDBL_MIN__ 3.36210314311209350626267781732175260e-4932L")
+    v.push("#define __LDBL_MIN_EXP__ (-16381)")
+    v.push("#define __LDBL_NORM_MAX__ 1.18973149535723176502126385303097021e+4932L")
+    v.push("#define __FINITE_MATH_ONLY__ 0")
+    v.push("#define __NO_INLINE__ 1")
+    v.push("#define __USER_LABEL_PREFIX__")
+    v.push("#define __REGISTER_PREFIX__")
+    v.push("#define __SSE__ 1")
+    v.push("#define __SSE2__ 1")
+    v.push("#define __SSE_MATH__ 1")
+    v.push("#define __SSE2_MATH__ 1")
+    v.push("#define __MMX__ 1")
+    v.push("#define __FXSR__ 1")
+    v.push("#define __k8 1")
+    v.push("#define __k8__ 1")
+    v.push("#define __code_model_small__ 1")
+    v.push("#define __GCC_HAVE_SYNC_COMPARE_AND_SWAP_1 1")
+    v.push("#define __GCC_HAVE_SYNC_COMPARE_AND_SWAP_2 1")
+    v.push("#define __GCC_HAVE_SYNC_COMPARE_AND_SWAP_4 1")
+    v.push("#define __GCC_HAVE_SYNC_COMPARE_AND_SWAP_8 1")
+    v.push("#define __GCC_ATOMIC_POINTER_LOCK_FREE 2")
+    v.push("#define __GCC_ATOMIC_INT_LOCK_FREE 2")
+    v.push("#define __GCC_IEC_559 2")
+    v.push("#define __GCC_IEC_559_COMPLEX 2")
+    v.push("#define __PRAGMA_REDEFINE_EXTNAME 1")
+    return cty_join(v, "\n") + "\n"
+}
+
+// the predefined macros of x86_64-w64-mingw32 GCC, made from the x86-64 Linux ones in `linux_text`:
+// the Linux/ELF/LP64 names are dropped, the data-model ones replaced, and the Windows names added
+fn cpp_predef_windows(linux_text: Str) -> Str {
+    var drop: Map<Str, Bool> = map()
+    let dropped = "__linux__ __linux __gnu_linux__ __unix__ __unix __ELF__ __LP64__ _LP64 __code_model_small__ __STDC_IEC_559__ __STDC_IEC_559_COMPLEX__ __STDC_ISO_10646__ "
+    var ds = 0
+    var di = 0
+    while di < dropped.len() {
+        if ord(dropped.at(di)) == 32 { drop.put(dropped.slice(ds, di), true)  ds = di + 1 }
+        di = di + 1
+    }
+    var repl: Map<Str, Str> = map()
+    var extra: Vec<Str> = vec()
+    extra.push("__SIZEOF_LONG__ 4")
+    extra.push("__SIZEOF_WCHAR_T__ 2")
+    extra.push("__SIZEOF_WINT_T__ 2")
+    extra.push("__LONG_MAX__ 0x7fffffffL")
+    extra.push("__LONG_WIDTH__ 32")
+    extra.push("__WCHAR_MAX__ 0xffff")
+    extra.push("__WCHAR_MIN__ 0")
+    extra.push("__WCHAR_TYPE__ short unsigned int")
+    extra.push("__WCHAR_WIDTH__ 16")
+    extra.push("__WINT_MAX__ 0xffff")
+    extra.push("__WINT_MIN__ 0")
+    extra.push("__WINT_TYPE__ short unsigned int")
+    extra.push("__WINT_WIDTH__ 16")
+    extra.push("__SIZE_TYPE__ long long unsigned int")
+    extra.push("__SIZE_MAX__ 0xffffffffffffffffULL")
+    extra.push("__PTRDIFF_TYPE__ long long int")
+    extra.push("__PTRDIFF_MAX__ 0x7fffffffffffffffLL")
+    extra.push("__INT64_TYPE__ long long int")
+    extra.push("__INT64_MAX__ 0x7fffffffffffffffLL")
+    extra.push("__INT64_C(c) c ## LL")
+    extra.push("__UINT64_TYPE__ long long unsigned int")
+    extra.push("__UINT64_MAX__ 0xffffffffffffffffULL")
+    extra.push("__UINT64_C(c) c ## ULL")
+    extra.push("__INTMAX_TYPE__ long long int")
+    extra.push("__INTMAX_MAX__ 0x7fffffffffffffffLL")
+    extra.push("__INTMAX_C(c) c ## LL")
+    extra.push("__UINTMAX_TYPE__ long long unsigned int")
+    extra.push("__UINTMAX_MAX__ 0xffffffffffffffffULL")
+    extra.push("__UINTMAX_C(c) c ## ULL")
+    extra.push("__INTPTR_TYPE__ long long int")
+    extra.push("__INTPTR_MAX__ 0x7fffffffffffffffLL")
+    extra.push("__UINTPTR_TYPE__ long long unsigned int")
+    extra.push("__UINTPTR_MAX__ 0xffffffffffffffffULL")
+    extra.push("__INT_LEAST64_TYPE__ long long int")
+    extra.push("__INT_LEAST64_MAX__ 0x7fffffffffffffffLL")
+    extra.push("__UINT_LEAST64_TYPE__ long long unsigned int")
+    extra.push("__UINT_LEAST64_MAX__ 0xffffffffffffffffULL")
+    extra.push("__INT_FAST16_TYPE__ short int")
+    extra.push("__INT_FAST16_MAX__ 0x7fff")
+    extra.push("__INT_FAST16_WIDTH__ 16")
+    extra.push("__INT_FAST32_TYPE__ int")
+    extra.push("__INT_FAST32_MAX__ 0x7fffffff")
+    extra.push("__INT_FAST32_WIDTH__ 32")
+    extra.push("__INT_FAST64_TYPE__ long long int")
+    extra.push("__INT_FAST64_MAX__ 0x7fffffffffffffffLL")
+    extra.push("__UINT_FAST16_TYPE__ short unsigned int")
+    extra.push("__UINT_FAST16_MAX__ 0xffff")
+    extra.push("__UINT_FAST32_TYPE__ unsigned int")
+    extra.push("__UINT_FAST32_MAX__ 0xffffffffU")
+    extra.push("__UINT_FAST64_TYPE__ long long unsigned int")
+    extra.push("__UINT_FAST64_MAX__ 0xffffffffffffffffULL")
+    extra.push("__code_model_medium__ 1")
+    extra.push("_WIN32 1")
+    extra.push("__WIN32 1")
+    extra.push("__WIN32__ 1")
+    extra.push("_WIN64 1")
+    extra.push("__WIN64 1")
+    extra.push("__WIN64__ 1")
+    extra.push("__WINNT 1")
+    extra.push("__WINNT__ 1")
+    extra.push("__MINGW32__ 1")
+    extra.push("__MINGW64__ 1")
+    extra.push("__MSVCRT__ 1")
+    extra.push("__SEH__ 1")
+    extra.push("_REENTRANT 1")
+    extra.push("_INTEGRAL_MAX_BITS 64")
+    extra.push("__cdecl __attribute__((__cdecl__))")
+    extra.push("__stdcall __attribute__((__stdcall__))")
+    extra.push("__fastcall __attribute__((__fastcall__))")
+    extra.push("__thiscall __attribute__((__thiscall__))")
+    extra.push("__declspec(x) __attribute__((x))")
+    foreach e in extra { repl.put(cpp_predef_name("#define " + e), "#define " + e) }
+    var out: Vec<Str> = vec()
+    var start = 0
+    let n = linux_text.len()
+    var i = 0
+    while i <= n {
+        if i == n || ord(linux_text.at(i)) == 10 {
+            if i > start {
+                let line = linux_text.slice(start, i)
+                let nm = cpp_predef_name(line)
+                if !drop.has(nm) && !repl.has(nm) { out.push(line) }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    foreach e2 in extra { out.push("#define " + e2) }
+    return cty_join(out, "\n") + "\n"
+}
+
+// the macro name a `#define NAME...` line defines
+fn cpp_predef_name(line: Str) -> Str {
+    var i = 8
+    while i < line.len() && ord(line.at(i)) != 32 && ord(line.at(i)) != 40 { i = i + 1 }
+    return line.slice(8, i)
+}
+
+// the names the preprocessor answers itself; `defined` is true for each
+fn cpp_builtin_names() -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    v.push(KW_UUFILE__)
+    v.push(KW_UULINE__)
+    v.push(KW_UUCOUNTER__)
+    v.push(KW_UUDATE__)
+    v.push(KW_UUTIME__)
+    v.push(KW_UUBASE_FILE__)
+    v.push(KW_UUhas_include)
+    v.push(KW_UUhas_include_next)
+    v.push(KW_UUhas_attribute)
+    v.push(KW_UUhas_builtin)
+    v.push(KW_UUhas_feature)
+    v.push(KW_UUhas_extension)
+    v.push(KW_UUhas_c_attribute)
+    v.push(KW_UUhas_cpp_attribute)
+    v.push(KW_UUhas_warning)
+    v.push(KW_UUis_identifier)
+    return v
+}
+
+fn cpp_predefine(inout s: St, opts: Options) {
+    foreach b in cpp_builtin_names() {
+        let m = s.m_name.len()
+        s.m_name.push(b)
+        s.m_kind.push(MK_BUILTIN)
+        s.m_nparams.push(0)
+        s.m_variadic.push(false)
+        s.m_start.push(0)
+        s.m_len.push(0)
+        s.m_loc.push(0)
+        s.m_pstart.push(s.mparams.len())
+        s.mac_of.put(b, m)
+    }
+    var text = ""
+    if opts.predefined {
+        text = cpp_predef_text()
+        if opts.target == "windows" { text = cpp_predef_windows(text) }
+    }
+    foreach d in opts.defines {
+        var eq = 0 - 1
+        var i = 0
+        while i < d.len() && eq < 0 { if ord(d.at(i)) == 61 { eq = i }  i = i + 1 }
+        if eq < 0 { text = text + "#define " + d + " 1\n" }
+        else { text = text + "#define " + d.slice(0, eq) + " " + d.slice(eq + 1, d.len()) + "\n" }
+    }
+    foreach ud in opts.undefines { text = text + "#undef " + ud + "\n" }
+    // the built-in text is file 0, lexed and run like any file; it produces no tokens
+    var toks: Vec<Int> = vec()
+    var lines: Vec<Int> = vec()
+    clx_lex(s, text, toks, lines)
+    s.ftoks.push(FileToks { path: "<built-in>", dir: "", fileno: 0, toks: sink toks, lines: sink lines, guard: 0 - 1, once: false })
+    cpp_push_frame(s, 0, 0 - 1)
+    cpp_run(s)
+}
+
+// ── files ────────────────────────────────────────────────────────────────────────────────────────
+
+// the directory part of a path ("" for a bare name)
+fn cpp_dirname(p: Str) -> Str {
+    var i = p.len() - 1
+    while i >= 0 {
+        if ord(p.at(i)) == 47 { return p.slice(0, i) }
+        i = i - 1
+    }
+    return ""
+}
+
+// lex `text` as a new file named `path` and return its cache index
+fn cpp_add_file_text(inout s: St, text: Str, path: Str) -> Int {
+    var toks: Vec<Int> = vec()
+    var lines: Vec<Int> = vec()
+    clx_lex(s, text, toks, lines)
+    let g = clx_guard(toks)
+    let fileno = s.unit.files.len()
+    s.unit.files.push(copy path)
+    let fi = s.ftoks.len()
+    s.ftoks.push(FileToks { path: copy path, dir: cpp_dirname(path), fileno: fileno, toks: sink toks, lines: sink lines, guard: g, once: false })
+    s.fcache.put(path, fi)
+    return fi
+}
+
+fn cpp_push_frame(inout s: St, fi: Int, dir_idx: Int) {
+    s.fr_file.push(fi)
+    s.fr_pos.push(0)
+    s.fr_dir.push(dir_idx)
+    s.fr_cond.push(s.conds.len())
+}
+
+fn cpp_pop_frame(inout s: St) {
+    let top = s.fr_file.len() - 1
+    let want = s.fr_cond[top]
+    if s.conds.len() > want {
+        let fi = s.fr_file[top]
+        let fno = s.ftoks[fi].fileno
+        let nl = s.ftoks[fi].lines.len()
+        var ln = 0
+        if nl > 0 { ln = s.ftoks[fi].lines[nl - 1] }
+        cst_note_at(s, fno, ln, "unterminated conditional at end of file")
+        while s.conds.len() > want { s.conds.pop() }
+    }
+    s.fr_file.pop()
+    s.fr_pos.pop()
+    s.fr_dir.pop()
+    s.fr_cond.pop()
+}
+
+// ── reading ──────────────────────────────────────────────────────────────────────────────────────
+
+// Read the next token into s.ct/s.cl/s.chs: from the pushed-back stack first, else from the file
+// on top of the include stack. Directives are carried out as they are met and never returned.
+fn cpp_read(inout s: St) {
+    while true {
+        let np = s.pk.len()
+        if np > 0 {
+            s.ct = s.pk.pop()
+            s.cl = s.pl.pop()
+            s.chs = s.ph.pop()
+            s.cdepth = 0 - 1
+            return
+        }
+        let nf = s.fr_file.len()
+        if nf == 0 {
+            s.ct = ctk_make(0, TK_EOF, 0)
+            s.cl = 0
+            s.chs = 0
+            s.cdepth = 0 - 1
+            return
+        }
+        let top = nf - 1
+        let fi = s.fr_file[top]
+        let p = s.fr_pos[top]
+        if p >= s.ftoks[fi].toks.len() {
+            cpp_pop_frame(s)
+            continue
+        }
+        let t = s.ftoks[fi].toks[p]
+        s.fr_pos[top] = p + 1
+        if ctk_id(t) == P_HASH && (ctk_flags(t) & TF_BOL) != 0 {
+            cpp_directive(s, top, fi, p + 1)
+            continue
+        }
+        s.ct = t
+        s.cl = (s.ftoks[fi].fileno << 24) | s.ftoks[fi].lines[p]
+        s.chs = 0
+        s.cdepth = nf
+        return
+    }
+}
+
+// put the token just read back in front of the input
+fn cpp_unread(inout s: St) {
+    if s.cdepth > 0 && s.cdepth == s.fr_file.len() {
+        let top = s.cdepth - 1
+        s.fr_pos[top] = s.fr_pos[top] - 1
+        return
+    }
+    s.pk.push(s.ct)
+    s.pl.push(s.cl)
+    s.ph.push(s.chs)
+}
+
+fn cpp_push_sentinel(inout s: St) {
+    s.pk.push(ctk_make(0, TK_SENT, 0))
+    s.pl.push(0)
+    s.ph.push(0)
+}
+
+// ── hide sets ────────────────────────────────────────────────────────────────────────────────────
+
+fn cpp_hs_has(s: St, hs: Int, name: Int) -> Bool {
+    var h = hs
+    while h != 0 {
+        if s.hs_name[h] == name { return true }
+        h = s.hs_next[h]
+    }
+    return false
+}
+
+fn cpp_hs_add(inout s: St, hs: Int, name: Int) -> Int {
+    if cpp_hs_has(s, hs, name) { return hs }
+    let key = (hs << 24) | name
+    let c = s.hs_cache[key] else 0
+    if c != 0 { return c }
+    let n = s.hs_name.len()
+    s.hs_name.push(name)
+    s.hs_next.push(hs)
+    s.hs_cache.put(key, n)
+    return n
+}
+
+fn cpp_hs_union(inout s: St, a: Int, b: Int) -> Int {
+    if a == 0 { return b }
+    if b == 0 { return a }
+    var r = b
+    var h = a
+    while h != 0 {
+        r = cpp_hs_add(s, r, s.hs_name[h])
+        h = s.hs_next[h]
+    }
+    return r
+}
+
+fn cpp_hs_inter(inout s: St, a: Int, b: Int) -> Int {
+    if a == 0 || b == 0 { return 0 }
+    var r = 0
+    var h = a
+    while h != 0 {
+        let nm = s.hs_name[h]
+        if cpp_hs_has(s, b, nm) { r = cpp_hs_add(s, r, nm) }
+        h = s.hs_next[h]
+    }
+    return r
+}
+
+// ── the expansion loop ───────────────────────────────────────────────────────────────────────────
+
+// preprocess everything left on the include stack into s.ot/s.ol
+fn cpp_run(inout s: St) {
+    while cpp_expand_one(s, false) { }
+}
+
+// Emit one fully expanded token, to the scratch buffer when `to_tmp` or else to the output. Answers
+// false at the end of input or at a sentinel (which it consumes).
+fn cpp_expand_one(inout s: St, to_tmp: Bool) -> Bool {
+    while true {
+        cpp_read(s)
+        let k = ctk_kind(s.ct)
+        if k == TK_EOF || k == TK_SENT { return false }
+        if k == TK_IDENT {
+            let id = ctk_id(s.ct)
+            if s.in_if && (id == KW_defined || id == KW_UUhas_include || id == KW_UUhas_include_next || id == KW_UUhas_attribute || id == KW_UUhas_builtin || id == KW_UUhas_feature || id == KW_UUhas_extension || id == KW_UUhas_c_attribute || id == KW_UUhas_cpp_attribute || id == KW_UUhas_warning || id == KW_UUis_identifier) {
+                let loc = s.cl
+                let v = cpp_if_operator(s, id)
+                var nt = ctk_make(P_ZERO, TK_NUM, TF_SPACE)
+                if v { nt = ctk_make(P_ONE, TK_NUM, TF_SPACE) }
+                cpp_emit(s, to_tmp, nt, loc, 0)
+                return true
+            }
+            let m = s.mac_of[id] else (0 - 1)
+            if m >= 0 && !cpp_hs_has(s, s.chs, id) {
+                if cpp_expand_macro(s, m, id) { continue }
+            }
+        }
+        cpp_emit(s, to_tmp, s.ct, s.cl, s.chs)
+        return true
+    }
+    return false
+}
+
+fn cpp_emit(inout s: St, to_tmp: Bool, t: Int, loc: Int, hs: Int) {
+    if to_tmp {
+        s.tt.push(t)
+        s.tl.push(loc)
+        s.th.push(hs)
+    } else {
+        s.ot.push(t)
+        s.ol.push(loc)
+    }
+}
+
+// Expand the macro `m` named by the token just read. Answers false (with that token restored in
+// s.ct) when it is a function-like macro not followed by `(`, or a builtin that stays a name.
+fn cpp_expand_macro(inout s: St, m: Int, id: Int) -> Bool {
+    let kind = s.m_kind[m]
+    let name_t = s.ct
+    let name_l = s.cl
+    let name_hs = s.chs
+    if kind == MK_BUILTIN {
+        if id == KW_UULINE__ {
+            let lt = ctk_make(cst_intern(s, to_str(name_l & 0xFFFFFF)), TK_NUM, ctk_flags(name_t))
+            cpp_push1(s, lt, name_l, name_hs)
+            return true
+        }
+        if id == KW_UUFILE__ || id == KW_UUBASE_FILE__ {
+            let fno = name_l >> 24
+            var fname = "<built-in>"
+            if fno < s.unit.files.len() { fname = copy s.unit.files[fno] }
+            let ft = ctk_make(cst_intern(s, "\"" + fname + "\""), TK_STR, ctk_flags(name_t))
+            cpp_push1(s, ft, name_l, name_hs)
+            return true
+        }
+        if id == KW_UUCOUNTER__ {
+            let ct = ctk_make(cst_intern(s, to_str(s.counter)), TK_NUM, ctk_flags(name_t))
+            s.counter = s.counter + 1
+            cpp_push1(s, ct, name_l, name_hs)
+            return true
+        }
+        if id == KW_UUDATE__ || id == KW_UUTIME__ {
+            cpp_push1(s, ctk_make(cst_intern(s, "\"Jan  1 1970\""), TK_STR, ctk_flags(name_t)), name_l, name_hs)
+            return true
+        }
+        return false
+    }
+    if kind == MK_OBJECT {
+        let hs = cpp_hs_add(s, name_hs, id)
+        let st = s.m_start[m]
+        var i = s.m_len[m] - 1
+        while i >= 0 {
+            var t = s.mbody[st + i]
+            if i == 0 { t = ctk_with_flags(t, ctk_flags(name_t)) }
+            s.pk.push(t)
+            s.pl.push(name_l)
+            s.ph.push(hs)
+            i = i - 1
+        }
+        return true
+    }
+    // function-like: the next token must be `(`
+    cpp_read(s)
+    if ctk_id(s.ct) != P_LPAREN || ctk_kind(s.ct) != TK_PUNCT {
+        cpp_unread(s)
+        s.ct = name_t
+        s.cl = name_l
+        s.chs = name_hs
+        return false
+    }
+    // collect the arguments, raw, into at/ah with each argument's start in ast
+    var at: Vec<Int> = vec()
+    var ah: Vec<Int> = vec()
+    var ast: Vec<Int> = vec()
+    let np = s.m_nparams[m]
+    let variadic = s.m_variadic[m]
+    ast.push(0)
+    var depth = 0
+    var rparen_hs = 0
+    var done = false
+    var lpar_t = s.ct
+    var lpar_l = s.cl
+    var lpar_hs = s.chs
+    while !done {
+        cpp_read(s)
+        let k = ctk_kind(s.ct)
+        if k == TK_EOF || k == TK_SENT {
+            // an unterminated call: put everything back and leave the name alone
+            if k == TK_SENT { cpp_unread(s) }
+            var j = at.len() - 1
+            while j >= 0 { s.pk.push(at[j])  s.pl.push(name_l)  s.ph.push(ah[j])  j = j - 1 }
+            s.pk.push(lpar_t)
+            s.pl.push(lpar_l)
+            s.ph.push(lpar_hs)
+            s.ct = name_t
+            s.cl = name_l
+            s.chs = name_hs
+            return false
+        }
+        let tid = ctk_id(s.ct)
+        let is_p = k == TK_PUNCT
+        if is_p && tid == P_LPAREN { depth = depth + 1 }
+        if is_p && tid == P_RPAREN {
+            if depth == 0 { rparen_hs = s.chs  done = true  continue }
+            depth = depth - 1
+        }
+        if is_p && tid == P_COMMA && depth == 0 && !(variadic && ast.len() >= np) {
+            ast.push(at.len())
+            continue
+        }
+        at.push(s.ct)
+        ah.push(s.chs)
+    }
+    let nargs = ast.len()
+    if nargs == 1 && at.len() == 0 && np == 0 { ast.pop() }
+    // a variadic macro called without its variadic argument
+    if variadic && ast.len() == np - 1 { ast.push(at.len()) }
+    let hs = cpp_hs_add(s, cpp_hs_inter(s, name_hs, rparen_hs), id)
+    cpp_subst(s, m, at, ah, ast, hs, name_l, ctk_flags(name_t))
+    return true
+}
+
+fn cpp_push1(inout s: St, t: Int, loc: Int, hs: Int) {
+    s.pk.push(t)
+    s.pl.push(loc)
+    s.ph.push(hs)
+}
+
+// the bounds of argument `a` in the collected argument tokens
+fn cpp_arg_lo(ast: Vec<Int>, a: Int, n: Int) -> Int {
+    if a >= ast.len() { return n }
+    return ast[a]
+}
+fn cpp_arg_hi(ast: Vec<Int>, a: Int, n: Int) -> Int {
+    if a + 1 >= ast.len() { return n }
+    return ast[a + 1]
+}
+
+// Substitute the arguments into macro `m`'s body and push the result back onto the input.
+fn cpp_subst(inout s: St, m: Int, at: Vec<Int>, ah: Vec<Int>, ast: Vec<Int>, hs: Int, loc: Int, first_flags: Int) {
+    var rt: Vec<Int> = vec()
+    var rh: Vec<Int> = vec()
+    let st = s.m_start[m]
+    let n = s.m_len[m]
+    let na = at.len()
+    let va = s.m_nparams[m] - 1
+    let variadic = s.m_variadic[m]
+    var i = 0
+    var placemarker = false
+    var vaopt_close = 0 - 1
+    while i < n {
+        let t = s.mbody[st + i]
+        let k = ctk_kind(t)
+        let tid = ctk_id(t)
+        if i == vaopt_close { i = i + 1  continue }
+        let next_paste = i + 1 < n && ctk_kind(s.mbody[st + i + 1]) == TK_PUNCT && ctk_id(s.mbody[st + i + 1]) == P_HASHHASH
+        if k == TK_PUNCT && tid == P_HASHHASH {
+            // the right operand of `##`
+            i = i + 1
+            if i >= n { break }
+            let r = s.mbody[st + i]
+            let rk = ctk_kind(r)
+            if rk == TK_PARAM {
+                let lo = cpp_arg_lo(ast, ctk_id(r), na)
+                let hi = cpp_arg_hi(ast, ctk_id(r), na)
+                if lo == hi {
+                    // `, ## __VA_ARGS__` with no variadic argument drops the comma
+                    if variadic && ctk_id(r) == va && rt.len() > 0 && ctk_id(rt[rt.len() - 1]) == P_COMMA && !placemarker {
+                        rt.pop()
+                        rh.pop()
+                    }
+                } else {
+                    var j = lo
+                    if rt.len() > 0 && !placemarker && !(variadic && ctk_id(r) == va && ctk_id(rt[rt.len() - 1]) == P_COMMA) {
+                        let pasted = cpp_paste(s, rt[rt.len() - 1], at[lo])
+                        rt[rt.len() - 1] = pasted
+                        j = lo + 1
+                    }
+                    while j < hi { rt.push(at[j])  rh.push(ah[j])  j = j + 1 }
+                }
+            } else {
+                var rtok = r
+                if rk == TK_STRFY { rtok = cpp_stringify(s, at, ast, ctk_id(r), na, 0) }
+                if rt.len() > 0 && !placemarker {
+                    rt[rt.len() - 1] = cpp_paste(s, rt[rt.len() - 1], rtok)
+                } else {
+                    rt.push(rtok)
+                    rh.push(0)
+                }
+            }
+            placemarker = false
+            i = i + 1
+            continue
+        }
+        if k == TK_STRFY {
+            rt.push(cpp_stringify(s, at, ast, tid, na, ctk_flags(t)))
+            rh.push(0)
+            placemarker = false
+            i = i + 1
+            continue
+        }
+        if k == TK_PARAM {
+            let lo2 = cpp_arg_lo(ast, tid, na)
+            let hi2 = cpp_arg_hi(ast, tid, na)
+            if next_paste {
+                var j2 = lo2
+                while j2 < hi2 { rt.push(at[j2])  rh.push(ah[j2])  j2 = j2 + 1 }
+                placemarker = lo2 == hi2
+            } else if lo2 < hi2 {
+                // the argument fully expanded on its own
+                let mark = s.tt.len()
+                cpp_push_sentinel(s)
+                var j3 = hi2 - 1
+                while j3 >= lo2 { s.pk.push(at[j3])  s.pl.push(loc)  s.ph.push(ah[j3])  j3 = j3 - 1 }
+                while cpp_expand_one(s, true) { }
+                var j4 = mark
+                while j4 < s.tt.len() {
+                    var et = s.tt[j4]
+                    if j4 == mark { et = ctk_with_flags(et, ctk_flags(t)) }
+                    rt.push(et)
+                    rh.push(s.th[j4])
+                    j4 = j4 + 1
+                }
+                while s.tt.len() > mark { s.tt.pop()  s.tl.pop()  s.th.pop() }
+                placemarker = false
+            }
+            i = i + 1
+            continue
+        }
+        if k == TK_IDENT && tid == KW_UUVA_OPT__ && variadic {
+            // __VA_OPT__( content ): the content when the variadic argument has tokens
+            var close = 0 - 1
+            if i + 1 < n && ctk_id(s.mbody[st + i + 1]) == P_LPAREN {
+                var d = 0
+                var q = i + 1
+                while q < n && close < 0 {
+                    let qi = ctk_id(s.mbody[st + q])
+                    if qi == P_LPAREN { d = d + 1 }
+                    if qi == P_RPAREN { d = d - 1  if d == 0 { close = q } }
+                    q = q + 1
+                }
+            }
+            if close > 0 {
+                let vlo = cpp_arg_lo(ast, va, na)
+                let vhi = cpp_arg_hi(ast, va, na)
+                if vlo < vhi { vaopt_close = close  i = i + 2 } else { i = close + 1 }
+                continue
+            }
+        }
+        rt.push(t)
+        rh.push(0)
+        placemarker = false
+        i = i + 1
+    }
+    var q2 = rt.len() - 1
+    while q2 >= 0 {
+        var t2 = rt[q2]
+        if q2 == 0 { t2 = ctk_with_flags(t2, first_flags) }
+        s.pk.push(t2)
+        s.pl.push(loc)
+        s.ph.push(cpp_hs_union(s, rh[q2], hs))
+        q2 = q2 - 1
+    }
+}
+
+// `#param`: the argument's spelling as a string literal token
+fn cpp_stringify(inout s: St, at: Vec<Int>, ast: Vec<Int>, a: Int, na: Int, flags: Int) -> Int {
+    let lo = cpp_arg_lo(ast, a, na)
+    let hi = cpp_arg_hi(ast, a, na)
+    var parts: Vec<Str> = vec()
+    parts.push("\"")
+    var j = lo
+    while j < hi {
+        let t = at[j]
+        if j > lo && (ctk_flags(t) & TF_SPACE) != 0 { parts.push(" ") }
+        let sp = s.names[ctk_id(t)]
+        let k = ctk_kind(t)
+        if k == TK_STR || k == TK_CHAR {
+            var e = 0
+            while e < sp.len() {
+                let c = ord(sp.at(e))
+                if c == 34 || c == 92 { parts.push("\\") }
+                parts.push(sp.slice(e, e + 1))
+                e = e + 1
+            }
+        } else {
+            parts.push(copy sp)
+        }
+        j = j + 1
+    }
+    parts.push("\"")
+    let text = cty_join(parts, "")
+    return ctk_make(cst_intern(s, text), TK_STR, flags & TF_SPACE)
+}
+
+// `a ## b`: the token spelled by the two spellings joined
+fn cpp_paste(inout s: St, a: Int, b: Int) -> Int {
+    let text = s.names[ctk_id(a)] + s.names[ctk_id(b)]
+    var toks: Vec<Int> = vec()
+    var lines: Vec<Int> = vec()
+    clx_lex(s, text, toks, lines)
+    if toks.len() == 0 { return a }
+    return ctk_with_flags(toks[0], ctk_flags(a))
+}
+
+// ── directives ───────────────────────────────────────────────────────────────────────────────────
+
+// Carry out the directive whose name is at index `p` of file `fi` (the `#` is at p - 1).
+fn cpp_directive(inout s: St, top: Int, fi: Int, p: Int) {
+    let ntoks = s.ftoks[fi].toks.len()
+    var e = p
+    while e < ntoks && (ctk_flags(s.ftoks[fi].toks[e]) & TF_BOL) == 0 { e = e + 1 }
+    s.fr_pos[top] = e
+    if e == p { return }
+    let loc = (s.ftoks[fi].fileno << 24) | s.ftoks[fi].lines[p]
+    let d = ctk_id(s.ftoks[fi].toks[p])
+    if d == KW_define { cpp_define(s, fi, p + 1, e, loc)  return }
+    if d == KW_undef {
+        if p + 1 < e { s.mac_of.put(ctk_id(s.ftoks[fi].toks[p + 1]), 0 - 1) }
+        return
+    }
+    if d == KW_include || d == KW_include_next || d == KW_import {
+        cpp_include(s, top, fi, p + 1, e, d == KW_include_next, loc)
+        return
+    }
+    if d == KW_if {
+        s.conds.push(CS_ACTIVE)
+        if !cpp_eval_line(s, fi, p + 1, e) { s.conds[s.conds.len() - 1] = CS_SEEKING  cpp_skip(s, top, fi) }
+        return
+    }
+    if d == KW_ifdef || d == KW_ifndef {
+        s.conds.push(CS_ACTIVE)
+        var def = false
+        if p + 1 < e { def = (s.mac_of[ctk_id(s.ftoks[fi].toks[p + 1])] else (0 - 1)) >= 0 }
+        if def != (d == KW_ifdef) { s.conds[s.conds.len() - 1] = CS_SEEKING  cpp_skip(s, top, fi) }
+        return
+    }
+    if d == KW_elif || d == KW_else || d == KW_elifdef || d == KW_elifndef {
+        let nc = s.conds.len()
+        if nc <= s.fr_cond[top] {
+            cst_note_loc(s, loc, "#" + s.names[d] + " without #if")
+            return
+        }
+        let state = s.conds[nc - 1]
+        if state == CS_ACTIVE || state == CS_DONE {
+            s.conds[nc - 1] = CS_DONE
+            cpp_skip(s, top, fi)
+            return
+        }
+        // seeking a branch
+        var take = true
+        if d == KW_elif { take = cpp_eval_line(s, fi, p + 1, e) }
+        if d == KW_elifdef || d == KW_elifndef {
+            var def2 = false
+            if p + 1 < e { def2 = (s.mac_of[ctk_id(s.ftoks[fi].toks[p + 1])] else (0 - 1)) >= 0 }
+            take = def2 == (d == KW_elifdef)
+        }
+        if take { s.conds[nc - 1] = CS_ACTIVE } else { cpp_skip(s, top, fi) }
+        return
+    }
+    if d == KW_endif {
+        if s.conds.len() <= s.fr_cond[top] {
+            cst_note_loc(s, loc, "#endif without #if")
+            return
+        }
+        s.conds.pop()
+        return
+    }
+    if d == KW_pragma {
+        if p + 1 < e {
+            let pd = ctk_id(s.ftoks[fi].toks[p + 1])
+            if pd == KW_once { s.ftoks[fi].once = true }
+            if pd == KW_pack { cpp_pragma_pack(s, fi, p + 2, e) }
+        }
+        return
+    }
+    if d == KW_error {
+        cst_note_loc(s, loc, "#error " + cpp_line_text(s, fi, p + 1, e))
+        return
+    }
+    if d == KW_warning || d == KW_line || d == KW_ident || d == KW_sccs || d == KW_assert || d == KW_unassert { return }
+    if ctk_kind(s.ftoks[fi].toks[p]) == TK_NUM { return }
+    cst_note_loc(s, loc, "unknown directive #" + s.names[d])
+}
+
+// the spelling of tokens [lo, hi) of file `fi`, spaced as written
+fn cpp_line_text(s: St, fi: Int, lo: Int, hi: Int) -> Str {
+    var parts: Vec<Str> = vec()
+    var i = lo
+    while i < hi {
+        let t = s.ftoks[fi].toks[i]
+        if i > lo && (ctk_flags(t) & TF_SPACE) != 0 { parts.push(" ") }
+        parts.push(copy s.names[ctk_id(t)])
+        i = i + 1
+    }
+    return cty_join(parts, "")
+}
+
+// Skip the rest of a conditional branch: move the cursor of file `fi` to the `#` of the next
+// `#elif`/`#else`/`#endif` belonging to the current conditional, or to the end of the file.
+fn cpp_skip(inout s: St, top: Int, fi: Int) {
+    var i = s.fr_pos[top]
+    let n = s.ftoks[fi].toks.len()
+    var depth = 0
+    while i < n {
+        let t = s.ftoks[fi].toks[i]
+        if ctk_id(t) == P_HASH && (ctk_flags(t) & TF_BOL) != 0 && i + 1 < n && (ctk_flags(s.ftoks[fi].toks[i + 1]) & TF_BOL) == 0 {
+            let d = ctk_id(s.ftoks[fi].toks[i + 1])
+            if d == KW_if || d == KW_ifdef || d == KW_ifndef { depth = depth + 1 }
+            else if d == KW_endif {
+                if depth == 0 { s.fr_pos[top] = i  return }
+                depth = depth - 1
+            } else if depth == 0 && (d == KW_elif || d == KW_else || d == KW_elifdef || d == KW_elifndef) {
+                s.fr_pos[top] = i
+                return
+            }
+        }
+        i = i + 1
+    }
+    s.fr_pos[top] = n
+}
+
+// #define NAME body / #define NAME(params) body, from tokens [p, e) of file `fi`
+fn cpp_define(inout s: St, fi: Int, p: Int, e: Int, loc: Int) {
+    if p >= e { return }
+    let nt = s.ftoks[fi].toks[p]
+    if ctk_kind(nt) != TK_IDENT { cst_note_loc(s, loc, "#define of a non-identifier")  return }
+    let name = ctk_id(nt)
+    var i = p + 1
+    var kind = MK_OBJECT
+    var params: Vec<Int> = vec()
+    var variadic = false
+    if i < e && ctk_id(s.ftoks[fi].toks[i]) == P_LPAREN && (ctk_flags(s.ftoks[fi].toks[i]) & TF_SPACE) == 0 {
+        kind = MK_FUNCTION
+        i = i + 1
+        var go = true
+        while go && i < e {
+            let t = s.ftoks[fi].toks[i]
+            let tid = ctk_id(t)
+            if tid == P_RPAREN { go = false }
+            else if tid == P_COMMA { }
+            else if tid == P_ELLIPSIS { variadic = true  params.push(KW_UUVA_ARGS__) }
+            else if ctk_kind(t) == TK_IDENT {
+                if i + 1 < e && ctk_id(s.ftoks[fi].toks[i + 1]) == P_ELLIPSIS { variadic = true  i = i + 1 }
+                params.push(tid)
+            }
+            i = i + 1
+        }
+        if go { cst_note_loc(s, loc, "#define " + s.names[name] + ": unterminated parameter list")  return }
+    }
+    let start = s.mbody.len()
+    var first = true
+    while i < e {
+        var t = s.ftoks[fi].toks[i]
+        if first { t = ctk_with_flags(t, 0)  first = false }
+        let tid = ctk_id(t)
+        let k = ctk_kind(t)
+        var pi = 0 - 1
+        if kind == MK_FUNCTION && k == TK_IDENT { pi = cpp_param_index(params, tid) }
+        if kind == MK_FUNCTION && k == TK_PUNCT && tid == P_HASH && i + 1 < e {
+            let nx = s.ftoks[fi].toks[i + 1]
+            let npi = cpp_param_index(params, ctk_id(nx))
+            if ctk_kind(nx) == TK_IDENT && npi >= 0 {
+                s.mbody.push(ctk_make(npi, TK_STRFY, ctk_flags(t)))
+                i = i + 2
+                continue
+            }
+        }
+        if pi >= 0 { s.mbody.push(ctk_make(pi, TK_PARAM, ctk_flags(t))) } else { s.mbody.push(t) }
+        i = i + 1
+    }
+    let m = s.m_name.len()
+    s.m_name.push(name)
+    s.m_kind.push(kind)
+    s.m_nparams.push(params.len())
+    s.m_variadic.push(variadic)
+    s.m_start.push(start)
+    s.m_len.push(s.mbody.len() - start)
+    s.m_loc.push(loc)
+    s.m_pstart.push(s.mparams.len())
+    foreach pn in params { s.mparams.push(pn) }
+    s.mac_of.put(name, m)
+}
+
+fn cpp_param_index(params: Vec<Int>, id: Int) -> Int {
+    var i = 0
+    while i < params.len() { if params[i] == id { return i }  i = i + 1 }
+    return 0 - 1
+}
+
+// #pragma pack(), pack(N), pack(push[, N]), pack(pop)
+fn cpp_pragma_pack(inout s: St, fi: Int, p: Int, e: Int) {
+    var i = p
+    if i < e && ctk_id(s.ftoks[fi].toks[i]) == P_LPAREN { i = i + 1 }
+    var val = 0 - 1
+    var push = false
+    var pop = false
+    while i < e {
+        let t = s.ftoks[fi].toks[i]
+        let tid = ctk_id(t)
+        if tid == KW_push { push = true }
+        if tid == KW_pop { pop = true }
+        if ctk_kind(t) == TK_NUM { val = cev_parse_int_text(s.names[tid]) }
+        i = i + 1
+    }
+    if push { s.pack_stack.push(s.pack_cur) }
+    if pop {
+        if s.pack_stack.len() > 0 { s.pack_cur = s.pack_stack.pop() } else { s.pack_cur = 0 }
+    }
+    if val >= 0 { s.pack_cur = val }
+    if !push && !pop && val < 0 { s.pack_cur = 0 }
+    s.pack_at.push(s.ot.len())
+    s.pack_val.push(s.pack_cur)
+}
+
+// ── #include ─────────────────────────────────────────────────────────────────────────────────────
+
+fn cpp_include(inout s: St, top: Int, fi: Int, p: Int, e: Int, next: Bool, loc: Int) {
+    var name = ""
+    var quoted = false
+    var ok = false
+    if p < e {
+        let t0 = s.ftoks[fi].toks[p]
+        if ctk_kind(t0) == TK_STR {
+            let sp = s.names[ctk_id(t0)]
+            name = sp.slice(1, sp.len() - 1)
+            quoted = true
+            ok = true
+        } else if ctk_id(t0) == P_LT {
+            var parts: Vec<Str> = vec()
+            var i = p + 1
+            while i < e && ctk_id(s.ftoks[fi].toks[i]) != P_GT { parts.push(copy s.names[ctk_id(s.ftoks[fi].toks[i])])  i = i + 1 }
+            name = cty_join(parts, "")
+            ok = i < e
+        } else {
+            // a macro naming the header
+            let mark = s.tt.len()
+            cpp_push_sentinel(s)
+            var j = e - 1
+            while j >= p { cpp_push1(s, s.ftoks[fi].toks[j], loc, 0)  j = j - 1 }
+            while cpp_expand_one(s, true) { }
+            if s.tt.len() > mark {
+                let x0 = s.tt[mark]
+                if ctk_kind(x0) == TK_STR {
+                    let sp2 = s.names[ctk_id(x0)]
+                    name = sp2.slice(1, sp2.len() - 1)
+                    quoted = true
+                    ok = true
+                } else if ctk_id(x0) == P_LT {
+                    var parts2: Vec<Str> = vec()
+                    var k = mark + 1
+                    while k < s.tt.len() && ctk_id(s.tt[k]) != P_GT { parts2.push(copy s.names[ctk_id(s.tt[k])])  k = k + 1 }
+                    name = cty_join(parts2, "")
+                    ok = k < s.tt.len()
+                }
+            }
+            while s.tt.len() > mark { s.tt.pop()  s.tl.pop()  s.th.pop() }
+        }
+    }
+    if !ok { cst_note_loc(s, loc, "malformed #include")  return }
+    var found_dir = 0 - 1
+    let path = cpp_find_include(s, top, fi, name, quoted, next, found_dir)
+    if path.len() == 0 {
+        if quoted { cst_note_loc(s, loc, "include not found: \"" + name + "\"") }
+        else { cst_note_loc(s, loc, "include not found: " + name) }
+        return
+    }
+    var cfi = s.fcache[path] else (0 - 1)
+    if cfi >= 0 {
+        if s.ftoks[cfi].once { return }
+        let g = s.ftoks[cfi].guard
+        if g >= 0 && (s.mac_of[g] else (0 - 1)) >= 0 { return }
+    } else {
+        let text = read_file(path)
+        cfi = cpp_add_file_text(s, text, path)
+    }
+    if s.fr_file.len() > 200 { cst_note_loc(s, loc, "#include nested too deeply: " + name)  return }
+    cpp_push_frame(s, cfi, found_dir)
+}
+
+// The path an include names, or "". `found_dir` receives the search-path index it was found at
+// (-1 for the including file's own directory or an absolute path), which `#include_next` resumes from.
+fn cpp_find_include(inout s: St, top: Int, fi: Int, name: Str, quoted: Bool, next: Bool, inout found_dir: Int) -> Str {
+    found_dir = 0 - 1
+    if name.len() > 0 && ord(name.at(0)) == 47 {
+        if cop_is_file(name) { return copy name }
+        return ""
+    }
+    var start = 0
+    if next {
+        start = s.fr_dir[top] + 1
+    } else if quoted {
+        let d = s.ftoks[fi].dir
+        var cand = copy name
+        if d.len() > 0 { cand = d + "/" + name }
+        if cop_is_file(cand) { return cand }
+    }
+    var i = start
+    while i < s.dirs.len() {
+        let cand2 = s.dirs[i] + "/" + name
+        if cop_is_file(cand2) { found_dir = i  return cand2 }
+        i = i + 1
+    }
+    return ""
+}
+
+// ── #if ──────────────────────────────────────────────────────────────────────────────────────────
+
+// evaluate the `#if` expression in tokens [p, e) of file `fi`
+fn cpp_eval_line(inout s: St, fi: Int, p: Int, e: Int) -> Bool {
+    let mark = s.tt.len()
+    cpp_push_sentinel(s)
+    var j = e - 1
+    let loc = (s.ftoks[fi].fileno << 24) | s.ftoks[fi].lines[p - 1]
+    while j >= p { cpp_push1(s, s.ftoks[fi].toks[j], loc, 0)  j = j - 1 }
+    let was = s.in_if
+    s.in_if = true
+    while cpp_expand_one(s, true) { }
+    s.in_if = was
+    // evaluate the expanded tokens with the parser's evaluator in preprocessor mode
+    var xt: Vec<Int> = vec()
+    var k = mark
+    while k < s.tt.len() { xt.push(s.tt[k])  k = k + 1 }
+    while s.tt.len() > mark { s.tt.pop()  s.tl.pop()  s.th.pop() }
+    let v = cev_eval_tokens(s, xt, loc, true)
+    if s.ev_fail {
+        s.ev_fail = false
+        cst_note_loc(s, loc, "#if expression not understood: " + cpp_line_text(s, fi, p, e))
+        return false
+    }
+    if s.ev_isf { return s.ev_fv != 0.0 }
+    return v != 0
+}
+
+// `defined X`, `__has_include(...)` and the other operators of an #if line, read unexpanded
+fn cpp_if_operator(inout s: St, id: Int) -> Bool {
+    cpp_read(s)
+    var paren = false
+    if ctk_id(s.ct) == P_LPAREN && ctk_kind(s.ct) == TK_PUNCT { paren = true  cpp_read(s) }
+    if id == KW_defined {
+        let nm = ctk_id(s.ct)
+        let def = ctk_kind(s.ct) == TK_IDENT && (s.mac_of[nm] else (0 - 1)) >= 0
+        if paren {
+            cpp_read(s)
+            if ctk_id(s.ct) != P_RPAREN { cpp_unread(s) }
+        }
+        return def
+    }
+    if !paren { cpp_unread(s)  return false }
+    // the operand's tokens up to the matching `)`
+    var toks: Vec<Int> = vec()
+    var depth = 0
+    var go = true
+    var first = true
+    while go {
+        if !first { cpp_read(s) }
+        first = false
+        let k = ctk_kind(s.ct)
+        if k == TK_EOF || k == TK_SENT { cpp_unread(s)  go = false }
+        else if ctk_id(s.ct) == P_RPAREN && depth == 0 { go = false }
+        else {
+            if ctk_id(s.ct) == P_LPAREN { depth = depth + 1 }
+            if ctk_id(s.ct) == P_RPAREN { depth = depth - 1 }
+            toks.push(s.ct)
+        }
+    }
+    if id == KW_UUhas_include || id == KW_UUhas_include_next {
+        if toks.len() == 0 { return false }
+        var name = ""
+        var quoted = false
+        if ctk_kind(toks[0]) == TK_STR {
+            let sp = s.names[ctk_id(toks[0])]
+            name = sp.slice(1, sp.len() - 1)
+            quoted = true
+        } else if ctk_id(toks[0]) == P_LT {
+            var parts: Vec<Str> = vec()
+            var i = 1
+            while i < toks.len() && ctk_id(toks[i]) != P_GT { parts.push(copy s.names[ctk_id(toks[i])])  i = i + 1 }
+            name = cty_join(parts, "")
+        } else { return false }
+        let top = s.fr_file.len() - 1
+        if top < 0 { return false }
+        var fd = 0
+        let path = cpp_find_include(s, top, s.fr_file[top], name, quoted, id == KW_UUhas_include_next, fd)
+        return path.len() > 0
+    }
+    if id == KW_UUis_identifier { return true }
+    if toks.len() == 0 { return false }
+    var an = copy s.names[ctk_id(toks[toks.len() - 1])]
+    if an.len() > 4 && ord(an.at(0)) == 95 && ord(an.at(1)) == 95 && ord(an.at(an.len() - 1)) == 95 && ord(an.at(an.len() - 2)) == 95 {
+        an = an.slice(2, an.len() - 2)
+    }
+    if id == KW_UUhas_attribute { return cpp_known(cpp_known_attributes(), an) }
+    if id == KW_UUhas_builtin { return cpp_known(cpp_known_builtins(), an) }
+    return false
+}
+
+fn cpp_known(list: Str, w: Str) -> Bool {
+    let n = list.len()
+    let wl = w.len()
+    var i = 0
+    while i < n {
+        var j = i
+        while j < n && ord(list.at(j)) != 32 { j = j + 1 }
+        if j - i == wl && list.slice(i, j) == w { return true }
+        i = j + 1
+    }
+    return false
+}
+
+fn cpp_known_attributes() -> Str {
+    return "aligned alloc_align alloc_size always_inline artificial access cold const constructor copy deprecated destructor "
+        + "error externally_visible fallthrough fd_arg fd_arg_read fd_arg_write flatten format format_arg gnu_inline hot "
+        + "ifunc leaf malloc mode no_instrument_function no_sanitize_address no_stack_protector noclone noinline nonnull "
+        + "noreturn nothrow optimize packed pure returns_nonnull returns_twice section sentinel symver tls_model "
+        + "transparent_union unavailable unused used visibility warn_unused_result warning weak weakref nonstring "
+        + "cleanup common nocommon alias assume_aligned no_reorder retain designated_init scalar_storage_order"
+}
+
+fn cpp_known_builtins() -> Str {
+    return "__builtin_expect __builtin_constant_p __builtin_offsetof __builtin_va_arg __builtin_va_start __builtin_va_end "
+        + "__builtin_va_copy __builtin_types_compatible_p __builtin_choose_expr __builtin_object_size __builtin_dynamic_object_size "
+        + "__builtin_unreachable __builtin_trap __builtin_bswap16 __builtin_bswap32 __builtin_bswap64 __builtin_clz __builtin_ctz "
+        + "__builtin_popcount __builtin_inf __builtin_nan __builtin_huge_val __builtin_isnan __builtin_isinf __builtin_signbit "
+        + "__builtin_add_overflow __builtin_sub_overflow __builtin_mul_overflow __builtin_alloca __builtin_memcpy __builtin_memset "
+        + "__builtin_strlen __builtin_va_arg_pack __builtin_va_arg_pack_len __builtin_fpclassify __builtin_isfinite "
+        + "builtin_expect builtin_constant_p builtin_offsetof"
+}

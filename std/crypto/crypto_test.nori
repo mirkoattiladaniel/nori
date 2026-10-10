@@ -1,0 +1,389 @@
+// .nori tests for std/crypto, run with
+//   noric --test std/crypto/crypto_test.nori compiler/runtime.nori --import-root .
+import "std/crypto" as crypto
+import "std/encoding" as enc
+
+fn test_sha256() {
+    // SHA-256 FIPS 180-4 test vectors
+    assert_streq(crypto::sha256(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(crypto::sha256("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    assert_streq(crypto::sha256("The quick brown fox jumps over the lazy dog"), "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592")
+}
+
+fn test_sha1() {
+    // SHA-1 test vectors
+    assert_streq(crypto::sha1(""), "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+    assert_streq(crypto::sha1("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d")
+}
+
+fn test_crc32() {
+    assert_streq(crypto::crc32_hex("123456789"), "cbf43926") // CRC-32/ISO-HDLC check value
+    assert_eq(crypto::crc32(""), 0)
+}
+
+fn test_hmac_sha256() {
+    // RFC 4231 / common vectors
+    assert_streq(crypto::hmac_sha256("key", "The quick brown fox jumps over the lazy dog"),
+        "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8")
+}
+
+// ---- randomness ----------------------------------------------------------------
+// There is no published test vector for a random number generator, so these assert
+// the properties whose absence would be dangerous: the right amount of output, a
+// hard failure rather than a weak one, and output that is actually varied.
+
+fn test_rand_bytes_length() {
+    assert_eq(crypto::rand_bytes(32).len(), 32)
+    assert_eq(crypto::rand_bytes(1).len(), 1)
+    assert_eq(crypto::rand_hex(32).len(), 64)          // hex: 2 chars per byte
+}
+
+fn test_rand_bytes_refuses_nonsense_rather_than_guessing() {
+    assert_eq(crypto::rand_bytes(0).len(), 0)
+    assert_eq(crypto::rand_bytes(0 - 5).len(), 0)
+}
+
+fn test_two_draws_differ() {
+    // a collision here is a 1-in-2^256 event, so a failure means the generator is
+    // repeating, which is the bug that makes session ids predictable
+    assert_true(crypto::rand_bytes(32) != crypto::rand_bytes(32))
+    assert_true(crypto::rand_hex(32) != crypto::rand_hex(32))
+}
+
+fn test_output_is_actually_varied() {
+    // 256 bytes from a real CSPRNG show ~162 distinct values; a constant, a counter,
+    // or a byte-repeating bug shows a handful. 40 is far below the real floor and far
+    // above anything broken.
+    let s = crypto::rand_bytes(256)
+    assert_eq(s.len(), 256)
+    var seen: Map<Str, Int> = map()
+    var i = 0
+    while i < s.len() { seen.put(to_str(ord(s.at(i))), 1)  i = i + 1 }
+    assert_true(seen.len() > 40)
+}
+
+// ---- constant-time compare -----------------------------------------------------
+// The timing property is by construction: no early return, and the loop always runs
+// the length of `a`. These assert the answers are right; a timing assertion would be
+// flaky enough to be worse than useless in a test suite.
+
+fn test_ct_eq_agrees_with_equality() {
+    assert_true(crypto::ct_eq("", ""))
+    assert_true(crypto::ct_eq("abc", "abc"))
+    assert_true(!crypto::ct_eq("abc", "abd"))          // differs at the end
+    assert_true(!crypto::ct_eq("abc", "zbc"))          // differs at the start
+    assert_true(!crypto::ct_eq("abc", "ab"))           // shorter
+    assert_true(!crypto::ct_eq("ab", "abc"))           // longer
+    assert_true(!crypto::ct_eq("", "a"))
+    assert_true(!crypto::ct_eq("a", ""))
+}
+
+fn test_ct_eq_on_a_real_digest() {
+    let h = crypto::sha256("abc")
+    assert_true(crypto::ct_eq(h, crypto::sha256("abc")))
+    assert_true(!crypto::ct_eq(h, crypto::sha256("abd")))
+}
+
+// ---- signed tokens -------------------------------------------------------------
+
+fn tk_key() -> Str { return "test-key-not-a-real-secret" }
+
+fn test_token_roundtrip() {
+    let t = crypto::token_new(tk_key(), "user:alice", 3600)
+    let r = crypto::token_read(tk_key(), t)
+    assert_true(r.ok)
+    assert_streq(r.payload, "user:alice")
+    assert_streq(r.why, "")
+    assert_true(r.expires > 0)
+}
+
+fn test_token_payload_survives_awkward_bytes() {
+    // the payload is base64url'd, so a dot cannot split the token and a newline
+    // cannot forge a line; worth asserting, since both would be format bugs
+    let odd = "a.b\nc\td  e=f&g\"h'\\i"
+    let t = crypto::token_new(tk_key(), odd, 60)
+    assert_streq(crypto::token_read(tk_key(), t).payload, odd)
+    let empty = crypto::token_new(tk_key(), "", 60)
+    assert_true(crypto::token_read(tk_key(), empty).ok)
+    assert_streq(crypto::token_read(tk_key(), empty).payload, "")
+}
+
+fn test_token_rejects_a_changed_payload() {
+    let t = crypto::token_new(tk_key(), "user:guest", 3600)
+    let parts = tk_split(t)
+    // same shape, different payload, original signature
+    let forged = parts[0] + ("." + (parts[1] + ("." + (enc::b64url_encode("user:admin") + ("." + parts[3])))))
+    assert_streq(crypto::token_read(tk_key(), forged).why, "bad_signature")
+}
+
+fn test_token_rejects_a_moved_deadline() {
+    // The reason the MAC covers the expiry: without it, the holder of a one-minute
+    // token edits three digits and has a ten-year one
+    let t = crypto::token_new(tk_key(), "user:alice", 60)
+    let parts = tk_split(t)
+    let forged = parts[0] + ("." + ("99999999999" + ("." + (parts[2] + ("." + parts[3])))))
+    assert_streq(crypto::token_read(tk_key(), forged).why, "bad_signature")
+}
+
+fn test_token_rejects_a_changed_signature_or_key() {
+    let t = crypto::token_new(tk_key(), "x", 3600)
+    // Flip to a character the last one is not. Replacing it with a fixed "0" would leave the token
+    // unchanged whenever the signature already ended in one, and the signature covers an expiry
+    // computed from the clock, so a new token is signed every second: the test would reject a forgery it
+    // had not actually made, and fail about one run in sixteen.
+    let lastc = t.slice(t.len() - 1, t.len())
+    var repl = "0"
+    if (lastc == "0") { repl = "1" }
+    let flipped = t.slice(0, t.len() - 1) + repl
+    assert_true(!crypto::token_read(tk_key(), flipped).ok)
+    assert_streq(crypto::token_read("a-different-key", t).why, "bad_signature")
+}
+
+fn test_token_expiry() {
+    // built by hand with a deadline in the past and a valid signature, so this
+    // exercises the expiry check rather than the signature check
+    let body = "v1." + ("1000000000" + ("." + enc::b64url_encode("stale")))
+    let t = body + ("." + crypto::hmac_sha256(tk_key(), body))
+    let r = crypto::token_read(tk_key(), t)
+    assert_true(!r.ok)
+    assert_streq(r.why, "expired")
+    assert_eq(r.expires, 1000000000)
+}
+
+fn test_token_without_an_expiry_is_accepted() {
+    let t = crypto::token_new(tk_key(), "forever", 0)
+    let r = crypto::token_read(tk_key(), t)
+    assert_true(r.ok)
+    assert_eq(r.expires, 0)
+}
+
+fn test_token_refuses_rubbish_without_trapping() {
+    assert_streq(crypto::token_read(tk_key(), "").why, "bad_format")
+    assert_streq(crypto::token_read(tk_key(), "nonsense").why, "bad_format")
+    assert_streq(crypto::token_read(tk_key(), "v1.60.x").why, "bad_format")        // too few parts
+    assert_streq(crypto::token_read(tk_key(), "v1.60.x.y.z").why, "bad_format")    // too many
+    assert_streq(crypto::token_read(tk_key(), "v2.60.eA.abc").why, "bad_format")   // unknown version
+    // right shape, non-numeric deadline, and a signature that matches it: the format
+    // check has to catch this after the signature passes
+    let body = "v1.notanumber." + enc::b64url_encode("x")
+    let t = body + ("." + crypto::hmac_sha256(tk_key(), body))
+    assert_streq(crypto::token_read(tk_key(), t).why, "bad_format")
+}
+
+fn tk_split(s: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var start = 0
+    var i = 0
+    while i <= s.len() {
+        if i == s.len() || ord(s.at(i)) == 46 { out.push(s.slice(start, i))  start = i + 1 }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- PBKDF2-HMAC-SHA256 ---------------------------------------------------------
+// Published vectors first: a KDF that is subtly wrong still produces plausible bytes,
+// so "it round-trips" proves nothing. These are the widely-cited SHA-256 counterparts
+// of the RFC 6070 inputs.
+
+fn test_pbkdf2_vectors() {
+    assert_streq(enc::hex_encode(crypto::pbkdf2_sha256("password", "salt", 1, 32)),
+        "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+    assert_streq(enc::hex_encode(crypto::pbkdf2_sha256("password", "salt", 2, 32)),
+        "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43")
+    assert_streq(enc::hex_encode(crypto::pbkdf2_sha256("password", "salt", 4096, 32)),
+        "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a")
+}
+
+fn test_pbkdf2_spans_multiple_blocks() {
+    // 40 bytes needs two PRF blocks, which exercises the block-index the salt is
+    // suffixed with. Get that wrong and only the first 32 bytes are right
+    assert_streq(enc::hex_encode(crypto::pbkdf2_sha256(
+        "passwordPASSWORDpassword", "saltSALTsaltSALTsaltSALTsaltSALTsalt", 4096, 40)),
+        "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9")
+}
+
+fn test_pbkdf2_refuses_nonsense() {
+    assert_eq(crypto::pbkdf2_sha256("p", "s", 0, 32).len(), 0)
+    assert_eq(crypto::pbkdf2_sha256("p", "s", 0 - 1, 32).len(), 0)
+    assert_eq(crypto::pbkdf2_sha256("p", "s", 1, 0).len(), 0)
+}
+
+fn test_hmac_raw_matches_the_hex_form() {
+    assert_streq(enc::hex_encode(crypto::hmac_sha256_raw("key", "msg")),
+                 crypto::hmac_sha256("key", "msg"))
+    assert_eq(crypto::hmac_sha256_raw("key", "msg").len(), 32)
+}
+
+// ---- password hashing ------------------------------------------------------------
+
+fn test_pbkdf2_hash_then_verify() {
+    let h = crypto::pbkdf2_hash_with("Tr0ub4dor&3", "sixteen-byte-slt", 1000)
+    assert_true(crypto::password_verify(h, "Tr0ub4dor&3"))
+    assert_true(!crypto::password_verify(h, "Tr0ub4dor&4"))
+    assert_true(!crypto::password_verify(h, ""))
+}
+
+fn test_pbkdf2_hash_is_self_describing() {
+    let h = crypto::pbkdf2_hash_with("pw", "sixteen-byte-slt", 1000)
+    assert_true(h.len() > 40)
+    assert_streq(h.slice(0, 24), "$pbkdf2-sha256$i=1000$c2")
+}
+
+fn test_same_password_hashes_differently() {
+    // a random salt per hash: two users sharing a password must not look alike, and
+    // precomputed tables must be useless
+    let a = crypto::password_hash("Tr0ub4dor&3")
+    let b = crypto::password_hash("Tr0ub4dor&3")
+    assert_true(a != b)
+    assert_true(crypto::password_verify(a, "Tr0ub4dor&3"))
+    assert_true(crypto::password_verify(b, "Tr0ub4dor&3"))
+}
+
+fn test_a_malformed_record_never_verifies() {
+    assert_true(!crypto::password_verify("", "pw"))
+    assert_true(!crypto::password_verify("nonsense", "pw"))
+    assert_true(!crypto::password_verify("$pbkdf2-sha256$i=1000$c2FsdA", "pw"))     // truncated
+    assert_true(!crypto::password_verify("$pbkdf2-sha256$i=0$c2FsdA$eA", "pw"))     // zero cost
+    assert_true(!crypto::password_verify("$pbkdf2-sha256$i=x$c2FsdA$eA", "pw"))     // non-numeric
+    assert_true(!crypto::password_verify("$argon2id$v=19$m=65536,t=2,p=1$c2E$eA", "pw"))  // another scheme
+    assert_true(crypto::password_hash("").len() == 0)
+}
+
+fn test_needs_rehash_tracks_the_current_cost() {
+    let old = crypto::pbkdf2_hash_with("pw", "sixteen-byte-slt", 1000)
+    assert_true(crypto::password_needs_rehash(old))
+    let now = crypto::password_hash("pw")
+    assert_true(!crypto::password_needs_rehash(now))
+    assert_true(crypto::password_needs_rehash(""))
+    assert_true(crypto::password_needs_rehash("garbage"))
+}
+
+// ---- BLAKE2b (RFC 7693) ---------------------------------------------------------
+
+fn test_blake2b_vectors() {
+    assert_streq(crypto::blake2b_hex("abc", 64),
+        "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923")
+    assert_streq(crypto::blake2b_hex("", 64),
+        "786a02f742015903c6c6fd852552d272912f4740e15847618a86e217f71f5419d25e1031afee585313896444934eb04b903a685b1448b755d56f701afe9be2ce")
+}
+
+fn test_blake2b_block_boundaries() {
+    // 128 bytes is exactly one block and 129 is one over, where the counter and the
+    // final-block flag are easiest to get wrong. Cross-checked against Python hashlib.
+    assert_streq(crypto::blake2b_hex(rep_ch("x", 128), 32).slice(0, 32), "164ffb7089bae6f5a62fb0795e751dc9")
+    assert_streq(crypto::blake2b_hex(rep_ch("a", 129), 32),
+        "2f64744a6de0d2c0b56e64cf6e29a5aaa255010d415d51c75ccc82f73dccd865")
+    assert_streq(crypto::blake2b_hex(rep_ch("x", 200), 32).slice(0, 32), "7eb9c902d76f4876a0494066a9773bd4")
+}
+
+fn test_blake2b_output_lengths() {
+    assert_eq(crypto::blake2b("abc", 1).len(), 1)
+    assert_eq(crypto::blake2b("abc", 32).len(), 32)
+    assert_eq(crypto::blake2b("abc", 64).len(), 64)
+    assert_eq(crypto::blake2b("abc", 0).len(), 0)          // refused
+    assert_eq(crypto::blake2b("abc", 65).len(), 0)         // refused
+}
+
+// ---- Argon2id (RFC 9106) ---------------------------------------------------------
+// A wrong Argon2 still produces plausible bytes, so every one of these is a value
+// produced by a different implementation: the RFC itself, or the reference argon2 CLI.
+
+fn test_argon2id_rfc9106_vector() {
+    // section 5.3: p=4, T=32, m=32, t=3, v=19, with a secret and associated data;
+    // one vector that exercises multiple lanes and every input field
+    let tag = crypto::argon2id_raw(rep_b(1, 32), rep_b(2, 16), rep_b(3, 8), rep_b(4, 12), 32, 3, 4, 32)
+    assert_streq(enc::hex_encode(tag),
+        "0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659")
+}
+
+fn test_argon2id_against_the_reference_cli() {
+    // `echo -n password | argon2 somesalt12345678 -id -t T -m log2(M) -p P -l 32 -r`
+    assert_streq(enc::hex_encode(crypto::argon2id_raw("password", "somesalt12345678", "", "", 4096, 2, 1, 32)),
+        "f6089af6bbe404c8fad75f08dccabb3bc4e2c00183edac95b66e570736e31e6a")
+    assert_streq(enc::hex_encode(crypto::argon2id_raw("password", "somesalt12345678", "", "", 1024, 3, 1, 32)),
+        "ba44073e237c737a73257f6c8d405d281dfd591b24e1bd9fd39d7d2b6f6a8f5e")
+    // two lanes, one pass
+    assert_streq(enc::hex_encode(crypto::argon2id_raw("password", "somesalt12345678", "", "", 16384, 1, 2, 32)),
+        "80efb4b5763952c0c6b3d4789ed946eb9b96d3e8cf6ae3502c960348ba348955")
+    // four lanes, and a segment long enough that the address block is regenerated
+    // mid-segment, which a small vector cannot reach
+    assert_streq(enc::hex_encode(crypto::argon2id_raw("password", "somesalt12345678", "", "", 4096, 2, 4, 32)),
+        "8fe3ba769f4425cb01ebc2cfb1e847aa5c7e07ddab55fb51c852a7eca5009423")
+}
+
+fn test_argon2id_refuses_impossible_parameters() {
+    assert_eq(crypto::argon2id_raw("p", "s", "", "", 8, 0, 1, 32).len(), 0)      // t=0
+    assert_eq(crypto::argon2id_raw("p", "s", "", "", 8, 1, 0, 32).len(), 0)      // p=0
+    assert_eq(crypto::argon2id_raw("p", "s", "", "", 4, 1, 1, 32).len(), 0)      // m < 8p
+    assert_eq(crypto::argon2id_raw("p", "s", "", "", 64, 1, 1, 3).len(), 0)      // tag too short
+}
+
+fn test_argon2id_phc_interoperates() {
+    // written by libsodium, verified here
+    let libsodium = "$argon2id$v=19$m=19456,t=2,p=1$N5H7zDQovbXBmiANb45vlQ$htv2wVDdaRFpL2YOm7Fuc+a8oQaIX+H873ZwBKGGqVI"
+    assert_true(crypto::argon2id_verify(libsodium, "hunter2"))
+    assert_true(!crypto::argon2id_verify(libsodium, "hunter3"))
+    // written by the reference CLI, verified here
+    let cli = "$argon2id$v=19$m=65536,t=2,p=1$c2FsdHlzYWx0eTE2Yg$GMhiumb+JXxrw62bvWsaekR4z15sInLOWbar8wcIFis"
+    assert_true(crypto::argon2id_verify(cli, "hunter2"))
+    // and written here, byte-identical to what the CLI emits for the same inputs
+    assert_streq(crypto::argon2id_hash_with("hunter2", "somesalt12345678", 4096, 2, 1),
+        "$argon2id$v=19$m=4096,t=2,p=1$c29tZXNhbHQxMjM0NTY3OA$fqGJsXfWRb9bsCgBbm5yMizmq0HXVlwpYYa0nfCoPOM")
+}
+
+fn test_argon2id_rejects_malformed_records() {
+    assert_true(!crypto::argon2id_verify("", "pw"))
+    assert_true(!crypto::argon2id_verify("nonsense", "pw"))
+    assert_true(!crypto::argon2id_verify("$argon2id$v=19$m=4096,t=2,p=1$c2E", "pw"))       // truncated
+    assert_true(!crypto::argon2id_verify("$argon2id$v=16$m=4096,t=2,p=1$c2E$eA", "pw"))    // wrong version
+    assert_true(!crypto::argon2id_verify("$argon2i$v=19$m=4096,t=2,p=1$c2E$eA", "pw"))     // wrong variant
+    assert_true(!crypto::argon2id_verify("$argon2id$v=19$m=x,t=2,p=1$c2E$eA", "pw"))       // bad params
+}
+
+// ---- the one password API --------------------------------------------------------
+
+fn test_password_api_uses_argon2id() {
+    let h = crypto::password_hash("Tr0ub4dor&3")
+    assert_streq(h.slice(0, 10), "$argon2id$")
+    assert_true(crypto::password_verify(h, "Tr0ub4dor&3"))
+    assert_true(!crypto::password_verify(h, "Tr0ub4dor&4"))
+    assert_true(!crypto::password_needs_rehash(h))
+}
+
+fn test_password_verify_still_reads_pbkdf2() {
+    // an existing table written before Argon2id existed keeps working, and each
+    // record is flagged for upgrade on its owner's next login
+    let old = crypto::pbkdf2_hash_with("Tr0ub4dor&3", "sixteen-byte-slt", 1000)
+    assert_true(crypto::password_verify(old, "Tr0ub4dor&3"))
+    assert_true(!crypto::password_verify(old, "wrong"))
+    assert_true(crypto::password_needs_rehash(old))
+    assert_true(crypto::password_needs_rehash("garbage"))
+}
+
+fn rep_ch(c: Str, n: Int) -> Str {
+    var s = ""
+    var i = 0
+    while i < n { s = s + c  i = i + 1 }
+    return s
+}
+fn rep_b(b: Int, n: Int) -> Str {
+    var s = ""
+    var i = 0
+    while i < n { s = s + chr(b)  i = i + 1 }
+    return s
+}
+
+fn test_md5() {
+    // RFC 1321 §A.5's test suite
+    assert_streq(crypto::md5(""), "d41d8cd98f00b204e9800998ecf8427e")
+    assert_streq(crypto::md5("a"), "0cc175b9c0f1b6a831c399e269772661")
+    assert_streq(crypto::md5("abc"), "900150983cd24fb0d6963f7d28e17f72")
+    assert_streq(crypto::md5("message digest"), "f96b697d7cb7938d525a2f31aaf161d0")
+    assert_streq(crypto::md5("abcdefghijklmnopqrstuvwxyz"), "c3fcd3d76192e4007dfb496cca67e13b")
+    assert_streq(crypto::md5("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"), "d174ab98d277d9f5a5611c2c9f419d9f")
+    assert_streq(crypto::md5("12345678901234567890123456789012345678901234567890123456789012345678901234567890"), "57edf4a22be3c955ac49da2e2107b67a")
+    // the thumbnail specification's own example: file:///home/jens/photos/me.png
+    assert_streq(crypto::md5("file:///home/jens/photos/me.png"), "c6ee772d9e49320e97ec29a7eb5b1697")
+    assert_eq(crypto::md5_raw("abc").len(), 16)
+}

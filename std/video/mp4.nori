@@ -1,0 +1,188 @@
+// std/video/mp4.nori: MP4 (ISO base media file format, ISO/IEC 14496-12; MP4 itself, 14496-14), read by offset:
+//
+//   boxes (§4.2): a 32-bit size (1: a 64-bit size follows the type; 0: to the end of the file) and a four-character
+//   type; the top level is walked by offset to find 'moov' (it may come after 'mdat'), which is read whole; it is
+//   the index, not the media (at most 64 MB);
+//   moov > trak > mdia > hdlr (§8.4.3: the handler type, 'vide' for video), mdhd (§8.4.2: the timescale), minf > stbl:
+//   stsd (§8.5.2: the first sample entry's format ('vp09', 'av01', 'avc1'/'avc3', 'hvc1'/'hev1', 'mp4v') and, for a
+//   visual sample entry (§12.1.3), its width and height), stts (§8.6.1.2: decoding time deltas, run-length coded),
+//   stsc (§8.7.4: samples per chunk, by runs of chunks), stsz (§8.7.3: each sample's size, or one for all), stco and
+//   co64 (§8.7.5: each chunk's file offset);
+//   a sample's place: the chunk it is in (stsc), the chunk's offset (stco/co64) plus the sizes of the samples before
+//   it in the chunk (stsz).
+//
+// Not read: fragmented files (moof/traf: a stream recorded for live playback), edit lists (elst: the track starts at
+// its first sample), composition offsets (ctts: the codecs decoded here have no frame reordering in the container).
+
+import "std/os" as os
+
+fn be32m(p: Int) -> Int { var v = 0  unsafe { v = (peek8(p) << 24) | (peek8(p + 1) << 16) | (peek8(p + 2) << 8) | peek8(p + 3) }  return v }
+fn be16m(p: Int) -> Int { var v = 0  unsafe { v = (peek8(p) << 8) | peek8(p + 1) }  return v }
+fn fourcc_at(p: Int) -> Str { var s = ""  unsafe { s = str_from_buf(p, 4) }  return s }
+
+/// the child box of type `want` inside [p, end) of the moov buffer: its payload's address and size in `out`
+struct Box { at: Int, n: Int }
+fn mp4_child(p: Int, end: Int, want: Str, inout out: Box) -> Bool {
+    var q = p
+    while q + 8 <= end {
+        var sz = be32m(q)
+        let t = fourcc_at(q + 4)
+        var hdr = 8
+        if sz == 1 { if q + 16 > end { return false }  sz = be32m(q + 8) * 4294967296 + be32m(q + 12)  hdr = 16 }
+        if sz == 0 { sz = end - q }
+        if sz < hdr || q + sz > end { return false }
+        if t == want { out.at = q + hdr  out.n = sz - hdr  return true }
+        q = q + sz
+    }
+    return false
+}
+
+fn mp4_open(inout v: Video) {
+    // the top level: find moov
+    var off = 0
+    var moov_off = 0 - 1
+    var moov_n = 0
+    while off + 8 <= v.size && moov_off < 0 {
+        let h = vread(v, off, 16)
+        var sz = sbe(h, 0, 4)
+        let t = h.slice(4, 8)
+        var hdr = 8
+        if sz == 1 { sz = sbe(h, 8, 8)  hdr = 16 }
+        if sz == 0 { sz = v.size - off }
+        if sz < hdr { v.err = "MP4: a box with a size smaller than its header"  return }
+        if t == "moov" { moov_off = off + hdr  moov_n = sz - hdr }
+        off = off + sz
+    }
+    if moov_off < 0 { v.err = "MP4 without a moov box (fragmented, or cut short)"  return }
+    if moov_n > 67108864 || moov_off + moov_n > v.size { v.err = "MP4: its moov box is too large or cut short"  return }
+    unsafe { v.moov = malloc(moov_n + 16) }
+    v.moov_n = os::read_at(v.fd, v.moov, moov_off, moov_n)
+    if v.moov_n != moov_n { v.err = "MP4: its moov box cannot be read"  return }
+    // the first video track
+    var q = v.moov
+    let end = v.moov + v.moov_n
+    var found = false
+    while q + 8 <= end && !found {
+        var sz = be32m(q)
+        var hdr = 8
+        if sz == 1 { sz = be32m(q + 8) * 4294967296 + be32m(q + 12)  hdr = 16 }
+        if sz == 0 { sz = end - q }
+        if sz < hdr || q + sz > end { q = end }
+        else {
+            if fourcc_at(q + 4) == "trak" { found = mp4_trak(v, q + hdr, q + sz) }
+            q = q + sz
+        }
+    }
+    if !found && v.err.len() == 0 { v.err = "MP4 without a video track" }
+    if found { mp4_rewind(v) }
+}
+
+/// a track: when it is video, its sample tables kept
+fn mp4_trak(inout v: Video, p: Int, end: Int) -> Bool {
+    var mdia = Box { at: 0, n: 0 }
+    if !mp4_child(p, end, "mdia", mdia) { return false }
+    var hdlr = Box { at: 0, n: 0 }
+    if !mp4_child(mdia.at, mdia.at + mdia.n, "hdlr", hdlr) || hdlr.n < 12 { return false }
+    if !(fourcc_at(hdlr.at + 8) == "vide") { return false }
+    var mdhd = Box { at: 0, n: 0 }
+    if mp4_child(mdia.at, mdia.at + mdia.n, "mdhd", mdhd) {
+        var ver = 0
+        unsafe { ver = peek8(mdhd.at) }
+        if ver == 1 { v.timescale = be32m(mdhd.at + 20) } else { v.timescale = be32m(mdhd.at + 12) }
+    }
+    if v.timescale <= 0 { v.timescale = 1000 }
+    var minf = Box { at: 0, n: 0 }
+    var stbl = Box { at: 0, n: 0 }
+    if !mp4_child(mdia.at, mdia.at + mdia.n, "minf", minf) || !mp4_child(minf.at, minf.at + minf.n, "stbl", stbl) { v.err = "MP4: a video track without sample tables"  return false }
+    let s0 = stbl.at
+    let s1 = stbl.at + stbl.n
+    var b = Box { at: 0, n: 0 }
+    // stsd: version/flags, entry count, then the entries (boxes)
+    if !mp4_child(s0, s1, "stsd", b) || b.n < 16 { v.err = "MP4: no sample description"  return false }
+    let entry = b.at + 8
+    let fmt = fourcc_at(entry + 4)
+    if fmt == "vp09" { v.codec = "vp9" }
+    else if fmt == "av01" { v.codec = "av1" }
+    else if fmt == "avc1" || fmt == "avc3" { v.codec = "h264" }
+    else if fmt == "hvc1" || fmt == "hev1" { v.codec = "hevc" }
+    else if fmt == "vp08" { v.codec = "vp8" }
+    else if fmt == "mp4v" { v.codec = "mpeg4" }
+    else { v.codec = copy fmt }
+    if entry + 36 <= b.at + b.n { v.w = be16m(entry + 32)  v.h = be16m(entry + 34) }
+    // the time-to-sample, sample-to-chunk, sizes and chunk offsets
+    if !mp4_child(s0, s1, "stts", b) { v.err = "MP4: no stts"  return false }
+    v.stts_n = be32m(b.at + 4)
+    v.stts = b.at + 8
+    if 8 + v.stts_n * 8 > b.n { v.err = "MP4: stts cut short"  return false }
+    if !mp4_child(s0, s1, "stsc", b) { v.err = "MP4: no stsc"  return false }
+    v.stsc_n = be32m(b.at + 4)
+    v.stsc = b.at + 8
+    if 8 + v.stsc_n * 12 > b.n || v.stsc_n == 0 { v.err = "MP4: stsc cut short"  return false }
+    if !mp4_child(s0, s1, "stsz", b) { v.err = "MP4: no stsz"  return false }
+    v.stsz_fixed = be32m(b.at + 4)
+    v.stsz_n = be32m(b.at + 8)
+    v.stsz = b.at + 12
+    if v.stsz_fixed == 0 && 12 + v.stsz_n * 4 > b.n { v.err = "MP4: stsz cut short"  return false }
+    if mp4_child(s0, s1, "stco", b) {
+        v.co64 = false
+        v.stco_n = be32m(b.at + 4)
+        v.stco = b.at + 8
+        if 8 + v.stco_n * 4 > b.n { v.err = "MP4: stco cut short"  return false }
+    } else if mp4_child(s0, s1, "co64", b) {
+        v.co64 = true
+        v.stco_n = be32m(b.at + 4)
+        v.stco = b.at + 8
+        if 8 + v.stco_n * 8 > b.n { v.err = "MP4: co64 cut short"  return false }
+    } else { v.err = "MP4: no chunk offsets"  return false }
+    if v.stsz_n > 0 && v.stts_n > 0 { v.default_dur = (be32m(v.stts + 4) * 1000000000) / v.timescale }
+    v.track = 1
+    return true
+}
+
+fn mp4_chunk_off(v: Video, c: Int) -> Int {
+    if v.co64 { return be32m(v.stco + c * 8) * 4294967296 + be32m(v.stco + c * 8 + 4) }
+    return be32m(v.stco + c * 4)
+}
+
+fn mp4_rewind(inout v: Video) {
+    v.sample = 0
+    v.chunk = 0
+    v.in_chunk = 0
+    v.chunk_off = 0
+    v.stsc_i = 0
+    v.stts_i = 0
+    v.stts_left = 0
+    if v.stts_n > 0 { v.stts_left = be32m(v.stts) }
+    v.dts = 0
+}
+
+/// the next sample into the packet buffer
+fn mp4_next(inout v: Video) -> Bool {
+    if v.sample >= v.stsz_n || v.chunk >= v.stco_n { return false }
+    var size = v.stsz_fixed
+    if size == 0 { size = be32m(v.stsz + v.sample * 4) }
+    let off = mp4_chunk_off(v, v.chunk) + v.chunk_off
+    if !pkt_read(v, off, size) { v.err = "MP4: a sample past the end of the file"  return false }
+    v.pkt_ms = (v.dts * 1000) / v.timescale
+    // the next sample's place: within this chunk, or the next chunk (stsc runs: first_chunk is 1-based)
+    v.sample = v.sample + 1
+    v.in_chunk = v.in_chunk + 1
+    v.chunk_off = v.chunk_off + size
+    let per = be32m(v.stsc + v.stsc_i * 12 + 4)
+    if v.in_chunk >= per {
+        v.chunk = v.chunk + 1
+        v.in_chunk = 0
+        v.chunk_off = 0
+        if v.stsc_i + 1 < v.stsc_n && v.chunk + 1 >= be32m(v.stsc + (v.stsc_i + 1) * 12) { v.stsc_i = v.stsc_i + 1 }
+    }
+    // the decoding time
+    if v.stts_i < v.stts_n {
+        v.dts = v.dts + be32m(v.stts + v.stts_i * 8 + 4)
+        v.stts_left = v.stts_left - 1
+        if v.stts_left <= 0 {
+            v.stts_i = v.stts_i + 1
+            if v.stts_i < v.stts_n { v.stts_left = be32m(v.stts + v.stts_i * 8) }
+        }
+    }
+    return true
+}

@@ -1,0 +1,363 @@
+// Native .nori tests for std/audio — run with
+//   noric --test std/audio/audio_test.nori compiler/runtime.nori --import-root .
+//
+// Everything here is device-free: WAV round-trips, format conversion, buffer arithmetic and the
+// mixer. Anything that needs a sound card (or even libasound's device list) is left out.
+// What is checked here can be checked anywhere: that a byte laid down is the byte read back.
+import "std/audio" as audio
+
+fn le16(s: Str, at: Int) -> Int { return ord(s.at(at)) | (ord(s.at(at + 1)) << 8) }
+fn le32(s: Str, at: Int) -> Int {
+    return ord(s.at(at)) | (ord(s.at(at + 1)) << 8) | (ord(s.at(at + 2)) << 16) | (ord(s.at(at + 3)) << 24)
+}
+fn s16(v: Int) -> Str {
+    var u = v
+    if u < 0 { u = u + 65536 }
+    return chr_at(u & 255) + chr_at((u >> 8) & 255)
+}
+fn chr_at(v: Int) -> Str { return "" + chr(v) }
+
+// A ramp whose every sample is distinguishable, so a conversion that shifts, swaps or drops a
+// sample cannot pass by accident.
+fn ramp(n: Int, ch: Int) -> audio::Sound {
+    var d = ""
+    var i = 0
+    while i < n * ch { d = d + s16(i * 37 - 12000)  i = i + 1 }
+    return audio::sound(44100, ch, d)
+}
+
+fn test_frame_arithmetic() {
+    let s = audio::silence(48000, 2, 500)
+    assert_eq(s.data.len(), 500 * 2 * 2)                 // frames * channels * 2 bytes
+    assert_eq(audio::frames(s), 500)
+    assert_eq(audio::duration_ms(s), 500 * 1000 / 48000)
+    let m = audio::silence(8000, 1, 8000)
+    assert_eq(audio::frames(m), 8000)
+    assert_eq(audio::duration_ms(m), 1000)               // exactly one second
+    // a Sound whose byte length is not a whole number of frames reports the whole frames only
+    let odd = audio::sound(44100, 2, s.data.slice(0, 401))
+    assert_eq(audio::frames(odd), 100)
+    // and a nonsense channel count does not divide by zero
+    assert_eq(audio::frames(audio::sound(44100, 0, "abcd")), 0)
+    assert_eq(audio::duration_ms(audio::sound(0, 2, "abcd")), 0)
+}
+
+fn test_sample_at_is_signed() {
+    var d = ""
+    d = d + s16(0) + s16(1)
+    d = d + s16(32767) + s16(0 - 32768)
+    d = d + s16(0 - 1) + s16(12345)
+    let s = audio::sound(44100, 2, d)
+    assert_eq(audio::frames(s), 3)
+    assert_eq(audio::sample_at(s, 0, 0), 0)
+    assert_eq(audio::sample_at(s, 0, 1), 1)
+    assert_eq(audio::sample_at(s, 1, 0), 32767)
+    assert_eq(audio::sample_at(s, 1, 1), 0 - 32768)      // the sign bit is a sign, not a big number
+    assert_eq(audio::sample_at(s, 2, 0), 0 - 1)
+    assert_eq(audio::sample_at(s, 2, 1), 12345)
+    assert_eq(audio::sample_at(s, 99, 0), 0)             // past the end reads as silence, not a trap
+    assert_eq(audio::sample_at(s, 0 - 1, 0), 0)
+}
+
+fn test_wav_header_is_a_real_riff() {
+    let s = ramp(100, 2)
+    let w = audio::wav_write(s)
+    assert_eq(w.len(), 44 + 400)
+    assert_streq(w.slice(0, 4), "RIFF")
+    assert_eq(le32(w, 4), 36 + 400)                      // RIFF size = everything after this field
+    assert_streq(w.slice(8, 12), "WAVE")
+    assert_streq(w.slice(12, 16), "fmt ")
+    assert_eq(le32(w, 16), 16)                           // PCM fmt chunk length
+    assert_eq(le16(w, 20), 1)                            // WAVE_FORMAT_PCM
+    assert_eq(le16(w, 22), 2)                            // channels
+    assert_eq(le32(w, 24), 44100)                        // sample rate
+    assert_eq(le32(w, 28), 44100 * 4)                    // byte rate
+    assert_eq(le16(w, 32), 4)                            // block align
+    assert_eq(le16(w, 34), 16)                           // bits
+    assert_streq(w.slice(36, 40), "data")
+    assert_eq(le32(w, 40), 400)
+}
+
+fn test_wav_roundtrip_is_byte_exact() {
+    let s = ramp(1000, 2)
+    let r = audio::wav_decode(audio::wav_write(s))
+    assert_streq(r.error, "")
+    assert_eq(r.sound.rate, 44100)
+    assert_eq(r.sound.channels, 2)
+    assert_eq(audio::frames(r.sound), 1000)
+    assert_streq(r.sound.data, s.data)                   // every one of the 4000 bytes
+    // mono, and an odd frame count
+    let m = ramp(777, 1)
+    let rm = audio::wav_decode(audio::wav_write(m))
+    assert_eq(rm.sound.channels, 1)
+    assert_eq(audio::frames(rm.sound), 777)
+    assert_streq(rm.sound.data, m.data)
+}
+
+fn test_wav_rejects_junk_with_a_reason() {
+    let r1 = audio::wav_decode("")
+    assert_eq(r1.sound.rate, 0)
+    assert_true(r1.error.len() > 0)
+    var big = ""
+    var i = 0
+    while i < 100 { big = big + "xxxxxxxx"  i = i + 1 }
+    let r2 = audio::wav_decode(big)
+    assert_eq(r2.sound.rate, 0)
+    assert_true(r2.error.len() > 0)
+    // right magic, no data chunk
+    let w = audio::wav_write(audio::silence(44100, 2, 4))
+    let r3 = audio::wav_decode(w.slice(0, 36))
+    assert_eq(r3.sound.rate, 0)
+    // a truncated data chunk yields the frames that are there rather than failing or over-reading
+    let r4 = audio::wav_decode(w.slice(0, 44 + 8))
+    assert_eq(r4.sound.rate, 44100)
+    assert_eq(audio::frames(r4.sound), 2)
+}
+
+fn test_wav_8bit_and_24bit_convert() {
+    // 8-bit PCM is unsigned with a 128 bias: 128 is silence, 0 is full negative, 255 near full positive.
+    var b = ""
+    b = b + "RIFF" + le32s(36 + 4) + "WAVE" + "fmt " + le32s(16)
+    b = b + le16s(1) + le16s(1) + le32s(8000) + le32s(8000) + le16s(1) + le16s(8)
+    b = b + "data" + le32s(4)
+    b = b + chr_at(128) + chr_at(255) + chr_at(0) + chr_at(129)
+    let r = audio::wav_decode(b)
+    assert_streq(r.error, "")
+    assert_eq(r.sound.rate, 8000)
+    assert_eq(r.sound.channels, 1)
+    assert_eq(audio::frames(r.sound), 4)
+    assert_eq(audio::sample_at(r.sound, 0, 0), 0)
+    assert_eq(audio::sample_at(r.sound, 1, 0), 127 * 256)
+    assert_eq(audio::sample_at(r.sound, 2, 0), 0 - 128 * 256)
+    assert_eq(audio::sample_at(r.sound, 3, 0), 256)
+    // 24-bit keeps the top 16 bits of each 3-byte little-endian sample
+    var c = ""
+    c = c + "RIFF" + le32s(36 + 6) + "WAVE" + "fmt " + le32s(16)
+    c = c + le16s(1) + le16s(1) + le32s(8000) + le32s(24000) + le16s(3) + le16s(24)
+    c = c + "data" + le32s(6)
+    c = c + chr_at(0) + chr_at(0) + chr_at(64)           // 0x400000 -> 0x4000
+    c = c + chr_at(255) + chr_at(255) + chr_at(255)      // -1       -> -1
+    let r2 = audio::wav_decode(c)
+    assert_streq(r2.error, "")
+    assert_eq(audio::frames(r2.sound), 2)
+    assert_eq(audio::sample_at(r2.sound, 0, 0), 16384)
+    assert_eq(audio::sample_at(r2.sound, 1, 0), 0 - 1)
+}
+fn le16s(v: Int) -> Str { return chr_at(v & 255) + chr_at((v >> 8) & 255) }
+fn le32s(v: Int) -> Str { return le16s(v) + le16s(v >> 16) }
+
+fn test_float_conversion() {
+    // f32_from_bits against hand-computed IEEE-754 binary32 patterns
+    assert_eq(audio::float_to_s16(audio::f32_from_bits(0)), 0)                    // +0.0
+    assert_eq(audio::float_to_s16(audio::f32_from_bits(1065353216)), 32767)       // 1.0 -> full scale
+    assert_eq(audio::float_to_s16(audio::f32_from_bits(3212836864)), 0 - 32767)   // -1.0
+    assert_eq(audio::float_to_s16(audio::f32_from_bits(1056964608)), 16384)       // 0.5 -> 16383.5, rounds up
+    assert_eq(audio::float_to_s16(audio::f32_from_bits(3204448256)), 0 - 16384)   // -0.5
+    // out of range clamps rather than wrapping: a float WAV with an overshoot must not go from
+    // loud-positive to loud-negative, which is what a wrap sounds like
+    assert_eq(audio::float_to_s16(audio::f32_from_bits(1073741824)), 32767)       // 2.0
+    assert_eq(audio::float_to_s16(audio::f32_from_bits(3221225472)), 0 - 32768)   // -2.0
+}
+
+fn test_wav_float32_chunk() {
+    var b = ""
+    b = b + "RIFF" + le32s(36 + 8) + "WAVE" + "fmt " + le32s(16)
+    b = b + le16s(3) + le16s(1) + le32s(44100) + le32s(44100 * 4) + le16s(4) + le16s(32)
+    b = b + "data" + le32s(8)
+    b = b + le32s(1065353216)                            // 1.0
+    b = b + le32s(3204448256)                            // -0.5
+    let r = audio::wav_decode(b)
+    assert_streq(r.error, "")
+    assert_eq(audio::frames(r.sound), 2)
+    assert_eq(audio::sample_at(r.sound, 0, 0), 32767)
+    assert_eq(audio::sample_at(r.sound, 1, 0), 0 - 16384)
+}
+
+fn test_wav_extensible_tag() {
+    // WAVE_FORMAT_EXTENSIBLE (0xFFFE) hides the real format tag in the first two bytes of the
+    // 22-byte extension. Nearly everything a Windows recorder emits is this.
+    var b = ""
+    b = b + "RIFF" + le32s(36 + 22 + 4) + "WAVE" + "fmt " + le32s(40)
+    b = b + le16s(65534) + le16s(1) + le32s(16000) + le32s(32000) + le16s(2) + le16s(16)
+    b = b + le16s(22) + le16s(16) + le32s(4)             // cbSize, valid bits, channel mask
+    b = b + le16s(1) + le16s(0)                          // the GUID's leading tag: PCM
+    var k = 0
+    while k < 12 { b = b + chr_at(0)  k = k + 1 }
+    b = b + "data" + le32s(4)
+    b = b + s16(1234) + s16(0 - 1234)
+    let r = audio::wav_decode(b)
+    assert_streq(r.error, "")
+    assert_eq(r.sound.rate, 16000)
+    assert_eq(audio::sample_at(r.sound, 0, 0), 1234)
+    assert_eq(audio::sample_at(r.sound, 1, 0), 0 - 1234)
+}
+
+// ── mixer ──────────────────────────────────────────────────────────────────────────────────────
+
+fn const_sound(rate: Int, ch: Int, n: Int, v: Int) -> audio::Sound {
+    var d = ""
+    var i = 0
+    while i < n * ch { d = d + s16(v)  i = i + 1 }
+    return audio::sound(rate, ch, d)
+}
+
+fn test_mixer_sums_and_retires() {
+    var m = audio::mixer_new(44100, 2)
+    assert_eq(audio::mix_active(m), 0)
+    let a = audio::mix_play(m, const_sound(44100, 2, 10, 1000), 1000, false)
+    let b = audio::mix_play(m, const_sound(44100, 2, 10, 2000), 1000, false)
+    assert_true(a > 0)
+    assert_true(b > 0)
+    assert_true(!(a == b))                                // ids are distinct
+    assert_eq(audio::mix_active(m), 2)
+    let out = audio::mix_render(m, 4)
+    assert_eq(out.len(), 4 * 2 * 2)
+    let s = audio::sound(44100, 2, out)
+    assert_eq(audio::sample_at(s, 0, 0), 3000)            // the two voices sum
+    assert_eq(audio::sample_at(s, 3, 1), 3000)
+    assert_eq(audio::mix_active(m), 2)
+    // render past the end of both and they retire themselves
+    let _tail = audio::mix_render(m, 20)
+    assert_eq(audio::mix_active(m), 0)
+    assert_true(!audio::mix_playing(m, a))
+}
+
+fn test_mixer_volume_and_stop() {
+    var m = audio::mixer_new(44100, 1)
+    let v = audio::mix_play(m, const_sound(44100, 1, 100, 10000), 1000, false)
+    assert_eq(audio::mix_volume(m, v), 1000)
+    let s1 = audio::sound(44100, 1, audio::mix_render(m, 1))
+    assert_eq(audio::sample_at(s1, 0, 0), 10000)
+    assert_true(audio::mix_set_volume(m, v, 250))
+    assert_eq(audio::mix_volume(m, v), 250)
+    let s2 = audio::sound(44100, 1, audio::mix_render(m, 1))
+    assert_eq(audio::sample_at(s2, 0, 0), 2500)           // a quarter gain, exactly
+    audio::mix_master(m, 500)
+    let s3 = audio::sound(44100, 1, audio::mix_render(m, 1))
+    assert_eq(audio::sample_at(s3, 0, 0), 1250)           // master multiplies the voice gain
+    assert_true(audio::mix_stop(m, v))
+    assert_eq(audio::mix_active(m), 0)
+    assert_true(!audio::mix_stop(m, v))                   // stopping twice is not an error, just false
+    assert_eq(audio::mix_volume(m, v), 0 - 1)
+    let s4 = audio::sound(44100, 1, audio::mix_render(m, 1))
+    assert_eq(audio::sample_at(s4, 0, 0), 0)              // silence, not the last sample repeated
+}
+
+fn test_mixer_clips_rather_than_wraps() {
+    var m = audio::mixer_new(44100, 1)
+    var i = 0
+    while i < 8 { let _v = audio::mix_play(m, const_sound(44100, 1, 4, 20000), 1000, false)  i = i + 1 }
+    assert_eq(audio::mix_active(m), 8)
+    let s = audio::sound(44100, 1, audio::mix_render(m, 2))
+    assert_eq(audio::sample_at(s, 0, 0), 32767)           // 160000 clamps, it does not wrap negative
+    // and the same downwards
+    var n = audio::mixer_new(44100, 1)
+    var k = 0
+    while k < 8 { let _v = audio::mix_play(n, const_sound(44100, 1, 4, 0 - 20000), 1000, false)  k = k + 1 }
+    let t = audio::sound(44100, 1, audio::mix_render(n, 2))
+    assert_eq(audio::sample_at(t, 0, 0), 0 - 32768)
+}
+
+fn test_mixer_loops_and_channel_fanout() {
+    // a looping voice outlives its own length
+    var m = audio::mixer_new(44100, 1)
+    let v = audio::mix_play(m, const_sound(44100, 1, 3, 500), 1000, true)
+    let _a = audio::mix_render(m, 100)
+    assert_true(audio::mix_playing(m, v))
+    let s = audio::sound(44100, 1, audio::mix_render(m, 2))
+    assert_eq(audio::sample_at(s, 0, 0), 500)             // still sounding after 100 frames
+    audio::mix_stop_all(m)
+    assert_eq(audio::mix_active(m), 0)
+    // a mono sound in a stereo mixer must reach both channels, not just the left
+    var st = audio::mixer_new(44100, 2)
+    let _w = audio::mix_play(st, const_sound(44100, 1, 8, 4000), 1000, false)
+    let o = audio::sound(44100, 2, audio::mix_render(st, 2))
+    assert_eq(audio::sample_at(o, 0, 0), 4000)
+    assert_eq(audio::sample_at(o, 0, 1), 4000)
+    assert_eq(audio::sample_at(o, 1, 1), 4000)
+}
+
+fn test_mixer_resamples_by_stepping() {
+    // a 22050 Hz sound in a 44100 Hz mixer advances half a source frame per output frame, so it
+    // lasts twice as long and each source sample appears twice.
+    var m = audio::mixer_new(44100, 1)
+    var d = ""
+    d = d + s16(100) + s16(200) + s16(300) + s16(400)
+    let _v = audio::mix_play(m, audio::sound(22050, 1, d), 1000, false)
+    let s = audio::sound(44100, 1, audio::mix_render(m, 8))
+    assert_eq(audio::sample_at(s, 0, 0), 100)
+    assert_eq(audio::sample_at(s, 1, 0), 100)
+    assert_eq(audio::sample_at(s, 2, 0), 200)
+    assert_eq(audio::sample_at(s, 3, 0), 200)
+    assert_eq(audio::sample_at(s, 6, 0), 400)
+    assert_eq(audio::sample_at(s, 7, 0), 400)
+    assert_eq(audio::mix_active(m), 0)                    // exactly used up after 8 output frames
+}
+
+fn test_mixer_rejects_empty_sounds() {
+    var m = audio::mixer_new(44100, 2)
+    assert_eq(audio::mix_play(m, audio::sound(44100, 2, ""), 1000, false), 0)
+    assert_eq(audio::mix_play(m, audio::sound(0, 2, "abcd"), 1000, false), 0)
+    assert_eq(audio::mix_active(m), 0)
+    // rendering with no voices gives real silence of the right length, not an empty buffer
+    let out = audio::mix_render(m, 32)
+    assert_eq(out.len(), 32 * 2 * 2)
+    assert_eq(audio::sample_at(audio::sound(44100, 2, out), 17, 1), 0)
+}
+
+fn test_mixer_reuses_slots() {
+    var m = audio::mixer_new(44100, 1)
+    let a = audio::mix_play(m, const_sound(44100, 1, 4, 100), 1000, false)
+    assert_true(audio::mix_stop(m, a))
+    let b = audio::mix_play(m, const_sound(44100, 1, 4, 100), 1000, false)
+    let c = audio::mix_play(m, const_sound(44100, 1, 4, 100), 1000, false)
+    assert_eq(audio::mix_active(m), 2)
+    assert_true(!(b == c))
+    assert_true(!(b == a))                                // a retired id is never handed out again
+}
+
+// ── the device, without a device ───────────────────────────────────────────────────────────────
+// These do not need a sound card. They check that the closed-device paths are inert rather than
+// crashing, which is the state a game runs in on a box with no audio.
+
+fn test_closed_device_is_inert() {
+    audio::alsa_set_quiet(true)                           // this opens a device that is not there
+    var d = audio::open_device("nori-no-such-pcm-device", 44100, 2, 20000)
+    assert_true(!audio::ok(d))
+    assert_true(d.err < 0)                                // a real negative ALSA errno
+    assert_true(audio::error_text(d).len() > 0)           // …with real text behind it
+    assert_eq(audio::writable(d), 0)
+    assert_eq(audio::drain(d), 0)
+    assert_eq(audio::stop(d), 0)
+    assert_eq(audio::write(d, audio::silence(44100, 2, 64).data), 0 - 19)   // -ENODEV, not a crash
+    assert_eq(audio::close(d), 0)
+    assert_eq(audio::close(d), 0)                         // closing twice is fine
+}
+
+fn test_libasound_resolves_at_runtime() {
+    // The backend dlopens libasound; this box has it, so the whole surface must answer. On a box
+    // without it `alsa_available` would be false and every call would return -ENOSYS. So the closed-device
+    // test above has to pass everywhere, and this one covers the present-and-working half.
+    assert_true(audio::alsa_available())
+    assert_true(audio::alsa_version().len() > 0)
+    assert_true(audio::alsa_strerror(0 - 2).len() > 0)    // ENOENT has ALSA text
+    assert_eq(audio::default_device_names().len(), 7)
+}
+
+fn test_hardcoded_alsa_abi_constants() {
+    // Not including alsa/asoundlib.h means these four enum values are spelled out in the glue.
+    // This pins their values, so an edit to the glue that changes one is caught without a C
+    // compiler in the loop.
+    assert_eq(audio::alsa_abi_const(0), 0)                // SND_PCM_STREAM_PLAYBACK
+    assert_eq(audio::alsa_abi_const(1), 3)                // SND_PCM_ACCESS_RW_INTERLEAVED
+    assert_eq(audio::alsa_abi_const(2), 2)                // SND_PCM_FORMAT_S16_LE
+    assert_eq(audio::alsa_abi_const(3), 14)               // SND_PCM_FORMAT_FLOAT_LE
+}
+
+fn test_pump_on_a_closed_device_does_nothing() {
+    var m = audio::mixer_new(44100, 2)
+    let _v = audio::mix_play(m, audio::silence(44100, 2, 1000), 1000, false)
+    var d = audio::open_device("nori-no-such-pcm-device", 44100, 2, 20000)
+    assert_eq(audio::mix_pump_ready(m, d, 0), 0)         // no device, no write, no crash
+    assert_eq(audio::mix_active(m), 1)                   // …and the voice was not consumed
+}

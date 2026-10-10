@@ -1,0 +1,901 @@
+use core::*
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// docking tree of split/leaf nodes and tabs
+//
+// Monomorphized to Tab = Str (the editor's DockState<String>: tab = panel id).
+// The tree is mutually recursive (Tree -> Node -> SplitData -> Tree). Fields of
+// an enum payload bound by `match` cannot be accessed directly, so SplitData /
+// LeafData fields are reached through accessor fns (sd_*/ld_*), which also
+// mutate in place because structs are reference handles.
+// ===========================================================================
+
+/// width/height of the thin strip shown for a collapsed pane (click to expand).
+pub fn collapsed_strip_size() -> Float { return 24.0 }
+
+/// direction of a split: Horizontal = left | right, Vertical = top | bottom.
+pub enum SplitDirection { DirHorizontal DirVertical }
+
+/// integer tag of a SplitDirection (0 = Horizontal, 1 = Vertical).
+pub fn split_direction_tag(d: SplitDirection) -> Int {
+    match d { SplitDirection::DirHorizontal => { return 0 } SplitDirection::DirVertical => { return 1 } }
+}
+
+/// the payload of a Split node: direction, ratio (fraction for the first child), per-side
+/// collapse flags, and the two child subtrees.
+pub struct SplitData {
+    direction: SplitDirection,
+    ratio: Float,
+    first_collapsed: Bool,
+    second_collapsed: Bool,
+    first: Tree,
+    second: Tree
+}
+
+/// the payload of a Leaf node: its tabs, active index, and (after layout) its rect.
+pub struct LeafData { tabs: Vec<Str>, active: Int, has_rect: Bool, rect: Rect }
+
+/// a dock tree node: empty, a leaf (tabs), or a split (two children).
+pub enum Node { NEmpty NLeaf(LeafData) NSplit(SplitData) }
+
+/// a dock subtree (wraps a single Node; empty trees carry Node::NEmpty).
+pub struct Tree { node: Node }
+
+/// one surface (main window or a floating window) holds a single tree.
+pub struct Surface { tree: Tree }
+
+/// a Tree of its own: every leaf's tabs and rect and every split copied.
+pub fn tree_dup(t: Tree) -> Tree { return Tree { node: node_dup(t.node) } }
+/// a Node of its own (see tree_dup).
+pub fn node_dup(n: Node) -> Node {
+    match n {
+        Node::NLeaf(l) => { return Node::NLeaf(LeafData { tabs: path_copy_str(l.tabs), active: copy l.active, has_rect: copy l.has_rect, rect: rect_dup(l.rect) }) }
+        Node::NSplit(s) => { return Node::NSplit(SplitData { direction: copy s.direction, ratio: copy s.ratio, first_collapsed: copy s.first_collapsed, second_collapsed: copy s.second_collapsed, first: tree_dup(s.first), second: tree_dup(s.second) }) }
+        Node::NEmpty => { return Node::NEmpty }
+    }
+}
+/// a fresh list of surface copies.
+pub fn surfaces_dup(v: Vec<Surface>) -> Vec<Surface> {
+    var out: Vec<Surface> = vec()
+    var i = 0
+    while i < v.len() { out.push(Surface { tree: tree_dup(v[i].tree) })  i = i + 1 }
+    return out
+}
+
+// ---- payload accessors (enum payloads cannot be field-accessed directly) ----
+/// the split direction.
+pub fn sd_direction(s: SplitData) -> SplitDirection { return copy s.direction }
+/// the split ratio (fraction of space for the first child).
+pub fn sd_ratio(s: SplitData) -> Float { return s.ratio }
+/// set the split ratio.
+pub fn sd_set_ratio(inout s: SplitData, r: Float) { s.ratio = r }
+/// whether the first child is collapsed.
+pub fn sd_first_collapsed(s: SplitData) -> Bool { return s.first_collapsed }
+/// whether the second child is collapsed.
+pub fn sd_second_collapsed(s: SplitData) -> Bool { return s.second_collapsed }
+/// set the first-child collapse flag.
+pub fn sd_set_first_collapsed(inout s: SplitData, b: Bool) { s.first_collapsed = b }
+/// set the second-child collapse flag.
+pub fn sd_set_second_collapsed(inout s: SplitData, b: Bool) { s.second_collapsed = b }
+/// the first child subtree.
+pub fn sd_first(s: SplitData) -> view Tree { return s.first }
+/// the second child subtree.
+pub fn sd_second(s: SplitData) -> view Tree { return s.second }
+/// replace the first child subtree.
+pub fn sd_set_first(inout s: SplitData, sink t: Tree) { s.first = t }
+/// replace the second child subtree.
+pub fn sd_set_second(inout s: SplitData, sink t: Tree) { s.second = t }
+
+/// the leaf's tabs (panel ids). A view of the leaf's own list: callers that rewrite tabs in place
+/// (remap_tree_tabs renames them during a dock move) reach the list through `l.tabs` directly.
+pub fn ld_tabs(l: LeafData) -> view Vec<Str> { return l.tabs }
+/// the active tab index.
+pub fn ld_active(l: LeafData) -> Int { return l.active }
+/// set the active tab index.
+pub fn ld_set_active(inout l: LeafData, a: Int) { l.active = a }
+/// whether the leaf has a laid-out rect.
+pub fn ld_has_rect(l: LeafData) -> Bool { return l.has_rect }
+/// the leaf's laid-out rect (valid only when ld_has_rect is true).
+pub fn ld_rect(l: LeafData) -> view Rect { return l.rect }
+/// set the leaf's laid-out rect.
+pub fn ld_set_rect(inout l: LeafData, sink r: Rect) { l.has_rect = true  l.rect = r }
+/// clear the leaf's laid-out rect.
+pub fn ld_clear_rect(inout l: LeafData) { l.has_rect = false }
+
+// ---- Tree / Node construction ----
+/// an empty tree.
+pub fn tree_empty() -> Tree { return Tree { node: Node::NEmpty } }
+/// a leaf tree with the given tabs and active index.
+pub fn tree_leaf(sink tabs: Vec<Str>, active: Int) -> Tree { return Tree { node: Node::NLeaf(LeafData { tabs: tabs, active: active, has_rect: false, rect: rect_min_max(vec2_zero(), vec2_zero()) }) } }
+/// a split tree with the given direction, ratio, and children (not collapsed).
+pub fn tree_split(direction: SplitDirection, ratio: Float, sink first: Tree, sink second: Tree) -> Tree {
+    return Tree { node: Node::NSplit(SplitData { direction: copy direction, ratio: ratio, first_collapsed: false, second_collapsed: false, first: first, second: second }) }
+}
+/// the node of a tree.
+pub fn tree_node(t: Tree) -> view Node { return t.node }
+/// replace a tree's node.
+pub fn tree_set_node(inout t: Tree, sink n: Node) { t.node = n }
+/// true if the tree's node is a leaf.
+pub fn node_is_leaf(n: Node) -> Bool { match n { Node::NLeaf(l) => { return true } Node::NSplit(s) => { return false } Node::NEmpty => { return false } } }
+/// true if the tree's node is a split.
+pub fn node_is_split(n: Node) -> Bool { match n { Node::NSplit(s) => { return true } Node::NLeaf(l) => { return false } Node::NEmpty => { return false } } }
+/// true if the tree's node is empty.
+pub fn node_is_empty(n: Node) -> Bool { match n { Node::NEmpty => { return true } Node::NLeaf(l) => { return false } Node::NSplit(s) => { return false } } }
+/// the leaf's tabs (empty Vec if not a leaf) - for code that can't match the payload directly.
+pub fn node_leaf_tabs(n: Node) -> Vec<Str> { match n { Node::NLeaf(l) => { return path_copy_str(ld_tabs(l)) } Node::NSplit(s) => { var e: Vec<Str> = vec()  return e } Node::NEmpty => { var e: Vec<Str> = vec()  return e } } }
+/// the leaf's active index (0 if not a leaf).
+pub fn node_leaf_active(n: Node) -> Int { match n { Node::NLeaf(l) => { return ld_active(l) } Node::NSplit(s) => { return 0 } Node::NEmpty => { return 0 } } }
+/// the split's direction (Horizontal if not a split).
+pub fn node_split_dir(n: Node) -> SplitDirection { match n { Node::NSplit(s) => { return sd_direction(s) } Node::NLeaf(l) => { return SplitDirection::DirHorizontal } Node::NEmpty => { return SplitDirection::DirHorizontal } } }
+/// the split's ratio (0 if not a split).
+pub fn node_split_ratio(n: Node) -> Float { match n { Node::NSplit(s) => { return sd_ratio(s) } Node::NLeaf(l) => { return 0.0 } Node::NEmpty => { return 0.0 } } }
+/// the split's first-collapsed flag.
+pub fn node_split_fc(n: Node) -> Bool { match n { Node::NSplit(s) => { return sd_first_collapsed(s) } Node::NLeaf(l) => { return false } Node::NEmpty => { return false } } }
+/// the split's second-collapsed flag.
+pub fn node_split_sc(n: Node) -> Bool { match n { Node::NSplit(s) => { return sd_second_collapsed(s) } Node::NLeaf(l) => { return false } Node::NEmpty => { return false } } }
+/// the split's first child (empty tree if not a split).
+pub fn node_split_first(n: Node) -> view Tree { match n { Node::NSplit(s) => { return sd_first(s) } Node::NLeaf(l) => { return tree_empty() } Node::NEmpty => { return tree_empty() } } }
+/// the split's second child (empty tree if not a split).
+pub fn node_split_second(n: Node) -> view Tree { match n { Node::NSplit(s) => { return sd_second(s) } Node::NLeaf(l) => { return tree_empty() } Node::NEmpty => { return tree_empty() } } }
+
+// ---- DockPath (Vec<Int>) helpers; Vecs are handles, so copy before storing ----
+/// a fresh copy of a path.
+pub fn path_copy(p: Vec<Int>) -> Vec<Int> { var r: Vec<Int> = vec()  var i = 0  while i < p.len() { r.push(p[i])  i = i + 1 }  return r }
+/// a fresh path = `p` with `idx` appended.
+pub fn path_with(p: Vec<Int>, idx: Int) -> Vec<Int> { var r = path_copy(p)  r.push(idx)  return r }
+/// a fresh path = `p` without its last element.
+pub fn path_parent(p: Vec<Int>) -> Vec<Int> { var r: Vec<Int> = vec()  var i = 0  while i + 1 < p.len() { r.push(p[i])  i = i + 1 }  return r }
+/// the last element of a non-empty path.
+pub fn path_last(p: Vec<Int>) -> Int { return p[p.len() - 1] }
+/// true if two paths are equal.
+pub fn path_eq(a: Vec<Int>, b: Vec<Int>) -> Bool {
+    if a.len() != b.len() { return false }
+    var i = 0
+    while i < a.len() { if a[i] != b[i] { return false }  i = i + 1 }
+    return true
+}
+
+/// a tree-at-path result: `tree` is a view into the tree that was searched (a miss views the
+/// searched tree itself), so a caller can rewrite the subtree in place through it.
+pub struct TreeOpt { ok: Bool, tree: view Tree }
+
+/// the child subtree of `t`'s node by index (0 = first, else second); ok=false for non-splits.
+pub fn node_child(inout t: Tree, idx: Int) -> TreeOpt {
+    match t.node {
+        Node::NSplit(s) => { if idx == 0 { return TreeOpt { ok: true, tree: inout s.first } }  return TreeOpt { ok: true, tree: inout s.second } }
+        Node::NLeaf(l) => { return TreeOpt { ok: false, tree: inout t } }
+        Node::NEmpty => { return TreeOpt { ok: false, tree: inout t } }
+    }
+}
+
+/// the subtree at `path` from `tree` (path empty = the tree itself); ok=false if the path is invalid.
+pub fn tree_at_path(inout tree: Tree, path: Vec<Int>) -> TreeOpt {
+    var cur = inout tree
+    var i = 0
+    while i < path.len() {
+        var nx = node_child(cur, path[i])
+        if !nx.ok { return TreeOpt { ok: false, tree: inout tree } }
+        cur = inout nx.tree
+        i = i + 1
+    }
+    return TreeOpt { ok: true, tree: inout cur }
+}
+
+// ---- leaf-rect and tab-location collection ----
+/// a (path, rect) pair for a laid-out leaf.
+pub struct LeafRect { path: Vec<Int>, rect: Rect }
+
+/// recursive worker for tree_leaf_rects.
+pub fn leaf_rects_inner(tree: Tree, path: Vec<Int>, inout out: Vec<LeafRect>) {
+    match tree.node {
+        Node::NLeaf(l) => { if ld_has_rect(l) { out.push(LeafRect { path: path_copy(path), rect: rect_dup(ld_rect(l)) }) } }
+        Node::NSplit(s) => {
+            leaf_rects_inner(sd_first(s), path_with(path, 0), out)
+            leaf_rects_inner(sd_second(s), path_with(path, 1), out)
+        }
+        Node::NEmpty => {}
+    }
+}
+
+/// collect (path, rect) for every laid-out leaf (call after layout_surface).
+pub fn tree_leaf_rects(tree: Tree) -> Vec<LeafRect> {
+    var out: Vec<LeafRect> = vec()
+    var root: Vec<Int> = vec()
+    leaf_rects_inner(tree, root, out)
+    return out
+}
+
+/// a (path, tab index) location of a tab within the tree.
+pub struct TabLoc { path: Vec<Int>, index: Int }
+
+/// recursive worker for tree_tab_locations.
+pub fn tab_locations_inner(tree: Tree, tab: Str, path: Vec<Int>, inout out: Vec<TabLoc>) {
+    match tree.node {
+        Node::NLeaf(l) => {
+            var tabs = ld_tabs(l)
+            var i = 0
+            while i < tabs.len() { if (tabs[i] == tab) { out.push(TabLoc { path: path_copy(path), index: i }) }  i = i + 1 }
+        }
+        Node::NSplit(s) => {
+            tab_locations_inner(sd_first(s), tab, path_with(path, 0), out)
+            tab_locations_inner(sd_second(s), tab, path_with(path, 1), out)
+        }
+        Node::NEmpty => {}
+    }
+}
+
+/// recursively keep only tabs present in `keep`, rebuilding each leaf and clamping active (empty
+/// leaves are left in place, not collapsed).
+pub fn retain_in_tree(tree: Tree, keep: Vec<Str>) {
+    match tree.node {
+        Node::NLeaf(l) => {
+            var tabs = ld_tabs(l)
+            var kept: Vec<Str> = vec()
+            var i = 0
+            while i < tabs.len() { if str_vec_contains(keep, tabs[i]) { kept.push(copy tabs[i]) }  i = i + 1 }
+            let nkept = kept.len()
+            l.tabs = kept
+            ld_set_active(l, imin_i(ld_active(l), imax_i(nkept - 1, 0)))
+        }
+        Node::NSplit(s) => { retain_in_tree(sd_first(s), keep)  retain_in_tree(sd_second(s), keep) }
+        Node::NEmpty => {}
+    }
+}
+
+/// recursively rename tab ids in place via `remap` (old id -> new id); ids absent from the map are left
+/// as-is. Complements normalize_tree_tabs (which then drops invalid ids).
+pub fn remap_tree_tabs(inout tree: Tree, remap: Map<Str, Str>) {
+    match tree.node {
+        Node::NLeaf(l) => {
+            var tabs = inout l.tabs
+            var i = 0
+            while i < tabs.len() { if remap.has(tabs[i]) { tabs[i] = copy remap.get(tabs[i]) }  i = i + 1 }
+        }
+        Node::NSplit(s) => { remap_tree_tabs(sd_first(s), remap)  remap_tree_tabs(sd_second(s), remap) }
+        Node::NEmpty => {}
+    }
+}
+
+/// every (path, index) where `tab` appears in the tree.
+pub fn tree_tab_locations(tree: Tree, tab: Str) -> Vec<TabLoc> {
+    var out: Vec<TabLoc> = vec()
+    var root: Vec<Int> = vec()
+    tab_locations_inner(tree, tab, root, out)
+    return out
+}
+
+// ---- split-rect geometry ----
+/// a split-rect result: first child rect, splitter rect, second child rect.
+pub struct SplitRects { first: Rect, splitter: Rect, second: Rect }
+
+/// compute child/splitter rects for `rect` split by `direction` at `ratio` with `splitter_width`.
+pub fn split_rect(rect: Rect, direction: SplitDirection, ratio: Float, splitter_width: Float) -> SplitRects {
+    var r = math::fclamp(ratio, 0.0, 1.0)
+    match direction {
+        SplitDirection::DirHorizontal => {
+            var total_w = rect.width()
+            var first_w = math::fmax(total_w * r - splitter_width / 2.0, 0.0)
+            var second_w = math::fmax(total_w - first_w - splitter_width, 0.0)
+            var fr = rect_min_size(rect.min, vec2(first_w, rect.height()))
+            var sr = rect_min_size(vec2(rect.min.x + first_w, rect.min.y), vec2(splitter_width, rect.height()))
+            var se = rect_min_size(vec2(rect.min.x + first_w + splitter_width, rect.min.y), vec2(second_w, rect.height()))
+            return SplitRects { first: fr, splitter: sr, second: se }
+        }
+        SplitDirection::DirVertical => {
+            var total_h = rect.height()
+            var first_h = math::fmax(total_h * r - splitter_width / 2.0, 0.0)
+            var second_h = math::fmax(total_h - first_h - splitter_width, 0.0)
+            var fr = rect_min_size(rect.min, vec2(rect.width(), first_h))
+            var sr = rect_min_size(vec2(rect.min.x, rect.min.y + first_h), vec2(rect.width(), splitter_width))
+            var se = rect_min_size(vec2(rect.min.x, rect.min.y + first_h + splitter_width), vec2(rect.width(), second_h))
+            return SplitRects { first: fr, splitter: sr, second: se }
+        }
+    }
+}
+
+/// a collapsible split-rect result: rects plus whether the splitter is a collapsed strip.
+pub struct SplitRectsC { first: Rect, splitter: Rect, second: Rect, is_collapsed_bar: Bool }
+
+/// like split_rect but honoring per-side collapse: a collapsed child becomes a thin strip.
+pub fn split_rect_collapsible(rect: Rect, direction: SplitDirection, ratio: Float, splitter_width: Float, first_collapsed: Bool, second_collapsed: Bool) -> SplitRectsC {
+    var strip = collapsed_strip_size()
+    if first_collapsed && !second_collapsed {
+        match direction {
+            SplitDirection::DirHorizontal => {
+                var fr = rect_min_size(rect.min, vec2(strip, rect.height()))
+                var se = rect_min_size(vec2(rect.min.x + strip, rect.min.y), vec2(math::fmax(rect.width() - strip, 0.0), rect.height()))
+                return SplitRectsC { first: rect_dup(fr), splitter: fr, second: se, is_collapsed_bar: true }
+            }
+            SplitDirection::DirVertical => {
+                var fr = rect_min_size(rect.min, vec2(rect.width(), strip))
+                var se = rect_min_size(vec2(rect.min.x, rect.min.y + strip), vec2(rect.width(), math::fmax(rect.height() - strip, 0.0)))
+                return SplitRectsC { first: rect_dup(fr), splitter: fr, second: se, is_collapsed_bar: true }
+            }
+        }
+    }
+    if second_collapsed && !first_collapsed {
+        match direction {
+            SplitDirection::DirHorizontal => {
+                var se = rect_min_size(vec2(rect.min.x + rect.width() - strip, rect.min.y), vec2(strip, rect.height()))
+                var fr = rect_min_size(rect.min, vec2(math::fmax(rect.width() - strip, 0.0), rect.height()))
+                return SplitRectsC { first: fr, splitter: rect_dup(se), second: se, is_collapsed_bar: true }
+            }
+            SplitDirection::DirVertical => {
+                var se = rect_min_size(vec2(rect.min.x, rect.min.y + rect.height() - strip), vec2(rect.width(), strip))
+                var fr = rect_min_size(rect.min, vec2(rect.width(), math::fmax(rect.height() - strip, 0.0)))
+                return SplitRectsC { first: fr, splitter: rect_dup(se), second: se, is_collapsed_bar: true }
+            }
+        }
+    }
+    var sr = split_rect(rect, direction, ratio, splitter_width)
+    return SplitRectsC { first: sink sr.first, splitter: sink sr.splitter, second: sink sr.second, is_collapsed_bar: false }
+}
+
+/// info about one splitter produced by layout: path, splitter rect, parent rect, direction,
+/// whether it's a collapsed edge, and (if so) which side is collapsed.
+pub struct SplitterInfo {
+    path: Vec<Int>,
+    splitter_rect: Rect,
+    parent_rect: Rect,
+    direction: SplitDirection,
+    is_collapsed_edge: Bool,
+    first_child_collapsed: Bool
+}
+
+/// recursively lay the tree into `rect`, filling each leaf's rect and collecting splitter infos.
+pub fn layout_tree(tree: Tree, rect: Rect, splitter_width: Float, inout out: Vec<SplitterInfo>, path: Vec<Int>) {
+    match tree.node {
+        Node::NLeaf(l) => { ld_set_rect(l, rect_dup(rect)) }
+        Node::NSplit(s) => {
+            var dir = sd_direction(s)
+            var r = sd_ratio(s)
+            var fc = sd_first_collapsed(s)
+            var sc = sd_second_collapsed(s)
+            var rects = split_rect_collapsible(rect, dir, r, splitter_width, fc, sc)
+            layout_tree(sd_first(s), rects.first, splitter_width, out, path_with(path, 0))
+            var first_child_collapsed = fc && !sc
+            out.push(SplitterInfo { path: path_copy(path), splitter_rect: rect_dup(rects.splitter), parent_rect: rect_dup(rect), direction: dir, is_collapsed_edge: rects.is_collapsed_bar, first_child_collapsed: first_child_collapsed })
+            layout_tree(sd_second(s), rects.second, splitter_width, out, path_with(path, 1))
+        }
+        Node::NEmpty => {}
+    }
+}
+
+// ---- Vec<Str> insert/remove (no builtin) ----
+/// a fresh Vec<Str> = `v` with `x` inserted at `idx` (clamped to [0, len]).
+pub fn str_vec_insert(v: Vec<Str>, idx: Int, x: Str) -> Vec<Str> {
+    var n = v.len()
+    var at = idx
+    if at < 0 { at = 0 }
+    if at > n { at = n }
+    var r: Vec<Str> = vec()
+    var i = 0
+    while i < at { r.push(copy v[i])  i = i + 1 }
+    r.push(copy x)
+    while i < n { r.push(copy v[i])  i = i + 1 }
+    return r
+}
+/// a fresh Vec<Str> = `v` with element at `idx` removed (no-op copy if out of range).
+pub fn str_vec_remove(v: Vec<Str>, idx: Int) -> Vec<Str> {
+    var r: Vec<Str> = vec()
+    var i = 0
+    while i < v.len() { if i != idx { r.push(copy v[i]) }  i = i + 1 }
+    return r
+}
+
+/// collapse the empty leaf at `leaf_path` by replacing its parent split with the sibling subtree.
+pub fn tree_collapse_empty_leaf(inout tree: Tree, leaf_path: Vec<Int>) {
+    if leaf_path.len() == 0 { tree_set_node(tree, Node::NEmpty)  return }
+    var last_idx = path_last(leaf_path)
+    var parent_path = path_parent(leaf_path)
+    var pt = tree_at_path(tree, parent_path)
+    if !pt.ok { return }
+    match pt.tree.node {
+        Node::NSplit(s) => {
+            var sibling: Tree = tree_empty()
+            if last_idx == 0 { sibling = tree_dup(s.second) } else { sibling = tree_dup(s.first) }
+            tree_set_node(pt.tree, sink sibling.node)
+        }
+        Node::NLeaf(l) => {}
+        Node::NEmpty => {}
+    }
+}
+
+/// replace the leaf at `leaf_path` with a split: the old leaf and a new leaf holding only `tab`.
+/// `new_pane_is_first` puts the new leaf on the first (top/left) side. Returns true on success.
+pub fn tree_replace_leaf_with_split(inout tree: Tree, leaf_path: Vec<Int>, direction: SplitDirection, ratio: Float, new_pane_is_first: Bool, tab: Str) -> Bool {
+    var split_ratio = ratio
+    if new_pane_is_first { split_ratio = 1.0 - ratio }
+    var to = tree_at_path(tree, leaf_path)
+    if !to.ok { return false }
+    var target = inout to.tree
+    var old_is_leaf = node_is_leaf(target.node)
+    if !old_is_leaf { return false }
+    var old_leaf_tree = Tree { node: node_dup(target.node) }
+    var nt: Vec<Str> = vec()  nt.push(copy tab)
+    var new_leaf = tree_leaf(nt, 0)
+    if new_pane_is_first { tree_set_node(target, Node::NSplit(SplitData { direction: copy direction, ratio: split_ratio, first_collapsed: false, second_collapsed: false, first: new_leaf, second: old_leaf_tree })) }
+    else { tree_set_node(target, Node::NSplit(SplitData { direction: copy direction, ratio: split_ratio, first_collapsed: false, second_collapsed: false, first: old_leaf_tree, second: new_leaf })) }
+    return true
+}
+
+/// Wrap the whole tree in a new split, putting `tab` in the new pane beside everything that is
+/// already there. Unlike `tree_replace_leaf_with_split` the target is the root, which is usually a
+/// split rather than a leaf. This is how a panel becomes a full-height
+/// column beside the rest of the dock instead of taking half of one leaf.
+pub fn tree_wrap_root_with_split(inout tree: Tree, direction: SplitDirection, ratio: Float, new_pane_is_first: Bool, tab: Str) -> Bool {
+    var split_ratio = ratio
+    if new_pane_is_first { split_ratio = 1.0 - ratio }
+    if node_is_empty(tree.node) { return false }
+    // the root, reached the same way tree_replace_leaf_with_split reaches its leaf: `tree` itself is
+    // a view here and cannot be assigned through, but the empty path names the root as a target.
+    var rp: Vec<Int> = vec()
+    var to = tree_at_path(tree, rp)
+    if !to.ok { return false }
+    var target = inout to.tree
+    var old_tree = Tree { node: node_dup(target.node) }
+    var nt: Vec<Str> = vec()  nt.push(copy tab)
+    var new_leaf = tree_leaf(nt, 0)
+    if new_pane_is_first { tree_set_node(target, Node::NSplit(SplitData { direction: copy direction, ratio: split_ratio, first_collapsed: false, second_collapsed: false, first: new_leaf, second: old_tree })) }
+    else { tree_set_node(target, Node::NSplit(SplitData { direction: copy direction, ratio: split_ratio, first_collapsed: false, second_collapsed: false, first: old_tree, second: new_leaf })) }
+    return true
+}
+
+/// true when `path` names a subtree of `tree` (every step descends a split).
+pub fn tree_path_ok(tree: Tree, path: Vec<Int>) -> Bool { return tree_path_ok_from(tree, path, 0) }
+/// true when `path[i..]` descends splits below `tree` (the recursion behind tree_path_ok).
+fn tree_path_ok_from(tree: Tree, path: Vec<Int>, i: Int) -> Bool {
+    if i >= path.len() { return true }
+    match tree.node {
+        Node::NSplit(s) => { if path[i] == 0 { return tree_path_ok_from(s.first, path, i + 1) }  return tree_path_ok_from(s.second, path, i + 1) }
+        Node::NLeaf(l) => { return false }
+        Node::NEmpty => { return false }
+    }
+}
+/// the subtree at `path`, read-only; an invalid path yields `tree` itself (check tree_path_ok first).
+pub fn tree_view_at(tree: Tree, path: Vec<Int>) -> view Tree { return tree_view_from(tree, path, 0) }
+/// the subtree at `path[i..]` below `tree` (the recursion behind tree_view_at).
+fn tree_view_from(tree: Tree, path: Vec<Int>, i: Int) -> view Tree {
+    if i >= path.len() { return tree }
+    match tree.node {
+        Node::NSplit(s) => { if path[i] == 0 { return tree_view_from(s.first, path, i + 1) }  return tree_view_from(s.second, path, i + 1) }
+        Node::NLeaf(l) => { return tree }
+        Node::NEmpty => { return tree }
+    }
+}
+
+/// true if the leaf at `leaf_path` is collapsed (its parent split marks that side collapsed).
+pub fn tree_is_leaf_collapsed(tree: Tree, leaf_path: Vec<Int>) -> Bool {
+    if leaf_path.len() == 0 { return false }
+    var which_first = path_last(leaf_path) == 0
+    var parent_path = path_parent(leaf_path)
+    if !tree_path_ok(tree, parent_path) { return false }
+    var parent = tree_view_at(tree, parent_path)
+    match parent.node {
+        Node::NSplit(s) => { if which_first { return sd_first_collapsed(s) }  return sd_second_collapsed(s) }
+        Node::NLeaf(l) => { return false }
+        Node::NEmpty => { return false }
+    }
+}
+
+// ---- DockState: one or more surfaces (main + optional floating) ----
+/// the full dock state: surfaces plus optional keyboard/click focus.
+pub struct DockState {
+    surfaces: Vec<Surface>,
+    has_focus_surface: Bool,
+    focused_surface_index: Int,
+    has_focus_leaf: Bool,
+    focused_leaf_path: Vec<Int>,
+    // Display titles, as parallel id/text vectors. The dock addresses a tab by a stable id
+    // everywhere (the tree holds ids, serialization writes ids, a host matches a panel by id), and
+    // a tab bar that draws those shows the user `files.panel` instead of `Files`. Titles live here
+    // rather than as another parameter to layout_dock_ui because the dock already knows its tabs;
+    // what it lacks is a place to be told what they are called.
+    title_ids: Vec<Str>,
+    title_texts: Vec<Str>
+}
+
+/// a new DockState with one surface whose root leaf holds `tab_ids`, focused on surface 0.
+pub fn dock_state_new(sink tab_ids: Vec<Str>) -> DockState {
+    var surfaces: Vec<Surface> = vec()
+    surfaces.push(Surface { tree: tree_leaf(tab_ids, 0) })
+    var fp: Vec<Int> = vec()
+    var ti: Vec<Str> = vec()
+    var tt: Vec<Str> = vec()
+    return DockState { surfaces: surfaces, has_focus_surface: true, focused_surface_index: 0, has_focus_leaf: false, focused_leaf_path: fp, title_ids: ti, title_texts: tt }
+}
+
+impl DockState {
+    /// what to draw for tab `id`. Setting the same id twice replaces it.
+    fn set_tab_title(self, id: Str, title: Str) {
+        var i = 0
+        while i < self.title_ids.len() {
+            if self.title_ids[i] == id { self.title_texts[i] = copy title  return }
+            i = i + 1
+        }
+        self.title_ids.push(copy id)
+        self.title_texts.push(copy title)
+    }
+
+    /// the title for `id`, or `id` itself when nobody set one, so an untitled dock shows the
+    /// ids and a host that does not care needs to do nothing.
+    fn tab_title(self, id: Str) -> Str {
+        var i = 0
+        while i < self.title_ids.len() {
+            if self.title_ids[i] == id { return copy self.title_texts[i] }
+            i = i + 1
+        }
+        // A duplicate has no title of its own. `term.panel#2` is the same panel as `term.panel`,
+        // made at runtime, and the host titles only what its manifest declares, so fall back to the
+        // base panel's title with the instance number after it. Without this a copy announces itself
+        // by its internal id, which is the one name the user never chose.
+        var hash = 0 - 1
+        var j = 0
+        while j < id.len() {
+            if hash < 0 && ord(id.at(j)) == 35 { hash = j }
+            j = j + 1
+        }
+        if hash > 0 {
+            let base = id.slice(0, hash)
+            let suffix = id.slice(hash + 1, id.len())
+            var k = 0
+            while k < self.title_ids.len() {
+                if self.title_ids[k] == base { return self.title_texts[k] + (" " + suffix) }
+                k = k + 1
+            }
+        }
+        return copy id
+    }
+
+    /// the tree of surface `i`, or an empty tree if `i` is out of range.
+    fn surface_tree(self, i: Int) -> view Tree {
+        if i < 0 || i >= self.surfaces.len() { return tree_empty() }
+        return self.surfaces[i].tree
+    }
+    /// set focus to a surface and (optional) leaf path; clamps to valid surfaces.
+    fn set_focus(inout self, surface_index: Int, has_leaf: Bool, leaf_path: Vec<Int>) {
+        if surface_index >= 0 && surface_index < self.surfaces.len() {
+            self.has_focus_surface = true
+            self.focused_surface_index = surface_index
+            self.has_focus_leaf = has_leaf
+            self.focused_leaf_path = path_copy(leaf_path)
+        }
+    }
+    /// clear all focus.
+    fn clear_focus(inout self) { self.has_focus_surface = false  self.has_focus_leaf = false }
+
+    /// push a tab onto the first leaf of surface 0 (descends first children to find it).
+    fn push_to_first_leaf(self, tab: Str) {
+        if self.surfaces.len() == 0 { return }
+        push_leaf_first(self.surfaces[0].tree, tab)
+    }
+    /// keep only tabs whose id is in `keep`, everywhere (empty leaves stay; active clamped).
+    fn retain_tabs(self, keep: Vec<Str>) {
+        var si = 0
+        while si < self.surfaces.len() { retain_in_tree(self.surfaces[si].tree, keep)  si = si + 1 }
+    }
+    /// normalize the dock: remap tab ids (`remap` old->new), drop tabs not in `valid`, and clamp active;
+    /// if that leaves no tabs anywhere, replace the whole dock with `default_dock`; otherwise push any
+    /// `ensure_tabs` that are valid but absent onto the first leaf. The id-normalizing and
+    /// default-if-empty steps are a remap Map and a prebuilt default dock.
+    fn normalize_dock_state(inout self, valid: Vec<Str>, remap: Map<Str, Str>, ensure_tabs: Vec<Str>, default_dock: DockState) {
+        var si = 0
+        while si < self.surfaces.len() {
+            remap_tree_tabs(self.surfaces[si].tree, remap)
+            normalize_tree_tabs(self.surfaces[si].tree, valid)
+            si = si + 1
+        }
+        var any = false
+        var s2 = 0
+        while s2 < self.surfaces.len() { if tree_has_any_tabs(self.surfaces[s2].tree) { any = true }  s2 = s2 + 1 }
+        if !any {
+            self.surfaces = surfaces_dup(default_dock.surfaces)
+            self.has_focus_surface = default_dock.has_focus_surface
+            self.focused_surface_index = default_dock.focused_surface_index
+            self.has_focus_leaf = default_dock.has_focus_leaf
+            self.focused_leaf_path = copy default_dock.focused_leaf_path
+            return
+        }
+        var present = collect_dock_tab_ids_from_state(self)
+        var e = 0
+        while e < ensure_tabs.len() {
+            var t = ensure_tabs[e]
+            if str_vec_contains(valid, t) && !str_vec_contains(present, t) { self.push_to_first_leaf(t) }
+            e = e + 1
+        }
+    }
+    /// true if `tab` appears anywhere on surface `surface_index`.
+    fn tab_is_present(self, surface_index: Int, tab: Str) -> Bool {
+        if surface_index < 0 || surface_index >= self.surfaces.len() { return false }
+        return tree_tab_locations(self.surfaces[surface_index].tree, tab).len() > 0
+    }
+    /// add (`present`=true) or remove every instance (`present`=false) of `tab` on the surface.
+    fn set_tab_present(self, surface_index: Int, tab: Str, present: Bool) {
+        if present {
+            if !self.tab_is_present(surface_index, tab) { self.push_to_first_leaf(tab) }
+            return
+        }
+        var go = true
+        while go {
+            if surface_index < 0 || surface_index >= self.surfaces.len() { return }
+            var locs = tree_tab_locations(self.surfaces[surface_index].tree, tab)
+            if locs.len() == 0 { go = false }
+            else {
+                var loc = locs[0]
+                var lp = loc.path
+                var removed = self.remove_tab_from_leaf(surface_index, lp, loc.index)
+                if !removed { go = false }
+                else {
+                    var to = tree_at_path(self.surfaces[surface_index].tree, lp)
+                    var empty = false
+                    if to.ok {
+                        match to.tree.node {
+                            Node::NLeaf(l) => { empty = ld_tabs(l).len() == 0 }
+                            Node::NSplit(s) => {}
+                            Node::NEmpty => {}
+                        }
+                    }
+                    if empty { self.collapse_empty_leaf(surface_index, lp) }
+                }
+            }
+        }
+    }
+
+    /// the leaf path whose laid-out rect contains `point` on surface `surface_index` (front-to-back).
+    fn find_leaf_path_containing_point(self, surface_index: Int, point: Vec2) -> TreeFindPath {
+        var nf: Vec<Int> = vec()
+        if surface_index < 0 || surface_index >= self.surfaces.len() { return TreeFindPath { ok: false, path: nf } }
+        var rects = tree_leaf_rects(self.surfaces[surface_index].tree)
+        var i = 0
+        while i < rects.len() {
+            if rects[i].rect.contains(point) { return TreeFindPath { ok: true, path: sink rects[i].path } }
+            i = i + 1
+        }
+        return TreeFindPath { ok: false, path: nf }
+    }
+
+    /// lay out surface `surface_index` into `dock_rect`, filling leaf rects; returns splitter infos.
+    fn layout_surface(self, surface_index: Int, dock_rect: Rect, splitter_width: Float) -> Vec<SplitterInfo> {
+        var out: Vec<SplitterInfo> = vec()
+        if surface_index < 0 || surface_index >= self.surfaces.len() { return out }
+        var root: Vec<Int> = vec()
+        layout_tree(self.surfaces[surface_index].tree, dock_rect, splitter_width, out, root)
+        return out
+    }
+
+    /// set whether the first/second child of the split at `path` is collapsed.
+    fn set_split_collapsed(self, surface_index: Int, path: Vec<Int>, first_side: Bool, collapsed: Bool) {
+        if surface_index < 0 || surface_index >= self.surfaces.len() { return }
+        var to = tree_at_path(self.surfaces[surface_index].tree, path)
+        if !to.ok { return }
+        match to.tree.node {
+            Node::NSplit(s) => { if first_side { sd_set_first_collapsed(s, collapsed) } else { sd_set_second_collapsed(s, collapsed) } }
+            Node::NLeaf(l) => {}
+            Node::NEmpty => {}
+        }
+    }
+    /// collapse the leaf at `leaf_path` (its sibling takes the space).
+    fn collapse_leaf(self, surface_index: Int, leaf_path: Vec<Int>) {
+        if leaf_path.len() == 0 { return }
+        self.set_split_collapsed(surface_index, path_parent(leaf_path), path_last(leaf_path) == 0, true)
+    }
+    /// expand the leaf at `leaf_path` if collapsed.
+    fn expand_leaf(self, surface_index: Int, leaf_path: Vec<Int>) {
+        if leaf_path.len() == 0 { return }
+        self.set_split_collapsed(surface_index, path_parent(leaf_path), path_last(leaf_path) == 0, false)
+    }
+    /// true if the leaf at `leaf_path` is collapsed.
+    fn is_leaf_collapsed(self, surface_index: Int, leaf_path: Vec<Int>) -> Bool {
+        if surface_index < 0 || surface_index >= self.surfaces.len() { return false }
+        return tree_is_leaf_collapsed(self.surfaces[surface_index].tree, leaf_path)
+    }
+    /// remove the leaf at `leaf_path` (replace its parent split with the sibling).
+    fn remove_leaf(self, surface_index: Int, leaf_path: Vec<Int>) {
+        if surface_index < 0 || surface_index >= self.surfaces.len() { return }
+        tree_collapse_empty_leaf(self.surfaces[surface_index].tree, leaf_path)
+    }
+    /// collapse the leaf at `leaf_path` if it has no tabs.
+    fn collapse_empty_leaf(self, surface_index: Int, leaf_path: Vec<Int>) {
+        if surface_index < 0 || surface_index >= self.surfaces.len() { return }
+        tree_collapse_empty_leaf(self.surfaces[surface_index].tree, leaf_path)
+    }
+    /// set the ratio (clamped to 0.15..0.85) of the split at `path`.
+    fn set_split_ratio(self, surface_index: Int, path: Vec<Int>, ratio: Float) {
+        if surface_index < 0 || surface_index >= self.surfaces.len() { return }
+        var to = tree_at_path(self.surfaces[surface_index].tree, path)
+        if !to.ok { return }
+        match to.tree.node {
+            Node::NSplit(s) => { sd_set_ratio(s, math::fclamp(ratio, 0.15, 0.85)) }
+            Node::NLeaf(l) => {}
+            Node::NEmpty => {}
+        }
+    }
+    /// the ratio of the split at `path`, or -1 if not a split.
+    fn split_ratio(self, surface_index: Int, path: Vec<Int>) -> Float {
+        if surface_index < 0 || surface_index >= self.surfaces.len() { return -1.0 }
+        var to = tree_at_path(self.surfaces[surface_index].tree, path)
+        if !to.ok { return -1.0 }
+        match to.tree.node {
+            Node::NSplit(s) => { return sd_ratio(s) }
+            Node::NLeaf(l) => { return -1.0 }
+            Node::NEmpty => { return -1.0 }
+        }
+    }
+    /// drag a divider to follow `cursor`, preserving the outer size of any nested same-direction split
+    /// child (so resizing `((A|B)|C)` keeps A's width).
+    fn resize_split_from_cursor(self, surface_index: Int, path: Vec<Int>, parent_rect: Rect, direction: SplitDirection, cursor: Vec2, splitter_width: Float) {
+        if surface_index < 0 || surface_index >= self.surfaces.len() { return }
+        var is_h = split_direction_tag(direction) == split_direction_tag(SplitDirection::DirHorizontal)
+        var parent_size = parent_rect.height()
+        if is_h { parent_size = parent_rect.width() }
+        if parent_size <= 0.0 { return }
+        var raw = (cursor.y - parent_rect.min.y - splitter_width / 2.0) / parent_size
+        if is_h { raw = (cursor.x - parent_rect.min.x - splitter_width / 2.0) / parent_size }
+        var ratio = math::fclamp(raw, 0.15, 0.85)
+        // inspect the split + its same-direction children before changing the ratio
+        var has_first = false
+        var first_preserved = 0.0
+        var has_second = false
+        var second_preserved = 0.0
+        var to = tree_at_path(self.surfaces[surface_index].tree, path)
+        if to.ok {
+            if node_is_split(to.tree.node) {
+                var old_ratio = node_split_ratio(to.tree.node)
+                var fsb = math::fmax(parent_size * old_ratio - splitter_width / 2.0, 0.0)
+                var ssb = math::fmax(parent_size - fsb - splitter_width, 0.0)
+                var fc = node_split_first(to.tree.node)
+                var sc = node_split_second(to.tree.node)
+                if node_is_split(fc.node) {
+                    if split_direction_tag(node_split_dir(fc.node)) == split_direction_tag(direction) {
+                        first_preserved = math::fmax(fsb * node_split_ratio(fc.node) - splitter_width / 2.0, 0.0)
+                        has_first = true
+                    }
+                }
+                if node_is_split(sc.node) {
+                    if split_direction_tag(node_split_dir(sc.node)) == split_direction_tag(direction) {
+                        second_preserved = math::fmax(ssb * (1.0 - node_split_ratio(sc.node)) - splitter_width / 2.0, 0.0)
+                        has_second = true
+                    }
+                }
+            }
+        }
+        self.set_split_ratio(surface_index, path, ratio)
+        var fsa = math::fmax(parent_size * ratio - splitter_width / 2.0, 0.0)
+        var ssa = math::fmax(parent_size - fsa - splitter_width, 0.0)
+        if has_first {
+            if fsa > 0.0 {
+                var cr = math::fclamp((first_preserved + splitter_width / 2.0) / fsa, 0.15, 0.85)
+                self.set_split_ratio(surface_index, path_with(path, 0), cr)
+            }
+        }
+        if has_second {
+            if ssa > 0.0 {
+                var cr = math::fclamp(1.0 - (second_preserved + splitter_width / 2.0) / ssa, 0.15, 0.85)
+                self.set_split_ratio(surface_index, path_with(path, 1), cr)
+            }
+        }
+    }
+    /// set the active tab index of the leaf at `leaf_path` (clamped to the tab count).
+    fn set_leaf_active(self, surface_index: Int, leaf_path: Vec<Int>, active: Int) {
+        if surface_index < 0 || surface_index >= self.surfaces.len() { return }
+        var to = tree_at_path(self.surfaces[surface_index].tree, leaf_path)
+        if !to.ok { return }
+        match to.tree.node {
+            Node::NLeaf(l) => { ld_set_active(l, imin_i(active, imax_i(ld_tabs(l).len() - 1, 0))) }
+            Node::NSplit(s) => {}
+            Node::NEmpty => {}
+        }
+    }
+    /// remove tab `tab_index` from the leaf at `leaf_path`; returns true if removed.
+    fn remove_tab_from_leaf(self, surface_index: Int, leaf_path: Vec<Int>, tab_index: Int) -> Bool {
+        if surface_index < 0 || surface_index >= self.surfaces.len() { return false }
+        var to = tree_at_path(self.surfaces[surface_index].tree, leaf_path)
+        if !to.ok { return false }
+        match to.tree.node {
+            Node::NLeaf(l) => {
+                var tabs = ld_tabs(l)
+                if tab_index < 0 || tab_index >= tabs.len() { return false }
+                l.tabs = str_vec_remove(tabs, tab_index)
+                var act = ld_active(l)
+                if tab_index < act { act = act - 1 }
+                ld_set_active(l, imin_i(act, imax_i(l.tabs.len() - 1, 0)))
+                return true
+            }
+            Node::NSplit(s) => { return false }
+            Node::NEmpty => { return false }
+        }
+    }
+    /// insert `tab` into the leaf at `leaf_path` at `tab_index` (push if past the end); returns true on success.
+    fn insert_tab_into_leaf(self, surface_index: Int, leaf_path: Vec<Int>, tab_index: Int, tab: Str) -> Bool {
+        if surface_index < 0 || surface_index >= self.surfaces.len() { return false }
+        var to = tree_at_path(self.surfaces[surface_index].tree, leaf_path)
+        if !to.ok { return false }
+        match to.tree.node {
+            Node::NLeaf(l) => {
+                var idx = imin_i(tab_index, ld_tabs(l).len())
+                l.tabs = str_vec_insert(ld_tabs(l), idx, tab)
+                ld_set_active(l, idx)
+                return true
+            }
+            Node::NSplit(s) => { return false }
+            Node::NEmpty => { return false }
+        }
+    }
+    /// split the leaf at `leaf_path`, moving `tab` into a new sibling leaf; returns true on success.
+    fn split_leaf_and_put_tab(self, surface_index: Int, leaf_path: Vec<Int>, direction: SplitDirection, ratio: Float, new_pane_is_first: Bool, tab: Str) -> Bool {
+        if surface_index < 0 || surface_index >= self.surfaces.len() { return false }
+        return tree_replace_leaf_with_split(self.surfaces[surface_index].tree, leaf_path, direction, math::fclamp(ratio, 0.15, 0.85), new_pane_is_first, tab)
+    }
+
+    /// put `tab` in a new pane beside the whole surface: a full-height column or a full-width strip
+    /// spanning everything already docked, rather than half of one leaf.
+    fn split_surface_and_put_tab(self, surface_index: Int, direction: SplitDirection, ratio: Float, new_pane_is_first: Bool, tab: Str) -> Bool {
+        if surface_index < 0 || surface_index >= self.surfaces.len() { return false }
+        return tree_wrap_root_with_split(self.surfaces[surface_index].tree, direction, math::fclamp(ratio, 0.15, 0.85), new_pane_is_first, tab)
+    }
+}
+
+/// a path-find result (present flag + path).
+pub struct TreeFindPath { ok: Bool, path: Vec<Int> }
+
+/// push `tab` onto the first leaf reachable by descending first children of `tree`.
+pub fn push_leaf_first(tree: Tree, tab: Str) -> Bool {
+    match tree.node {
+        Node::NLeaf(l) => { l.tabs.push(copy tab)  return true }
+        Node::NSplit(s) => { return push_leaf_first(sd_first(s), tab) }
+        Node::NEmpty => { return false }
+    }
+}
+
+/// min of two Ints (local helper; std math is aliased).
+pub fn imin_i(a: Int, b: Int) -> Int { if a < b { return a }  return b }
+/// max of two Ints (local helper).
+pub fn imax_i(a: Int, b: Int) -> Int { if a > b { return a }  return b }
+/// make `tab` visible in surface `surface_index`: if it is already docked, activate it in its
+/// leaf; if it is not, append it to the first laid-out leaf and activate it there. Returns false
+/// only when the surface has no leaf to put it in.
+///
+/// This is what a "Panels" menu needs and nothing in DockState offered: `set_leaf_active` wants a
+/// path the caller does not have, and `push_to_first_leaf` neither focuses nor checks for a tab
+/// that is already there (docking it twice).
+pub fn dock_show_tab(ds: DockState, surface_index: Int, tab: Str) -> Bool {
+    var tree = ds.surface_tree(surface_index)
+    var locs = tree_tab_locations(tree, tab)
+    if locs.len() > 0 { ds.set_leaf_active(surface_index, locs[0].path, locs[0].index)  return true }
+    var lrs = tree_leaf_rects(tree)
+    if lrs.len() == 0 { return false }
+    if !ds.insert_tab_into_leaf(surface_index, lrs[0].path, 99999, tab) { return false }
+    var again = tree_tab_locations(ds.surface_tree(surface_index), tab)
+    if again.len() > 0 { ds.set_leaf_active(surface_index, again[0].path, again[0].index) }
+    return true
+}
+
+/// true when `tab` is the active tab of whatever leaf holds it, i.e. showing right now.
+/// A "Panels" menu greys out the entry for the panel that is already in front, which is the
+/// honest way to have a disabled row without inventing a command that does nothing.
+pub fn dock_tab_is_showing(ds: DockState, surface_index: Int, tab: Str) -> Bool {
+    var tree = ds.surface_tree(surface_index)
+    var locs = tree_tab_locations(tree, tab)
+    if locs.len() == 0 { return false }
+    if !tree_path_ok(tree, locs[0].path) { return false }
+    var leaf = tree_view_at(tree, locs[0].path)
+    return node_leaf_active(leaf.node) == locs[0].index
+}
+
+/// take on `src`'s surfaces and focus, in place.
+///
+/// A host holds its DockState by reference (`inout`), so `ds = seed_dock(h)` is rejected: it can
+/// be changed, but not replaced. A "reset layout" menu action needs exactly that, so it is offered
+/// here rather than open-coded in every host.
+pub fn dock_adopt(inout ds: DockState, src: DockState) {
+    var fresh: Vec<Surface> = vec()
+    var i = 0
+    while i < src.surfaces.len() { fresh.push(Surface { tree: tree_dup(src.surfaces[i].tree) })  i = i + 1 }
+    ds.surfaces = fresh
+    ds.has_focus_surface = src.has_focus_surface
+    ds.focused_surface_index = src.focused_surface_index
+    ds.has_focus_leaf = src.has_focus_leaf
+    ds.focused_leaf_path = path_copy(src.focused_leaf_path)
+}

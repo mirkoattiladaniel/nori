@@ -1,0 +1,206 @@
+// The tokenizer: C text to preprocessing tokens. Comments and line splices are whitespace; each token
+// records whether it starts a line and whether whitespace precedes it, which is all the preprocessor
+// needs to find directives, tell `#define f(x)` from `#define f (x)`, and space a stringified argument.
+
+fn clx_is_ident_start(c: Int) -> Bool { return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c == 36 || c >= 128 }
+fn clx_is_ident(c: Int) -> Bool { return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c == 36 || c >= 128 || (c >= 48 && c <= 57) }
+fn clx_is_digit(c: Int) -> Bool { return c >= 48 && c <= 57 }
+
+// the byte at `i`, or 0 past the end
+fn clx_at(text: Str, i: Int) -> Int {
+    if i < text.len() { return ord(text.at(i)) }
+    return 0
+}
+
+// the length of the punctuator starting at `i`
+fn clx_punct_len(text: Str, i: Int) -> Int {
+    let c = ord(text.at(i))
+    let c1 = clx_at(text, i + 1)
+    let c2 = clx_at(text, i + 2)
+    if c == 46 && c1 == 46 && c2 == 46 { return 3 }                                   // ...
+    if (c == 60 && c1 == 60 && c2 == 61) || (c == 62 && c1 == 62 && c2 == 61) { return 3 }   // <<= >>=
+    if c1 == 61 {                                                                          // X=
+        if c == 60 || c == 62 || c == 61 || c == 33 || c == 42 || c == 47 || c == 37 || c == 43 || c == 45 || c == 38 || c == 94 || c == 124 { return 2 }
+    }
+    if c == 45 && (c1 == 62 || c1 == 45) { return 2 }                                     // -> --
+    if c == 43 && c1 == 43 { return 2 }
+    if c == 60 && c1 == 60 { return 2 }
+    if c == 62 && c1 == 62 { return 2 }
+    if c == 38 && c1 == 38 { return 2 }
+    if c == 124 && c1 == 124 { return 2 }
+    if c == 35 && c1 == 35 { return 2 }
+    return 1
+}
+
+// the end of a quoted literal starting at `i` (on its quote), or -1 when the line ends first
+fn clx_quoted_end(text: Str, i: Int) -> Int {
+    let q = ord(text.at(i))
+    let n = text.len()
+    var k = i + 1
+    while k < n {
+        let d = ord(text.at(k))
+        if d == 92 { k = k + 2 }
+        else if d == q { return k + 1 }
+        else if d == 10 { return 0 - 1 }
+        else { k = k + 1 }
+    }
+    return 0 - 1
+}
+
+// tokenize `text`, appending packed tokens and their line numbers
+fn clx_lex(inout s: St, text: Str, inout toks: Vec<Int>, inout lines: Vec<Int>) {
+    let n = text.len()
+    var i = 0
+    var line = 1
+    var bol = true
+    var space = false
+    while i < n {
+        let c = ord(text.at(i))
+        if c == 10 { line = line + 1  bol = true  space = true  i = i + 1  continue }
+        if c == 32 || c == 9 || c == 13 || c == 12 || c == 11 { space = true  i = i + 1  continue }
+        if c == 92 {
+            let c1 = clx_at(text, i + 1)
+            if c1 == 10 { i = i + 2  line = line + 1  space = true  continue }
+            if c1 == 13 && clx_at(text, i + 2) == 10 { i = i + 3  line = line + 1  space = true  continue }
+        }
+        if c == 47 {
+            let c1b = clx_at(text, i + 1)
+            if c1b == 42 {
+                var k = i + 2
+                while k + 1 < n && !(ord(text.at(k)) == 42 && ord(text.at(k + 1)) == 47) {
+                    if ord(text.at(k)) == 10 { line = line + 1 }
+                    k = k + 1
+                }
+                i = k + 2
+                space = true
+                continue
+            }
+            if c1b == 47 {
+                var k2 = i + 2
+                while k2 < n && ord(text.at(k2)) != 10 {
+                    if ord(text.at(k2)) == 92 && clx_at(text, k2 + 1) == 10 { line = line + 1  k2 = k2 + 1 }
+                    k2 = k2 + 1
+                }
+                i = k2
+                space = true
+                continue
+            }
+        }
+        var flags = 0
+        if bol { flags = TF_BOL }
+        if space { flags = flags | TF_SPACE }
+        bol = false
+        space = false
+        let start = i
+        var kind = TK_PUNCT
+        if clx_is_ident_start(c) {
+            i = i + 1
+            while i < n && clx_is_ident(ord(text.at(i))) { i = i + 1 }
+            kind = TK_IDENT
+            if i < n {
+                let q = ord(text.at(i))
+                if q == 34 || q == 39 {
+                    let pl = i - start
+                    let p0 = c
+                    var pre = false
+                    if pl == 1 && (p0 == 76 || p0 == 117 || p0 == 85) { pre = true }
+                    if pl == 2 && p0 == 117 && ord(text.at(start + 1)) == 56 { pre = true }
+                    if pre {
+                        let e = clx_quoted_end(text, i)
+                        if e > 0 {
+                            i = e
+                            if q == 34 { kind = TK_STR } else { kind = TK_CHAR }
+                        }
+                    }
+                }
+            }
+        } else if clx_is_digit(c) || (c == 46 && clx_is_digit(clx_at(text, i + 1))) {
+            i = i + 1
+            var go = true
+            while go && i < n {
+                let d = ord(text.at(i))
+                if (d == 101 || d == 69 || d == 112 || d == 80) && (clx_at(text, i + 1) == 43 || clx_at(text, i + 1) == 45) { i = i + 2 }
+                else if clx_is_ident(d) || d == 46 { i = i + 1 }
+                else if d == 39 && clx_is_ident(clx_at(text, i + 1)) { i = i + 2 }
+                else { go = false }
+            }
+            kind = TK_NUM
+        } else if c == 34 || c == 39 {
+            let e2 = clx_quoted_end(text, i)
+            if e2 > 0 {
+                i = e2
+                if c == 34 { kind = TK_STR } else { kind = TK_CHAR }
+            } else {
+                i = i + 1
+                kind = TK_OTHER
+            }
+        } else {
+            let pn = clx_punct_len(text, i)
+            if pn == 1 {
+                var id1 = s.punct1[c]
+                if id1 < 0 {
+                    id1 = cst_intern(s, text.slice(i, i + 1))
+                    s.punct1[c] = id1
+                }
+                i = i + 1
+                var k1 = TK_PUNCT
+                if c == 64 || c == 96 || c >= 128 || c < 32 { k1 = TK_OTHER }
+                toks.push(ctk_make(id1, k1, flags))
+                lines.push(line)
+                continue
+            }
+            i = i + pn
+        }
+        let id = cst_intern(s, text.slice(start, i))
+        toks.push(ctk_make(id, kind, flags))
+        lines.push(line)
+    }
+}
+
+// the first `#`-directive name at index `i` of a token list (a `#` starting a line), or -1
+fn clx_directive_at(toks: Vec<Int>, i: Int) -> Int {
+    if i + 1 >= toks.len() { return 0 - 1 }
+    let t = toks[i]
+    if ctk_id(t) != P_HASH || (ctk_flags(t) & TF_BOL) == 0 { return 0 - 1 }
+    let t2 = toks[i + 1]
+    if (ctk_flags(t2) & TF_BOL) != 0 { return 0 - 1 }
+    return ctk_id(t2)
+}
+
+// the index of the next token starting a line after `i`
+fn clx_line_end(toks: Vec<Int>, i: Int) -> Int {
+    var k = i + 1
+    while k < toks.len() && (ctk_flags(toks[k]) & TF_BOL) == 0 { k = k + 1 }
+    return k
+}
+
+// The include guard of a lexed file: the name `NAME` when the file is `#ifndef NAME` (or
+// `#if !defined NAME` / `#if !defined(NAME)`) and the `#endif` matching it is the file's last line.
+fn clx_guard(toks: Vec<Int>) -> Int {
+    let d = clx_directive_at(toks, 0)
+    if d < 0 { return 0 - 1 }
+    var name = 0 - 1
+    let e0 = clx_line_end(toks, 0)
+    if d == KW_ifndef && e0 == 3 && ctk_kind(toks[2]) == TK_IDENT { name = ctk_id(toks[2]) }
+    if d == KW_if && e0 >= 5 && ctk_id(toks[2]) == P_NOT && ctk_id(toks[3]) == KW_defined {
+        if e0 == 5 && ctk_kind(toks[4]) == TK_IDENT { name = ctk_id(toks[4]) }
+        if e0 == 7 && ctk_id(toks[4]) == P_LPAREN && ctk_kind(toks[5]) == TK_IDENT && ctk_id(toks[6]) == P_RPAREN { name = ctk_id(toks[5]) }
+    }
+    if name < 0 { return 0 - 1 }
+    var depth = 0
+    var i = e0
+    while i < toks.len() {
+        let dd = clx_directive_at(toks, i)
+        let e = clx_line_end(toks, i)
+        if dd == KW_if || dd == KW_ifdef || dd == KW_ifndef { depth = depth + 1 }
+        else if dd == KW_endif {
+            if depth == 0 {
+                if e == toks.len() { return name }
+                return 0 - 1
+            }
+            depth = depth - 1
+        } else if depth == 0 && (dd == KW_else || dd == KW_elif || dd == KW_elifdef || dd == KW_elifndef) { return 0 - 1 }
+        i = e
+    }
+    return 0 - 1
+}

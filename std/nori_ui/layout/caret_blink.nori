@@ -1,0 +1,60 @@
+use core::*
+
+// ===========================================================================
+// layout/caret_blink: the one bit of caret state that is not the caller's.
+//
+// A caret blinks, and blinking is the only thing in this library that depends
+// on when it is drawn rather than on what it is drawn from. Layout is a pure
+// function of the state it is handed and stays one: the phase is not read from
+// a clock here, it is set by the host once per frame and only consulted at
+// every place a caret is painted.
+//
+// This keeps `--shot` deterministic. A test that renders one frame offscreen
+// and asserts on pixels would see a caret that is present in some captures and
+// absent in others if it consulted a clock. The host never calls `set_caret_on`
+// on the shot path, so the phase stays at its default and every captured caret
+// is solid.
+//
+// The same arrangement as `set_char_advances` in text_measure.nori, and for the
+// same reason: a plugin `.so` carries its own image of this module with its own
+// globals, so a host that wants a blinking caret in a plugin's widgets has to
+// say so in that plugin's image too.
+// ===========================================================================
+
+/// how long the caret spends on, and then off, in milliseconds.
+///
+/// 530ms is the interval Windows has long used and most toolkits copied; a
+/// caret is a thing people read past rather than look at, and faster reads as
+/// a flicker.
+pub fn caret_blink_period_ms() -> Int { return 530 }
+
+/// the blink phase for a caret whose owner last did something `since_ms` ago.
+///
+/// Phase 0 is ON. Measuring from the last keystroke rather than from a fixed
+/// epoch means the caret is solid the instant you type and stays that way for
+/// a full period, so a burst of typing never strobes.
+pub fn caret_blink_on(since_ms: Int) -> Bool {
+    var p = caret_blink_period_ms()
+    var s = since_ms
+    if s < 0 { s = 0 }
+    return ((s / p) % 2) == 0
+}
+
+// On unless a host says otherwise. Everything that does not blink carets
+// (offscreen frames, embedders that never call this) gets a solid caret.
+//
+// An Int rather than a Bool because a top-level `global` takes an integer
+// literal and nothing else, and this one's default has to be the ON side.
+global g_caret_hidden: Int = 0
+
+/// tell this image of the library whether carets are in their ON phase.
+///
+/// Call it once per frame, before laying anything out. Widgets are painted
+/// from documents the host does not own field by field, so the phase cannot
+/// travel as an attribute; it is one global read at four paint sites.
+pub fn set_caret_on(on: Bool) {
+    if on { g_caret_hidden = 0 } else { g_caret_hidden = 1 }
+}
+
+/// whether a focused widget should paint its caret this frame.
+pub fn caret_on() -> Bool { return g_caret_hidden == 0 }

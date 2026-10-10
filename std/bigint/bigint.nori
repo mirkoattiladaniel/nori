@@ -1,0 +1,558 @@
+//! std/bigint: arbitrary-precision signed integers. Sign-magnitude with base-10^9 limbs
+//! (little-endian), so products of two limbs fit in an i64 and decimal I/O is cheap. Values are immutable;
+//! every operation returns a fresh Big.
+//!   import "std/bigint" as big
+//!   let a = big::parse("123456789012345678901234567890")
+//!   big::to_string(big::mul(a, a))
+//!   big::to_string(big::pow(big::from_int(2), 100))     // "1267650600228229401496703205376"
+
+pub struct Big { neg: Bool, limbs: Vec<Int> } // limbs: little-endian base-10^9, no high zeros; zero = empty
+pub struct DivMod {
+    q: Big,
+    r: Big
+}
+
+fn base() -> Int {
+    return 1000000000
+}
+fn bool_eq(a: Bool, b: Bool) -> Bool {
+    if a {
+        return b
+    }
+    return !b
+}
+
+/// drop high-order zero limbs in place.
+fn norm(sink ls: Vec<Int>) -> Vec<Int> {
+    var n = ls.len()
+    while n > 0 {
+        if ls[n - 1] == 0 {
+            ls.pop()
+            n = n - 1
+        } else {
+            n = 0 - 1
+        }
+    }
+    return ls
+}
+/// build a Big, forcing zero to be non-negative.
+fn mk(neg: Bool, sink limbs: Vec<Int>) -> Big {
+    let l = norm(limbs)
+    if l.len() == 0 {
+        return Big { neg: false, limbs: l }
+    }
+    return Big { neg: neg, limbs: l }
+}
+/// a magnitude holding the single limb `x` (0 -> empty).
+fn one_limb(x: Int) -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    if x > 0 {
+        v.push(x)
+    }
+    return v
+}
+
+/// the additive identity.
+pub fn zero() -> Big {
+    var e: Vec<Int> = vec()
+    return Big { neg: false, limbs: e }
+}
+/// is `b` zero?
+pub fn is_zero(b: Big) -> Bool {
+    return b.limbs.len() == 0
+}
+
+/// a Big from a machine integer.
+pub fn from_int(n: Int) -> Big {
+    var neg = false
+    var v = n
+    if v < 0 {
+        neg = true
+        v = 0 - v
+    }
+    var ls: Vec<Int> = vec()
+    let B = base()
+    while v > 0 {
+        ls.push(v % B)
+        v = v / B
+    }
+    return mk(neg, ls)
+}
+/// the negation of `b`.
+pub fn neg(b: Big) -> Big {
+    var ls: Vec<Int> = vec()
+    var i = 0
+    while i < b.limbs.len() {
+        ls.push(b.limbs[i])
+        i = i + 1
+    }
+    return mk(!b.neg, ls)
+}
+
+// ---- magnitude helpers (operate on limb vectors) ----
+fn cmp_mag(a: Vec<Int>, b: Vec<Int>) -> Int {
+    if a.len() != b.len() {
+        if a.len() < b.len() {
+            return 0 - 1
+        }
+        return 1
+    }
+    var i = a.len() - 1
+    while i >= 0 {
+        if a[i] != b[i] {
+            if a[i] < b[i] {
+                return 0 - 1
+            }
+            return 1
+        }
+        i = i - 1
+    }
+    return 0
+}
+fn add_mag(a: Vec<Int>, b: Vec<Int>) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    let B = base()
+    var carry = 0
+    var i = 0
+    var m = a.len()
+    if b.len() > m {
+        m = b.len()
+    }
+    while i < m || carry > 0 {
+        var s = carry
+        if i < a.len() {
+            s = s + a[i]
+        }
+        if i < b.len() {
+            s = s + b[i]
+        }
+        out.push(s % B)
+        carry = s / B
+        i = i + 1
+    }
+    return out
+}
+fn sub_mag(a: Vec<Int>, b: Vec<Int>) -> Vec<Int> {
+    // requires |a| >= |b|
+    var out: Vec<Int> = vec()
+    let B = base()
+    var borrow = 0
+    var i = 0
+    while i < a.len() {
+        var s = a[i] - borrow
+        if i < b.len() {
+            s = s - b[i]
+        }
+        if s < 0 {
+            s = s + B
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        out.push(s)
+        i = i + 1
+    }
+    return norm(out)
+}
+fn mul_small(a: Vec<Int>, m: Int) -> Vec<Int> {
+    if m == 0 {
+        var e: Vec<Int> = vec()
+        return e
+    }
+    var out: Vec<Int> = vec()
+    let B = base()
+    var carry = 0
+    var i = 0
+    while i < a.len() {
+        let cur = a[i] * m + carry
+        out.push(cur % B)
+        carry = cur / B
+        i = i + 1
+    }
+    while carry > 0 {
+        out.push(carry % B)
+        carry = carry / B
+    }
+    return norm(out)
+}
+fn mul_mag(a: Vec<Int>, b: Vec<Int>) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    if a.len() == 0 {
+        return out
+    }
+    if b.len() == 0 {
+        return out
+    }
+    let B = base()
+    var k = 0
+    while k < a.len() + b.len() {
+        out.push(0)
+        k = k + 1
+    }
+    var i = 0
+    while i < a.len() {
+        var carry = 0
+        var j = 0
+        while j < b.len() {
+            let cur = out[i + j] + (a[i] * b[j]) + carry
+            out[i + j] = cur % B
+            carry = cur / B
+            j = j + 1
+        }
+        var p = i + b.len()
+        while carry > 0 {
+            let cur = out[p] + carry
+            out[p] = cur % B
+            carry = cur / B
+            p = p + 1
+        }
+        i = i + 1
+    }
+    return norm(out)
+}
+fn shift_limb(a: Vec<Int>) -> Vec<Int> {
+    // multiply by base (prepend a low zero limb)
+    if a.len() == 0 {
+        var e: Vec<Int> = vec()
+        return e
+    }
+    var out: Vec<Int> = vec()
+    out.push(0)
+    var i = 0
+    while i < a.len() {
+        out.push(a[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ---- signed operations ----
+/// signed comparison: -1 if a<b, 0 if equal, 1 if a>b.
+pub fn cmp(a: Big, b: Big) -> Int {
+    if a.neg {
+        if !b.neg {
+            return 0 - 1
+        }
+    } else {
+        if b.neg {
+            return 1
+        }
+    }
+    let m = cmp_mag(a.limbs, b.limbs)
+    if a.neg {
+        return 0 - m
+    }
+    return m
+}
+/// a + b.
+pub fn add(a: Big, b: Big) -> Big {
+    if bool_eq(a.neg, b.neg) {
+        return mk(a.neg, add_mag(a.limbs, b.limbs))
+    }
+    let c = cmp_mag(a.limbs, b.limbs)
+    if c == 0 {
+        return zero()
+    }
+    if c > 0 {
+        return mk(a.neg, sub_mag(a.limbs, b.limbs))
+    }
+    return mk(b.neg, sub_mag(b.limbs, a.limbs))
+}
+/// a - b.
+pub fn sub(a: Big, b: Big) -> Big {
+    return add(a, neg(b))
+}
+/// a * b.
+pub fn mul(a: Big, b: Big) -> Big {
+    return mk(!bool_eq(a.neg, b.neg), mul_mag(a.limbs, b.limbs))
+}
+
+/// a magnitude divided by a single limb, low limb first.
+fn div_small(a: Vec<Int>, m: Int) -> Vec<Int> {
+    let B = base()
+    var rev: Vec<Int> = vec()
+    var r = 0
+    var i = a.len() - 1
+    while i >= 0 {
+        let cur = r * B + a[i]
+        rev.push(cur / m)
+        r = cur % m
+        i = i - 1
+    }
+    var out: Vec<Int> = vec()
+    var k = rev.len() - 1
+    while k >= 0 {
+        out.push(rev[k])
+        k = k - 1
+    }
+    return norm(out)
+}
+
+/// truncated division: q = a/b (toward zero), r = a - q*b (sign of a). Dividing by zero traps, as
+/// `Int` division does.
+pub fn divmod(a: Big, b: Big) -> DivMod {
+    let B = base()
+    let nb = b.limbs.len()
+    if nb == 0 { fail("bigint: division by zero") }
+    if cmp_mag(a.limbs, b.limbs) < 0 {
+        // nothing to divide out: the quotient is zero and the dividend is its own remainder
+        var rc: Vec<Int> = vec()
+        var t = 0
+        while t < a.limbs.len() {
+            rc.push(a.limbs[t])
+            t = t + 1
+        }
+        var ez: Vec<Int> = vec()
+        return DivMod { q: mk(false, ez), r: mk(a.neg, rc) }
+    }
+    // Scale both sides so the divisor's leading limb is at least half the base. A quotient limb
+    // guessed from the leading limbs is then never more than two too large, so two corrections
+    // replace the thirty whole-divisor multiplies a binary search over the limb range costs.
+    var s = B / (b.limbs[nb - 1] + 1)
+    if s < 1 {
+        s = 1
+    }
+    let an = mul_small(a.limbs, s)
+    let bn = mul_small(b.limbs, s)
+    let nbn = bn.len()
+    let bt = bn[nbn - 1]
+    var rem: Vec<Int> = vec()
+    var qrev: Vec<Int> = vec()
+    var i = an.len() - 1
+    while i >= 0 {
+        rem = norm(add_mag(shift_limb(rem), one_limb(an[i]))) // rem = rem*base + an[i]
+        var d = 0
+        if cmp_mag(rem, bn) >= 0 {
+            // rem holds at most one limb more than the divisor, so its two leading limbs over the
+            // divisor's one is the classic estimate
+            var top = 0
+            if rem.len() > nbn {
+                top = rem[rem.len() - 1]
+            }
+            d = (top * B + rem[nbn - 1]) / bt
+            if d > B - 1 {
+                d = B - 1
+            }
+            var prod = mul_small(bn, d)
+            while cmp_mag(prod, rem) > 0 {
+                d = d - 1
+                prod = mul_small(bn, d)
+            }
+            rem = sub_mag(rem, prod)
+        }
+        qrev.push(d)
+        i = i - 1
+    }
+    var q: Vec<Int> = vec()
+    var k = qrev.len() - 1
+    while k >= 0 {
+        q.push(qrev[k])
+        k = k - 1
+    }
+    return DivMod { q: mk(!bool_eq(a.neg, b.neg), q), r: mk(a.neg, div_small(rem, s)) }
+}
+/// a / b (truncated toward zero).
+pub fn div(a: Big, b: Big) -> Big {
+    var dm = divmod(a, b)
+    return sink dm.q
+}
+/// a mod b (sign of a).
+pub fn rem(a: Big, b: Big) -> Big {
+    var dm = divmod(a, b)
+    return sink dm.r
+}
+
+/// base raised to a non-negative machine-int exponent (binary exponentiation).
+pub fn pow(b: Big, e: Int) -> Big {
+    var result = from_int(1)
+    var base_ = b
+    var ee = e
+    while ee > 0 {
+        if ee % 2 == 1 {
+            result = mul(result, base_)
+        }
+        base_ = mul(base_, base_)
+        ee = ee / 2
+    }
+    return result
+}
+
+// magnitude / 2, exactly. Base 10^9 is not a power of two, so halving is a carry-propagating
+// pass from the high limb down: an odd limb leaves 10^9/2 to add into the one below it.
+fn half_mag(a: Vec<Int>) -> Vec<Int> {
+    let B = base()
+    var out: Vec<Int> = vec()
+    var i = 0
+    while i < a.len() { out.push(0)  i = i + 1 }
+    var carry = 0
+    i = a.len() - 1
+    while i >= 0 {
+        let cur = (a[i] + (carry * B))
+        out[i] = (cur / 2)
+        carry = (cur % 2)
+        i = i - 1
+    }
+    return norm(out)
+}
+
+/// base^exp mod m, for a non-negative `exp` and a positive `m`: the operation RSA verification
+/// is, and the one `pow` cannot stand in for. `pow` takes a machine-int exponent and never
+/// reduces, so it computes the full number: for RSA that is a value with more digits than the
+/// machine has memory. Reducing at every step is the whole difference.
+///
+/// Zero when `m` is not positive or `exp` is negative. A negative exponent would be a modular
+/// inverse, which is a different algorithm and is not implemented; returning zero rather than
+/// guessing keeps a caller from mistaking one for the other.
+///
+/// The cost is one modular reduction per exponent bit, and reduction here is long division, so
+/// this suits public exponents (the 17 bits of 65537) and not private ones. A private-key
+/// operation would need a different representation (power-of-two limbs, Montgomery form) and,
+/// more importantly, blinding: the square-and-multiply below branches on exponent bits and its
+/// timing says which they were. That is harmless for a public exponent, where the bits are
+/// published, and disqualifying for a secret one.
+pub fn modpow(b: Big, exp: Big, m: Big) -> Big {
+    if m.neg { return zero() }
+    if is_zero(m) { return zero() }
+    if exp.neg { return zero() }
+    if cmp(m, from_int(1)) == 0 { return zero() }        // everything is 0 mod 1
+
+    // fold the base into range first, and give a negative one its non-negative representative:
+    // `rem` truncates toward zero, so (-3) rem 7 is -3 and not 4.
+    var base_ = rem(b, m)
+    if base_.neg { base_ = add(base_, m) }
+
+    var result = from_int(1)
+    var e = mk(false, copy exp.limbs)
+    while !is_zero(e) {
+        if (e.limbs[0] % 2) == 1 { result = rem(mul(result, base_), m) }
+        e = mk(false, half_mag(e.limbs))
+        if !is_zero(e) { base_ = rem(mul(base_, base_), m) }
+    }
+    return result
+}
+
+// Three bytes at a time, because 2^24 fits in a base-10^9 limb with room for the carry, so one
+// pass per three bytes rather than per byte.
+fn byte_chunk() -> Int { return 16777216 }
+
+/// A big-endian unsigned byte string as a Big. This is how a key, a modulus or a signature arrives
+/// from a certificate: as bytes, not as decimal.
+pub fn from_bytes_be(s: Str) -> Big {
+    var acc = zero()
+    let mul = from_int(byte_chunk())
+    var i = 0
+    // a leading partial group, so that everything after it is exactly three bytes
+    let head = (s.len() % 3)
+    var first = 0
+    while i < head { first = ((first << 8) | ord(s.at(i)))  i = i + 1 }
+    if head > 0 { acc = from_int(first) }
+    while i < s.len() {
+        let c = (((ord(s.at(i)) << 16) | (ord(s.at(i + 1)) << 8)) | ord(s.at(i + 2)))
+        acc = add(mul_big(acc, mul), from_int(c))
+        i = i + 3
+    }
+    return acc
+}
+
+// `mul` under another name, so the loop above reads as arithmetic rather than as a call to itself.
+fn mul_big(a: Big, b: Big) -> Big { return mul(a, b) }
+
+/// `b` as exactly `n` big-endian bytes, zero-padded on the left. "" if it does not fit in `n`, or
+/// if `b` is negative: a modulus or a signature that will not fit the width it is supposed to
+/// have is malformed, and truncating it would turn that into a value.
+pub fn to_bytes_be(b: Big, n: Int) -> Str {
+    if b.neg { return "" }
+    if n < 0 { return "" }
+    var out: Vec<Int> = vec()
+    var cur = b
+    let div = from_int(byte_chunk())
+    while !is_zero(cur) {
+        let dm = divmod(cur, div)
+        var r = 0
+        if !is_zero(dm.r) { r = to_int_small(dm.r) }
+        out.push((r & 0xff))
+        out.push(((r >> 8) & 0xff))
+        out.push(((r >> 16) & 0xff))
+        cur = sink dm.q
+    }
+    // strip the zero bytes the last three-byte group padded with, then check the width
+    var top = out.len()
+    while top > 0 { if out[top - 1] != 0 { top = 0 - top } else { top = top - 1 } }
+    var used = 0
+    if top < 0 { used = (0 - top) }
+    if used > n { return "" }
+    var s = ""
+    var i = 0
+    while i < (n - used) { s = (s + chr(0))  i = i + 1 }
+    i = used - 1
+    while i >= 0 { s = (s + chr(out[i]))  i = i - 1 }
+    return s
+}
+
+// A Big known to fit in a machine int (a remainder below 2^24 here). 0 if it does not.
+fn to_int_small(b: Big) -> Int {
+    var v = 0
+    var i = b.limbs.len() - 1
+    if i > 1 { return 0 }
+    while i >= 0 { v = ((v * base()) + b.limbs[i])  i = i - 1 }
+    return v
+}
+
+/// parse a decimal string (optional leading `-`); non-digits are ignored.
+pub fn parse(s: Str) -> Big {
+    var neg = false
+    var start = 0
+    if s.len() > 0 {
+        if ord(s.at(0)) == 45 {
+            neg = true
+            start = 1
+        }
+    }
+    var mag: Vec<Int> = vec()
+    var i = start
+    while i < s.len() {
+        let c = ord(s.at(i))
+        if c >= 48 && c <= 57 {
+            mag = norm(add_mag(mul_small(mag, 10), one_limb(c - 48)))
+        }
+        i = i + 1
+    }
+    return mk(neg, mag)
+}
+
+/// `x` (0..10^9-1) as up to 9 decimal digits, zero-padded to `width`.
+fn limb_str(x: Int, width: Int) -> Str {
+    let D = "0123456789"
+    var s = ""
+    var v = x
+    if v == 0 {
+        s = "0"
+    } else {
+        while v > 0 {
+            let d = v % 10
+            s = (D.slice(d, d + 1) + s)
+            v = v / 10
+        }
+    }
+    while s.len() < width {
+        s = ("0" + s)
+    }
+    return s
+}
+/// decimal string form. Not `to_str`: that is the built-in every value already answers to, and a
+/// top-level function wearing a built-in's name is one nothing can call.
+pub fn to_string(b: Big) -> Str {
+    if is_zero(b) {
+        return "0"
+    }
+    var out = limb_str(b.limbs[b.limbs.len() - 1], 0) // top limb: no padding
+    var i = b.limbs.len() - 2
+    while i >= 0 {
+        out = (out + limb_str(b.limbs[i], 9))
+        i = i - 1
+    }
+    if b.neg {
+        return("-" + out)
+    }
+    return out
+}

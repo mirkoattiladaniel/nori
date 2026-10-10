@@ -1,0 +1,397 @@
+//! std/xdg icons, following the Icon Theme Specification: `index.theme` parsing, the lookup a launcher wants
+//! (the theme, its parents via Inherits, `hicolor`, then `/usr/share/pixmaps`; png/svg/xpm with png
+//! and svg preferred), and a cache of directory listings so a lookup never re-reads a directory.
+//! Same module as `std/xdg`: import "std/xdg" and call `xdg::icon_lookup(...)`.
+//!
+//!   import "std/xdg" as xdg
+//!   xdg::icon_lookup("my-app", 48)              // full path, or "" when no icon matches
+//!   xdg::icon_resolve(entries_icon_value, 48)   // an absolute path in Icon= is used as is
+//!
+//! A theme is a directory `<basedir>/<theme>/index.theme` where the base directories are
+//! `$HOME/.icons`, then `<datadir>/icons` for each entry of `xdg::data_search_paths` (the spec:
+//! "apps should look in $HOME/.icons (for backwards compatibility), in $XDG_DATA_DIRS/icons ...").
+//! The theme's configuration, the `Directories=` list, each directory's Size/Type/…, comes from
+//! the first base directory whose `<theme>/index.theme` exists ("The first index.theme found while
+//! searching the base directories in order is used"), but the icon files are searched in the
+//! theme's subdirectories under every base directory, in base-directory order ("A theme can be
+//! spread across several base directories ... This way users can extend and override system
+//! themes"). The spec's lookup: "The lookup order ... is: first the theme itself, then each theme
+//! listed in the Inherits key, ... then hicolor" and finally the pixmap directories; within a
+//! theme the `Directories=` order is searched (the spec's LookupIcon: "for each subdir in $(theme
+//! subdir list) { for each directory in $(basename list) { ... } }") and a directory with
+//! `Type=Fixed|Scalable|Threshold` qualifies when the requested size fits it (the spec's
+//! Directories() pseudocode).
+import "std/os" as os
+import "std/strutil" as su
+
+/// a directory config of an icon theme (`[48x48]` etc.).
+pub struct IconDirCfg {
+    name: Str,        // the subdirectory in the theme, e.g. "48x48"
+    size: Int,        // Size (in the directory's own Scale units)
+    scale: Int,       // Scale (default 1)
+    kind: Int,        // ICON_FIXED / ICON_SCALABLE / ICON_THRESHOLD
+    min_size: Int,    // MinSize (default Size)
+    max_size: Int,    // MaxSize (default Size)
+    threshold: Int,   // Threshold (default 2)
+}
+
+/// a parsed icon theme: its directories (in `Directories=` order) and the themes it inherits.
+pub struct IconTheme { name: Str, dirs: Vec<IconDirCfg>, inherits: Vec<Str> }
+
+/// directory type: fixed size.
+pub fn ICON_FIXED() -> Int { return 0 }
+/// directory type: scalable between MinSize and MaxSize.
+pub fn ICON_SCALABLE() -> Int { return 1 }
+/// directory type: usable within Threshold of Size.
+pub fn ICON_THRESHOLD() -> Int { return 2 }
+
+// -----------------------------------------------------------------------------------------------
+
+/// the theme `name` from the first base directory that has it (`$HOME/.icons`, then each
+/// `<datadir>/icons` in priority order), or an empty theme (no dirs, no inherits) when it is not
+/// installed.
+/// (Icon Theme Spec: "In at least one of the theme directories there must be a file called
+/// index.theme that describes the theme. The first index.theme found while searching the base
+/// directories in order is used.")
+pub fn load_theme(name: Str) -> IconTheme {
+    let base = i_theme_dir(name)
+    if base.len() == 0 {
+        var empty: Vec<IconDirCfg> = vec()
+        var ei: Vec<Str> = vec()
+        return IconTheme { name: copy name, dirs: empty, inherits: ei }
+    }
+    return i_theme_load(base)
+}
+
+/// lookup icon `name` at pixel `size`, scale 1, in the default theme "hicolor".
+pub fn icon_lookup(name: Str, size: Int) -> Str { return icon_lookup_scale(name, size, 1) }
+
+/// lookup icon `name` at pixel `size` on screen at `scale` (a hidpi display), default theme hicolor.
+pub fn icon_lookup_scale(name: Str, size: Int, scale: Int) -> Str { return icon_lookup_in("hicolor", name, size, scale) }
+
+/// lookup icon `name` in theme `theme` (then its Inherits, then hicolor, then /usr/share/pixmaps)
+/// at pixel `size` and `scale`; "" when nothing matches.
+///
+/// The theme's directory list comes from the first base directory holding its index.theme; the
+/// icon file itself is then searched in each matching subdirectory under every base directory, in
+/// base-directory order ($HOME/.icons, then each data dir's icons/). This is the spec's LookupIcon:
+/// "for each subdir in $(theme subdir list) { for each directory in $(basename list) { ... } }".
+/// The spec's chain: "The theme is searched ... If that fails, the parent themes are checked ...
+/// If no parent themes are specified ... 'hicolor' is used as the fallback", plus the pixmap
+/// fallback ("as a last resort, ... /usr/share/pixmaps").
+pub fn icon_lookup_in(theme: Str, name: Str, size: Int, scale: Int) -> Str {
+    var chain: Vec<Str> = vec()
+    i_chain_add(theme, chain)
+    i_chain_add("hicolor", chain)
+    var ci = 0
+    while ci < chain.len() {
+        let tn = chain[ci]
+        let base = i_theme_dir(tn)
+        if base.len() > 0 {
+            let t = i_theme_load(base)
+            var di = 0
+            while di < t.dirs.len() {
+                let dc = t.dirs[di]
+                if i_dir_matches(dc, size, scale) {
+                    let hit = i_find_icon(tn, dc.name, name)
+                    if hit.len() > 0 { return hit }
+                }
+                di = di + 1
+            }
+        }
+        ci = ci + 1
+    }
+    var k = 0
+    while k < 3 {
+        let p = ("/usr/share/pixmaps/") + (name + i_icon_ext(k))
+        if os::path_exists(p) { return p }
+        k = k + 1
+    }
+    return ""
+}
+
+/// resolve an `Icon=` value: an absolute path is used as is (Desktop Entry Spec: "The value ...
+/// may be given as an absolute path ... the file is used as is"); anything else is looked up as a
+/// themed icon name at `size`. "" when there is no icon or none matches.
+pub fn icon_resolve(icon: Str, size: Int) -> Str {
+    if icon.len() == 0 { return "" }
+    if ord(icon.at(0)) == 47 { return copy icon }
+    return icon_lookup(icon, size)
+}
+
+/// the full icon path for the app's Icon key (absolute values as-is, themed otherwise).
+pub fn app_icon_path(a: App, locale: Str, size: Int) -> Str {
+    return icon_resolve(app_icon(a, locale), size)
+}
+
+// ---- internals --------------------------------------------------------------------------------
+
+/// the base directories an icon theme and its icon files live under, first to last: `$HOME/.icons`,
+/// then `<datadir>/icons` for each data search path entry.
+/// (Icon Theme Spec §3: "By default, apps should look in $HOME/.icons (for backwards
+/// compatibility), in $XDG_DATA_DIRS/icons and in /usr/share/pixmaps (in that order)." The theme
+/// itself lives in `<basedir>/<themename>`.)
+fn i_icon_bases() -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    out.push(os::home_dir() + "/.icons")
+    let ds = data_search_paths()
+    var i = 0
+    while i < ds.len() { out.push(ds[i] + "/icons")  i = i + 1 }
+    return out
+}
+
+/// the theme directory `<basedir>/<tn>` whose index.theme exists, or "": the first base directory
+/// that has the file.
+/// (Icon Theme Spec §3: "In at least one of the theme directories there must be a file called
+/// index.theme that describes the theme. The first index.theme found while searching the base
+/// directories in order is used.")
+fn i_theme_dir(tn: Str) -> Str {
+    let bases = i_icon_bases()
+    var i = 0
+    while i < bases.len() {
+        let p = (bases[i] + "/") + tn
+        if os::path_exists((p + "/index.theme")) { return p }
+        i = i + 1
+    }
+    return ""
+}
+
+/// index of byte `ch` in `s`, or -1.
+fn i_idx(s: Str, ch: Int) -> Int {
+    var i = 0
+    while i < s.len() { if ord(s.at(i)) == ch { return i }  i = i + 1 }
+    return 0 - 1
+}
+
+/// split a `;`- or `,`-separated list (the Icon Theme Spec's Directories/Inherits are written with
+/// commas; several themes in the wild use ';' like desktop-entry lists), dropping empty items.
+fn i_split_list(v: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let a = su::split(v, ";")
+    var i = 0
+    while i < a.len() {
+        let b = su::split(a[i], ",")
+        var j = 0
+        while j < b.len() {
+            if b[j].len() > 0 { out.push(copy b[j]) }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// a safe parse_int: 0 on any non-integer text.
+fn i_parse_int(s: Str) -> Int {
+    var n = s.len()
+    if n == 0 { return 0 }
+    var i = 0
+    if ord(s.at(0)) == 45 { if n == 1 { return 0 }  i = 1 }      // '-'
+    while i < n {
+        let c = ord(s.at(i))
+        if c < 48 { return 0 }                                    // '0'
+        if c > 57 { return 0 }                                    // '9'
+        i = i + 1
+    }
+    return parse_int(s)
+}
+
+/// "Fixed", "Scalable" or "Threshold" (case-insensitively; anything else is Fixed; the default).
+fn i_type_of(v: Str) -> Int {
+    let t = su::to_lower(copy v)
+    if t == "scalable" { return ICON_SCALABLE() }
+    if t == "threshold" { return ICON_THRESHOLD() }
+    return ICON_FIXED()
+}
+
+/// does a directory with config `dc` serve the requested (size, scale)?
+/// The spec's Directories() rules: Fixed qualifies when Size*Scale == size; Scalable when
+/// MinSize*Scale .. MaxSize*Scale contains size; Threshold when |size - Size*Scale| <= Threshold*Scale
+/// (Scale here is the directory's own Scale).
+fn i_dir_matches(dc: IconDirCfg, size: Int, scale: Int) -> Bool {
+    if dc.kind == ICON_SCALABLE() {
+        if dc.min_size * dc.scale <= size { if size <= dc.max_size * dc.scale { return true } }
+        return false
+    }
+    if dc.kind == ICON_THRESHOLD() {
+        let px = dc.size * dc.scale
+        var diff = size - px
+        if diff < 0 { diff = 0 - diff }
+        return diff <= dc.threshold * dc.scale
+    }
+    return dc.size * dc.scale == size
+}
+
+/// the extension tried for icon kind `k`: 0 png, 1 svg, 2 xpm; png and svg before xpm.
+fn i_icon_ext(k: Int) -> Str {
+    if k == 1 { return ".svg" }
+    if k == 2 { return ".xpm" }
+    return ".png"
+}
+
+/// the icon file `<basedir>/<tn>/<subdir>/<name>.<ext>` under the first base directory whose
+/// (cached) listing contains it, searching every base in order: $HOME/.icons before the data
+/// dirs. (Icon Theme Spec §3: "A theme can be spread across several base directories by having
+/// subdirectories of the same name. This way users can extend and override system themes."; §5
+/// LookupIcon: "for each subdir in $(theme subdir list) { for each directory in $(basename list) {
+/// ... filename = directory/$(themename)/subdir/iconname.extension } }")
+fn i_find_icon(tn: Str, subdir: Str, name: Str) -> Str {
+    let bases = i_icon_bases()
+    var b = 0
+    while b < bases.len() {
+        let dir = ((bases[b] + "/") + tn) + ("/" + subdir)
+        let listing = i_dir_listing(dir)
+        if listing.len() > 0 {
+            var k = 0
+            while k < 3 {
+                let fname = name + i_icon_ext(k)
+                if i_has(listing, fname) { return (dir + "/") + fname }
+                k = k + 1
+            }
+        }
+        b = b + 1
+    }
+    return ""
+}
+
+fn i_has(listing: Vec<Str>, fname: Str) -> Bool {
+    var i = 0
+    while i < listing.len() { if listing[i] == fname { return true }  i = i + 1 }
+    return false
+}
+
+// -- listing cache: a lookup must not re-read a directory it has already listed -----------------
+
+struct iDirEntry { path: Str, names: Vec<Str> }
+global g_iDirCache: Vec<iDirEntry>
+
+/// the file names of `dir` (dot files excluded), cached per directory path so repeated lookups do
+/// not re-read the directory.
+fn i_dir_listing(dir: Str) -> Vec<Str> {
+    var i = 0
+    while i < g_iDirCache.len() {
+        if g_iDirCache[i].path == dir { return copy g_iDirCache[i].names }
+        i = i + 1
+    }
+    var names: Vec<Str> = vec()
+    let raw = os::read_dir(dir)
+    var j = 0
+    while j < raw.len() {
+        let e = raw[j]
+        if e.len() > 0 { if ord(e.at(0)) != 46 { names.push(copy e) } }     // skip "." ".." hidden
+        j = j + 1
+    }
+    var ent = iDirEntry { path: copy dir, names: copy names }
+    g_iDirCache.push(ent)
+    return names
+}
+
+// -- parsed-theme cache (keyed by the theme's own directory) --------------------------------------
+
+struct iThemeE { base: Str, t: IconTheme }
+global g_iThemeCache: Vec<iThemeE>
+
+fn i_theme_load(base: Str) -> IconTheme {
+    var i = 0
+    while i < g_iThemeCache.len() {
+        if g_iThemeCache[i].base == base { return copy g_iThemeCache[i].t }
+        i = i + 1
+    }
+    let t = i_parse_theme(read_file((base + "/index.theme")), base)
+    var e = iThemeE { base: copy base, t: copy t }
+    g_iThemeCache.push(e)
+    return t
+}
+
+// -- the theme chain (theme itself, parents via Inherits, then hicolor), deduplicated -------------
+
+fn i_chain_has(tn: Str, chain: Vec<Str>) -> Bool {
+    var i = 0
+    while i < chain.len() { if chain[i] == tn { return true }  i = i + 1 }
+    return false
+}
+
+fn i_chain_add(tn: Str, inout chain: Vec<Str>) {
+    if tn.len() == 0 { return }
+    if i_chain_has(tn, chain) { return }                     // inside a cycle: don't loop forever
+    chain.push(copy tn)
+    let t = load_theme(tn)
+    var i = 0
+    while i < t.inherits.len() {
+        i_chain_add(t.inherits[i], chain)
+        i = i + 1
+    }
+}
+
+// -- index.theme parsing -------------------------------------------------------------------------
+
+fn i_parse_theme(text: Str, base: Str) -> IconTheme {
+    var name = ""
+    var dir_order: Vec<Str> = vec()
+    var inherits: Vec<Str> = vec()
+    var cfgs: Vec<IconDirCfg> = vec()
+    var cfg_idx: Map<Str, Int> = map()
+    var cur = ""
+    var start = 0
+    var i = 0
+    let n = text.len()
+    while i <= n {
+        if i == n || ord(text.at(i)) == 10 {                  // '\n'
+            var line = text.slice(start, i)
+            if line.len() > 0 { if ord(line.at(line.len() - 1)) == 13 { line = line.slice(0, line.len() - 1) } }
+            let t = su::trim(line)
+            if !(t == "") {
+                let c0 = ord(t.at(0))
+                if c0 == 35 {                                 // '#' comment
+                } else if c0 == 91 {                          // '[' section header
+                    let cb = i_idx(t, 93)
+                    if cb > 0 { cur = su::trim(t.slice(1, cb)) }
+                } else {
+                    let eq = i_idx(t, 61)                     // '='
+                    if eq > 0 {
+                        let k = su::trim(t.slice(0, eq))
+                        let v = su::trim(t.slice(eq + 1, t.len()))
+                        if cur == "Icon Theme" {
+                            if k == "Name" { name = copy v }
+                            else if k == "Directories" { dir_order = i_split_list(v) }
+                            else if k == "Inherits" { inherits = i_split_list(v) }
+                        } else if cur.len() > 0 {
+                            var ci = 0 - 1
+                            if cfg_idx.has(cur) { ci = cfg_idx.get(cur) } else {
+                                var c = IconDirCfg { name: copy cur, size: 0, scale: 1, kind: ICON_FIXED(), min_size: 0, max_size: 0, threshold: 2 }
+                                cfgs.push(c)
+                                ci = cfgs.len() - 1
+                                cfg_idx.put(copy cur, ci)
+                            }
+                            if k == "Size" { var c = copy cfgs[ci]  c.size = i_parse_int(v)  cfgs[ci] = c }
+                            else if k == "Scale" { var c = copy cfgs[ci]  c.scale = i_parse_int(v)  cfgs[ci] = c }
+                            else if k == "Type" { var c = copy cfgs[ci]  c.kind = i_type_of(v)  cfgs[ci] = c }
+                            else if k == "MinSize" { var c = copy cfgs[ci]  c.min_size = i_parse_int(v)  cfgs[ci] = c }
+                            else if k == "MaxSize" { var c = copy cfgs[ci]  c.max_size = i_parse_int(v)  cfgs[ci] = c }
+                            else if k == "Threshold" { var c = copy cfgs[ci]  c.threshold = i_parse_int(v)  cfgs[ci] = c }
+                        }
+                    }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    // the directories in Directories= order, with the spec's defaults applied
+    var dirs: Vec<IconDirCfg> = vec()
+    i = 0
+    while i < dir_order.len() {
+        let dn = dir_order[i]
+        if cfg_idx.has(dn) {
+            var c = copy cfgs[cfg_idx.get(dn)]
+            if c.size > 0 {                                   // Size is required for a usable dir
+                if c.min_size <= 0 { c.min_size = c.size }
+                if c.max_size <= 0 { c.max_size = c.size }
+                if c.scale <= 0 { c.scale = 1 }
+                dirs.push(c)
+            }
+        }
+        i = i + 1
+    }
+    return IconTheme { name: name, dirs: dirs, inherits: inherits }
+}

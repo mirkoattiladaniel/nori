@@ -1,0 +1,236 @@
+import "std/net" as net
+
+// ---------------- IPv4 ----------------
+
+fn test_parse_ipv4_good() {
+    let ip = net::parse_ipv4("192.168.1.1")
+    assert_eq(ip.ok, 1)
+    assert_eq(ip.a, 192)
+    assert_eq(ip.b, 168)
+    assert_eq(ip.c, 1)
+    assert_eq(ip.d, 1)
+}
+
+fn test_parse_ipv4_zeros() {
+    let ip = net::parse_ipv4("0.0.0.0")
+    assert_eq(ip.ok, 1)
+    assert_eq(ip.a, 0)
+    assert_eq(ip.d, 0)
+}
+
+fn test_parse_ipv4_max() {
+    let ip = net::parse_ipv4("255.255.255.255")
+    assert_eq(ip.ok, 1)
+    assert_eq(ip.a, 255)
+    assert_eq(ip.d, 255)
+}
+
+fn test_parse_ipv4_bad_octet_too_big() {
+    let ip = net::parse_ipv4("256.0.0.1")
+    assert_eq(ip.ok, 0)
+}
+
+fn test_parse_ipv4_bad_too_few() {
+    let ip = net::parse_ipv4("1.2.3")
+    assert_eq(ip.ok, 0)
+}
+
+fn test_parse_ipv4_bad_too_many() {
+    let ip = net::parse_ipv4("1.2.3.4.5")
+    assert_eq(ip.ok, 0)
+}
+
+fn test_parse_ipv4_bad_empty_octet() {
+    let ip = net::parse_ipv4("1..2.3")
+    assert_eq(ip.ok, 0)
+}
+
+fn test_parse_ipv4_bad_letters() {
+    let ip = net::parse_ipv4("1.2.x.4")
+    assert_eq(ip.ok, 0)
+}
+
+fn test_parse_ipv4_bad_trailing_dot() {
+    let ip = net::parse_ipv4("1.2.3.")
+    assert_eq(ip.ok, 0)
+}
+
+fn test_ipv4_str() {
+    let ip = net::ipv4(10, 20, 30, 40)
+    assert_streq(net::ipv4_str(ip), "10.20.30.40")
+}
+
+fn test_ipv4_roundtrip_str() {
+    let ip = net::parse_ipv4("172.16.254.1")
+    assert_streq(net::ipv4_str(ip), "172.16.254.1")
+}
+
+fn test_ipv4_u32_roundtrip() {
+    let ip = net::ipv4(1, 2, 3, 4)
+    let x = net::ipv4_u32(ip)
+    let back = net::ipv4_from_u32(x)
+    assert_true(net::ipv4_eq(ip, back))
+    assert_eq(back.a, 1)
+    assert_eq(back.b, 2)
+    assert_eq(back.c, 3)
+    assert_eq(back.d, 4)
+}
+
+fn test_ipv4_u32_value() {
+    // 1.2.3.4 = 1*16777216 + 2*65536 + 3*256 + 4
+    let ip = net::ipv4(1, 2, 3, 4)
+    assert_eq(net::ipv4_u32(ip), 16909060)
+}
+
+fn test_ipv4_eq() {
+    let p = net::ipv4(1, 1, 1, 1)
+    let q = net::ipv4(1, 1, 1, 1)
+    let r = net::ipv4(1, 1, 1, 2)
+    assert_true(net::ipv4_eq(p, q))
+    assert_false(net::ipv4_eq(p, r))
+}
+
+fn test_ipv4_is_loopback() {
+    assert_true(net::ipv4_is_loopback(net::ipv4(127, 0, 0, 1)))
+    assert_false(net::ipv4_is_loopback(net::ipv4(128, 0, 0, 1)))
+}
+
+fn test_ipv4_is_unspecified() {
+    assert_true(net::ipv4_is_unspecified(net::ipv4(0, 0, 0, 0)))
+    assert_false(net::ipv4_is_unspecified(net::ipv4(0, 0, 0, 1)))
+}
+
+fn test_ipv4_is_broadcast() {
+    assert_true(net::ipv4_is_broadcast(net::ipv4(255, 255, 255, 255)))
+    assert_false(net::ipv4_is_broadcast(net::ipv4(255, 255, 255, 254)))
+}
+
+fn test_ipv4_is_multicast() {
+    assert_true(net::ipv4_is_multicast(net::ipv4(224, 0, 0, 1)))
+    assert_true(net::ipv4_is_multicast(net::ipv4(239, 0, 0, 1)))
+    assert_false(net::ipv4_is_multicast(net::ipv4(223, 0, 0, 1)))
+    assert_false(net::ipv4_is_multicast(net::ipv4(240, 0, 0, 1)))
+}
+
+fn test_ipv4_is_private() {
+    assert_true(net::ipv4_is_private(net::ipv4(10, 0, 0, 1)))
+    assert_true(net::ipv4_is_private(net::ipv4(172, 16, 0, 1)))
+    assert_true(net::ipv4_is_private(net::ipv4(172, 31, 255, 255)))
+    assert_true(net::ipv4_is_private(net::ipv4(192, 168, 1, 1)))
+    assert_false(net::ipv4_is_private(net::ipv4(172, 15, 0, 1)))
+    assert_false(net::ipv4_is_private(net::ipv4(172, 32, 0, 1)))
+    assert_false(net::ipv4_is_private(net::ipv4(8, 8, 8, 8)))
+}
+
+// ---------------- helpers ----------------
+
+fn test_has_dot() {
+    assert_true(net::has_dot("1.2.3.4"))
+    assert_false(net::has_dot("abcd"))
+    assert_false(net::has_dot(""))
+}
+
+fn test_ends_colon() {
+    assert_true(net::ends_colon("ff:"))
+    assert_false(net::ends_colon("ff"))
+    assert_false(net::ends_colon(""))
+}
+
+fn test_hexd() {
+    assert_eq(net::hexd(48), 0)        // '0'
+    assert_eq(net::hexd(57), 9)        // '9'
+    assert_eq(net::hexd(97), 10)       // 'a'
+    assert_eq(net::hexd(102), 15)      // 'f'
+    assert_eq(net::hexd(65), 10)       // 'A'
+    assert_eq(net::hexd(70), 15)       // 'F'
+    assert_eq(net::hexd(103), 0 - 1)   // 'g' -> bad
+}
+
+fn test_hex16() {
+    assert_streq(net::hex16(0), "0")
+    assert_streq(net::hex16(15), "f")
+    assert_streq(net::hex16(255), "ff")
+    assert_streq(net::hex16(4096), "1000")
+}
+
+fn test_find_dcolon() {
+    assert_eq(net::find_dcolon("::1"), 0)
+    assert_eq(net::find_dcolon("fe80::1"), 4)
+    assert_eq(net::find_dcolon("1:2:3"), 0 - 1)
+}
+
+// ---------------- IPv6 ----------------
+
+fn test_parse_ipv6_full() {
+    let ip = net::parse_ipv6("2001:db8:0:0:0:0:0:1")
+    assert_eq(ip.ok, 1)
+    assert_eq(ip.g0, 8193)     // 0x2001
+    assert_eq(ip.g1, 3512)     // 0x0db8
+    assert_eq(ip.g7, 1)
+}
+
+fn test_parse_ipv6_loopback() {
+    let ip = net::parse_ipv6("::1")
+    assert_eq(ip.ok, 1)
+    assert_true(net::ipv6_is_loopback(ip))
+    assert_false(net::ipv6_is_unspecified(ip))
+}
+
+fn test_parse_ipv6_unspecified() {
+    let ip = net::parse_ipv6("::")
+    assert_eq(ip.ok, 1)
+    assert_true(net::ipv6_is_unspecified(ip))
+}
+
+fn test_parse_ipv6_compressed() {
+    let ip = net::parse_ipv6("fe80::1")
+    assert_eq(ip.ok, 1)
+    assert_eq(ip.g0, 65152)    // 0xfe80
+    assert_eq(ip.g1, 0)
+    assert_eq(ip.g7, 1)
+}
+
+fn test_parse_ipv6_embedded_ipv4() {
+    let ip = net::parse_ipv6("::ffff:1.2.3.4")
+    assert_eq(ip.ok, 1)
+    assert_eq(ip.g5, 65535)        // ffff
+    assert_eq(ip.g6, 258)          // 1.2 -> 1*256+2
+    assert_eq(ip.g7, 772)          // 3.4 -> 3*256+4
+}
+
+fn test_parse_ipv6_bad_group() {
+    let ip = net::parse_ipv6("12345::1")    // group > 4 hex digits
+    assert_eq(ip.ok, 0)
+}
+
+fn test_parse_ipv6_bad_nonhex() {
+    let ip = net::parse_ipv6("xyz::1")
+    assert_eq(ip.ok, 0)
+}
+
+fn test_ipv6_str_compress() {
+    let ip = net::parse_ipv6("2001:db8::1")
+    assert_streq(net::ipv6_str(ip), "2001:db8::1")
+}
+
+fn test_ipv6_str_loopback() {
+    let ip = net::parse_ipv6("::1")
+    assert_streq(net::ipv6_str(ip), "::1")
+}
+
+fn test_ipv6_str_unspecified() {
+    let ip = net::parse_ipv6("::")
+    assert_streq(net::ipv6_str(ip), "::")
+}
+
+fn test_ipv6_roundtrip() {
+    let ip = net::parse_ipv6("fe80::abcd")
+    assert_streq(net::ipv6_str(ip), "fe80::abcd")
+}
+
+fn test_ip6_group() {
+    let ip = net::parse_ipv6("1:2:3:4:5:6:7:8")
+    assert_eq(net::ip6_group(ip, 0), 1)
+    assert_eq(net::ip6_group(ip, 3), 4)
+    assert_eq(net::ip6_group(ip, 7), 8)
+}

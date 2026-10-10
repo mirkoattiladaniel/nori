@@ -1,0 +1,29 @@
+// Tests for std/sys: host facts (the target triple "<arch>-<os>").
+// Only assert non-emptiness, lowercasing, and expected substrings (deterministic on the host).
+import "std/sys" as sys
+import "std/strutil" as s
+
+fn test_target_nonempty() {
+    assert_true((sys::target()).len() > 0)
+}
+
+fn test_target_has_dash() {
+    // the triple is "<arch>-<os>", so it contains a '-' separating two non-empty parts.
+    let t = sys::target()
+    let parts = s::split(t, "-")
+    assert_true(parts.len() >= 2)
+    assert_true(parts[0].len() > 0)
+    assert_true(parts[1].len() > 0)
+}
+
+fn test_target_lowercase() {
+    // sysname is lowercased by std/sys; assert no uppercase letters in the triple.
+    let t = sys::target()
+    assert_streq(t, s::to_lower(copy t))   // `copy`, or to_lower returns `t` itself and the assert is vacuous
+}
+
+fn test_target_os_substring() {
+    // on this host (Linux) the triple ends with "-linux".
+    assert_true(s::contains(sys::target(), "linux"))
+    assert_true(s::ends_with(sys::target(), "linux"))
+}

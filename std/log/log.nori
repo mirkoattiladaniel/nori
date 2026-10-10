@@ -1,0 +1,67 @@
+//! std/log: leveled logging. Four levels (DEBUG < INFO < WARN < ERROR) gated by a global threshold
+//! `g_log_level` (default INFO); messages below it are suppressed. An optional `HH:MM:SS` timestamp
+//! prefix is toggled by `set_timestamps`. Output goes through `printl`.
+//!
+//!   import "std/log" as log
+//!   log::set_level(log::DEBUG())
+//!   log::info("server up")        // -> [INFO] server up
+//!   log::set_timestamps(true)
+//!   log::warn("disk low")         // -> 14:03:09 [WARN] disk low
+
+import "std/time" as time
+
+/// the active level threshold (DEBUG=0, INFO=1, WARN=2, ERROR=3); default INFO. Messages below it are dropped.
+pub global g_log_level: Int = 1
+/// whether to prefix each line with an `HH:MM:SS` timestamp (0 = off, 1 = on); default off.
+pub global g_log_time: Int = 0
+
+/// level constant: DEBUG (0), the most verbose level.
+pub fn DEBUG() -> Int { return 0 }
+/// level constant: INFO (1), informational messages.
+pub fn INFO() -> Int { return 1 }
+/// level constant: WARN (2), warnings.
+pub fn WARN() -> Int { return 2 }
+/// level constant: ERROR (3), errors.
+pub fn ERROR() -> Int { return 3 }
+
+/// set the level threshold; messages below `l` are suppressed.
+pub fn set_level(l: Int) -> Int { g_log_level = l  return 0 }
+/// get the current level threshold.
+pub fn get_level() -> Int { return g_log_level }
+/// turn the `HH:MM:SS` timestamp prefix on or off.
+pub fn set_timestamps(on: Bool) -> Int {
+    if on { g_log_time = 1 } else { g_log_time = 0 }
+    return 0
+}
+
+/// internal: zero-pad an integer to (at least) 2 digits as a string.
+pub fn pad2(n: Int) -> Str {
+    if n < 10 { return "0" + n }
+    return "" + n
+}
+
+/// internal: emit a line if `level` meets the threshold, with optional timestamp prefix and `[tag]`.
+pub fn emit(level: Int, tag: Str, msg: Str) -> Int {
+    if level < g_log_level { return 0 }
+    var prefix = ""
+    if g_log_time == 1 {
+        let dt = time::now()
+        let hh = pad2(dt.hour)
+        let mm = pad2(dt.minute)
+        let ss = pad2(dt.second)
+        prefix = hh + ":" + mm + ":" + ss + " "
+    }
+    let body = "[" + tag + "] " + msg
+    let line = prefix + body
+    printl(line)
+    return 0
+}
+
+/// log a DEBUG-level message.
+pub fn debug(msg: Str) -> Int { return emit(0, "DEBUG", msg) }
+/// log an INFO-level message.
+pub fn info(msg: Str) -> Int { return emit(1, "INFO", msg) }
+/// log a WARN-level message.
+pub fn warn(msg: Str) -> Int { return emit(2, "WARN", msg) }
+/// log an ERROR-level message.
+pub fn error(msg: Str) -> Int { return emit(3, "ERROR", msg) }

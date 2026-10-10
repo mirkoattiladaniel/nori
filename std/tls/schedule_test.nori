@@ -1,0 +1,508 @@
+// .nori tests for the TLS 1.3 key schedule, run with
+//   noric --test std/tls/schedule_test.nori compiler/runtime.nori --import-root .
+//
+// Every value below is copied out of RFC 8448, "TLS 1.3 Traces", which publishes five complete
+// handshakes byte for byte: every secret, every label, every derived key at every step. Nothing
+// here was produced by the code it tests, and nothing here is a round-trip.
+//
+// That matters more for a key schedule than for almost anything else. A wrong schedule still
+// returns well-formed pseudorandom bytes of exactly the right length, and every structural check
+// you can write about it passes; two peers running the same wrong schedule even interoperate
+// happily with each other. Only a published answer finds the bug.
+//
+// The `info` bytes are asserted as well as the outputs, so the label encoding is pinned directly
+// rather than inferred from a matching result.
+//
+// The values were extracted from the RFC text by a script rather than typed by hand.
+import "std/tls" as tls
+import "std/crypto" as crypto
+
+fn hexv(c: Byte) -> Int {
+    let o = ord(c)
+    if o >= 97 { return (o - 87) }
+    if o >= 65 { return (o - 55) }
+    return (o - 48)
+}
+fn unhex(h: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < h.len() { out = (out + chr(((hexv(h.at(i)) << 4) | hexv(h.at(i + 1)))))  i = i + 2 }
+    return out
+}
+fn tohex(s: Str) -> Str {
+    let d = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < s.len() { let b = ord(s.at(i))  out = ((out + d.at((b >> 4))) + d.at((b & 15)))  i = i + 1 }
+    return out
+}
+
+// Derive-Secret and the raw HKDF-Expand-Label under it. Both the serialised HkdfLabel
+// (`info`) and the output are checked: a label that is wrong but self-consistent would
+// still expand to something, and only the info bytes catch it.
+fn test_expand_label_vectors() {
+    // RFC 8448 section 3: "tls13 derived"
+    assert_streq(tohex(tls::hkdf_label("derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(tohex(tls::expand_label(32, unhex("33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"), "derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")
+    // RFC 8448 section 3: "tls13 c hs traffic"
+    assert_streq(tohex(tls::hkdf_label("c hs traffic", unhex("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8"), 32)), "002012746c7331332063206873207472616666696320860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8")
+    assert_streq(tohex(tls::expand_label(32, unhex("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"), "c hs traffic", unhex("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8"), 32)), "b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21")
+    // RFC 8448 section 3: "tls13 s hs traffic"
+    assert_streq(tohex(tls::hkdf_label("s hs traffic", unhex("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8"), 32)), "002012746c7331332073206873207472616666696320860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8")
+    assert_streq(tohex(tls::expand_label(32, unhex("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"), "s hs traffic", unhex("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8"), 32)), "b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38")
+    // RFC 8448 section 3: "tls13 derived"
+    assert_streq(tohex(tls::hkdf_label("derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(tohex(tls::expand_label(32, unhex("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"), "derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "43de77e0c77713859a944db9db2590b53190a65b3ee2e4f12dd7a0bb7ce254b4")
+    // RFC 8448 section 3: "tls13 finished"
+    assert_streq(tohex(tls::hkdf_label("finished", unhex(""), 32)), "00200e746c7331332066696e697368656400")
+    assert_streq(tohex(tls::expand_label(32, unhex("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"), "finished", unhex(""), 32)), "008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8")
+    // RFC 8448 section 3: "tls13 c ap traffic"
+    assert_streq(tohex(tls::hkdf_label("c ap traffic", unhex("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13"), 32)), "002012746c73313320632061702074726166666963209608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13")
+    assert_streq(tohex(tls::expand_label(32, unhex("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"), "c ap traffic", unhex("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13"), 32)), "9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5")
+    // RFC 8448 section 3: "tls13 s ap traffic"
+    assert_streq(tohex(tls::hkdf_label("s ap traffic", unhex("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13"), 32)), "002012746c73313320732061702074726166666963209608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13")
+    assert_streq(tohex(tls::expand_label(32, unhex("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"), "s ap traffic", unhex("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13"), 32)), "a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643")
+    // RFC 8448 section 3: "tls13 exp master"
+    assert_streq(tohex(tls::hkdf_label("exp master", unhex("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13"), 32)), "002010746c73313320657870206d6173746572209608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13")
+    assert_streq(tohex(tls::expand_label(32, unhex("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"), "exp master", unhex("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13"), 32)), "fe22f881176eda18eb8f44529e6792c50c9a3f89452f68d8ae311b4309d3cf50")
+    // RFC 8448 section 3: "tls13 derived"
+    assert_streq(tohex(tls::hkdf_label("derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(tohex(tls::expand_label(32, unhex("33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"), "derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")
+    // RFC 8448 section 3: "tls13 finished"
+    assert_streq(tohex(tls::hkdf_label("finished", unhex(""), 32)), "00200e746c7331332066696e697368656400")
+    assert_streq(tohex(tls::expand_label(32, unhex("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"), "finished", unhex(""), 32)), "b80ad01015fb2f0bd65ff7d4da5d6bf83f84821d1f87fdc7d3c75b5a7b42d9c4")
+    // RFC 8448 section 3: "tls13 res master"
+    assert_streq(tohex(tls::hkdf_label("res master", unhex("209145a96ee8e2a122ff810047cc952684658d6049e86429426db87c54ad143d"), 32)), "002010746c73313320726573206d617374657220209145a96ee8e2a122ff810047cc952684658d6049e86429426db87c54ad143d")
+    assert_streq(tohex(tls::expand_label(32, unhex("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"), "res master", unhex("209145a96ee8e2a122ff810047cc952684658d6049e86429426db87c54ad143d"), 32)), "7df235f2031d2a051287d02b0241b0bfdaf86cc856231f2d5aba46c434ec196c")
+    // RFC 8448 section 3: "tls13 resumption"
+    assert_streq(tohex(tls::hkdf_label("resumption", unhex("0000"), 32)), "002010746c73313320726573756d7074696f6e020000")
+    assert_streq(tohex(tls::expand_label(32, unhex("7df235f2031d2a051287d02b0241b0bfdaf86cc856231f2d5aba46c434ec196c"), "resumption", unhex("0000"), 32)), "4ecd0eb6ec3b4d87f5d6028f922ca4c5851a277fd41311c9e62d2c9492e1c4f3")
+    // RFC 8448 section 4: "tls13 c e traffic"
+    assert_streq(tohex(tls::hkdf_label("c e traffic", unhex("08ad0fa05d7c7233b1775ba2ff9f4c5b8b59276b7f227f13a976245f5d960913"), 32)), "002011746c7331332063206520747261666669632008ad0fa05d7c7233b1775ba2ff9f4c5b8b59276b7f227f13a976245f5d960913")
+    assert_streq(tohex(tls::expand_label(32, unhex("9b2188e9b2fc6d64d71dc329900e20bb41915000f678aa839cbb797cb7d8332c"), "c e traffic", unhex("08ad0fa05d7c7233b1775ba2ff9f4c5b8b59276b7f227f13a976245f5d960913"), 32)), "3fbbe6a60deb66c30a32795aba0eff7eaa10105586e7be5c09678d63b6caab62")
+    // RFC 8448 section 4: "tls13 e exp master"
+    assert_streq(tohex(tls::hkdf_label("e exp master", unhex("08ad0fa05d7c7233b1775ba2ff9f4c5b8b59276b7f227f13a976245f5d960913"), 32)), "002012746c733133206520657870206d61737465722008ad0fa05d7c7233b1775ba2ff9f4c5b8b59276b7f227f13a976245f5d960913")
+    assert_streq(tohex(tls::expand_label(32, unhex("9b2188e9b2fc6d64d71dc329900e20bb41915000f678aa839cbb797cb7d8332c"), "e exp master", unhex("08ad0fa05d7c7233b1775ba2ff9f4c5b8b59276b7f227f13a976245f5d960913"), 32)), "b2026866610937d7423e5be90862ccf24c0e6091186d34f812089ff5be2ef7df")
+    // RFC 8448 section 4: "tls13 derived"
+    assert_streq(tohex(tls::hkdf_label("derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(tohex(tls::expand_label(32, unhex("9b2188e9b2fc6d64d71dc329900e20bb41915000f678aa839cbb797cb7d8332c"), "derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "5f1790bbd82c5e7d376ed2e1e52f8e6038c9346db61b43be9a52f77ef3998e80")
+    // RFC 8448 section 4: "tls13 c hs traffic"
+    assert_streq(tohex(tls::hkdf_label("c hs traffic", unhex("f736cb34fe25e701551bee6fd24c1cc7102a7daf9405cb15d97aafe16f757d03"), 32)), "002012746c7331332063206873207472616666696320f736cb34fe25e701551bee6fd24c1cc7102a7daf9405cb15d97aafe16f757d03")
+    assert_streq(tohex(tls::expand_label(32, unhex("005cb112fd8eb4ccc623bb88a07c64b3ede1605363fc7d0df8c7ce4ff0fb4ae6"), "c hs traffic", unhex("f736cb34fe25e701551bee6fd24c1cc7102a7daf9405cb15d97aafe16f757d03"), 32)), "2faac08f851d35fea3604fcb4de82dc62c9b164a70974d0462e27f1ab278700f")
+    // RFC 8448 section 4: "tls13 s hs traffic"
+    assert_streq(tohex(tls::hkdf_label("s hs traffic", unhex("f736cb34fe25e701551bee6fd24c1cc7102a7daf9405cb15d97aafe16f757d03"), 32)), "002012746c7331332073206873207472616666696320f736cb34fe25e701551bee6fd24c1cc7102a7daf9405cb15d97aafe16f757d03")
+    assert_streq(tohex(tls::expand_label(32, unhex("005cb112fd8eb4ccc623bb88a07c64b3ede1605363fc7d0df8c7ce4ff0fb4ae6"), "s hs traffic", unhex("f736cb34fe25e701551bee6fd24c1cc7102a7daf9405cb15d97aafe16f757d03"), 32)), "fe927ae271312e8bf0275b581c54eef020450dc4ecffaa05a1a35d27518e7803")
+    // RFC 8448 section 4: "tls13 derived"
+    assert_streq(tohex(tls::hkdf_label("derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(tohex(tls::expand_label(32, unhex("005cb112fd8eb4ccc623bb88a07c64b3ede1605363fc7d0df8c7ce4ff0fb4ae6"), "derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "e2f16030251df0874ba19b9aba257610bc6d531c1dd206df0ca6e84ae2a26742")
+    // RFC 8448 section 4: "tls13 finished"
+    assert_streq(tohex(tls::hkdf_label("finished", unhex(""), 32)), "00200e746c7331332066696e697368656400")
+    assert_streq(tohex(tls::expand_label(32, unhex("fe927ae271312e8bf0275b581c54eef020450dc4ecffaa05a1a35d27518e7803"), "finished", unhex(""), 32)), "4bb74cae7a5dc8914604c0bfbe2f0c062396883922bec8a15e2a9b532a5d392c")
+    // RFC 8448 section 4: "tls13 c ap traffic"
+    assert_streq(tohex(tls::hkdf_label("c ap traffic", unhex("b0aeffc46a2cfe33114e6fd7d51f9f04b1ca3c497dab08934a774a9d9ad7dbf3"), 32)), "002012746c7331332063206170207472616666696320b0aeffc46a2cfe33114e6fd7d51f9f04b1ca3c497dab08934a774a9d9ad7dbf3")
+    assert_streq(tohex(tls::expand_label(32, unhex("e2d32d4ed66dd37897a0e80c84107503ce58bf8aad4cb55a5002d77ecb890ece"), "c ap traffic", unhex("b0aeffc46a2cfe33114e6fd7d51f9f04b1ca3c497dab08934a774a9d9ad7dbf3"), 32)), "2abbf2b8e381d23dbebe1dd2a7d16a8bf484cb4950d23fb7fb7fa8547062d9a1")
+    // RFC 8448 section 4: "tls13 s ap traffic"
+    assert_streq(tohex(tls::hkdf_label("s ap traffic", unhex("b0aeffc46a2cfe33114e6fd7d51f9f04b1ca3c497dab08934a774a9d9ad7dbf3"), 32)), "002012746c7331332073206170207472616666696320b0aeffc46a2cfe33114e6fd7d51f9f04b1ca3c497dab08934a774a9d9ad7dbf3")
+    assert_streq(tohex(tls::expand_label(32, unhex("e2d32d4ed66dd37897a0e80c84107503ce58bf8aad4cb55a5002d77ecb890ece"), "s ap traffic", unhex("b0aeffc46a2cfe33114e6fd7d51f9f04b1ca3c497dab08934a774a9d9ad7dbf3"), 32)), "cc21f1bf8feb7dd5fa505bd9c4b468a9984d554a993dc49e6d285598fb672691")
+    // RFC 8448 section 4: "tls13 exp master"
+    assert_streq(tohex(tls::hkdf_label("exp master", unhex("b0aeffc46a2cfe33114e6fd7d51f9f04b1ca3c497dab08934a774a9d9ad7dbf3"), 32)), "002010746c73313320657870206d617374657220b0aeffc46a2cfe33114e6fd7d51f9f04b1ca3c497dab08934a774a9d9ad7dbf3")
+    assert_streq(tohex(tls::expand_label(32, unhex("e2d32d4ed66dd37897a0e80c84107503ce58bf8aad4cb55a5002d77ecb890ece"), "exp master", unhex("b0aeffc46a2cfe33114e6fd7d51f9f04b1ca3c497dab08934a774a9d9ad7dbf3"), 32)), "3fd93d4ffddc98e64b14dd107aedf8ee4add23f4510f58a4592d0b201bee56b4")
+    // RFC 8448 section 4: "tls13 derived"
+    assert_streq(tohex(tls::hkdf_label("derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(tohex(tls::expand_label(32, unhex("9b2188e9b2fc6d64d71dc329900e20bb41915000f678aa839cbb797cb7d8332c"), "derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "5f1790bbd82c5e7d376ed2e1e52f8e6038c9346db61b43be9a52f77ef3998e80")
+    // RFC 8448 section 4: "tls13 finished"
+    assert_streq(tohex(tls::hkdf_label("finished", unhex(""), 32)), "00200e746c7331332066696e697368656400")
+    assert_streq(tohex(tls::expand_label(32, unhex("2faac08f851d35fea3604fcb4de82dc62c9b164a70974d0462e27f1ab278700f"), "finished", unhex(""), 32)), "5ace394c26980d581243f627d1150ae27e37fa52364e0a7f20ac686d09cd0e8e")
+    // RFC 8448 section 4: "tls13 res master"
+    assert_streq(tohex(tls::hkdf_label("res master", unhex("c3c122e0bd907a4a3ff6112d8fd53dbf89c773d9552e8b6b9d56d361b3a97bf6"), 32)), "002010746c73313320726573206d617374657220c3c122e0bd907a4a3ff6112d8fd53dbf89c773d9552e8b6b9d56d361b3a97bf6")
+    assert_streq(tohex(tls::expand_label(32, unhex("e2d32d4ed66dd37897a0e80c84107503ce58bf8aad4cb55a5002d77ecb890ece"), "res master", unhex("c3c122e0bd907a4a3ff6112d8fd53dbf89c773d9552e8b6b9d56d361b3a97bf6"), 32)), "5e95bdf1f89005ea2e9aa0ba85e728e3c19c5fe0c699e3f5bee59faebd0b5406")
+    // RFC 8448 section 5: "tls13 derived"
+    assert_streq(tohex(tls::hkdf_label("derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(tohex(tls::expand_label(32, unhex("33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"), "derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")
+    // RFC 8448 section 5: "tls13 c hs traffic"
+    assert_streq(tohex(tls::hkdf_label("c hs traffic", unhex("8aa8e828ec2f8a884fec95a3139de01c15a3daa7ff5bfc3f4bfcc21b438d7bf8"), 32)), "002012746c73313320632068732074726166666963208aa8e828ec2f8a884fec95a3139de01c15a3daa7ff5bfc3f4bfcc21b438d7bf8")
+    assert_streq(tohex(tls::expand_label(32, unhex("ce022e5e6e81e50736d773f2d3adfce8220d049bf510f0dbfac927ef4243b148"), "c hs traffic", unhex("8aa8e828ec2f8a884fec95a3139de01c15a3daa7ff5bfc3f4bfcc21b438d7bf8"), 32)), "158aa7ab8855073582b41d674b4055cabcc534728f659314861b4e08e2011566")
+    // RFC 8448 section 5: "tls13 s hs traffic"
+    assert_streq(tohex(tls::hkdf_label("s hs traffic", unhex("8aa8e828ec2f8a884fec95a3139de01c15a3daa7ff5bfc3f4bfcc21b438d7bf8"), 32)), "002012746c73313320732068732074726166666963208aa8e828ec2f8a884fec95a3139de01c15a3daa7ff5bfc3f4bfcc21b438d7bf8")
+    assert_streq(tohex(tls::expand_label(32, unhex("ce022e5e6e81e50736d773f2d3adfce8220d049bf510f0dbfac927ef4243b148"), "s hs traffic", unhex("8aa8e828ec2f8a884fec95a3139de01c15a3daa7ff5bfc3f4bfcc21b438d7bf8"), 32)), "3403e781e2af7b6508da28574f6e95a1abf162de83a97927c37672a4a0cef8a1")
+    // RFC 8448 section 5: "tls13 derived"
+    assert_streq(tohex(tls::hkdf_label("derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(tohex(tls::expand_label(32, unhex("ce022e5e6e81e50736d773f2d3adfce8220d049bf510f0dbfac927ef4243b148"), "derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "ad1cbcd3a0dc7053eeb3ed3a47901d16a9fc63a73c64beb567481a7dfb3a2cb3")
+    // RFC 8448 section 5: "tls13 finished"
+    assert_streq(tohex(tls::hkdf_label("finished", unhex(""), 32)), "00200e746c7331332066696e697368656400")
+    assert_streq(tohex(tls::expand_label(32, unhex("3403e781e2af7b6508da28574f6e95a1abf162de83a97927c37672a4a0cef8a1"), "finished", unhex(""), 32)), "e7f8bb3ea4b6c30c4710b3d09c3313658117e70b097e850368e2510ca5631f74")
+    // RFC 8448 section 5: "tls13 c ap traffic"
+    assert_streq(tohex(tls::hkdf_label("c ap traffic", unhex("50f63cbf36b0dd049e7a0ba27d6455745ea2aaac54bb167f9950b2b7ce9509da"), 32)), "002012746c733133206320617020747261666669632050f63cbf36b0dd049e7a0ba27d6455745ea2aaac54bb167f9950b2b7ce9509da")
+    assert_streq(tohex(tls::expand_label(32, unhex("1131545d0baf79ddce9b87f06945781a57dd18ef378dcd2060f8f9a569027ed8"), "c ap traffic", unhex("50f63cbf36b0dd049e7a0ba27d6455745ea2aaac54bb167f9950b2b7ce9509da"), 32)), "75ecf4b972525aa0dcd057c9944d4cd5d82671d8843141d7dc2a4ff15a21dc51")
+    // RFC 8448 section 5: "tls13 s ap traffic"
+    assert_streq(tohex(tls::hkdf_label("s ap traffic", unhex("50f63cbf36b0dd049e7a0ba27d6455745ea2aaac54bb167f9950b2b7ce9509da"), 32)), "002012746c733133207320617020747261666669632050f63cbf36b0dd049e7a0ba27d6455745ea2aaac54bb167f9950b2b7ce9509da")
+    assert_streq(tohex(tls::expand_label(32, unhex("1131545d0baf79ddce9b87f06945781a57dd18ef378dcd2060f8f9a569027ed8"), "s ap traffic", unhex("50f63cbf36b0dd049e7a0ba27d6455745ea2aaac54bb167f9950b2b7ce9509da"), 32)), "5c74f87df04225db0f8209c9de6429e49435fdefa7cad61864874d12f31cfc8d")
+    // RFC 8448 section 5: "tls13 exp master"
+    assert_streq(tohex(tls::hkdf_label("exp master", unhex("50f63cbf36b0dd049e7a0ba27d6455745ea2aaac54bb167f9950b2b7ce9509da"), 32)), "002010746c73313320657870206d61737465722050f63cbf36b0dd049e7a0ba27d6455745ea2aaac54bb167f9950b2b7ce9509da")
+    assert_streq(tohex(tls::expand_label(32, unhex("1131545d0baf79ddce9b87f06945781a57dd18ef378dcd2060f8f9a569027ed8"), "exp master", unhex("50f63cbf36b0dd049e7a0ba27d6455745ea2aaac54bb167f9950b2b7ce9509da"), 32)), "7c06d3ae106a3a374ace4837b3985cac67780a6e2c5c04b58319d584df09d223")
+    // RFC 8448 section 5: "tls13 derived"
+    assert_streq(tohex(tls::hkdf_label("derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(tohex(tls::expand_label(32, unhex("33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"), "derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")
+    // RFC 8448 section 5: "tls13 finished"
+    assert_streq(tohex(tls::hkdf_label("finished", unhex(""), 32)), "00200e746c7331332066696e697368656400")
+    assert_streq(tohex(tls::expand_label(32, unhex("158aa7ab8855073582b41d674b4055cabcc534728f659314861b4e08e2011566"), "finished", unhex(""), 32)), "81be4131fbb9b6f4471450846f74fd1e68c5224ba7c2a8677f5c53ad226fdc13")
+    // RFC 8448 section 5: "tls13 res master"
+    assert_streq(tohex(tls::hkdf_label("res master", unhex("0e8b349158b855fdcd0c11dbbc4e83e43caa6e483c6c65df53151888e50165f4"), 32)), "002010746c73313320726573206d6173746572200e8b349158b855fdcd0c11dbbc4e83e43caa6e483c6c65df53151888e50165f4")
+    assert_streq(tohex(tls::expand_label(32, unhex("1131545d0baf79ddce9b87f06945781a57dd18ef378dcd2060f8f9a569027ed8"), "res master", unhex("0e8b349158b855fdcd0c11dbbc4e83e43caa6e483c6c65df53151888e50165f4"), 32)), "09170c6d472721566f9cf99b08699daff561ec8fb22d5a32c3f94ce009b69975")
+    // RFC 8448 section 6: "tls13 derived"
+    assert_streq(tohex(tls::hkdf_label("derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(tohex(tls::expand_label(32, unhex("33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"), "derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")
+    // RFC 8448 section 6: "tls13 c hs traffic"
+    assert_streq(tohex(tls::hkdf_label("c hs traffic", unhex("88ebc042bd0d5a643b22fca7a47defd4007dfe184949a6261c596c4e002a74a2"), 32)), "002012746c733133206320687320747261666669632088ebc042bd0d5a643b22fca7a47defd4007dfe184949a6261c596c4e002a74a2")
+    assert_streq(tohex(tls::expand_label(32, unhex("d995243674fb6400d7d37bc0e9861bdbd9ed095601dcf2994874f2803de22e39"), "c hs traffic", unhex("88ebc042bd0d5a643b22fca7a47defd4007dfe184949a6261c596c4e002a74a2"), 32)), "cec7a30c6872070f22a7eeb065768db67c45e29533db879908ce6dc66f5911de")
+    // RFC 8448 section 6: "tls13 s hs traffic"
+    assert_streq(tohex(tls::hkdf_label("s hs traffic", unhex("88ebc042bd0d5a643b22fca7a47defd4007dfe184949a6261c596c4e002a74a2"), 32)), "002012746c733133207320687320747261666669632088ebc042bd0d5a643b22fca7a47defd4007dfe184949a6261c596c4e002a74a2")
+    assert_streq(tohex(tls::expand_label(32, unhex("d995243674fb6400d7d37bc0e9861bdbd9ed095601dcf2994874f2803de22e39"), "s hs traffic", unhex("88ebc042bd0d5a643b22fca7a47defd4007dfe184949a6261c596c4e002a74a2"), 32)), "8b02d3c00442a2722c4098ebe8675b23e801510f0d7ed778d8eb0b8f42a19a5e")
+    // RFC 8448 section 6: "tls13 derived"
+    assert_streq(tohex(tls::hkdf_label("derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(tohex(tls::expand_label(32, unhex("d995243674fb6400d7d37bc0e9861bdbd9ed095601dcf2994874f2803de22e39"), "derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "74575526b07c81a9c1b17e6b34e0e6d084747a61f396f597ebb92c0736ec60e8")
+    // RFC 8448 section 6: "tls13 finished"
+    assert_streq(tohex(tls::hkdf_label("finished", unhex(""), 32)), "00200e746c7331332066696e697368656400")
+    assert_streq(tohex(tls::expand_label(32, unhex("8b02d3c00442a2722c4098ebe8675b23e801510f0d7ed778d8eb0b8f42a19a5e"), "finished", unhex(""), 32)), "4e795cde239d5e190eae441b9e716eeb138549058cdb76fa9aeeaf548aef563e")
+    // RFC 8448 section 6: "tls13 c ap traffic"
+    assert_streq(tohex(tls::hkdf_label("c ap traffic", unhex("5177a29af5a17f9b4933e431851d128345366c1720d38f8f0465eeeae6740372"), 32)), "002012746c73313320632061702074726166666963205177a29af5a17f9b4933e431851d128345366c1720d38f8f0465eeeae6740372")
+    assert_streq(tohex(tls::expand_label(32, unhex("57c15d7b9d441b3d40a9c6ea8a3d730e07b3a1ea7a3339ed7070b9a74a3f4f28"), "c ap traffic", unhex("5177a29af5a17f9b4933e431851d128345366c1720d38f8f0465eeeae6740372"), 32)), "73c2e890fa8d067258d6d50fa92fe456b098cf00d9727eed91e8892ef4e6f860")
+    // RFC 8448 section 6: "tls13 s ap traffic"
+    assert_streq(tohex(tls::hkdf_label("s ap traffic", unhex("5177a29af5a17f9b4933e431851d128345366c1720d38f8f0465eeeae6740372"), 32)), "002012746c73313320732061702074726166666963205177a29af5a17f9b4933e431851d128345366c1720d38f8f0465eeeae6740372")
+    assert_streq(tohex(tls::expand_label(32, unhex("57c15d7b9d441b3d40a9c6ea8a3d730e07b3a1ea7a3339ed7070b9a74a3f4f28"), "s ap traffic", unhex("5177a29af5a17f9b4933e431851d128345366c1720d38f8f0465eeeae6740372"), 32)), "c49a91faf57f8c545d5048a015bf849ff63942e4a7edcd319f8b438a97c52e21")
+    // RFC 8448 section 6: "tls13 exp master"
+    assert_streq(tohex(tls::hkdf_label("exp master", unhex("5177a29af5a17f9b4933e431851d128345366c1720d38f8f0465eeeae6740372"), 32)), "002010746c73313320657870206d6173746572205177a29af5a17f9b4933e431851d128345366c1720d38f8f0465eeeae6740372")
+    assert_streq(tohex(tls::expand_label(32, unhex("57c15d7b9d441b3d40a9c6ea8a3d730e07b3a1ea7a3339ed7070b9a74a3f4f28"), "exp master", unhex("5177a29af5a17f9b4933e431851d128345366c1720d38f8f0465eeeae6740372"), 32)), "052e39795e5f2be6e4e0974cfdd86c6a7afe3e57e5589810a3cccf642958beb2")
+    // RFC 8448 section 6: "tls13 derived"
+    assert_streq(tohex(tls::hkdf_label("derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(tohex(tls::expand_label(32, unhex("33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"), "derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")
+    // RFC 8448 section 6: "tls13 finished"
+    assert_streq(tohex(tls::hkdf_label("finished", unhex(""), 32)), "00200e746c7331332066696e697368656400")
+    assert_streq(tohex(tls::expand_label(32, unhex("cec7a30c6872070f22a7eeb065768db67c45e29533db879908ce6dc66f5911de"), "finished", unhex(""), 32)), "4fddd76bbcb8e30c7261b1db401bb136ed39bce6a4815a2124476e27e6cbcbf6")
+    // RFC 8448 section 6: "tls13 res master"
+    assert_streq(tohex(tls::hkdf_label("res master", unhex("391d004bd84c831b1582444414b4dc8064010ecc76f37f88bfeb1e88fe135c25"), 32)), "002010746c73313320726573206d617374657220391d004bd84c831b1582444414b4dc8064010ecc76f37f88bfeb1e88fe135c25")
+    assert_streq(tohex(tls::expand_label(32, unhex("57c15d7b9d441b3d40a9c6ea8a3d730e07b3a1ea7a3339ed7070b9a74a3f4f28"), "res master", unhex("391d004bd84c831b1582444414b4dc8064010ecc76f37f88bfeb1e88fe135c25"), 32)), "1006dccbf40eb4eb978bff0392a9e452a4fbad58aa14784d5a241c6b49daccfb")
+    // RFC 8448 section 7: "tls13 derived"
+    assert_streq(tohex(tls::hkdf_label("derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(tohex(tls::expand_label(32, unhex("33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"), "derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")
+    // RFC 8448 section 7: "tls13 c hs traffic"
+    assert_streq(tohex(tls::hkdf_label("c hs traffic", unhex("745c55bac399310b7b5a7c81a2c130b4d56dff6f68c3ab477857601e01f1f8d1"), 32)), "002012746c7331332063206873207472616666696320745c55bac399310b7b5a7c81a2c130b4d56dff6f68c3ab477857601e01f1f8d1")
+    assert_streq(tohex(tls::expand_label(32, unhex("f91761354a67e9b07c6dcc3a55707efa69c4519d8040e5f215121e0df69afa4a"), "c hs traffic", unhex("745c55bac399310b7b5a7c81a2c130b4d56dff6f68c3ab477857601e01f1f8d1"), 32)), "2c3cb24a1081edb59518ee6861e89a6b72b3801afe7713e4cbbc21c0795bf831")
+    // RFC 8448 section 7: "tls13 s hs traffic"
+    assert_streq(tohex(tls::hkdf_label("s hs traffic", unhex("745c55bac399310b7b5a7c81a2c130b4d56dff6f68c3ab477857601e01f1f8d1"), 32)), "002012746c7331332073206873207472616666696320745c55bac399310b7b5a7c81a2c130b4d56dff6f68c3ab477857601e01f1f8d1")
+    assert_streq(tohex(tls::expand_label(32, unhex("f91761354a67e9b07c6dcc3a55707efa69c4519d8040e5f215121e0df69afa4a"), "s hs traffic", unhex("745c55bac399310b7b5a7c81a2c130b4d56dff6f68c3ab477857601e01f1f8d1"), 32)), "cace3d555cc1c577cf970cff28cf978d6a9800085442e18d695b50f3151d18c8")
+    // RFC 8448 section 7: "tls13 derived"
+    assert_streq(tohex(tls::hkdf_label("derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(tohex(tls::expand_label(32, unhex("f91761354a67e9b07c6dcc3a55707efa69c4519d8040e5f215121e0df69afa4a"), "derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "5da12dc47835ba73fdd994b14ab7e63cc63f0d79162f6756e9a46756c8b2b642")
+    // RFC 8448 section 7: "tls13 finished"
+    assert_streq(tohex(tls::hkdf_label("finished", unhex(""), 32)), "00200e746c7331332066696e697368656400")
+    assert_streq(tohex(tls::expand_label(32, unhex("cace3d555cc1c577cf970cff28cf978d6a9800085442e18d695b50f3151d18c8"), "finished", unhex(""), 32)), "2c9f72f27b81e7df668caccd49371f1286d411e16c8ccc1c0d9aed72cbbdc080")
+    // RFC 8448 section 7: "tls13 c ap traffic"
+    assert_streq(tohex(tls::hkdf_label("c ap traffic", unhex("0707dcac7b2fa428cc7f691694a2590c806aaa5c0cf5087ed5385012e7f96cd4"), 32)), "002012746c73313320632061702074726166666963200707dcac7b2fa428cc7f691694a2590c806aaa5c0cf5087ed5385012e7f96cd4")
+    assert_streq(tohex(tls::expand_label(32, unhex("628112dae2f702488063e42de6c850a5c0820b90903e00abc31875da03d4bc5b"), "c ap traffic", unhex("0707dcac7b2fa428cc7f691694a2590c806aaa5c0cf5087ed5385012e7f96cd4"), 32)), "743e4c6b56cf3909d1b06d01956ccd2c4b37758449aec41d98dae44924eaa299")
+    // RFC 8448 section 7: "tls13 s ap traffic"
+    assert_streq(tohex(tls::hkdf_label("s ap traffic", unhex("0707dcac7b2fa428cc7f691694a2590c806aaa5c0cf5087ed5385012e7f96cd4"), 32)), "002012746c73313320732061702074726166666963200707dcac7b2fa428cc7f691694a2590c806aaa5c0cf5087ed5385012e7f96cd4")
+    assert_streq(tohex(tls::expand_label(32, unhex("628112dae2f702488063e42de6c850a5c0820b90903e00abc31875da03d4bc5b"), "s ap traffic", unhex("0707dcac7b2fa428cc7f691694a2590c806aaa5c0cf5087ed5385012e7f96cd4"), 32)), "b6b8144aa335ed3059c0c9c8f0ecabf7afc94af6643bdecdfd9210188fab7451")
+    // RFC 8448 section 7: "tls13 exp master"
+    assert_streq(tohex(tls::hkdf_label("exp master", unhex("0707dcac7b2fa428cc7f691694a2590c806aaa5c0cf5087ed5385012e7f96cd4"), 32)), "002010746c73313320657870206d6173746572200707dcac7b2fa428cc7f691694a2590c806aaa5c0cf5087ed5385012e7f96cd4")
+    assert_streq(tohex(tls::expand_label(32, unhex("628112dae2f702488063e42de6c850a5c0820b90903e00abc31875da03d4bc5b"), "exp master", unhex("0707dcac7b2fa428cc7f691694a2590c806aaa5c0cf5087ed5385012e7f96cd4"), 32)), "fb69121cea334db459e12272d179baca2369b643d11a6ac72b8b27a5c964feb1")
+    // RFC 8448 section 7: "tls13 derived"
+    assert_streq(tohex(tls::hkdf_label("derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_streq(tohex(tls::expand_label(32, unhex("33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"), "derived", unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), 32)), "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")
+    // RFC 8448 section 7: "tls13 finished"
+    assert_streq(tohex(tls::hkdf_label("finished", unhex(""), 32)), "00200e746c7331332066696e697368656400")
+    assert_streq(tohex(tls::expand_label(32, unhex("2c3cb24a1081edb59518ee6861e89a6b72b3801afe7713e4cbbc21c0795bf831"), "finished", unhex(""), 32)), "77341abc8c0ffab5180736713e41d2f665c410a404c8c21edcd948a4440fd80c")
+    // RFC 8448 section 7: "tls13 res master"
+    assert_streq(tohex(tls::hkdf_label("res master", unhex("a021d3a05bd418a772813875ef79b0af68c5123215427ab7333f8c27722a9fd5"), 32)), "002010746c73313320726573206d617374657220a021d3a05bd418a772813875ef79b0af68c5123215427ab7333f8c27722a9fd5")
+    assert_streq(tohex(tls::expand_label(32, unhex("628112dae2f702488063e42de6c850a5c0820b90903e00abc31875da03d4bc5b"), "res master", unhex("a021d3a05bd418a772813875ef79b0af68c5123215427ab7333f8c27722a9fd5"), 32)), "0b5d4407cea0a42a3a81dd477647b7fe9180db297e5114f1ad8796b4dc475004")
+}
+
+// HKDF-Extract at each of the three stages. The "early" and "master" extractions take
+// all-zero input keying material, which is a case worth pinning: a bug that ignored the IKM
+// entirely would still pass those two and fail only at "handshake".
+fn test_extract_vectors() {
+    // section 3: extract "early"
+    assert_streq(tohex(crypto::hkdf_extract_h(32, unhex("0000000000000000000000000000000000000000000000000000000000000000"), unhex("0000000000000000000000000000000000000000000000000000000000000000"))), "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a")
+    // section 3: extract "handshake"
+    assert_streq(tohex(crypto::hkdf_extract_h(32, unhex("6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba"), unhex("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d"))), "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac")
+    // section 3: extract "master"
+    assert_streq(tohex(crypto::hkdf_extract_h(32, unhex("43de77e0c77713859a944db9db2590b53190a65b3ee2e4f12dd7a0bb7ce254b4"), unhex("0000000000000000000000000000000000000000000000000000000000000000"))), "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919")
+    // section 4: extract "early"
+    assert_streq(tohex(crypto::hkdf_extract_h(32, unhex("0000000000000000000000000000000000000000000000000000000000000000"), unhex("4ecd0eb6ec3b4d87f5d6028f922ca4c5851a277fd41311c9e62d2c9492e1c4f3"))), "9b2188e9b2fc6d64d71dc329900e20bb41915000f678aa839cbb797cb7d8332c")
+    // section 4: extract "handshake"
+    assert_streq(tohex(crypto::hkdf_extract_h(32, unhex("5f1790bbd82c5e7d376ed2e1e52f8e6038c9346db61b43be9a52f77ef3998e80"), unhex("f44194756ff9ec9d25180635d66ea6824c6ab3bf179977be37f723570e7ccb2e"))), "005cb112fd8eb4ccc623bb88a07c64b3ede1605363fc7d0df8c7ce4ff0fb4ae6")
+    // section 4: extract "master"
+    assert_streq(tohex(crypto::hkdf_extract_h(32, unhex("e2f16030251df0874ba19b9aba257610bc6d531c1dd206df0ca6e84ae2a26742"), unhex("0000000000000000000000000000000000000000000000000000000000000000"))), "e2d32d4ed66dd37897a0e80c84107503ce58bf8aad4cb55a5002d77ecb890ece")
+    // section 5: extract "early"
+    assert_streq(tohex(crypto::hkdf_extract_h(32, unhex("0000000000000000000000000000000000000000000000000000000000000000"), unhex("0000000000000000000000000000000000000000000000000000000000000000"))), "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a")
+    // section 5: extract "handshake"
+    assert_streq(tohex(crypto::hkdf_extract_h(32, unhex("6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba"), unhex("c142ce13ca11b5c2233652e63ad3d97844f1621fbfb9de69d547dc8fedeabeb4"))), "ce022e5e6e81e50736d773f2d3adfce8220d049bf510f0dbfac927ef4243b148")
+    // section 5: extract "master"
+    assert_streq(tohex(crypto::hkdf_extract_h(32, unhex("ad1cbcd3a0dc7053eeb3ed3a47901d16a9fc63a73c64beb567481a7dfb3a2cb3"), unhex("0000000000000000000000000000000000000000000000000000000000000000"))), "1131545d0baf79ddce9b87f06945781a57dd18ef378dcd2060f8f9a569027ed8")
+    // section 6: extract "early"
+    assert_streq(tohex(crypto::hkdf_extract_h(32, unhex("0000000000000000000000000000000000000000000000000000000000000000"), unhex("0000000000000000000000000000000000000000000000000000000000000000"))), "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a")
+    // section 6: extract "handshake"
+    assert_streq(tohex(crypto::hkdf_extract_h(32, unhex("6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba"), unhex("7dc114f6475dfa7977be736ef7cbebc48c70329e8e9a74b4d7033c43f9597d4f"))), "d995243674fb6400d7d37bc0e9861bdbd9ed095601dcf2994874f2803de22e39")
+    // section 6: extract "master"
+    assert_streq(tohex(crypto::hkdf_extract_h(32, unhex("74575526b07c81a9c1b17e6b34e0e6d084747a61f396f597ebb92c0736ec60e8"), unhex("0000000000000000000000000000000000000000000000000000000000000000"))), "57c15d7b9d441b3d40a9c6ea8a3d730e07b3a1ea7a3339ed7070b9a74a3f4f28")
+    // section 7: extract "early"
+    assert_streq(tohex(crypto::hkdf_extract_h(32, unhex("0000000000000000000000000000000000000000000000000000000000000000"), unhex("0000000000000000000000000000000000000000000000000000000000000000"))), "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a")
+    // section 7: extract "handshake"
+    assert_streq(tohex(crypto::hkdf_extract_h(32, unhex("6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba"), unhex("eef790559077db5bb63b6684e4169f051e8fb34ce59bafce2f9c8ee68cc4eb79"))), "f91761354a67e9b07c6dcc3a55707efa69c4519d8040e5f215121e0df69afa4a")
+    // section 7: extract "master"
+    assert_streq(tohex(crypto::hkdf_extract_h(32, unhex("5da12dc47835ba73fdd994b14ab7e63cc63f0d79162f6756e9a46756c8b2b642"), unhex("0000000000000000000000000000000000000000000000000000000000000000"))), "628112dae2f702488063e42de6c850a5c0820b90903e00abc31875da03d4bc5b")
+}
+
+// Record-protection keys. The IV is 12 bytes regardless of the key length because it is
+// XORed with the sequence number to form the AEAD nonce, so its size is the nonce's.
+fn test_traffic_key_vectors() {
+    // section 3: derive write traffic keys for handshake data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k347 = tls::traffic_keys(32, unhex("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"), 16)
+    assert_streq(tohex(k347.key), "3fce516009c21727d0f2e4e86ee403bc")
+    assert_streq(tohex(k347.iv), "5d313eb2671276ee13000b30")
+    // section 3: derive write traffic keys for application data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k564 = tls::traffic_keys(32, unhex("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"), 16)
+    assert_streq(tohex(k564.key), "9f02283b6c9c07efc26bb9f2ac92e356")
+    assert_streq(tohex(k564.iv), "cf782b88dd83549aadf1e984")
+    // section 3: derive read traffic keys for handshake data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k578 = tls::traffic_keys(32, unhex("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"), 16)
+    assert_streq(tohex(k578.key), "dbfaa693d1762c5b666af5d950258d01")
+    assert_streq(tohex(k578.iv), "5bd3c71b836e0b76bb73265f")
+    // section 3: derive write traffic keys for application data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k681 = tls::traffic_keys(32, unhex("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"), 16)
+    assert_streq(tohex(k681.key), "17422dda596ed5d9acd890e3c63f5051")
+    assert_streq(tohex(k681.iv), "5b78923dee08579033e523d9")
+    // section 4: derive write traffic keys for early application data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k1032 = tls::traffic_keys(32, unhex("3fbbe6a60deb66c30a32795aba0eff7eaa10105586e7be5c09678d63b6caab62"), 16)
+    assert_streq(tohex(k1032.key), "920205a5b7bf2115e6fc5c2942834f54")
+    assert_streq(tohex(k1032.iv), "6d475f0993c8e564610db2b9")
+    // section 4: derive write traffic keys for handshake data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k1194 = tls::traffic_keys(32, unhex("fe927ae271312e8bf0275b581c54eef020450dc4ecffaa05a1a35d27518e7803"), 16)
+    assert_streq(tohex(k1194.key), "27c6bdc0a3dcea39a47326d79bc9e4ee")
+    assert_streq(tohex(k1194.iv), "9569ecdd4d0536705e9ef725")
+    // section 4: derive write traffic keys for application data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k1317 = tls::traffic_keys(32, unhex("cc21f1bf8feb7dd5fa505bd9c4b468a9984d554a993dc49e6d285598fb672691"), 16)
+    assert_streq(tohex(k1317.key), "e857c690a34c5a9129d833619684f95e")
+    assert_streq(tohex(k1317.iv), "0685d6b561aab9ef1013faf9")
+    // section 4: derive write traffic keys for handshake data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k1389 = tls::traffic_keys(32, unhex("2faac08f851d35fea3604fcb4de82dc62c9b164a70974d0462e27f1ab278700f"), 16)
+    assert_streq(tohex(k1389.key), "b1530806f4adfeac83f1413032bbfa82")
+    assert_streq(tohex(k1389.iv), "eb50c16be7654abf99dd06d9")
+    // section 4: derive write traffic keys for application data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k1445 = tls::traffic_keys(32, unhex("2abbf2b8e381d23dbebe1dd2a7d16a8bf484cb4950d23fb7fb7fa8547062d9a1"), 16)
+    assert_streq(tohex(k1445.key), "3cf122f301c6358ca7989553250efd72")
+    assert_streq(tohex(k1445.iv), "ab1aec26aa78b8fc1176b9ac")
+    // section 5: derive write traffic keys for handshake data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k1881 = tls::traffic_keys(32, unhex("3403e781e2af7b6508da28574f6e95a1abf162de83a97927c37672a4a0cef8a1"), 16)
+    assert_streq(tohex(k1881.key), "4646bfac1712c426cd78d8a24a8a6f6b")
+    assert_streq(tohex(k1881.iv), "c7d395c08d62f297d13768ea")
+    // section 5: derive write traffic keys for application data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k2095 = tls::traffic_keys(32, unhex("5c74f87df04225db0f8209c9de6429e49435fdefa7cad61864874d12f31cfc8d"), 16)
+    assert_streq(tohex(k2095.key), "f27a5d97bd25550c4823b0f3e5d29388")
+    assert_streq(tohex(k2095.iv), "0dd631f7b71cbbc797c35fe7")
+    // section 5: derive read traffic keys for handshake data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k2114 = tls::traffic_keys(32, unhex("158aa7ab8855073582b41d674b4055cabcc534728f659314861b4e08e2011566"), 16)
+    assert_streq(tohex(k2114.key), "2f1f918663d590e7421149a29d94b0b6")
+    assert_streq(tohex(k2114.iv), "414d5485235e1a688793bd74")
+    // section 5: derive write traffic keys for application data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k2210 = tls::traffic_keys(32, unhex("75ecf4b972525aa0dcd057c9944d4cd5d82671d8843141d7dc2a4ff15a21dc51"), 16)
+    assert_streq(tohex(k2210.key), "a7eb2a0525eb4331d58fcbf9f7ca2e9c")
+    assert_streq(tohex(k2210.iv), "86e8be227c1bd2b3e39cb444")
+    // section 6: derive write traffic keys for handshake data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k2468 = tls::traffic_keys(32, unhex("8b02d3c00442a2722c4098ebe8675b23e801510f0d7ed778d8eb0b8f42a19a5e"), 16)
+    assert_streq(tohex(k2468.key), "6cb6e60619d8c7355c5d4c4bc2be90d5")
+    assert_streq(tohex(k2468.iv), "64f239530c3b888fde85e0be")
+    // section 6: derive write traffic keys for application data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k2670 = tls::traffic_keys(32, unhex("c49a91faf57f8c545d5048a015bf849ff63942e4a7edcd319f8b438a97c52e21"), 16)
+    assert_streq(tohex(k2670.key), "88b3123ddecadf8c1ba298e2c18176b0")
+    assert_streq(tohex(k2670.iv), "4e0978513f9de8327c08e4f3")
+    // section 6: derive read traffic keys for handshake data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k2684 = tls::traffic_keys(32, unhex("cec7a30c6872070f22a7eeb065768db67c45e29533db879908ce6dc66f5911de"), 16)
+    assert_streq(tohex(k2684.key), "916948f728d9823fa41a004d083f217f")
+    assert_streq(tohex(k2684.iv), "64153d79bac9ea10ca5a0a88")
+    // section 6: derive write traffic keys for application data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k2892 = tls::traffic_keys(32, unhex("73c2e890fa8d067258d6d50fa92fe456b098cf00d9727eed91e8892ef4e6f860"), 16)
+    assert_streq(tohex(k2892.key), "cdc09c806aa8f86dfcd51efc44a0c039")
+    assert_streq(tohex(k2892.iv), "6ef852e78b46d913668e53e7")
+    // section 7: derive write traffic keys for handshake data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k3167 = tls::traffic_keys(32, unhex("cace3d555cc1c577cf970cff28cf978d6a9800085442e18d695b50f3151d18c8"), 16)
+    assert_streq(tohex(k3167.key), "041091fdab29f2c8abfb156dc5fc8d54")
+    assert_streq(tohex(k3167.iv), "7464d791685de05998fcbadb")
+    // section 7: derive write traffic keys for application data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k3384 = tls::traffic_keys(32, unhex("b6b8144aa335ed3059c0c9c8f0ecabf7afc94af6643bdecdfd9210188fab7451"), 16)
+    assert_streq(tohex(k3384.key), "edc4cbd0041c28cc7167441d7ca53e6a")
+    assert_streq(tohex(k3384.iv), "bf6c7d8e0a9545b427dcf139")
+    // section 7: derive read traffic keys for handshake data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k3398 = tls::traffic_keys(32, unhex("2c3cb24a1081edb59518ee6861e89a6b72b3801afe7713e4cbbc21c0795bf831"), 16)
+    assert_streq(tohex(k3398.key), "62d13c13ffd7402fc1c09e3d163665cb")
+    assert_streq(tohex(k3398.iv), "7166f20028bf146dcfbd5a40")
+    // section 7: derive write traffic keys for application data
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("iv", "", 12)), "000c08746c73313320697600")
+    let k3506 = tls::traffic_keys(32, unhex("743e4c6b56cf3909d1b06d01956ccd2c4b37758449aec41d98dae44924eaa299"), 16)
+    assert_streq(tohex(k3506.key), "33d7f9709756c966488ad4438437e673")
+    assert_streq(tohex(k3506.iv), "c5f30d34b0e91b7d6c8eea65")
+}
+
+// The transcript, and the HelloRetryRequest substitution.
+//
+// Section 5 is the one that matters here. When a server sends a HelloRetryRequest, the first
+// ClientHello is removed from the transcript and replaced by a synthetic `message_hash`
+// message holding its hash. Getting that wrong produces no error at the point of the
+// mistake: the handshake fails much later, decrypting a Finished that will never match.
+//
+// Section 4 (0-RTT resumption) is absent: its ClientHello carries a PSK binder
+// computed over a truncated copy of itself, and resumption is out of scope for this client.
+fn test_transcript_simple_1rtt() {
+    var t = tls::transcript_new(32)
+    tls::transcript_add(t, unhex("010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece7000006130113031302010000910000000b0009000006736572766572ff01000100000a00140012001d0017001800190100010101020103010400230000003300260024001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c00024001"))   // ClientHello
+    tls::transcript_add(t, unhex("020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304"))   // ServerHello
+    assert_streq(tohex(tls::transcript_hash(t)), "860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8")
+    assert_streq(tohex(tls::transcript_hash(t)), "860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8")
+    tls::transcript_add(t, unhex("080000240022000a00140012001d00170018001901000101010201030104001c0002400100000000"))   // EncryptedExtensions
+    tls::transcript_add(t, unhex("0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de10000"))   // Certificate
+    tls::transcript_add(t, unhex("0f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea20d53dfacd42f74f3"))   // CertificateVerify
+    assert_streq(tohex(tls::verify_data(32, unhex("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"), tls::transcript_hash(t))), "9b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718")
+    tls::transcript_add(t, unhex("140000209b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718"))   // Finished
+    assert_streq(tohex(tls::transcript_hash(t)), "9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13")
+    assert_streq(tohex(tls::transcript_hash(t)), "9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13")
+    assert_streq(tohex(tls::transcript_hash(t)), "9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13")
+    assert_streq(tohex(tls::verify_data(32, unhex("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"), tls::transcript_hash(t))), "a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61")
+    tls::transcript_add(t, unhex("14000020a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61"))   // Finished
+    assert_streq(tohex(tls::transcript_hash(t)), "209145a96ee8e2a122ff810047cc952684658d6049e86429426db87c54ad143d")
+    tls::transcript_add(t, unhex("040000c90000001efad6aac502000000b22c035d829359ee5ff7af4ec900000000262a6494dc486d2c8a34cb33fa90bf1b0070ad3c498883c9367c09a2be785abc55cd226097a3a982117283f82a03a143efd3ff5dd36d64e861be7fd61d2827db279cce145077d454a3664d4e6da4d29ee03725a6a4dafcd0fc67d2aea70529513e3da2677fa5906c5b3f7d8f92f228bda40dda721470f9fbf297b5aea617646fac5c03272e970727c621a79141ef5f7de6505e5bfbc388e93343694093934ae4d3570008002a000400000400"))   // NewSessionTicket
+}
+
+fn test_transcript_hello_retry_request() {
+    var t = tls::transcript_new(32)
+    tls::transcript_add(t, unhex("010000b00303b0b1c5a5aa37c5919f2ed1d5c6fff7fcb7849716945a2b8cee9258a346677b6f000006130113031302010000810000000b0009000006736572766572ff01000100000a00080006001d00170018003300260024001d0020e8e8e3f3b93a25ed97a14a7dcacb8a272c6288e585c6484d05262fcad062ad1f002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c00024001"))   // ClientHello
+    assert_true(tls::is_hello_retry_request(unhex("020000ac0303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c001301000084003300020017002c0074007271dcd04bb88bc3189119398a00000000eefafc76c146b823b096f8aacad365dd0030953f4edf625636e5f21bb2e23fcc654b1b5b40318d10d137abcbb87574e36e8a1f025f7dfa5d6e50781b5eda4aa15b0c8be778257d16aa3030e9e7841dd9e4c0342267e8ca0caf571fb2b7cff0f934b0002b00020304")))
+    tls::transcript_hrr(t)          // ClientHello1 -> message_hash
+    tls::transcript_add(t, unhex("020000ac0303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c001301000084003300020017002c0074007271dcd04bb88bc3189119398a00000000eefafc76c146b823b096f8aacad365dd0030953f4edf625636e5f21bb2e23fcc654b1b5b40318d10d137abcbb87574e36e8a1f025f7dfa5d6e50781b5eda4aa15b0c8be778257d16aa3030e9e7841dd9e4c0342267e8ca0caf571fb2b7cff0f934b0002b00020304"))   // ServerHello
+    tls::transcript_add(t, unhex("010001fc0303b0b1c5a5aa37c5919f2ed1d5c6fff7fcb7849716945a2b8cee9258a346677b6f000006130113031302010001cd0000000b0009000006736572766572ff01000100000a00080006001d001700180033004700450017004104a6da7392ec591e17abfd535964b99894d13befb221b3def2ebe3830eac8f0151812677c4d6d2237e85cf01d6910cfb83954e76ba7352830534159897e8065780002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002c0074007271dcd04bb88bc3189119398a00000000eefafc76c146b823b096f8aacad365dd0030953f4edf625636e5f21bb2e23fcc654b1b5b40318d10d137abcbb87574e36e8a1f025f7dfa5d6e50781b5eda4aa15b0c8be778257d16aa3030e9e7841dd9e4c0342267e8ca0caf571fb2b7cff0f934b0002d00020101001c00024001001500af00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"))   // ClientHello
+    tls::transcript_add(t, unhex("020000770303bb341d847fd789c47c387172dc0c9bf147fccacb5043d86ca4c598d3ff571b9800130100004f003300450017004104583e054b7a66672ae020ad9d2686fcc85b5ad41a134a0f03ee72b893052bd85b4c8de6776f5b04ac07d83540eab3e3d9c547bc6528c4317d294686093a6cad7d002b00020304"))   // ServerHello
+    assert_streq(tohex(tls::transcript_hash(t)), "8aa8e828ec2f8a884fec95a3139de01c15a3daa7ff5bfc3f4bfcc21b438d7bf8")
+    assert_streq(tohex(tls::transcript_hash(t)), "8aa8e828ec2f8a884fec95a3139de01c15a3daa7ff5bfc3f4bfcc21b438d7bf8")
+    tls::transcript_add(t, unhex("080000180016000a0008000600170018001d001c0002400100000000"))   // EncryptedExtensions
+    tls::transcript_add(t, unhex("0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de10000"))   // Certificate
+    tls::transcript_add(t, unhex("0f0000840804008033ab13d4462707231b5dcae6c8190b63d1dabc74f28c395370da0b07e5b83066d0246a31acd95df475bfd799a4a70d33ad93d3a317a9b2c0d237a5685b219e774112e391a247607d1aeff1bbd0a39f382ee1a5fe88ae99ec59228e6497e45d48ce275a6d5ef40d169fb6f9d33b052ed3dcdd6b5a48baafffbcb290128415bd38"))   // CertificateVerify
+    assert_streq(tohex(tls::verify_data(32, unhex("3403e781e2af7b6508da28574f6e95a1abf162de83a97927c37672a4a0cef8a1"), tls::transcript_hash(t))), "8863e6bfb0420a927fa27f34336a70ae426e968e3eb884945b96856dba3976d1")
+    tls::transcript_add(t, unhex("140000208863e6bfb0420a927fa27f34336a70ae426e968e3eb884945b96856dba3976d1"))   // Finished
+    assert_streq(tohex(tls::transcript_hash(t)), "50f63cbf36b0dd049e7a0ba27d6455745ea2aaac54bb167f9950b2b7ce9509da")
+    assert_streq(tohex(tls::transcript_hash(t)), "50f63cbf36b0dd049e7a0ba27d6455745ea2aaac54bb167f9950b2b7ce9509da")
+    assert_streq(tohex(tls::transcript_hash(t)), "50f63cbf36b0dd049e7a0ba27d6455745ea2aaac54bb167f9950b2b7ce9509da")
+    assert_streq(tohex(tls::verify_data(32, unhex("158aa7ab8855073582b41d674b4055cabcc534728f659314861b4e08e2011566"), tls::transcript_hash(t))), "23f52fdb0709a55bd7f79b991f25484087bcfd4d4380b12326a52a28b2e368e1")
+    tls::transcript_add(t, unhex("1400002023f52fdb0709a55bd7f79b991f25484087bcfd4d4380b12326a52a28b2e368e1"))   // Finished
+    assert_streq(tohex(tls::transcript_hash(t)), "0e8b349158b855fdcd0c11dbbc4e83e43caa6e483c6c65df53151888e50165f4")
+}
+
+fn test_transcript_client_auth() {
+    var t = tls::transcript_new(32)
+    tls::transcript_add(t, unhex("010000bc03036a472236328b83af40386d3a3e1f1ce624fa4ed89ab865a4ff0f4144ce3ae2330000061301130313020100008d0000000b0009000006736572766572ff01000100000a00140012001d00170018001901000101010201030104003300260024001d0020089cc2671f738d9a671e5b2e464981d05b76e361aa22aea91f1d49ca10a7a362002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c00024001"))   // ClientHello
+    tls::transcript_add(t, unhex("0200005603033b50fdf1c3d572e40e68953e7fff4e2758459c59afa0582c0ea032874255fe6e00130100002e00330024001d00206c2e50e865919a6b5a12dfaf918f92b442567b0f89bc54478c6921366658f062002b00020304"))   // ServerHello
+    assert_streq(tohex(tls::transcript_hash(t)), "88ebc042bd0d5a643b22fca7a47defd4007dfe184949a6261c596c4e002a74a2")
+    assert_streq(tohex(tls::transcript_hash(t)), "88ebc042bd0d5a643b22fca7a47defd4007dfe184949a6261c596c4e002a74a2")
+    tls::transcript_add(t, unhex("080000240022000a00140012001d00170018001901000101010201030104001c0002400100000000"))   // EncryptedExtensions
+    tls::transcript_add(t, unhex("0d000027000024000d0020001e040305030603020308040805080604010501060102010402050206020202"))   // CertificateRequest
+    tls::transcript_add(t, unhex("0b00013b000001370001323082012e3081d5a003020102020107300a06082a8648ce3d04030230133111300f060355040313086563647361323536301e170d3136303733303031323430305a170d3236303733303031323430305a30133111300f0603550403130865636473613235363059301306072a8648ce3d020106082a8648ce3d0301070342000408d530161575f4cfe7f154ee3448180086001e88431a79ee62ee6e2f83ef38ba61e9fb37f34e007a7df4d2f5b56d1f04ece45d621f468406f5c3a15158948dd0a31a301830090603551d1304023000300b0603551d0f040403020780300a06082a8648ce3d0403020348003045022100df30fd4507f5edd22c1a6ff86db479ca693feeca3b71b3f9ef556b2937c0594d022062e2a47250d320fea83c7e2dcb5b76a50e0200c09adbd13fee946e513e011d110000"))   // Certificate
+    tls::transcript_add(t, unhex("0f00004b040300473045022100d7a4d34bd54f55fee1a89625678c3dd5e5f60dac73ec940c5c7b9304a02084a90220289f595ed488b9ac689a3d192b1a8bb38f34af7874c059c9806a1f38269353e8"))   // CertificateVerify
+    assert_streq(tohex(tls::verify_data(32, unhex("8b02d3c00442a2722c4098ebe8675b23e801510f0d7ed778d8eb0b8f42a19a5e"), tls::transcript_hash(t))), "93b70cdf4781985b96345caac701b4e750d3042df1a689d8faca812251113c11")
+    tls::transcript_add(t, unhex("1400002093b70cdf4781985b96345caac701b4e750d3042df1a689d8faca812251113c11"))   // Finished
+    assert_streq(tohex(tls::transcript_hash(t)), "5177a29af5a17f9b4933e431851d128345366c1720d38f8f0465eeeae6740372")
+    assert_streq(tohex(tls::transcript_hash(t)), "5177a29af5a17f9b4933e431851d128345366c1720d38f8f0465eeeae6740372")
+    assert_streq(tohex(tls::transcript_hash(t)), "5177a29af5a17f9b4933e431851d128345366c1720d38f8f0465eeeae6740372")
+    tls::transcript_add(t, unhex("0b0001bf000001bb0001b6308201b23082011ba003020102020101300d06092a864886f70d01010b05003011310f300d06035504031306636c69656e74301e170d3136303733303031323335395a170d3236303733303031323335395a3011310f300d06035504031306636c69656e7430819f300d06092a864886f70d010101050003818d0030818902818100c38175e004a68d093f823b9c379d201fbc0bb7a1c791905e3fbf76847e44e751ebbcd360bd945c81e5222bcc8846d3a8a0f93e9bf5bebabd92edf1de1ff19021703e7ab6c0901513f97e39b111f09c9348971c7b211984a754cd45fe095af0ea4236829bccf7a7fe9b2888e78ab477690a5b9e1ccbe91c6a4a0f97a7e02842010203010001a31a301830090603551d1304023000300b0603551d0f040403020780300d06092a864886f70d01010b0500038181001a7a5a018532b022af0767d486160cff2d167a1915d23835b54594916dc680be5d2e626076c5d52722ebcc775d7d99f980be2fc94d34acf6cc00ba90cbcfb0608aa1e7e3971ef0c07a41d47ad8345d1f81fe418a1cf41054429fd217bd777dc1cf08f05df90799c659361e0f1a8ee4ac0f7897420bdbc823da80a2f2ba23081c0000"))   // Certificate
+    tls::transcript_add(t, unhex("0f00008408040080186b2223b503a759c35dba0e9721b4b579138d5f0f5e6ec7feaaf27f3ad7f386c2c7bd7cb2be52fbf5ed8393f406ee79369692ec7ac695651d858219e672a8eb7b2a677b640b46ab630edc5f3f2f8272b9c0d906f81f84ddc5b8c7bcf955c78a3cf99e5016f73e04eb7dfcb28833f13e8f75ec2ff3581e2f098ad4157fd6d6ad"))   // CertificateVerify
+    assert_streq(tohex(tls::verify_data(32, unhex("cec7a30c6872070f22a7eeb065768db67c45e29533db879908ce6dc66f5911de"), tls::transcript_hash(t))), "9afe2ba2f63a09d229d8a429e5b37ffd9fcc73bdb5911b82425972aa2892440f")
+    tls::transcript_add(t, unhex("140000209afe2ba2f63a09d229d8a429e5b37ffd9fcc73bdb5911b82425972aa2892440f"))   // Finished
+    assert_streq(tohex(tls::transcript_hash(t)), "391d004bd84c831b1582444414b4dc8064010ecc76f37f88bfeb1e88fe135c25")
+}
+
+fn test_transcript_compat_mode() {
+    var t = tls::transcript_new(32)
+    tls::transcript_add(t, unhex("010000dc03034e640a3f2c2738f09c9418bd78edccd7559d0531199276d4d92a0e9ee9d77d0920a80c165581a8e0d06c0018d54d3a06dd32cfd4051eb026fad3fd0ba99269e6ef00061301130313020100008d0000000b0009000006736572766572ff01000100000a00140012001d00170018001901000101010201030104003300260024001d00208e7292cf3056dbb0d25fcbe55c107dc9bbf83dd9708f39203ba341249a7d9b63002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c00024001"))   // ClientHello
+    tls::transcript_add(t, unhex("020000760303e5dd5948c435f7a38f0f0130708dc322d9df09abd4838117c183a7bb6d994f2c20a80c165581a8e0d06c0018d54d3a06dd32cfd4051eb026fad3fd0ba99269e6ef130100002e00330024001d00203e30f0f4ba551afd62768341175f5265e4daf0c8841617aa4fafdd2142320c22002b00020304"))   // ServerHello
+    assert_streq(tohex(tls::transcript_hash(t)), "745c55bac399310b7b5a7c81a2c130b4d56dff6f68c3ab477857601e01f1f8d1")
+    assert_streq(tohex(tls::transcript_hash(t)), "745c55bac399310b7b5a7c81a2c130b4d56dff6f68c3ab477857601e01f1f8d1")
+    tls::transcript_add(t, unhex("080000240022000a00140012001d00170018001901000101010201030104001c0002400100000000"))   // EncryptedExtensions
+    tls::transcript_add(t, unhex("0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de10000"))   // Certificate
+    tls::transcript_add(t, unhex("0f00008408040080a2301a68dd1ceee6938fe9d40c46b9201b34d59952a37e06523a39cf8ba6c9c8b68ae94492af780516ed7b73c82812e99dd3fabea45e09d9c6848721c2808c61501b0c75e7fcaba5f78bef68a2c2b69b19558b3e40387eea93d25c7781c1cc00e9f519f7e2e4adb73e76d66089000a2dc866c2ed30bba50a0d457f19dc6eb9f3"))   // CertificateVerify
+    assert_streq(tohex(tls::verify_data(32, unhex("cace3d555cc1c577cf970cff28cf978d6a9800085442e18d695b50f3151d18c8"), tls::transcript_hash(t))), "c8c3a8f1bff5274061f4bc3a7caffbdc9616094ca625caa65f8e76ed46db74d3")
+    tls::transcript_add(t, unhex("14000020c8c3a8f1bff5274061f4bc3a7caffbdc9616094ca625caa65f8e76ed46db74d3"))   // Finished
+    assert_streq(tohex(tls::transcript_hash(t)), "0707dcac7b2fa428cc7f691694a2590c806aaa5c0cf5087ed5385012e7f96cd4")
+    assert_streq(tohex(tls::transcript_hash(t)), "0707dcac7b2fa428cc7f691694a2590c806aaa5c0cf5087ed5385012e7f96cd4")
+    assert_streq(tohex(tls::transcript_hash(t)), "0707dcac7b2fa428cc7f691694a2590c806aaa5c0cf5087ed5385012e7f96cd4")
+    assert_streq(tohex(tls::verify_data(32, unhex("2c3cb24a1081edb59518ee6861e89a6b72b3801afe7713e4cbbc21c0795bf831"), tls::transcript_hash(t))), "692cab155cc6c100ead60733d0617f6fb09b71aa1e8c9accbbbc9e8ed336c1dd")
+    tls::transcript_add(t, unhex("14000020692cab155cc6c100ead60733d0617f6fb09b71aa1e8c9accbbbc9e8ed336c1dd"))   // Finished
+    assert_streq(tohex(tls::transcript_hash(t)), "a021d3a05bd418a772813875ef79b0af68c5123215427ab7333f8c27722a9fd5")
+}
+
+// An ordinary ServerHello must not be mistaken for a HelloRetryRequest. The two share a
+// message type, so the Random is the only thing separating them, and treating a real
+// ServerHello as an HRR would silently destroy the transcript.
+fn test_ordinary_server_hello_is_not_hrr() {
+    assert_true(!tls::is_hello_retry_request(unhex("020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304")))
+    assert_true(!tls::is_hello_retry_request(unhex("0200005c03033ccfd2dec890222763472ae8136777c9d7358777bb66e91ea5122495f559ea2d00130100003400290002000000330024001d0020121761ee42c333e1b9e77b60dd57c2053cd94512ab47f115e86eff50942cea31002b00020304")))
+    assert_true(!tls::is_hello_retry_request(unhex("020000770303bb341d847fd789c47c387172dc0c9bf147fccacb5043d86ca4c598d3ff571b9800130100004f003300450017004104583e054b7a66672ae020ad9d2686fcc85b5ad41a134a0f03ee72b893052bd85b4c8de6776f5b04ac07d83540eab3e3d9c547bc6528c4317d294686093a6cad7d002b00020304")))
+    assert_true(!tls::is_hello_retry_request(unhex("0200005603033b50fdf1c3d572e40e68953e7fff4e2758459c59afa0582c0ea032874255fe6e00130100002e00330024001d00206c2e50e865919a6b5a12dfaf918f92b442567b0f89bc54478c6921366658f062002b00020304")))
+    assert_true(!tls::is_hello_retry_request(unhex("020000760303e5dd5948c435f7a38f0f0130708dc322d9df09abd4838117c183a7bb6d994f2c20a80c165581a8e0d06c0018d54d3a06dd32cfd4051eb026fad3fd0ba99269e6ef130100002e00330024001d00203e30f0f4ba551afd62768341175f5265e4daf0c8841617aa4fafdd2142320c22002b00020304")))
+    assert_true(!tls::is_hello_retry_request(""))
+    assert_true(!tls::is_hello_retry_request("short"))
+}
+
+// The schedule driven end to end, as a client actually drives it, rather than one step at a
+// time. Section 3's secrets must all fall out of the same three extractions.
+fn test_schedule_end_to_end() {
+    var s = tls::schedule_start(32, "")
+    assert_streq(tohex(s.early), "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a")
+    tls::schedule_handshake(s, unhex("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d"))
+    assert_streq(tohex(s.handshake), "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac")
+    tls::schedule_master(s)
+    assert_streq(tohex(s.master), "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919")
+    assert_streq(tohex(tls::client_handshake_traffic(s, unhex("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8"))), "b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21")
+    assert_streq(tohex(tls::server_handshake_traffic(s, unhex("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8"))), "b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38")
+    assert_streq(tohex(tls::client_app_traffic(s, unhex("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13"))), "9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5")
+    assert_streq(tohex(tls::server_app_traffic(s, unhex("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13"))), "a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643")
+    assert_streq(tohex(tls::exporter_master(s, unhex("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13"))), "fe22f881176eda18eb8f44529e6792c50c9a3f89452f68d8ae311b4309d3cf50")
+    assert_streq(tohex(tls::resumption_master(s, unhex("209145a96ee8e2a122ff810047cc952684658d6049e86429426db87c54ad143d"))), "7df235f2031d2a051287d02b0241b0bfdaf86cc856231f2d5aba46c434ec196c")
+}

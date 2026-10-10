@@ -1,0 +1,12 @@
+# The C glue a program built with `noric --build --native --target x86_64-w64-mingw32` cannot compile,
+# and the Nori module that answers it; the same format as std/native_seams, which lists the Linux ones.
+#
+# PREFIX  MODULE  [IMPORTED FILES...]
+
+# std/window: the LLVM build links window_win32.c. The native build makes and drives the window over
+# user32, gdi32 and shell32 in Nori.
+@nori_win_ std/window/__native_win32.nori
+
+# std/nori_ui/paint_gpu: the LLVM build links ui_gpu_glue.c or ui_gpu_absent.c. The native build opens
+# wgpu_native.dll at run time and answers as the absent glue does when it is not there.
+@ui_gpu_ std/nori_ui/paint_gpu/__native_ui_gpu.nori

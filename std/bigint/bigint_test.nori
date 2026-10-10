@@ -1,0 +1,165 @@
+// .nori tests for std/bigint, run with
+//   noric --test std/bigint/bigint_test.nori compiler/runtime.nori --import-root .
+import "std/bigint" as big
+
+fn test_roundtrip() {
+    assert_streq(big::to_string(big::from_int(12345)), "12345")
+    assert_streq(big::to_string(big::from_int(0)), "0")
+    assert_streq(big::to_string(big::from_int(0 - 7)), "-7")
+    let s = "123456789012345678901234567890"
+    assert_streq(big::to_string(big::parse(s)), s)
+}
+
+fn test_add_sub() {
+    let a = big::parse("99999999999999999999")
+    let b = big::from_int(1)
+    assert_streq(big::to_string(big::add(a, b)), "100000000000000000000")
+    assert_streq(big::to_string(big::sub(big::add(a, b), b)), "99999999999999999999")
+    // mixed signs
+    assert_streq(big::to_string(big::add(big::from_int(0 - 100), big::from_int(30))), "-70")
+}
+
+fn test_mul_pow() {
+    assert_streq(big::to_string(big::pow(big::from_int(2), 100)), "1267650600228229401496703205376")
+    assert_streq(big::to_string(big::pow(big::from_int(2), 64)), "18446744073709551616")
+    let n = big::parse("99999999999")
+    assert_streq(big::to_string(big::mul(n, n)), "9999999999800000000001")
+}
+
+fn test_divmod() {
+    let dm = big::divmod(big::from_int(100), big::from_int(7))
+    assert_streq(big::to_string(dm.q), "14")
+    assert_streq(big::to_string(dm.r), "2")
+    // big / big
+    let big10_21 = big::pow(big::from_int(10), 21)
+    let big10_9 = big::pow(big::from_int(10), 9)
+    assert_streq(big::to_string(big::div(big10_21, big10_9)), "1000000000000")
+    assert_streq(big::to_string(big::rem(big10_21, big10_9)), "0")
+    // truncation toward zero, remainder takes the dividend's sign
+    let nd = big::divmod(big::from_int(0 - 100), big::from_int(7))
+    assert_streq(big::to_string(nd.q), "-14")
+    assert_streq(big::to_string(nd.r), "-2")
+}
+
+fn test_cmp() {
+    assert_eq(big::cmp(big::from_int(5), big::from_int(3)), 1)
+    assert_eq(big::cmp(big::parse("-10"), big::from_int(0)), 0 - 1)
+    assert_eq(big::cmp(big::from_int(42), big::from_int(42)), 0)
+}
+
+// ---- laws: universally-quantified properties, fuzzed by `noric --fuzz-laws` / `roll law` ----
+// (Int-parameterized: each law builds Bigs from random Ints, so carry/borrow/sign edges get exercised.)
+law bigint_add_commutes(a: Int, b: Int) {
+    assert(big::cmp(big::add(big::from_int(a), big::from_int(b)), big::add(big::from_int(b), big::from_int(a))) == 0)
+}
+law bigint_add_associates(a: Int, b: Int, c: Int) {
+    let ba = big::from_int(a) let bb = big::from_int(b) let bc = big::from_int(c)
+    assert(big::cmp(big::add(big::add(ba, bb), bc), big::add(ba, big::add(bb, bc))) == 0)
+}
+law bigint_mul_commutes(a: Int, b: Int) {
+    assert(big::cmp(big::mul(big::from_int(a), big::from_int(b)), big::mul(big::from_int(b), big::from_int(a))) == 0)
+}
+law bigint_mul_associates(a: Int, b: Int, c: Int) {
+    let ba = big::from_int(a) let bb = big::from_int(b) let bc = big::from_int(c)
+    assert(big::cmp(big::mul(big::mul(ba, bb), bc), big::mul(ba, big::mul(bb, bc))) == 0)
+}
+law bigint_distributes(a: Int, b: Int, c: Int) {
+    let ba = big::from_int(a) let bb = big::from_int(b) let bc = big::from_int(c)
+    assert(big::cmp(big::mul(ba, big::add(bb, bc)), big::add(big::mul(ba, bb), big::mul(ba, bc))) == 0)
+}
+law bigint_sub_add_inverse(a: Int, b: Int) {
+    let ba = big::from_int(a) let bb = big::from_int(b)
+    assert(big::cmp(big::add(big::sub(ba, bb), bb), ba) == 0)
+}
+law bigint_sub_self_is_zero(a: Int) {
+    assert(big::is_zero(big::sub(big::from_int(a), big::from_int(a))))
+}
+
+
+// modpow. Every answer is Python's `pow(b, e, m)`, an independent implementation of the same
+// operation, so these prove agreement rather than self-consistency.
+//
+// The project's test suite also cross-checks a few thousand fresh random triples on every
+// run, so a bug that happens to agree with the constants below cannot hide behind them.
+fn test_modpow_known() {
+    assert_streq(big::to_string(big::modpow(big::from_int(4), big::from_int(13), big::from_int(497))), "445")
+    assert_streq(big::to_string(big::modpow(big::from_int(2), big::from_int(1000), big::from_int(1000000007))), "688423210")
+    assert_streq(big::to_string(big::modpow(big::from_int(3), big::from_int(0), big::from_int(7))), "1")
+    assert_streq(big::to_string(big::modpow(big::from_int(3), big::from_int(1), big::from_int(7))), "3")
+    assert_streq(big::to_string(big::modpow(big::from_int(0), big::from_int(0), big::from_int(7))), "1")
+    assert_streq(big::to_string(big::modpow(big::from_int(0), big::from_int(5), big::from_int(7))), "0")
+    assert_streq(big::to_string(big::modpow(big::from_int(1), big::from_int(99), big::from_int(7))), "1")
+    assert_streq(big::to_string(big::modpow(big::from_int(7), big::from_int(5), big::from_int(7))), "0")
+    assert_streq(big::to_string(big::modpow(big::from_int(2), big::from_int(10), big::from_int(1))), "0")
+    assert_streq(big::to_string(big::modpow(big::from_int(123456789), big::from_int(987654321), big::from_int(1000000007))), "652541198")
+}
+
+// The cases where a wrong answer is still a plausible-looking number.
+fn test_modpow_edges() {
+    // a zero exponent is 1, even for a zero base
+    assert_streq(big::to_string(big::modpow(big::from_int(0), big::from_int(0), big::from_int(7))), "1")
+    // modulus 1 collapses everything to zero
+    assert_streq(big::to_string(big::modpow(big::from_int(5), big::from_int(3), big::from_int(1))), "0")
+    // a base larger than the modulus must be reduced first
+    assert_streq(big::to_string(big::modpow(big::from_int(1000003), big::from_int(17), big::from_int(101))), "75")
+    // a base equal to the modulus is zero
+    assert_streq(big::to_string(big::modpow(big::from_int(97), big::from_int(3), big::from_int(97))), "0")
+    // a negative base takes its non-negative representative: `rem` truncates toward zero, so
+    // the raw remainder of -5 mod 7 is -5 and the answer wanted is 2.
+    assert_streq(big::to_string(big::modpow(big::from_int(0 - 5), big::from_int(1), big::from_int(7))), "2")
+    assert_streq(big::to_string(big::modpow(big::from_int(0 - 5), big::from_int(3), big::from_int(7))), "1")
+    // A modulus of 1 with a zero exponent. Every other m=1 case reaches zero through the loop
+    // whatever the special case does, so this is the only input that distinguishes them: without
+    // it, `x^0 mod 1` answers 1 and nothing notices.
+    assert_streq(big::to_string(big::modpow(big::from_int(5), big::from_int(0), big::from_int(1))), "0")
+    assert_streq(big::to_string(big::modpow(big::from_int(0), big::from_int(0), big::from_int(1))), "0")
+    // refusals, each a distinct reason and each returning zero rather than a wrong number
+    assert_true(big::is_zero(big::modpow(big::from_int(5), big::from_int(0 - 1), big::from_int(7))))   // negative exponent
+    assert_true(big::is_zero(big::modpow(big::from_int(5), big::from_int(3), big::from_int(0))))       // zero modulus
+    assert_true(big::is_zero(big::modpow(big::from_int(5), big::from_int(3), big::from_int(0 - 7))))   // negative modulus
+}
+
+// An RSA-2048 verification, which is what this operation exists for: s^65537 mod n, with a
+// modulus and a signature of the size a real certificate carries. The full power would have
+// roughly 2^36 digits, so this passing at all is the evidence that the reduction happens at every
+// step rather than at the end.
+fn test_modpow_rsa_sized() {
+    let n = big::parse("27346259780097196443406627680655836624538499527402013369662771595593564393912632797008257694130955845728433165872703084593224032534283534972254907076049350052885733707161177703256572749615815018784619934639854007492156492162333697368885534982454065510741466739732062253620519945136088491375022031774810200565682881294283541249477845825093324614730214068020072237565544325110737879550980644485657750951935931917395426337285392799705916034425423388473582538765971577020239535965473775061607788533295540449320700582952609641822831245967405595112204285148652797371558641068588060352557653660251031081354129627660436109379")
+    let s = big::parse("59658220132269699158158225009815724883783329083566897706176190465839774598322183339809058259215626232621295023963721266924197632021875789777354789138481820923244378690130217973141176967383609809485783206394871550051622797816331753224744045750269758048518211114985621466418627231559395460384321328903529743975781268976912626039361430134522564669785398805859858847609721522137705192208099675005853392766912582457992097951516000683180146050796430502648366594011788759872523870206037137241399931264525580165765599072536595606479079845834450181650485802032444000480543247952207750982454464203768934684619588103768549285")
+    assert_streq(big::to_string(big::modpow(s, big::from_int(65537), n)), "24880756427556674060104181009653655935574026418040925265823336748956509778292980788408193814898641298539080023797861035670570448424347054025990294342166579258916750683171142641843550158426381011908120350786058871229143621381379914850767099595594221193172570704330939796067165076324580797813798727392048056276075769029755070238738578305000103257897037541179462425389196726945150691646490993375851211889218571448908177565041833888219772381843397583492049337902331268098242420035148510377186497638507270167058136986172149900057317624022721917565440783918191034932358010955597227750646336032647421908622506837074850906830")
+}
+
+// modpow must agree with repeated multiplication, for exponents small enough to do both ways.
+// The base is forced non-negative first: `rem` truncates toward zero, so the naive loop and
+// modpow disagree about a negative base by construction, and that difference is the subject of
+// test_modpow_edges rather than of this law.
+law bigint_modpow_matches_repeated_mul(b: Int, e: Int) {
+    let m = big::from_int(1000003)
+    var bb = big::rem(big::from_int(b), m)
+    if bb.neg { bb = big::add(bb, m) }
+    let ee = (((e % 12) + 12) % 12)
+    var want = big::from_int(1)
+    var i = 0
+    while i < ee { want = big::rem(big::mul(want, bb), m)  i = i + 1 }
+    assert(big::cmp(big::modpow(bb, big::from_int(ee), m), want) == 0)
+}
+
+// Fermat: for a prime p and a base it does not divide, b^(p-1) is 1. An independent property, and
+// one that a merely self-consistent modpow fails: it constrains the answer to a single value.
+law bigint_modpow_fermat(b: Int) {
+    let p = big::from_int(1000003)
+    var bb = big::rem(big::from_int(b), p)
+    if bb.neg { bb = big::add(bb, p) }
+    if !big::is_zero(bb) {
+        assert(big::cmp(big::modpow(bb, big::from_int(1000002), p), big::from_int(1)) == 0)
+    }
+}
+
+// Exponents larger than one base-10^9 limb. Halving a magnitude in this representation carries
+// between limbs, and every exponent above (65537 included) fits in a single limb, where that
+// carry does not exist. Without a case here, dropping it entirely goes unnoticed.
+fn test_modpow_multilimb_exponent() {
+    assert_streq(big::to_string(big::modpow(big::parse("17232748278189393983"), big::parse("1028598790210"), big::parse("229174088325621541054486578098060309265"))), "71168295800358387622610250581649687109")
+    assert_streq(big::to_string(big::modpow(big::parse("6921383014213670232"), big::parse("55348783685047760469634318421"), big::parse("39028746834008671197295987148938039239"))), "7652624129410689835439415621766135350")
+    assert_streq(big::to_string(big::modpow(big::parse("735602788894318478"), big::parse("1376412489251646113181605826435105816903308071353455469628873"), big::parse("66961341532622966420914162772728465243"))), "39100586875619184527402570909083514420")
+}

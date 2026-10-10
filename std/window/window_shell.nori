@@ -1,0 +1,249 @@
+// std/window's desktop-shell half: what a taskbar, a dock or a panel needs from the compositor that an
+// application does not.
+//
+//   * a layer surface: a window the compositor places at the screen's edges instead of managing it
+//     (zwlr_layer_shell_v1): `open_layer` returns an ordinary `Window`, so polling, clicks, presenting
+//     and std/nori_ui's renderers work on it unchanged;
+//   * the window list: every toplevel the compositor has, with its title, app id, a stable identifier
+//     and its state, and the requests that act on one (ext_foreign_toplevel_list_v1 for the list,
+//     zwlr_foreign_toplevel_management_v1 for the state and the actions): `toplevels_open`.
+//
+// The wlr protocols' XML is beside this file (wlr-layer-shell-unstable-v1.xml,
+// wlr-foreign-toplevel-management-unstable-v1.xml), from https://gitlab.freedesktop.org/wlroots/wlr-protocols
+// at bf4fc79abc359eea5a0edec0ac6d4a2b2955f82a (2026-03-09); ext_foreign_toplevel_list_v1's is in
+// wayland-protocols (staging/ext-foreign-toplevel-list).
+//
+// Both are Wayland protocols that Sway and Hyprland (and NoriOS's own compositor)
+// speak. They are served by the native build (`noric --build --native`: __native_wayland.nori and
+// __native_wayland_shell.nori). The C backends do not speak them (the C Wayland shim would need the
+// protocols' generated code, and X11 and Win32 have no such protocols), so there `open_layer` gives a
+// window `opened` reports false and `toplevels_open` a list `toplevels_ok` reports false, which is also
+// what a compositor without the protocols gets.
+//
+//   var bar = window::open_layer("taskbar", window::layer_spec(window::LAYER_BOTTOM(),
+//                 window::ANCHOR_BOTTOM() | window::ANCHOR_LEFT() | window::ANCHOR_RIGHT(), 0, 40))
+//   var tl = window::toplevels_open()
+//   ... wait on window::fd(bar) and window::toplevels_fd(tl) (window.nori's fd/dispatch), then:
+//   if window::toplevels_dispatch(tl) == 1 { foreach t in window::toplevels_list(tl) { ... } }
+//   window::toplevel_activate(tl, id)
+
+extern fn nori_win_open_layer(Int, Int) -> Int       // (namespace char*, spec Int[10]) -> handle (0: not available)
+extern fn nori_win_layer_keyboard(Int, Int)          // (handle, mode): change a layer surface's keyboard interactivity
+extern fn nori_win_layer_size(Int, Int, Int)         // (handle, width, height): a shown layer surface's new size
+extern fn nori_win_input_none(Int, Int)              // (handle, none): an empty input region (1) or the whole surface (0)
+extern fn nori_win_tl_open() -> Int                  // -> list handle (0: no compositor, or no list protocol)
+extern fn nori_win_tl_caps(Int) -> Int               // 1 ext list, 2 wlr management
+extern fn nori_win_tl_fd(Int) -> Int
+extern fn nori_win_tl_dispatch(Int) -> Int           // 1 changed, 0 not, -1 the compositor is gone
+extern fn nori_win_tl_count(Int) -> Int
+extern fn nori_win_tl_uid(Int, Int) -> Int
+extern fn nori_win_tl_state(Int, Int) -> Int         // 1 maximized, 2 minimized, 4 activated, 8 fullscreen
+extern fn nori_win_tl_str(Int, Int, Int) -> Int      // (h, index, 0 title / 1 app id / 2 identifier) -> malloc'd char*
+extern fn nori_win_tl_act(Int, Int, Int) -> Int      // (h, id, action) -> 1 if sent
+extern fn nori_win_tl_close(Int)
+extern fn nori_win_ws_count(Int) -> Int
+extern fn nori_win_ws_uid(Int, Int) -> Int
+extern fn nori_win_ws_state(Int, Int) -> Int         // 1 active, 2 urgent, 4 hidden; capabilities << 8
+extern fn nori_win_ws_str(Int, Int, Int) -> Int      // (h, index, 0 name / 1 id / 2 coordinates) -> malloc'd char*
+extern fn nori_win_ws_act(Int, Int, Int) -> Int      // (h, uid, 1 activate / 2 deactivate) -> 1 if sent
+
+// ---- layer surfaces ------------------------------------------------------------------------------------
+
+/// The layers, bottom to top. Windows sit between BOTTOM and TOP: a wallpaper is BACKGROUND, a taskbar
+/// is TOP (above the windows) or BOTTOM (below them, which only shows where they leave room), and a lock
+/// screen or a notification is OVERLAY.
+pub fn LAYER_BACKGROUND() -> Int { return 0 }
+pub fn LAYER_BOTTOM() -> Int { return 1 }
+pub fn LAYER_TOP() -> Int { return 2 }
+pub fn LAYER_OVERLAY() -> Int { return 3 }
+
+/// The edges a layer surface is anchored to, OR'd together. Anchored to one edge it sits centred along
+/// it; anchored to both edges of an axis it is stretched along that axis (ask for size 0 there).
+pub fn ANCHOR_TOP() -> Int { return 1 }
+pub fn ANCHOR_BOTTOM() -> Int { return 2 }
+pub fn ANCHOR_LEFT() -> Int { return 4 }
+pub fn ANCHOR_RIGHT() -> Int { return 8 }
+
+/// Whether a layer surface takes the keyboard: never (a taskbar), always while it is mapped (a lock
+/// screen, a launcher that owns the keys), or when it is clicked like a window (a start menu's search).
+pub fn KEYBOARD_NONE() -> Int { return 0 }
+pub fn KEYBOARD_EXCLUSIVE() -> Int { return 1 }
+pub fn KEYBOARD_ON_DEMAND() -> Int { return 2 }
+
+/// How a layer surface asks to be placed. `exclusive_zone` is the strip of its edge it reserves:
+/// windows are laid out beside it, not under it: a taskbar reserves its height. 0 reserves nothing and
+/// -1 asks to be placed over other surfaces' zones too.
+pub struct LayerSpec {
+    layer: Int, anchor: Int, width: Int, height: Int, exclusive_zone: Int, keyboard: Int,
+    margin_top: Int, margin_right: Int, margin_bottom: Int, margin_left: Int
+}
+
+/// a spec with no exclusive zone, no keyboard and no margins; set the fields that differ.
+pub fn layer_spec(layer: Int, anchor: Int, width: Int, height: Int) -> LayerSpec {
+    return LayerSpec { layer: layer, anchor: anchor, width: width, height: height, exclusive_zone: 0,
+                       keyboard: KEYBOARD_NONE(), margin_top: 0, margin_right: 0, margin_bottom: 0, margin_left: 0 }
+}
+
+/// Open a layer surface. `namespace` says what it is ("taskbar", "notifications"): compositors match
+/// their rules on it. The compositor answers with the size it gives the surface before this returns, so
+/// `width`/`height` of the window are that size, e.g. the screen's width for a bar anchored left and right.
+/// `opened` is false when there is no compositor or it has no layer shell.
+pub fn open_layer(namespace: Str, spec: LayerSpec) -> Window {
+    let ns = cstr(namespace)
+    var sp = 0
+    unsafe {
+        sp = malloc(80)
+        poke(sp, spec.layer)  poke(sp + 8, spec.anchor)  poke(sp + 16, spec.width)  poke(sp + 24, spec.height)
+        poke(sp + 32, spec.exclusive_zone)  poke(sp + 40, spec.keyboard)
+        poke(sp + 48, spec.margin_top)  poke(sp + 56, spec.margin_right)  poke(sp + 64, spec.margin_bottom)  poke(sp + 72, spec.margin_left)
+    }
+    let hd = nori_win_open_layer(ns, sp)
+    unsafe { free(ns)  free(sp) }
+    return adopt(hd, spec.width, spec.height)
+}
+
+/// Change a layer surface's keyboard interactivity while it is shown (KEYBOARD_*). A launcher opens
+/// with EXCLUSIVE, so the keys go to it at once whatever the compositor does on map, and switches to ON_DEMAND once it
+/// has them, so a click elsewhere takes them away (and it can close).
+pub fn layer_set_keyboard(w: Window, mode: Int) { if w.handle != 0 { nori_win_layer_keyboard(w.handle, mode) } }
+
+/// Ask for another size while a layer surface is shown (a stack of notifications that grew): the compositor
+/// answers, and `poll` reports Resized with the size it gave once that arrives; present the next frame at it. The
+/// surface stays mapped, so there is no empty frame between the two sizes.
+pub fn layer_set_size(w: Window, width: Int, height: Int) { if w.handle != 0 { nori_win_layer_size(w.handle, width, height) } }
+
+/// Let the pointer through a surface (`none`, an empty input region: clicks and hovers reach what is under it, as for
+/// a surface fading out), or take it again over the whole surface. Wayland only; elsewhere nothing.
+pub fn set_input_none(w: Window, none: Bool) { if w.handle != 0 { var n = 0  if none { n = 1 }  nori_win_input_none(w.handle, n) } }
+
+// ---- the window list -----------------------------------------------------------------------------------
+
+/// The compositor's toplevels, kept up to date on a connection of its own.
+pub struct Toplevels { handle: Int }
+
+/// One toplevel. `id` is this list's own name for it, stable for as long as the toplevel exists and
+/// never reused; `identifier` is the compositor's (ext_foreign_toplevel_list_v1's), "" when it does not
+/// say one.
+pub struct Toplevel {
+    id: Int, title: Str, app_id: Str, identifier: Str,
+    activated: Bool, minimized: Bool, maximized: Bool, fullscreen: Bool
+}
+
+/// Connect and take the toplevels there are. `toplevels_ok` says whether the compositor offered a list.
+pub fn toplevels_open() -> Toplevels { return Toplevels { handle: nori_win_tl_open() } }
+
+/// did the compositor give us a window list?
+pub fn toplevels_ok(t: Toplevels) -> Bool { return t.handle != 0 }
+
+/// can the list's toplevels be acted on (activated, closed, minimized)? The ext list alone only lists.
+pub fn toplevels_can_act(t: Toplevels) -> Bool {
+    if t.handle == 0 { return false }
+    return (nori_win_tl_caps(t.handle) & 2) != 0
+}
+
+/// the descriptor the list's events arrive on (-1 when there is none)
+pub fn toplevels_fd(t: Toplevels) -> Int {
+    if t.handle == 0 { return 0 - 1 }
+    return nori_win_tl_fd(t.handle)
+}
+
+/// Decode whatever has arrived, without waiting. 1 when the list changed (a toplevel came, went, or
+/// changed its title, app id or state), 0 when nothing did, -1 when the compositor is gone.
+pub fn toplevels_dispatch(t: Toplevels) -> Int {
+    if t.handle == 0 { return 0 - 1 }
+    return nori_win_tl_dispatch(t.handle)
+}
+
+/// the toplevels, oldest first
+pub fn toplevels_list(t: Toplevels) -> Vec<Toplevel> {
+    var out: Vec<Toplevel> = vec()
+    if t.handle == 0 { return out }
+    let n = nori_win_tl_count(t.handle)
+    var i = 0
+    while i < n {
+        let st = nori_win_tl_state(t.handle, i)
+        out.push(Toplevel {
+            id: nori_win_tl_uid(t.handle, i),
+            title: take_cstr(nori_win_tl_str(t.handle, i, 0)),
+            app_id: take_cstr(nori_win_tl_str(t.handle, i, 1)),
+            identifier: take_cstr(nori_win_tl_str(t.handle, i, 2)),
+            activated: (st & 4) != 0, minimized: (st & 2) != 0, maximized: (st & 1) != 0, fullscreen: (st & 8) != 0
+        })
+        i = i + 1
+    }
+    return out
+}
+
+/// Ask the compositor to activate (focus and raise) toplevel `id`, unminimizing it if need be. False
+/// when it is gone, or the compositor only lists toplevels. A request: the toplevel's `activated` state
+/// says what the compositor did.
+pub fn toplevel_activate(t: Toplevels, id: Int) -> Bool { return tl_act(t, id, 1) }
+/// ask toplevel `id` to close (as its close button would: the program may ask first)
+pub fn toplevel_close(t: Toplevels, id: Int) -> Bool { return tl_act(t, id, 2) }
+/// minimize toplevel `id`, or bring it back
+pub fn toplevel_set_minimized(t: Toplevels, id: Int, on: Bool) -> Bool {
+    if on { return tl_act(t, id, 3) }
+    return tl_act(t, id, 4)
+}
+/// maximize toplevel `id`, or restore it
+pub fn toplevel_set_maximized(t: Toplevels, id: Int, on: Bool) -> Bool {
+    if on { return tl_act(t, id, 5) }
+    return tl_act(t, id, 6)
+}
+
+fn tl_act(t: Toplevels, id: Int, act: Int) -> Bool {
+    if t.handle == 0 { return false }
+    return nori_win_tl_act(t.handle, id, act) == 1
+}
+
+// ---- the workspaces -------------------------------------------------------------------------------------
+//
+// ext_workspace_v1, on the window list's connection: the compositor's workspaces with their names, their
+// coordinates and their state, kept up to date by `toplevels_dispatch` (which says 1 when they changed
+// too). The protocol does not say which workspace a toplevel is on; a compositor's own interface does.
+
+/// One workspace. `id` is this list's name for it, stable while it exists and never reused; `ident` is
+/// the compositor's own (ext_workspace_handle_v1.id, "" when it gives none); `coords` its position in
+/// its group's grid ("1" for Sway's workspace 1), "" when it has none.
+pub struct Workspace {
+    id: Int, name: Str, ident: Str, coords: Str,
+    active: Bool, urgent: Bool, hidden: Bool, can_activate: Bool
+}
+
+/// does the compositor offer workspaces (ext_workspace_v1)?
+pub fn workspaces_ok(t: Toplevels) -> Bool {
+    if t.handle == 0 { return false }
+    return (nori_win_tl_caps(t.handle) & 4) != 0
+}
+
+/// the workspaces, in the order the compositor announced them
+pub fn workspaces(t: Toplevels) -> Vec<Workspace> {
+    var out: Vec<Workspace> = vec()
+    if t.handle == 0 { return out }
+    let n = nori_win_ws_count(t.handle)
+    var i = 0
+    while i < n {
+        let st = nori_win_ws_state(t.handle, i)
+        out.push(Workspace {
+            id: nori_win_ws_uid(t.handle, i),
+            name: take_cstr(nori_win_ws_str(t.handle, i, 0)),
+            ident: take_cstr(nori_win_ws_str(t.handle, i, 1)),
+            coords: take_cstr(nori_win_ws_str(t.handle, i, 2)),
+            active: (st & 1) != 0, urgent: (st & 2) != 0, hidden: (st & 4) != 0, can_activate: ((st >> 8) & 1) != 0
+        })
+        i = i + 1
+    }
+    return out
+}
+
+/// Ask the compositor to switch to workspace `id` (activate it, and commit). False when it is gone or
+/// there are no workspaces. A request: the workspace's `active` says what the compositor did.
+pub fn workspace_activate(t: Toplevels, id: Int) -> Bool {
+    if t.handle == 0 { return false }
+    return nori_win_ws_act(t.handle, id, 1) == 1
+}
+
+/// disconnect and free
+pub fn toplevels_close(inout t: Toplevels) {
+    if t.handle != 0 { nori_win_tl_close(t.handle)  t.handle = 0 }
+}

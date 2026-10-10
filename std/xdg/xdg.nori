@@ -1,0 +1,704 @@
+//! std/xdg: freedesktop XDG base directories, `.desktop` desktop entries, the installed-app list and
+//! Exec field codes; the layer a desktop shell's launcher and dock sit on. Icon lookup (the Icon Theme
+//! Specification) lives in `icon.nori`, in the same module.
+//!
+//!   import "std/xdg" as xdg
+//!
+//! **XDG base directories** (Base Directory Specification): `data_home()`, `data_dirs()`,
+//! `config_home()`, `config_dirs()`, `cache_home()`, `runtime_dir()` honour `$XDG_*` with the spec's
+//! defaults (`~/.local/share`, `/usr/local/share:/usr/share`, `~/.config`, `/etc/xdg`, `~/.cache`,
+//! nothing for the runtime dir which has no default).
+//!
+//! **Desktop entries** (Desktop Entry Specification 1.5): `parse_desktop(text)` reads groups, keys,
+//! localized keys (`Name[hu]`), escapes (`\s \n \t \r \\`), `;`-separated lists and booleans.
+//! `entry_str(e, key, locale)` fetches a value through the spec's locale fallback
+//! (lang_COUNTRY@MODIFIER → lang_COUNTRY → lang@MODIFIER → lang → plain); `entry_list`/`entry_bool`
+//! apply the list and boolean rules; the `[Desktop Action X]` groups are reachable via
+//! `entry_str_in(e, "Desktop Action …", …)` / `entry_actions(e)`.
+//!
+//! **Applications** (Desktop Entry Specification's "Desktop File ID" + "Hidden"): `list_apps()` walks
+//! every `applications/` directory under the data dirs: earlier directories win, subdirectories become
+//! `-` in the id, and a `Hidden=true` entry removes an id. `shown_apps` applies NoDisplay and the
+//! OnlyShowIn/NotShowIn and TryExec rules for a real launcher.
+//!
+//! **MIME types and default applications** (Shared MIME-info Database, MIME Applications Associations):
+//! `mime.nori`: `mime_db_load`, `mime_guess(db, name, head)`, `mime_is_a`, `mime_icon_names`, `mime_comment`,
+//! `mimeapps_load`, `apps_for_mime`, `default_app_for_mime`, `mimeapps_set_default`.
+//!
+//! **Exec field codes** (`%f %F %u %U %i %c %k %%`): `expand_exec(exec, name, icon, file_path, files,
+//! urls)` splits the Exec value with the spec's quoting (double-quoted arguments, `""` `` `` `` `$$`
+//! escapes) and expands the field codes into an argv; `app_argv(a, locale, files, urls)` does it for an
+//! App.
+import "std/os" as os
+import "std/strutil" as su
+
+extern fn access(Int, Int) -> I32          // POSIX: int access(const char* path, int mode)
+extern fn free(Int)                        // POSIX: void free(void*)
+
+// ---- XDG base directories (Base Directory Specification, version 0.8) -------------------------
+
+// "If $XDG_DATA_HOME is either not set or empty, a default equal to $HOME/.local/share should be
+// used." (§2). The spec also requires every path set in these variables to be absolute, so a relative
+// value is treated as unset rather than believed.
+
+/// $XDG_DATA_HOME, or `$HOME/.local/share` when unset/empty/relative.
+/// (Base Directory Spec §2: "If $XDG_DATA_HOME is either not set or empty, a default equal to
+/// $HOME/.local/share should be used.")
+pub fn data_home() -> Str {
+    let v = os::env("XDG_DATA_HOME")
+    if v.len() > 0 { if ord(v.at(0)) == 47 { return v } }
+    return (os::home_dir() + "/.local/share")
+}
+
+/// $XDG_DATA_DIRS split on ':' (relative entries ignored), or [`/usr/local/share`, `/usr/share`].
+/// (Base Directory Spec §2: "If $XDG_DATA_DIRS is either not set or empty, a value equal to
+/// /usr/local/share/:/usr/share/ should be used.")
+pub fn data_dirs() -> Vec<Str> {
+    let v = os::env("XDG_DATA_DIRS")
+    if v.len() > 0 { return d_abs_colon(v) }
+    var out: Vec<Str> = vec()
+    out.push("/usr/local/share")
+    out.push("/usr/share")
+    return out
+}
+
+/// $XDG_CONFIG_HOME, or `$HOME/.config` when unset/empty/relative.
+/// (Base Directory Spec §3: "If $XDG_CONFIG_HOME is either not set or empty, a default equal to
+/// $HOME/.config should be used.")
+pub fn config_home() -> Str {
+    let v = os::env("XDG_CONFIG_HOME")
+    if v.len() > 0 { if ord(v.at(0)) == 47 { return v } }
+    return (os::home_dir() + "/.config")
+}
+
+/// $XDG_CONFIG_DIRS split on ':' (relative entries ignored), or [`/etc/xdg`].
+/// (Base Directory Spec §3: "If $XDG_CONFIG_DIRS is either not set or empty, a value equal to
+/// /etc/xdg should be used.")
+pub fn config_dirs() -> Vec<Str> {
+    let v = os::env("XDG_CONFIG_DIRS")
+    if v.len() > 0 { return d_abs_colon(v) }
+    var out: Vec<Str> = vec()
+    out.push("/etc/xdg")
+    return out
+}
+
+/// $XDG_CACHE_HOME, or `$HOME/.cache` when unset/empty/relative.
+/// (Base Directory Spec §4: "If $XDG_CACHE_HOME is either not set or empty, a default equal to
+/// $HOME/.cache should be used.")
+pub fn cache_home() -> Str {
+    let v = os::env("XDG_CACHE_HOME")
+    if v.len() > 0 { if ord(v.at(0)) == 47 { return v } }
+    return (os::home_dir() + "/.cache")
+}
+
+/// $XDG_RUNTIME_DIR, or "" when unset.
+/// (Base Directory Spec §6: "If $XDG_RUNTIME_DIR is not set, the program should fall back to a
+/// place ... with a warning"; returning "" is our fallback.)
+pub fn runtime_dir() -> Str { return os::env("XDG_RUNTIME_DIR") }
+
+/// the data search path in priority order: data_home() first, then each data_dirs() entry.
+/// (Base Directory Spec §2: "There is a single base directory $XDG_DATA_HOME ... and a set of
+/// preference-ordered base directories relative to which data files should be searched.")
+pub fn data_search_paths() -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    out.push(data_home())
+    let ds = data_dirs()
+    var i = 0
+    while i < ds.len() { out.push(copy ds[i])  i = i + 1 }
+    return out
+}
+
+/// split a ':'-separated directory list on ':' keeping only absolute entries (the spec demands
+/// absolute paths; relative ones are ignored).
+fn d_abs_colon(v: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let parts = su::split(v, ":")
+    var i = 0
+    while i < parts.len() {
+        let p = parts[i]
+        if p.len() > 0 { if ord(p.at(0)) == 47 { out.push(copy p) } }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- desktop entry parsing (Desktop Entry Specification 1.5) -----------------------------------
+
+/// one key of a desktop entry: `key` is the name without a locale suffix; `locale` is the `[hu_HU]`
+/// suffix ("" for a plain key); `value` has the `\s \n \t \r \\` escapes already applied.
+pub struct DescKey { key: Str, locale: Str, value: Str }
+
+/// one `[Group]` of a desktop entry, with its keys in file order.
+pub struct DescGroup { name: Str, keys: Vec<DescKey> }
+
+/// a parsed desktop entry file: its groups in file order.
+pub struct DesktopEntry { groups: Vec<DescGroup> }
+
+/// parse the text of a `.desktop` file (UTF-8). Keys before the first `[Group]` header are dropped
+/// (the spec: "The first section of every desktop file is the 'Desktop Entry' section"; a file with
+/// no group describes nothing), as are comment lines ("Lines starting with a '#' are comments,
+/// and are ignored") and malformed `key=value` lines without an '='.
+pub fn parse_desktop(text: Str) -> DesktopEntry {
+    var groups: Vec<DescGroup> = vec()
+    var gi = 0 - 1
+    var start = 0
+    var i = 0
+    let n = text.len()
+    while i <= n {
+        if i == n || ord(text.at(i)) == 10 {                      // '\n' ends a line
+            var line = text.slice(start, i)
+            if line.len() > 0 { if ord(line.at(line.len() - 1)) == 13 { line = line.slice(0, line.len() - 1) } }   // strip \r (CRLF)
+            let t = su::trim(line)
+            if !(t == "") {
+                let c0 = ord(t.at(0))
+                if c0 == 35 {                                     // '#': comment
+                } else if c0 == 91 {                              // '[': a group header
+                    let cb = d_idx(t, 93)                         // ']'
+                    if cb > 0 {
+                        let gname = su::trim(t.slice(1, cb))
+                        var g = DescGroup { name: gname, keys: vec() }
+                        groups.push(g)
+                        gi = groups.len() - 1
+                    }
+                } else if gi >= 0 {
+                    let eq = d_idx(t, 61)                         // '='
+                    if eq > 0 {
+                        let kt = su::trim(t.slice(0, eq))
+                        if kt.len() > 0 {
+                            // the key may carry a locale suffix: "Name[hu_HU]". The value's
+                            // surrounding whitespace is ignored ("Whitespace before/after ... is
+                            // ignored": the value field proper starts at the first non-space).
+                            let kv = d_parse_keyname(kt)
+                            let raw = su::trim(t.slice(eq + 1, t.len()))
+                            var dk = DescKey { key: copy kv[0], locale: copy kv[1], value: d_unescape(raw) }
+                            groups[gi].keys.push(dk)
+                        }
+                    }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return DesktopEntry { groups: groups }
+}
+
+/// index of byte `ch` in `s`, or -1.
+fn d_idx(s: Str, ch: Int) -> Int {
+    var i = 0
+    while i < s.len() { if ord(s.at(i)) == ch { return i }  i = i + 1 }
+    return 0 - 1
+}
+
+/// split `kt` (e.g. "Name[hu]") into the base key and the locale suffix ("" when absent).
+fn d_parse_keyname(kt: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var i = 0
+    let n = kt.len()
+    while i < n {
+        if ord(kt.at(i)) == 91 {                                 // '['
+            var j = i + 1
+            while j < n { if ord(kt.at(j)) == 93 { break }  j = j + 1 }   // ']'
+            out.push(kt.slice(0, i))
+            if j >= n { out.push(kt.slice(i + 1, n)) } else { out.push(kt.slice(i + 1, j)) }
+            return out
+        }
+        i = i + 1
+    }
+    out.push(copy kt)
+    out.push("")
+    return out
+}
+
+// Desktop Entry Spec: "Certain characters can be represented using escape sequences... \s \n \t \r
+// \\", and (1.1) an escape sequence not in the list is treated as the character alone (the
+// backslash is discarded).
+fn d_unescape(s: Str) -> Str {
+    var out = ""
+    var i = 0
+    let n = s.len()
+    while i < n {
+        let c = ord(s.at(i))
+        if c == 92 {                                              // '\\'
+            if i + 1 < n {
+                let e = ord(s.at(i + 1))
+                if e == 115 { out = (out + " ") }                 // \s -> space
+                else if e == 110 { out = (out + chr(10)) }        // \n -> newline
+                else if e == 116 { out = (out + chr(9)) }         // \t -> tab
+                else if e == 114 { out = (out + chr(13)) }        // \r -> carriage return
+                else if e == 92 { out = (out + "\\") }            // \\ -> backslash
+                else { out = (out + chr(e)) }                     // unknown: drop the backslash
+                i = i + 2
+            } else {
+                i = i + 1                                         // trailing backslash: dropped
+            }
+        } else { out = (out + chr(c))  i = i + 1 }
+    }
+    return out
+}
+
+// Desktop Entry Spec: the localized key lookup order for a requested locale e.g. "hu_HU" is
+// lang_COUNTRY@MODIFIER, lang_COUNTRY, lang@MODIFIER, lang, then the plain key ("If a key is not
+// found ... the default is used"). The C locale reads plain keys only.
+fn d_locale_fallbacks(locale: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var loc = locale
+    // strip a charset/encoding suffix: the spec's examples are "hu_HU", "fr"; real environments
+    // carry "hu_HU.UTF-8", whose .UTF-8 is not part of the lookup key.
+    let dot = d_idx(loc, 46)                                     // '.'
+    if dot > 0 { loc = loc.slice(0, dot) }
+    if (loc == "") || (loc == "C") || (loc == "POSIX") { out.push("")  return out }
+    var lang = ""
+    var country = ""
+    var modifier = ""
+    var base = loc
+    let at = d_idx(loc, 64)                                      // '@'
+    if at >= 0 {
+        modifier = loc.slice(at + 1, loc.len())
+        base = loc.slice(0, at)
+    }
+    let us = d_idx(base, 95)                                     // '_'
+    if us > 0 {
+        lang = base.slice(0, us)
+        country = base.slice(us + 1, base.len())
+    } else {
+        lang = copy base
+    }
+    if country.len() > 0 {
+        if modifier.len() > 0 { out.push((((lang + "_") + country) + "@") + modifier) }
+        out.push((lang + "_") + country)
+    }
+    if modifier.len() > 0 { out.push((lang + "@") + modifier) }
+    if lang.len() > 0 { out.push(copy lang) }
+    out.push("")
+    return out
+}
+
+fn d_group_idx(e: DesktopEntry, group: Str) -> Int {
+    var i = 0
+    while i < e.groups.len() {
+        if e.groups[i].name == group { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// does `group` contain `key` (with any locale)?
+pub fn entry_has_key_in(e: DesktopEntry, group: Str, key: Str) -> Bool {
+    let g = d_group_idx(e, group)
+    if g < 0 { return false }
+    var i = 0
+    while i < e.groups[g].keys.len() {
+        if e.groups[g].keys[i].key == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+/// does the `[Desktop Entry]` group contain `key` (with any locale)?
+pub fn entry_has_key(e: DesktopEntry, key: Str) -> Bool { return entry_has_key_in(e, "Desktop Entry", key) }
+
+/// the value of `key` in `group`, through the spec's locale fallback for `locale`
+/// (lang_COUNTRY@MODIFIER → lang_COUNTRY → lang@MODIFIER → lang → plain key), or "" if none exists.
+/// The locale "C" (or "POSIX") reads the plain key only.
+pub fn entry_str_in(e: DesktopEntry, group: Str, key: Str, locale: Str) -> Str {
+    let g = d_group_idx(e, group)
+    if g < 0 { return "" }
+    let cands = d_locale_fallbacks(locale)
+    var ci = 0
+    while ci < cands.len() {
+        let c = cands[ci]
+        var ki = 0
+        while ki < e.groups[g].keys.len() {
+            let k = e.groups[g].keys[ki]
+            if (k.key == key) && (k.locale == c) { return copy k.value }
+            ki = ki + 1
+        }
+        ci = ci + 1
+    }
+    return ""
+}
+
+/// the value of `key` in the `[Desktop Entry]` group, through the locale fallback (see entry_str_in).
+pub fn entry_str(e: DesktopEntry, key: Str, locale: Str) -> Str {
+    return entry_str_in(e, "Desktop Entry", key, locale)
+}
+
+/// a ';'-separated list value. (Desktop Entry Spec: "A list value is a string that contains one or
+/// more strings separated by semicolons ... entries must not contain semicolons"; a trailing
+/// separator is the canonical form and empty entries carry nothing for a launcher, so they are
+/// dropped.)
+fn d_split_list(v: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    if v.len() > 0 {
+        let parts = su::split(v, ";")
+        var i = 0
+        while i < parts.len() {
+            if parts[i].len() > 0 { out.push(copy parts[i]) }
+            i = i + 1
+        }
+    }
+    return out
+}
+
+/// `key` of `group` as a list ("" ignored; `;`-separated).
+pub fn entry_list_in(e: DesktopEntry, group: Str, key: Str) -> Vec<Str> {
+    return d_split_list(entry_str_in(e, group, key, ""))
+}
+
+/// `[Desktop Entry]` `key` as a list ("" ignored; `;`-separated).
+pub fn entry_list(e: DesktopEntry, key: Str) -> Vec<Str> { return entry_list_in(e, "Desktop Entry", key) }
+
+/// a localized list value: the fallback chain of entry_str_in, then split as a list.
+pub fn entry_list_locale_in(e: DesktopEntry, group: Str, key: Str, locale: Str) -> Vec<Str> {
+    return d_split_list(entry_str_in(e, group, key, locale))
+}
+
+/// a localized list value from the `[Desktop Entry]` group.
+pub fn entry_list_locale(e: DesktopEntry, key: Str, locale: Str) -> Vec<Str> {
+    return d_split_list(entry_str(e, key, locale))
+}
+
+/// `key` of `group` as a boolean. (Desktop Entry Spec: "Boolean values are ... 'true' or 'false'".
+/// Accepted case-insensitively; anything else is false.)
+pub fn entry_bool_in(e: DesktopEntry, group: Str, key: Str) -> Bool {
+    let v = su::to_lower(entry_str_in(e, group, key, ""))
+    return v == "true"
+}
+
+/// `[Desktop Entry]` `key` as a boolean (see entry_bool_in).
+pub fn entry_bool(e: DesktopEntry, key: Str) -> Bool { return entry_bool_in(e, "Desktop Entry", key) }
+
+/// every group name starting with "Desktop Action ": the `[Desktop Action X]` groups the spec
+/// defines for secondary actions ("the name of the action group ... must be prefixed by
+/// 'Desktop Action'").
+pub fn entry_actions(e: DesktopEntry) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var i = 0
+    while i < e.groups.len() {
+        let g = e.groups[i].name
+        if su::starts_with(g, "Desktop Action ") { out.push(copy g) }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- installed applications ----------------------------------------------------------------
+
+/// an installed application: its desktop file id, the file it was read from, and the full parse, so
+/// localized values and the Exec line stay available after listing.
+pub struct App { id: Str, path: Str, entry: DesktopEntry }
+
+/// every `.desktop` file under the `applications/` directory of each data dir, in data-dir priority
+/// order (earlier directories win, with a `Hidden=true` file removing an id even from an earlier
+/// directory). Desktop File IDs follow the spec: "The desktop file ID is the file name with the
+/// .desktop extension removed, relative to the applications directory, with '/' replaced by '-'".
+pub fn list_apps() -> Vec<App> {
+    let dirs = data_search_paths()
+    var all_files: Vec<Str> = vec()
+    var all_dirs: Vec<Str> = vec()                        // the applications/ dir each file lives in
+    var di = 0
+    while di < dirs.len() {
+        let ad = (dirs[di] + "/applications")
+        let files = d_app_files(ad)
+        var fi = 0
+        while fi < files.len() {
+            all_files.push(copy files[fi])
+            all_dirs.push(copy ad)
+            fi = fi + 1
+        }
+        di = di + 1
+    }
+    // "Hidden ... a value of true ... the file is ignored" and removes the id from the list.
+    var hidden_ids: Map<Str, Bool> = map()
+    var i = 0
+    while i < all_files.len() {
+        let e = parse_desktop(read_file(all_files[i]))
+        if entry_bool(e, "Hidden") { hidden_ids.put(d_app_id(all_dirs[i], all_files[i]), true) }
+        i = i + 1
+    }
+    var out: Vec<App> = vec()
+    var seen: Map<Str, Bool> = map()
+    i = 0
+    while i < all_files.len() {
+        let id = d_app_id(all_dirs[i], all_files[i])
+        var keep = true
+        if hidden_ids.has(id) { keep = false } else { if seen.has(id) { keep = false } }
+        if keep {
+            seen.put(id, true)
+            let e = parse_desktop(read_file(all_files[i]))
+            out.push(App { id: id, path: copy all_files[i], entry: e })
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// all files under `apps_dir` ending in ".desktop" (recursively; `os::list_tree` yields a sorted
+/// walk, so the order is deterministic).
+fn d_app_files(apps_dir: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let all = os::list_tree(apps_dir)
+    var i = 0
+    while i < all.len() {
+        let f = all[i]
+        if su::ends_with(f, ".desktop") { out.push(copy f) }
+        i = i + 1
+    }
+    return out
+}
+
+/// the desktop file id of `f` inside `apps_dir`: the relative path minus `.desktop`, '/' -> '-'
+/// (Desktop Entry Spec, "Desktop File ID": "...the path relative to the applications directory ...
+/// with the '.desktop' extension removed and each '/' replaced by '-'").
+fn d_app_id(apps_dir: Str, f: Str) -> Str {
+    var rel = f
+    let base = (apps_dir + "/")
+    if su::starts_with(f, base) { rel = f.slice(base.len(), f.len()) }
+    let noext = rel.slice(0, rel.len() - 8)               // ".desktop" is 8 bytes
+    return su::replace(noext, "/", "-")
+}
+
+/// the desktop file id.
+pub fn app_id(a: App) -> Str { return copy a.id }
+/// the path the app was read from.
+pub fn app_path(a: App) -> Str { return copy a.path }
+/// the parsed entry: for localized keys and the raw keys a launcher wants verbatim.
+pub fn app_entry(a: App) -> DesktopEntry { return copy a.entry }
+
+/// the `Name` (localized through `locale`).
+pub fn app_name(a: App, locale: Str) -> Str { return entry_str(a.entry, "Name", locale) }
+/// the `GenericName` (localized).
+pub fn app_generic_name(a: App, locale: Str) -> Str { return entry_str(a.entry, "GenericName", locale) }
+/// the `Comment` (localized).
+pub fn app_comment(a: App, locale: Str) -> Str { return entry_str(a.entry, "Comment", locale) }
+/// the `Icon` (a themed name or an absolute path; resolve it with icon_resolve / app_icon_path).
+pub fn app_icon(a: App, locale: Str) -> Str { return entry_str(a.entry, "Icon", locale) }
+/// the `Type` ("Application", "Link", ...). Only "Application" entries are launchable apps.
+pub fn app_type(a: App) -> Str { return entry_str(a.entry, "Type", "") }
+/// the `Exec` line.
+pub fn app_exec(a: App) -> Str { return entry_str(a.entry, "Exec", "") }
+/// the `TryExec` line ("the executable ... to check if the program is actually installed"; if it
+/// does not resolve, the entry "must be ignored").
+pub fn app_try_exec(a: App) -> Str { return entry_str(a.entry, "TryExec", "") }
+/// the `Path` key (the working directory to launch in).
+pub fn app_work_path(a: App) -> Str { return entry_str(a.entry, "Path", "") }
+/// the `Terminal` key ("Whether the program runs in a terminal window").
+pub fn app_terminal(a: App) -> Bool { return entry_bool(a.entry, "Terminal") }
+/// the `NoDisplay` key ("'true' if the application should not be shown in the menus").
+pub fn app_no_display(a: App) -> Bool { return entry_bool(a.entry, "NoDisplay") }
+/// the `Hidden` key (a hidden entry removes its id entirely: list_apps already drops it).
+pub fn app_hidden(a: App) -> Bool { return entry_bool(a.entry, "Hidden") }
+/// the `StartupWMClass` key (the WM class for startup tracking).
+pub fn app_startup_wm_class(a: App) -> Str { return entry_str(a.entry, "StartupWMClass", "") }
+/// the `OnlyShowIn` list ("the application should be shown only if there is a match with the
+/// current desktop environment").
+pub fn app_only_show_in(a: App) -> Vec<Str> { return entry_list(a.entry, "OnlyShowIn") }
+/// the `NotShowIn` list ("... should not be shown if there is a match with the current desktop
+/// environment").
+pub fn app_not_show_in(a: App) -> Vec<Str> { return entry_list(a.entry, "NotShowIn") }
+/// the `Categories` list.
+pub fn app_categories(a: App) -> Vec<Str> { return entry_list(a.entry, "Categories") }
+/// the `Keywords` list (localized).
+pub fn app_keywords(a: App, locale: Str) -> Vec<Str> { return entry_list_locale(a.entry, "Keywords", locale) }
+/// the `MimeType` list.
+pub fn app_mime_type(a: App) -> Vec<Str> { return entry_list(a.entry, "MimeType") }
+/// the `[Desktop Action X]` group names.
+pub fn app_actions(a: App) -> Vec<Str> { return entry_actions(a.entry) }
+
+/// the apps a launcher should actually show: list_apps() minus:
+///  · NoDisplay=true ("If NoDisplay is true ... this entry should be skipped when searching for an
+///    application to present to users"),
+///  · entries whose OnlyShowIn/NotShowIn rules exclude `current_desktops` (both keys "are the list
+///    of desktop environments"),
+///  · entries whose TryExec does not resolve ("If this key is present, the program ... must exist,
+///    else the entry must be ignored").
+/// `current_desktops` is the (colon-split) $XDG_CURRENT_DESKTOP; empty hides nothing on its own.
+pub fn shown_apps(apps: Vec<App>, current_desktops: Vec<Str>) -> Vec<App> {
+    var out: Vec<App> = vec()
+    var i = 0
+    while i < apps.len() {
+        let a = apps[i]
+        var ok = true
+        if app_no_display(a) { ok = false }
+        if ok {
+            let osp = app_only_show_in(a)
+            if osp.len() > 0 { if !d_de_in(osp, current_desktops) { ok = false } }
+        }
+        if ok {
+            let nsp = app_not_show_in(a)
+            if nsp.len() > 0 { if d_de_in(nsp, current_desktops) { ok = false } }
+        }
+        if ok {
+            let te = app_try_exec(a)
+            if te.len() > 0 { if !try_exec_ok(te) { ok = false } }
+        }
+        if ok { out.push(copy a) }
+        i = i + 1
+    }
+    return out
+}
+
+/// does any entry of `list` name one of the current desktops?
+fn d_de_in(list: Vec<Str>, current: Vec<Str>) -> Bool {
+    var i = 0
+    while i < list.len() {
+        var j = 0
+        while j < current.len() { if list[i] == current[j] { return true }  j = j + 1 }
+        i = i + 1
+    }
+    return false
+}
+
+/// does the TryExec value resolve? A value containing '/' is a path; otherwise it is searched on
+/// $PATH. (Desktop Entry Spec, "TryExec": "may be used to test whether this program is actually
+/// installed"; X_OK on the resolved path is our test.)
+pub fn try_exec_ok(try_exec: Str) -> Bool {
+    if try_exec.len() == 0 { return true }
+    if su::contains(try_exec, "/") { return d_access_ok(try_exec) }
+    let path = os::env("PATH")
+    var st = 0
+    var i = 0
+    let n = path.len()
+    while i <= n {
+        if i == n || ord(path.at(i)) == 58 {                  // ':'
+            let d = path.slice(st, i)
+            var p = copy try_exec
+            if d.len() > 0 {
+                if ord(d.at(d.len() - 1)) == 47 { p = d + try_exec } else { p = (d + "/") + try_exec }
+            }
+            if d_access_ok(p) { return true }
+            st = i + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// access(path, X_OK): can the file be executed? X_OK is 1.
+fn d_access_ok(p: Str) -> Bool {
+    let c = os::os_cstr(p)
+    var r = 0
+    unsafe { r = to_int(access(c, 1)) }
+    free(c)
+    return r == 0
+}
+
+// ---- Exec: field codes + the spec's quoting, producing an argv ---------------------------------
+
+// Desktop Entry Spec ("Exec key"): "Arguments may be quoted ... Quoting must be done by enclosing
+// the argument between double quotes and escaping the double quote character, back tick character
+// and dollar sign by preceding it with an additional double quote character.": i.e. `""` -> ", ``` `
+// ``` -> `, `$$` -> $; arguments are separated by unquoted whitespace, and a quoted string may be
+// part of a word. Field codes expand per the spec's list: %f/%u take the (first) file/URL and with
+// none supplied the whole token is removed; %F/%U splice every file/URL as its own argument; %i
+// becomes `--icon <icon>` (or nothing when the icon is empty); %c the (localized) name; %k the
+// desktop file's path; %% a literal '%'.
+
+/// the argv of an Exec value. `name` feeds %c, `icon` %i, `file_path` %k, `files` %f/%F and `urls`
+/// %u/%U. A word whose file/URL/icon field code has nothing to substitute is dropped.
+pub fn expand_exec(exec: Str, name: Str, icon: Str, file_path: Str, files: Vec<Str>, urls: Vec<Str>) -> Vec<Str> {
+    // pass 1: split into words, honouring double-quoted regions and the "" `` $$ escapes.
+    var words: Vec<Str> = vec()
+    var cur = ""
+    var inq = false
+    var i = 0
+    let n = exec.len()
+    while i < n {
+        let c = ord(exec.at(i))
+        if inq {
+            if c == 34 {                                      // '"'
+                if i + 1 < n && ord(exec.at(i + 1)) == 34 { cur = (cur + "\"")  i = i + 1 }   // "" -> "
+                else { inq = false }
+            } else if c == 96 {                                // '`'
+                if i + 1 < n && ord(exec.at(i + 1)) == 96 { cur = (cur + "`")  i = i + 1 }    // `` -> `
+                else { cur = (cur + chr(96)) }
+            } else if c == 36 {                                // '$'
+                if i + 1 < n && ord(exec.at(i + 1)) == 36 { cur = (cur + "$")  i = i + 1 }    // $$ -> $
+                else { cur = (cur + "$") }
+            } else { cur = (cur + chr(c)) }
+        } else {
+            if c == 34 {
+                inq = true                                     // a quote opens mid-word too
+            } else if c == 32 || c == 9 {                      // space / tab separate arguments
+                if cur.len() > 0 { words.push(cur)  cur = "" }
+            } else { cur = (cur + chr(c)) }
+        }
+        i = i + 1
+    }
+    if cur.len() > 0 { words.push(cur) }
+    // pass 2: expand field codes word by word.
+    var out: Vec<Str> = vec()
+    var wi = 0
+    while wi < words.len() {
+        let ex = d_expand_word(words[wi], name, icon, file_path, files, urls)
+        var ei = 0
+        while ei < ex.len() { out.push(copy ex[ei])  ei = ei + 1 }
+        wi = wi + 1
+    }
+    return out
+}
+
+/// expand one word; returns 0..n argv entries (a word dropped by %f/%u/%i with nothing to
+/// substitute yields none).
+fn d_expand_word(w: Str, name: Str, icon: Str, file_path: Str, files: Vec<Str>, urls: Vec<Str>) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var buf = ""
+    var drop = false
+    var i = 0
+    let n = w.len()
+    while i < n {
+        let c = ord(w.at(i))
+        if c == 37 {                                          // '%'
+            if i + 1 >= n {
+                buf = (buf + "%")
+                i = i + 1
+            } else {
+                let d = ord(w.at(i + 1))
+                if d == 37 { buf = (buf + "%")  i = i + 2 }                            // %%
+                else if d == 102 {                                                      // %f
+                    if files.len() == 0 { drop = true  i = i + 2 } else { buf = (buf + files[0])  i = i + 2 }
+                }
+                else if d == 117 {                                                      // %u
+                    if urls.len() == 0 { drop = true  i = i + 2 } else { buf = (buf + urls[0])  i = i + 2 }
+                }
+                else if d == 70 {                                                       // %F
+                    if files.len() == 0 { drop = true  i = i + 2 } else {
+                        if buf.len() > 0 { out.push(copy buf)  buf = "" }
+                        var fi = 0
+                        while fi < files.len() { out.push(copy files[fi])  fi = fi + 1 }
+                        i = i + 2
+                    }
+                }
+                else if d == 85 {                                                       // %U
+                    if urls.len() == 0 { drop = true  i = i + 2 } else {
+                        if buf.len() > 0 { out.push(copy buf)  buf = "" }
+                        var ui = 0
+                        while ui < urls.len() { out.push(copy urls[ui])  ui = ui + 1 }
+                        i = i + 2
+                    }
+                }
+                else if d == 105 {                                                      // %i
+                    if icon.len() == 0 { drop = true  i = i + 2 } else {
+                        if buf.len() > 0 { out.push(copy buf)  buf = "" }
+                        out.push("--icon")
+                        out.push(copy icon)
+                        i = i + 2
+                    }
+                }
+                else if d == 99 { buf = (buf + name)  i = i + 2 }                       // %c
+                else if d == 107 { buf = (buf + file_path)  i = i + 2 }                 // %k
+                else { buf = (buf + "%")  buf = (buf + chr(d))  i = i + 2 }             // unrecognised: literal
+            }
+        } else { buf = (buf + chr(c))  i = i + 1 }
+    }
+    if drop { return out }
+    if buf.len() > 0 { out.push(buf) }
+    return out
+}
+
+/// the argv for launching `a`: its Exec expanded with %c = the localized Name, %i = the Icon key,
+/// %k = the desktop file path, and `files`/`urls` for %f %F %u %U.
+pub fn app_argv(a: App, locale: Str, files: Vec<Str>, urls: Vec<Str>) -> Vec<Str> {
+    return expand_exec(app_exec(a), app_name(a, locale), app_icon(a, locale), a.path, files, urls)
+}

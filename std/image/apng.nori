@@ -1,0 +1,154 @@
+// std/image: animated PNG, streamed (anim.nori's canvas). Written from the APNG specification (version 1.0,
+// wiki.mozilla.org/APNG_Specification), over the PNG decoder in image.nori:
+//
+//   acTL   num_frames, num_plays (0: for ever); before the first IDAT; a PNG without one is a still picture;
+//   fcTL   a frame: sequence number, width, height, x and y offsets (the region must lie inside the canvas, the
+//          IHDR's size), delay_num/delay_den seconds (a denominator of 0 means 100), dispose_op (0 none, 1 clear
+//          to transparent black, 2 put back the previous contents: on the first frame 2 is taken as 1) and
+//          blend_op (0 SOURCE: the region replaced, alpha too; 1 OVER: composited, straight alpha);
+//   fdAT   a frame's data: a sequence number, then what an IDAT holds (the zlib stream of filtered scanlines, at
+//          the IHDR's bit depth, colour type and palette); a frame's data is all its fdATs joined;
+//   the default image (IDAT) is the first frame when an fcTL comes before it, otherwise it is not shown;
+//   sequence numbers: fcTL and fdAT share one, from 0, in order, no gaps; out of order is an error.
+//
+// The canvas is cleared to transparent black at the start of each play (anim_rewind). A frame is inflated and
+// unfiltered when it is shown (png_pixels), laid onto the canvas, and its own pixels let go; no frame is kept.
+// Chunk CRCs are not checked on frames (the zlib stream's Adler-32 is): the still decoder checks them on the
+// critical chunks, and a frame is decoded thirty times a second.
+
+fn apng_open(inout a: Anim) {
+    var pos = 8
+    var have_actl = false
+    var actl_frames = 0
+    var fctls = 0
+    var first_fctl = 0 - 1
+    var seen_idat = false
+    var w = 0
+    var h = 0
+    var interlace = 0
+    while pos + 8 <= a.dn {
+        let clen = abe32(a, pos)
+        let t = abe32(a, pos + 4)
+        let d = pos + 8
+        if d + clen + 4 > a.dn || clen < 0 { pos = a.dn }
+        else {
+            if t == png_tag(73, 72, 68, 82) {                                  // IHDR
+                w = abe32(a, d)  h = abe32(a, d + 4)
+                a.pbd = ab(a, d + 8)  a.pct = ab(a, d + 9)  interlace = ab(a, d + 12)
+            } else if t == png_tag(80, 76, 84, 69) { a.plte = d  a.plten = clen / 3 }       // PLTE
+            else if t == png_tag(116, 82, 78, 83) { a.trns = d  a.trnsn = clen }             // tRNS
+            else if t == png_tag(97, 99, 84, 76) && clen >= 8 && !seen_idat {                 // acTL
+                have_actl = true
+                actl_frames = abe32(a, d)
+                a.loops = abe32(a, d + 4)
+            } else if t == png_tag(102, 99, 84, 76) && clen >= 26 {                         // fcTL
+                if first_fctl < 0 { first_fctl = pos  a.pdefault = !seen_idat }
+                fctls = fctls + 1
+            } else if t == png_tag(73, 68, 65, 84) { seen_idat = true }                       // IDAT
+            else if t == png_tag(73, 69, 78, 68) { pos = a.dn }                                // IEND
+            if pos < a.dn { pos = d + clen + 4 }
+        }
+    }
+    if !have_actl || fctls == 0 || actl_frames <= 0 { still_open(a)  return }
+    if interlace != 0 || (a.pbd != 8 && a.pbd != 16) || (a.pct == 3 && a.pbd != 8) {
+        // an animation this decoder cannot play: its default image, if the still decoder reads it
+        still_open(a)
+        if a.kind != 0 { a.err = "APNG: bit depth " + to_str(a.pbd) + (if interlace != 0 { ", interlaced" } else { "" }) + " — its default image shown" }
+        return
+    }
+    if !anim_canvas(a, w, h) { a.err = "APNG: " + a.err  return }
+    a.frames = fctls
+    if actl_frames < fctls { a.frames = actl_frames }
+    a.first = first_fctl
+    a.pos = first_fctl
+    a.kind = ANIM_PNG()
+}
+
+fn png_tag(c0: Int, c1: Int, c2: Int, c3: Int) -> Int { return c0 * 16777216 + c1 * 65536 + c2 * 256 + c3 }
+
+/// the frame whose fcTL is at a.pos: its data gathered (IDAT, or fdAT without their sequence numbers),
+/// decoded, laid onto the canvas
+fn apng_next(inout a: Anim) -> Bool {
+    let fc = a.pos + 8
+    if abe32(a, a.pos + 4) != png_tag(102, 99, 84, 76) { a.err = "APNG: no fcTL for frame " + to_str(a.index)  return false }
+    let seq0 = abe32(a, fc)
+    let fw = abe32(a, fc + 4)
+    let fh = abe32(a, fc + 8)
+    let fx = abe32(a, fc + 12)
+    let fy = abe32(a, fc + 16)
+    let dnum = abe16(a, fc + 20)
+    var dden = abe16(a, fc + 22)
+    var dop = ab(a, fc + 24)
+    let bop = ab(a, fc + 25)
+    if fw <= 0 || fh <= 0 || fx < 0 || fy < 0 || fx + fw > a.w || fy + fh > a.h { a.err = "APNG: frame " + to_str(a.index) + " lies outside the canvas"  return false }
+    if dop > 2 || bop > 1 { a.err = "APNG: frame " + to_str(a.index) + ": dispose " + to_str(dop) + ", blend " + to_str(bop)  return false }
+    if a.index == 0 && dop == 2 { dop = 1 }
+    if a.index == 0 && a.pdefault && (fw != a.w || fh != a.h || fx != 0 || fy != 0) { a.err = "APNG: the default image's fcTL is not the whole canvas"  return false }
+    // the frame's data: the chunks after its fcTL up to the next fcTL (or IEND)
+    var pos = a.pos + 8 + abe32(a, a.pos) + 4
+    var total = 0
+    var next = 0 - 1
+    var seq = seq0 + 1
+    var scan = pos
+    var bad_seq = false
+    while scan + 8 <= a.dn && next < 0 {
+        let clen = abe32(a, scan)
+        let t = abe32(a, scan + 4)
+        if scan + 8 + clen + 4 > a.dn { next = a.dn }
+        else if t == png_tag(102, 99, 84, 76) || t == png_tag(73, 69, 78, 68) { next = scan }
+        else {
+            if t == png_tag(73, 68, 65, 84) && a.index == 0 && a.pdefault { total = total + clen }
+            if t == png_tag(102, 100, 65, 84) && clen >= 4 && !(a.index == 0 && a.pdefault) {
+                if abe32(a, scan + 8) != seq { bad_seq = true }
+                seq = seq + 1
+                total = total + clen - 4
+            }
+            scan = scan + 8 + clen + 4
+        }
+    }
+    if next < 0 { next = a.dn }
+    if bad_seq { a.err = "APNG: frame " + to_str(a.index) + "'s chunks are out of sequence"  return false }
+    if total == 0 { a.err = "APNG: frame " + to_str(a.index) + " has no data"  return false }
+    var buf = 0
+    unsafe { buf = malloc(total) }
+    if buf == 0 { a.err = "APNG: no memory"  return false }
+    var off = 0
+    scan = pos
+    while scan < next {
+        let clen = abe32(a, scan)
+        let t = abe32(a, scan + 4)
+        unsafe {
+            if t == png_tag(73, 68, 65, 84) && a.index == 0 && a.pdefault { memcpy(buf + off, a.dp + scan + 8, clen)  off = off + clen }
+            if t == png_tag(102, 100, 65, 84) && clen >= 4 && !(a.index == 0 && a.pdefault) { memcpy(buf + off, a.dp + scan + 12, clen - 4)  off = off + clen - 4 }
+        }
+        scan = scan + 8 + clen + 4
+    }
+    var cstr = ""
+    unsafe { cstr = str_from_buf(buf, total)  free(buf) }
+    var fr = png_pixels(cstr, fw, fh, a.pct, a.pbd, a.data, a.plte, a.trns, a.trnsn)
+    if !ok(fr) { a.err = "APNG: frame " + to_str(a.index) + "'s image data does not decode"  return false }
+    anim_dispose(a)
+    if dop == 2 { if !anim_save(a) { dispose(fr)  return false } }
+    var y = 0
+    while y < fh {
+        let dst = a.canvas + ((fy + y) * a.w + fx) * 4
+        let src = fr.px + y * fw * 4
+        if bop == 0 { unsafe { memcpy(dst, src, fw * 4) } }
+        else {
+            var x = 0
+            while x < fw {
+                var r = 0  var g = 0  var b = 0  var al = 0
+                unsafe { r = peek8(src + x * 4)  g = peek8(src + x * 4 + 1)  b = peek8(src + x * 4 + 2)  al = peek8(src + x * 4 + 3) }
+                blend_over(dst + x * 4, r, g, b, al)
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+    dispose(fr)
+    if dop == 1 { anim_after(a, 1, fx, fy, fw, fh) } else if dop == 2 { anim_after(a, 2, fx, fy, fw, fh) } else { a.disp = 0 }
+    if dden == 0 { dden = 100 }
+    a.delay = (dnum * 1000 + dden / 2) / dden
+    a.pos = next
+    return true
+}

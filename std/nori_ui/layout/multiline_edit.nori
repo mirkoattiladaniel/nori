@@ -1,0 +1,891 @@
+use core::*
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// layout/multiline_edit: the multiline text / code editor core
+// (core subset).
+//
+// One MultilineEditState per editor field (the host maps ids to states; an
+// id-keyed global map, IME preedit, clipboard actions, config caching and the
+// syntax-cache plumbing are host-domain). Offsets are byte indices (ASCII
+// model). Selection is [min(anchor,caret),
+// max(anchor,caret)); editing ops respect read_only, push an undo snapshot,
+// and clear the redo stack. Painting is virtualized over the visible lines.
+// ===========================================================================
+
+/// one find match: [start, end) in character offsets.
+pub struct FindMatch { found: Bool, start: Int, fend: Int }
+pub fn find_none() -> FindMatch { return FindMatch { found: false, start: 0, fend: 0 } }
+
+/// the per-field editor state.
+pub struct MultilineEditState {
+    text: Str,
+    caret: Int,
+    sel_anchor: Int,
+    scroll_x: Float,
+    scroll_y: Float,
+    tab_size: Int,
+    word_wrap: Bool,
+    read_only: Bool,
+    dirty: Bool,
+    // the paragraph direction of every line (dir_ltr / dir_rtl / dir_auto, the default: each line
+    // its first strong character's), which way the arrow keys move through it (text_edit.nori)
+    dir: Int = 2,
+    // ---- the history, as a tree ----
+    //
+    // A stack throws away the branch you undid the moment you type: undo three times, type one
+    // character, and the three edits you undid are gone for good. That is tolerable in a text box
+    // and wrong in an editor something else also writes into: undoing what a tool did means undoing
+    // everything you did after it, so the two fight over one line of history.
+    //
+    // A tree keeps both. An edit made while not at the newest state becomes a sibling of what was
+    // there, and nothing is discarded. It costs no more storage than a stack of
+    // whole-text snapshots would.
+    //
+    // `hist[hcur]` is the committed text; `text` may be ahead of it mid-edit and is folded in by
+    // `me_hist_sync` at the next snapshot, undo or redo. One hook, so an editing op that knows
+    // nothing about history still lands in it.
+    hist: Vec<Str>,       // the text at each node
+    hparent: Vec<Int>,    // its parent; -1 for a root, and for a node whose parent has been pruned
+    hlabel: Vec<Str>,     // what made it: "edit", or whatever a caller named it
+    hlast: Vec<Int>,      // the child last come down from, which way `redo` goes; -1 for none
+    hdead: Vec<Bool>,     // pruned: its text is gone and it is not a place you can return to
+    hcur: Int
+}
+
+/// how much history one buffer keeps, in bytes of stored text.
+///
+/// A node is a whole copy of the text, so the size of the history is the size of the file times
+/// the number of edits. A count would give a 1 KB file a thousand states and a 1 MB file the same
+/// thousand, which is four hundred megabytes for one buffer. A byte budget gives each file as many
+/// states as it can afford.
+pub fn me_hist_cap_bytes() -> Int { return 8 * 1024 * 1024 }
+
+pub fn multiline_edit_new(text: Str) -> MultilineEditState {
+    var h: Vec<Str> = vec()
+    var hp: Vec<Int> = vec()
+    var hl: Vec<Str> = vec()
+    var hn: Vec<Int> = vec()
+    var hd: Vec<Bool> = vec()
+    h.push(copy text)  hp.push(0 - 1)  hl.push("open")  hn.push(0 - 1)  hd.push(false)
+    return MultilineEditState { text: copy text, caret: 0, sel_anchor: 0, scroll_x: 0.0, scroll_y: 0.0, tab_size: 4, word_wrap: false, read_only: false, dirty: false, hist: h, hparent: hp, hlabel: hl, hlast: hn, hdead: hd, hcur: 0 }
+}
+
+// ---- the history tree ---------------------------------------------------------------------------
+
+/// fold whatever the text has become into a node of its own. A no-op when nothing has changed.
+///
+/// The one hook. Every editing op already calls `me_snapshot` before it mutates; this runs there and
+/// at both navigators, so a new op needs to know nothing about history to be recorded by it.
+fn me_hist_sync(inout state: MultilineEditState) {
+    if state.hist.len() == 0 {
+        state.hist.push(copy state.text)  state.hparent.push(0 - 1)  state.hlabel.push("open")
+        state.hlast.push(0 - 1)  state.hdead.push(false)  state.hcur = 0
+        return
+    }
+    if state.hist[state.hcur] == state.text { return }
+    state.hist.push(copy state.text)
+    state.hparent.push(state.hcur)
+    state.hlabel.push("edit")
+    state.hlast.push(0 - 1)
+    state.hdead.push(false)
+    let n = state.hist.len() - 1
+    state.hlast[state.hcur] = n
+    state.hcur = n
+    me_hist_prune(state)
+}
+
+/// keep the tree under the cap by forgetting its oldest states.
+///
+/// Pruned rather than removed: an index is a node's identity (a chat turn remembers one so it can
+/// bring a buffer back to it), so nothing is ever renumbered. A pruned node loses its text and its
+/// children become roots, which is history forgetting its beginning rather than its middle.
+fn me_hist_prune(inout state: MultilineEditState) {
+    var held = 0
+    var i = 0
+    while i < state.hist.len() { held = held + state.hist[i].len()  i = i + 1 }
+    let cap = me_hist_cap_bytes()
+    if held <= cap { return }
+    // Oldest first, and never the one the buffer is at. Dropping from the front is history
+    // forgetting its beginning, which is the end nobody reaches for.
+    var k = 0
+    while held > cap && k < state.hist.len() {
+        if !state.hdead[k] && !(k == state.hcur) {
+            held = held - state.hist[k].len()
+            state.hdead[k] = true
+            state.hist[k] = ""
+            var c = 0
+            while c < state.hparent.len() { if state.hparent[c] == k { state.hparent[c] = 0 - 1 }  c = c + 1 }
+            state.hlast[k] = 0 - 1
+        }
+        k = k + 1
+    }
+}
+
+/// how many nodes the tree has, pruned ones included (they keep their numbers).
+pub fn me_hist_count(state: MultilineEditState) -> Int { return state.hist.len() }
+/// which node the buffer is at.
+pub fn me_hist_cur(state: MultilineEditState) -> Int { return state.hcur }
+/// node `i`'s parent, or -1 when it is a root or its parent was pruned.
+pub fn me_hist_parent(state: MultilineEditState, i: Int) -> Int {
+    if i < 0 || i >= state.hparent.len() { return 0 - 1 }
+    return state.hparent[i]
+}
+/// what made node `i`.
+pub fn me_hist_label(state: MultilineEditState, i: Int) -> Str {
+    if i < 0 || i >= state.hlabel.len() { return "" }
+    return copy state.hlabel[i]
+}
+/// name the node the buffer is at ("chat: turn 7", say) so a history can be read.
+pub fn me_hist_name(inout state: MultilineEditState, label: Str) {
+    me_hist_sync(state)
+    if state.hcur >= 0 && state.hcur < state.hlabel.len() { state.hlabel[state.hcur] = copy label }
+}
+/// the text at node `i`, or "" when it has been pruned.
+pub fn me_hist_text(state: MultilineEditState, i: Int) -> Str {
+    if i < 0 || i >= state.hist.len() { return "" }
+    return copy state.hist[i]
+}
+/// does node `i` still have its text?
+pub fn me_hist_live(state: MultilineEditState, i: Int) -> Bool {
+    if i < 0 || i >= state.hdead.len() { return false }
+    return !state.hdead[i]
+}
+/// every child of node `i`, oldest first. A node with two is a fork: one branch you went back on and
+/// one you took instead, and both are still there.
+pub fn me_hist_children(state: MultilineEditState, i: Int) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    var c = 0
+    while c < state.hparent.len() { if state.hparent[c] == i { out.push(c) }  c = c + 1 }
+    return out
+}
+
+/// put the buffer at node `i`. False when there is no such node, or its text has been pruned.
+///
+/// This is what a rewind is: one buffer, one node. Everything else (undo, redo, reverting what a
+/// tool wrote) is this with the node worked out differently.
+pub fn me_goto(inout state: MultilineEditState, i: Int) -> Bool {
+    if i < 0 || i >= state.hist.len() { return false }
+    if state.hdead[i] { return false }
+    me_hist_sync(state)
+    if i == state.hcur { return true }
+    // remember the way down, so a redo from the parent comes back here
+    let p = state.hparent[i]
+    if p >= 0 { state.hlast[p] = i }
+    state.hcur = i
+    state.text = copy state.hist[i]
+    state.dirty = true
+    me_clamp_caret(state)
+    return true
+}
+
+// ---- position helpers (byte-indexed) ----
+/// (line, col) of offset `idx`.
+pub fn me_line_col_at(text: Str, idx: Int) -> (Int, Int) {
+    var line = 0
+    var col = 0
+    var i = 0
+    var n = text.len()
+    while i < n && i < idx {
+        if ord(text.at(i)) == 10 { line = line + 1  col = 0 } else { col = col + 1 }
+        i = i + 1
+    }
+    return (line, col)
+}
+/// the offset where `line` starts (text length when past the last line).
+pub fn me_line_start(text: Str, line: Int) -> Int {
+    var current = 0
+    var i = 0
+    var n = text.len()
+    while i < n {
+        if current == line { return i }
+        if ord(text.at(i)) == 10 { current = current + 1 }
+        i = i + 1
+    }
+    if current == line { return n }
+    return n
+}
+/// the offset just past the last char of the line containing `idx` (before its newline).
+pub fn me_line_end_index(text: Str, idx: Int) -> Int {
+    let (line, _c0) = me_line_col_at(text, idx)
+    var i = me_line_start(text, line)
+    var n = text.len()
+    while i < n { if ord(text.at(i)) == 10 { return i }  i = i + 1 }
+    return n
+}
+/// the offset where the line containing `idx` starts.
+pub fn me_line_start_index(text: Str, idx: Int) -> Int {
+    let (line, _c0) = me_line_col_at(text, idx)
+    return me_line_start(text, line)
+}
+/// total line count (a trailing newline still counts its empty last line).
+pub fn me_line_count(text: Str) -> Int {
+    var lines = 1
+    var i = 0
+    var n = text.len()
+    while i < n { if ord(text.at(i)) == 10 { lines = lines + 1 }  i = i + 1 }
+    return lines
+}
+/// the caret moved to the adjacent line (delta -1 up / +1 down), clamped, keeping the column.
+pub fn me_caret_adjacent_line(text: Str, idx: Int, delta: Int) -> Int {
+    let (line, col) = me_line_col_at(text, idx)
+    var target = line + delta
+    if target < 0 { target = 0 }
+    // No upper clamp: past the last line, me_line_start returns the text length, so Down on the
+    // last line snaps the caret to end-of-document.
+    var ts = me_line_start(text, target)
+    var te = me_line_end_index(text, ts)
+    var tl = te - ts
+    var c = col
+    if c > tl { c = tl }
+    // the same byte column can fall inside a character, or inside a cluster, on the other line
+    return text_snap_cluster(text, ts + c)
+}
+// a byte of a word: ASCII letters, digits and `_`, and any byte of a non-ASCII character. A word in
+// Greek, Arabic or Devanagari is a word too, and counting every byte of one keeps a word boundary
+// from ever falling inside a character
+fn me_is_word_byte(c: Int) -> Bool {
+    if c >= 128 { return true }
+    if c >= 48 && c <= 57 { return true }
+    if c >= 65 && c <= 90 { return true }
+    if c >= 97 && c <= 122 { return true }
+    return c == 95
+}
+/// the [start, end) of the word around `idx` (empty range on a non-word char).
+pub fn me_word_bounds(text: Str, idx: Int) -> (Int, Int) {
+    var n = text.len()
+    var i = idx
+    if i > n { i = n }
+    var start = i
+    while start > 0 && me_is_word_byte(ord(text.at(start - 1))) { start = start - 1 }
+    var wend = i
+    while wend < n && me_is_word_byte(ord(text.at(wend))) { wend = wend + 1 }
+    return (start, wend)
+}
+
+// ---- selection ----
+/// the ordered selection range [start, end); start == end when nothing is selected.
+pub fn me_selection(state: MultilineEditState) -> (Int, Int) {
+    if state.sel_anchor < state.caret { return (state.sel_anchor, state.caret) }
+    return (state.caret, state.sel_anchor)
+}
+/// the selected text ("" when the selection is empty).
+pub fn me_selected_text(state: MultilineEditState) -> Str {
+    let (s, e) = me_selection(state)
+    return state.text.slice(s, e)
+}
+/// select everything (caret at the end).
+pub fn me_select_all(inout state: MultilineEditState) {
+    state.sel_anchor = 0
+    state.caret = state.text.len()
+}
+/// select the word at the caret.
+pub fn me_select_word(inout state: MultilineEditState) {
+    let (ws, we) = me_word_bounds(state.text, state.caret)
+    state.sel_anchor = ws
+    state.caret = we
+}
+
+// ---- editing (read_only-guarded; snapshots to undo; clears redo) ----
+fn me_snapshot(inout state: MultilineEditState) {
+    me_hist_sync(state)
+    state.dirty = true
+}
+fn me_clamp_caret(inout state: MultilineEditState) {
+    var n = state.text.len()
+    if state.caret > n { state.caret = n }
+    if state.caret < 0 { state.caret = 0 }
+    if state.sel_anchor > n { state.sel_anchor = n }
+    if state.sel_anchor < 0 { state.sel_anchor = 0 }
+}
+/// insert `s` at the caret, replacing the selection; caret lands after the insertion.
+pub fn me_insert(inout state: MultilineEditState, s: Str) {
+    if state.read_only { return }
+    me_snapshot(state)
+    let (a, b) = me_selection(state)
+    state.text = (state.text.slice(0, a) + (s + state.text.slice(b, state.text.len())))
+    state.caret = a + s.len()
+    state.sel_anchor = state.caret
+}
+/// delete the selection, or the char before the caret.
+pub fn me_backspace(inout state: MultilineEditState) {
+    if state.read_only { return }
+    let (a, b) = me_selection(state)
+    if a != b {
+        me_snapshot(state)
+        state.text = (state.text.slice(0, a) + state.text.slice(b, state.text.len()))
+        state.caret = a
+        state.sel_anchor = state.caret
+        return
+    }
+    if state.caret == 0 { return }
+    me_snapshot(state)
+    // one code point, or one cluster when it is a single symbol (text_backspace_from)
+    let from = text_backspace_from(state.text, state.caret)
+    state.text = (state.text.slice(0, from) + state.text.slice(state.caret, state.text.len()))
+    state.caret = from
+    state.sel_anchor = state.caret
+}
+/// delete the selection, or the char after the caret.
+pub fn me_delete(inout state: MultilineEditState) {
+    if state.read_only { return }
+    let (a, b) = me_selection(state)
+    if a != b {
+        me_snapshot(state)
+        state.text = (state.text.slice(0, a) + state.text.slice(b, state.text.len()))
+        state.caret = a
+        state.sel_anchor = state.caret
+        return
+    }
+    if state.caret >= state.text.len() { return }
+    me_snapshot(state)
+    // the whole cluster after the caret
+    let to = text_next_cluster(state.text, state.caret)
+    state.text = (state.text.slice(0, state.caret) + state.text.slice(to, state.text.len()))
+    state.sel_anchor = state.caret
+}
+/// insert a newline, auto-indenting with the current line's leading whitespace.
+pub fn me_insert_newline(inout state: MultilineEditState) {
+    if state.read_only { return }
+    var ls = me_line_start_index(state.text, state.caret)
+    var indent = ""
+    var i = ls
+    while i < state.caret {
+        var c = ord(state.text.at(i))
+        if c == 32 || c == 9 { indent = (indent + state.text.slice(i, i + 1)) } else { i = state.caret }
+        i = i + 1
+    }
+    me_insert(state, (("" + chr(10)) + indent))
+}
+/// insert spaces to the next tab stop (tab_size).
+pub fn me_insert_tab(inout state: MultilineEditState) {
+    if state.read_only { return }
+    let (_line, col) = me_line_col_at(state.text, state.caret)
+    var n = state.tab_size - (col % state.tab_size)
+    if n <= 0 { n = state.tab_size }
+    var pad = ""
+    var i = 0
+    while i < n { pad = (pad + " ")  i = i + 1 }
+    me_insert(state, pad)
+}
+/// replace the whole buffer (host seeding); resets caret/selection/undo.
+pub fn me_set_text(inout state: MultilineEditState, text: Str) {
+    state.text = copy text
+    state.caret = 0
+    state.sel_anchor = 0
+    var h: Vec<Str> = vec()
+    var hp: Vec<Int> = vec()
+    var hl: Vec<Str> = vec()
+    var hn: Vec<Int> = vec()
+    var hd: Vec<Bool> = vec()
+    h.push(copy text)  hp.push(0 - 1)  hl.push("open")  hn.push(0 - 1)  hd.push(false)
+    state.hist = h  state.hparent = hp  state.hlabel = hl  state.hlast = hn  state.hdead = hd
+    state.hcur = 0
+    state.dirty = false
+}
+/// undo the last edit (text snapshot; caret clamps).
+pub fn me_undo(inout state: MultilineEditState) {
+    me_hist_sync(state)
+    let p = state.hparent[state.hcur]
+    if p < 0 { return }
+    if state.hdead[p] { return }
+    state.hcur = p
+    state.text = copy state.hist[p]
+    me_clamp_caret(state)
+}
+/// redo the last undone edit, down the branch you last came up from.
+///
+/// The other branches are still there. Typing after an undo forks the history rather than
+/// deleting the redo stack: `hlast` points at the newer branch, and the older one stays reachable
+/// through `me_hist_children` and `me_goto`.
+pub fn me_redo(inout state: MultilineEditState) {
+    me_hist_sync(state)
+    let c = state.hlast[state.hcur]
+    if c < 0 { return }
+    if c >= state.hist.len() { return }
+    if state.hdead[c] { return }
+    state.hcur = c
+    state.text = copy state.hist[c]
+    me_clamp_caret(state)
+}
+
+// ---- caret movement (select=true keeps the anchor; false collapses) ----
+fn me_after_move(inout state: MultilineEditState, sel: Bool) { if !sel { state.sel_anchor = state.caret } }
+// Left and Right move on screen, one grapheme cluster at a time (text_move_visual): logical in a
+// line with nothing right-to-left in it, backwards through the string inside a run of Arabic.
+// Collapsing a selection goes to its left or right end on screen: in a right-to-left line that is the
+// selection's logical end for Left.
+fn me_line_rtl(state: MultilineEditState) -> Bool { return me_para_dir(state) == 1 }
+/// the direction every line of the box runs (dir_ltr or dir_rtl): `state.dir`, or for dir_auto the
+/// first strong character of the whole text (HTML's dir=auto on a text area), so one Arabic message
+/// is right-aligned and reordered as a whole, not line by line.
+pub fn me_para_dir(state: MultilineEditState) -> Int {
+    if state.dir == 0 || state.dir == 1 { return state.dir }
+    return text_para_dir(state.text, 2)
+}
+// does line [ls, le) need the bidi caret model? (a right-to-left box, or anything right-to-left in it)
+fn me_line_bidi(state: MultilineEditState, ls: Int, le: Int, pdir: Int) -> Bool {
+    if pdir == 1 { return true }
+    var i = ls
+    while i < le { if ord(state.text.at(i)) >= 214 { return true }  i = i + 1 }
+    return false
+}
+/// the caret geometry of line [ls, le) and the x its left edge is drawn at inside `content`: a
+/// right-to-left box puts each line flush right.
+fn me_line_tc(state: MultilineEditState, ls: Int, le: Int, content: Rect, style: TextMeasureStyle, pdir: Int, inout x0: Vec<Float>) -> TextCarets {
+    let tc = text_carets(state.text.slice(ls, le), style, pdir, false)
+    var x = content.min.x - state.scroll_x
+    if pdir == 1 { x = content.max.x - tc.width - state.scroll_x }
+    x0.push(x)
+    return tc
+}
+pub fn me_move_left(inout state: MultilineEditState, sel: Bool) {
+    if !sel && state.sel_anchor != state.caret {
+        let (a, b) = me_selection(state)
+        if me_line_rtl(state) { state.caret = b } else { state.caret = a }
+    }
+    else if state.caret > 0 || me_line_rtl(state) { state.caret = text_move_visual(state.text, state.caret, 0 - 1, me_para_dir(state)) }
+    me_after_move(state, sel)
+}
+pub fn me_move_right(inout state: MultilineEditState, sel: Bool) {
+    if !sel && state.sel_anchor != state.caret {
+        let (a, b) = me_selection(state)
+        if me_line_rtl(state) { state.caret = a } else { state.caret = b }
+    }
+    else if state.caret < state.text.len() || me_line_rtl(state) { state.caret = text_move_visual(state.text, state.caret, 1, me_para_dir(state)) }
+    me_after_move(state, sel)
+}
+pub fn me_move_up(inout state: MultilineEditState, sel: Bool) { state.caret = me_caret_adjacent_line(state.text, state.caret, 0 - 1)  me_after_move(state, sel) }
+pub fn me_move_down(inout state: MultilineEditState, sel: Bool) { state.caret = me_caret_adjacent_line(state.text, state.caret, 1)  me_after_move(state, sel) }
+pub fn me_move_home(inout state: MultilineEditState, sel: Bool) { state.caret = me_line_start_index(state.text, state.caret)  me_after_move(state, sel) }
+pub fn me_move_end(inout state: MultilineEditState, sel: Bool) { state.caret = me_line_end_index(state.text, state.caret)  me_after_move(state, sel) }
+pub fn me_move_word_left(inout state: MultilineEditState, sel: Bool) {
+    var i = state.caret
+    while i > 0 && !me_is_word_byte(ord(state.text.at(i - 1))) { i = i - 1 }
+    while i > 0 && me_is_word_byte(ord(state.text.at(i - 1))) { i = i - 1 }
+    state.caret = i
+    me_after_move(state, sel)
+}
+pub fn me_move_word_right(inout state: MultilineEditState, sel: Bool) {
+    var n = state.text.len()
+    var i = state.caret
+    while i < n && !me_is_word_byte(ord(state.text.at(i))) { i = i + 1 }
+    while i < n && me_is_word_byte(ord(state.text.at(i))) { i = i + 1 }
+    state.caret = i
+    me_after_move(state, sel)
+}
+
+// ---- find (literal matches; regex is deferred) ----
+fn me_fold_byte(c: Int, case_sensitive: Bool) -> Int {
+    if case_sensitive { return c }
+    if c >= 65 && c <= 90 { return c + 32 }
+    return c
+}
+fn me_match_at(text: Str, query: Str, at: Int, case_sensitive: Bool) -> Bool {
+    var q = query.len()
+    var i = 0
+    while i < q {
+        if me_fold_byte(ord(text.at(at + i)), case_sensitive) != me_fold_byte(ord(query.at(i)), case_sensitive) { return false }
+        i = i + 1
+    }
+    return true
+}
+/// the next literal match at/after `frm`.
+pub fn me_find_next(text: Str, query: Str, frm: Int, case_sensitive: Bool) -> FindMatch {
+    var q = query.len()
+    if q == 0 { return find_none() }
+    var n = text.len()
+    var i = frm
+    if i < 0 { i = 0 }
+    while i + q <= n {
+        if me_match_at(text, query, i, case_sensitive) { return FindMatch { found: true, start: i, fend: i + q } }
+        i = i + 1
+    }
+    return find_none()
+}
+/// the previous literal match starting at or before `frm`.
+pub fn me_find_prev(text: Str, query: Str, frm: Int, case_sensitive: Bool) -> FindMatch {
+    var q = query.len()
+    if q == 0 { return find_none() }
+    var n = text.len()
+    var i = frm
+    if i > n - q { i = n - q }
+    while i >= 0 {
+        if me_match_at(text, query, i, case_sensitive) { return FindMatch { found: true, start: i, fend: i + q } }
+        i = i - 1
+    }
+    return find_none()
+}
+/// every literal match, left to right (non-overlapping).
+pub fn me_find_all(text: Str, query: Str, case_sensitive: Bool) -> Vec<FindMatch> {
+    var out: Vec<FindMatch> = vec()
+    var at = 0
+    while true {
+        var m = me_find_next(text, query, at, case_sensitive)
+        if !m.found { return out }
+        var nxt = m.fend
+        out.push(m)
+        if nxt <= at { nxt = at + 1 }
+        at = nxt
+    }
+    return out
+}
+
+// ---- geometry: hit-testing + caret position ----
+/// the caret offset for a click at (x, y) inside `content` (scroll-adjusted).
+pub fn me_hit_to_caret(state: MultilineEditState, x: Float, y: Float, content: Rect, size_px: Float) -> Int {
+    var style = text_measure_style(size_px)
+    var line_h = text_line_height(style.size_px)
+    var rel_y = y - content.min.y + state.scroll_y
+    var line = to_int(math::floor(rel_y / line_h))
+    if line < 0 { line = 0 }
+    var maxl = me_line_count(state.text) - 1
+    if line > maxl { line = maxl }
+    var ls = me_line_start(state.text, line)
+    var le = me_line_end_index(state.text, ls)
+    let pdir = me_para_dir(state)
+    if me_line_bidi(state, ls, le, pdir) {
+        // the cluster drawn under the pointer, through mixed directions (text_edit.nori)
+        var x0: Vec<Float> = vec()
+        let tc = me_line_tc(state, ls, le, content, style, pdir, x0)
+        return ls + text_carets_hit(tc, x - x0[0])
+    }
+    var line_str = state.text.slice(ls, le)
+    var rel_x = math::fmax(x - content.min.x + state.scroll_x, 0.0)
+    // nearest caret stop by advance width, between grapheme clusters, measured as the line is drawn
+    let tc = text_carets(line_str, style, 0, false)
+    return ls + text_carets_hit(tc, rel_x)   // a tie rounds to the higher column
+}
+/// the caret's pixel position (top of its line) inside `content`, scroll-adjusted.
+pub fn me_caret_pos(state: MultilineEditState, content: Rect, size_px: Float) -> Vec2 {
+    var style = text_measure_style(size_px)
+    var line_h = text_line_height(style.size_px)
+    let (line, col) = me_line_col_at(state.text, state.caret)
+    var ls = me_line_start(state.text, line)
+    var x = content.min.x - state.scroll_x + text_measure_width(state.text.slice(ls, ls + col), style)
+    let le = me_line_end_index(state.text, ls)
+    let pdir = me_para_dir(state)
+    if me_line_bidi(state, ls, le, pdir) {
+        var x0: Vec<Float> = vec()
+        let tc = me_line_tc(state, ls, le, content, style, pdir, x0)
+        x = x0[0] + text_carets_x(tc, col)
+    }
+    var y = content.min.y - state.scroll_y + to_float(line) * line_h
+    return vec2(x, y)
+}
+
+// ---- paint (virtualized) ----
+/// paint options; multiline_paint_opts() gives the code-editor defaults.
+pub struct MultilinePaintOpts {
+    /// the content inset, each side. 8 is CONTENT_PAD, what an editor pane wants; a one-line input
+    /// bar asks for less so that it sits level with the 28px controls beside it.
+    pad_x: Float,
+    pad_y: Float,
+    line_numbers: Bool,
+    /// the line whose `link` runs are drawn as hovered, or -1.
+    hot_line: Int,
+    highlight_current: Bool,
+    text_color: Color,
+    sel_color: Color,
+    caret_color: Color,
+    gutter_text_color: Color,
+    /// One entry per line, or empty. A glyph drawn in its own column left of the numbers, and a dim
+    /// note drawn after the line's text.
+    ///
+    /// This is what lets a caller annotate code without copying it. `roll xray` reports when a heap
+    /// value is born and last used, and that is a fact about a range of lines, a shape a report
+    /// printed elsewhere can only redraw the source to show. Drawn here it lands beside the buffer
+    /// the author is editing, which is the only place the shape means anything.
+    marks: Vec<Str>,
+    notes: Vec<Str>,
+    mark_color: Color,
+    note_color: Color,
+    /// 1-based line range to keep lit; everything outside is painted flat and dim. 0 disables it.
+    ///
+    /// A value's lifetime is a span of lines, and the question "where is this alive" is answered by
+    /// making the rest of the file quiet, not by adding another annotation to a screen that already
+    /// has some. Dimming is subtraction, which is why it can say something the rail cannot.
+    focus_from: Int,
+    focus_to: Int,
+    /// What the checker said, and exactly where; not a per-line annotation like `marks`.
+    ///
+    /// A diagnostic is about a span, not a line: `undefined_name` is wrong, the two spaces beside
+    /// it are not. Kept apart from `marks` for a second reason as well: severity has a colour,
+    /// and the rail's colour belongs to the rail. A lifeline is information and reads blue; an
+    /// error is not, and a blue dot in front of one reads as a note about it rather than as the
+    /// thing being broken.
+    diags: Vec<MeDiag>,
+    diag_err_color: Color,
+    diag_warn_color: Color,
+    current_line_color: Color
+}
+
+/// one diagnostic as the editor was told it: 1-based line and column, the length of the span it is
+/// about, and 1 for an error / 2 for a warning.
+pub struct MeDiag { line: Int, col: Int, len: Int, sev: Int }
+pub fn multiline_paint_opts() -> MultilinePaintOpts {
+    return MultilinePaintOpts {
+        pad_x: 8.0,
+        pad_y: 8.0,
+        line_numbers: true,
+        hot_line: 0 - 1,
+        highlight_current: true,
+        text_color: color_rgb(212, 212, 212),
+        sel_color: color_rgba(86, 156, 214, 70),
+        caret_color: color_rgb(255, 255, 255),
+        gutter_text_color: color_gray(120),
+        marks: mp_none(),
+        notes: mp_none(),
+        mark_color: color_rgba(120, 170, 255, 200),
+        note_color: color_gray(110),
+        focus_from: 0,
+        focus_to: 0,
+        diags: mp_no_diags(),
+        // the same two the panels already use for severity, so a red dot means in the margin what
+        // it means in the problem list.
+        diag_err_color: color_rgb(224, 138, 122),
+        diag_warn_color: color_rgb(224, 184, 119),
+        current_line_color: color_rgba(255, 255, 255, 12)
+    }
+}
+fn mp_none() -> Vec<Str> { var v: Vec<Str> = vec()  return v }
+fn mp_no_diags() -> Vec<MeDiag> { var v: Vec<MeDiag> = vec()  return v }
+
+/// `LINE:COL:LEN:SEV|...`, all 1-based except SEV. A malformed entry is dropped rather than guessed
+/// at: an underline in the wrong place points at innocent code and is worse than none.
+pub fn me_parse_diags(spec: Str) -> Vec<MeDiag> {
+    var out: Vec<MeDiag> = vec()
+    if spec.len() == 0 { return out }
+    var f: Vec<Int> = vec()
+    var cur = 0
+    var got = false
+    var i = 0
+    while i <= spec.len() {
+        var end = i == spec.len()
+        var bar = false
+        var colon = false
+        if !end {
+            let o = ord(spec.at(i))
+            bar = o == 124
+            colon = o == 58
+            if !bar && !colon {
+                if o >= 48 && o <= 57 { cur = cur * 10 + (o - 48)  got = true } else { got = false  f.push(0 - 1) }
+            }
+        }
+        if end || bar || colon {
+            if got { f.push(cur) } else { f.push(0 - 1) }
+            cur = 0
+            got = false
+            if end || bar {
+                if f.len() == 4 {
+                    if f[0] >= 1 && f[1] >= 1 && f[2] >= 0 && f[3] >= 1 { out.push(MeDiag { line: f[0], col: f[1], len: f[2], sev: f[3] }) }
+                }
+                var fresh: Vec<Int> = vec()
+                f = sink fresh
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// `L:text|L:text` into one entry per line, 0-based, "" where a line has nothing.
+///
+/// A sparse thing written sparsely. A file has thousands of lines and a handful of annotations, so
+/// the caller sends the handful and this spreads them; the alternative is a plugin building a
+/// string with one empty field per line of the file, across an ABI that only carries strings.
+pub fn me_parse_perline(spec: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    if spec.len() == 0 { return out }
+    var i = 0
+    var cur = ""
+    while i <= spec.len() {
+        var end = i == spec.len()
+        var bar = false
+        if !end { bar = ord(spec.at(i)) == 124 }          // '|'
+        if end || bar {
+            var c = 0 - 1
+            var k = 0
+            while k < cur.len() { if ord(cur.at(k)) == 58 { c = k  k = cur.len() } else { k = k + 1 } }
+            if c > 0 {
+                var ln = 0
+                var d = 0
+                var okn = true
+                while d < c { let o = ord(cur.at(d))  if o < 48 || o > 57 { okn = false }  if okn { ln = ln * 10 + (o - 48) }  d = d + 1 }
+                if okn && ln >= 1 {
+                    while out.len() < ln { out.push("") }
+                    // Appended, not replaced. A line where a value dies and a loop gets its verdict
+                    // has two things to say, and keeping only the last one silently drops whichever
+                    // the caller happened to write first.
+                    if out[ln - 1].len() > 0 { out[ln - 1] = (out[ln - 1] + ("   " + cur.slice(c + 1, cur.len()))) }
+                    else { out[ln - 1] = cur.slice(c + 1, cur.len()) }
+                }
+            }
+            cur = ""
+        } else { cur = (cur + spec.at(i)) }
+        i = i + 1
+    }
+    return out
+}
+
+/// The rail has a column of its own, reserved inside the gutter.
+///
+/// A rail drawn in the padding the gutter already had would be wrong in the plainest possible
+/// way: with a one-digit gutter the padding is where the number is, so a lifeline would be painted
+/// straight through `3`, `4`, `5` and neither could be read.
+///
+/// The gutter's width feeds `code_editor_content_rect`, which is what the caret is positioned
+/// against, so widening the paint without widening the measurement puts the caret a column off.
+/// The width is therefore added in one place: `me_gutter_width` is what every caller asks, the
+/// paint and the content rect included, so a column added there is a column everybody already
+/// agrees about.
+///
+/// Reserved whenever the numbers are on, whether or not anything is in it. A gutter that changes
+/// width when a diagnostic appears would slide the whole document sideways under the pointer.
+pub fn me_rail_width(size_px: Float) -> Float { return size_px * 0.62 + 4.0 }
+
+/// the gutter width for `total` lines at `size_px` (digits + padding), 0 when line numbers are off.
+pub fn me_gutter_width(total_lines: Int, size_px: Float, line_numbers: Bool) -> Float {
+    if !line_numbers { return 0.0 }
+    var digits = 1
+    var v = total_lines
+    while v >= 10 { digits = digits + 1  v = v / 10 }
+    return to_float(digits) * (size_px * 0.52) + 12.0 + me_rail_width(size_px)
+}
+/// lay the editor out into `rect`: gutter numbers, current-line highlight, per-line selection rects,
+/// visible line text (virtualized with 5 lines of overscan), and the caret when `focused`.
+pub fn layout_multiline_edit(state: MultilineEditState, rect: Rect, size_px: Float, focused: Bool, opts: MultilinePaintOpts) -> Vec<PaintPrimitive> {
+    var prims: Vec<PaintPrimitive> = vec()
+    var style = text_measure_style(size_px)
+    var line_h = text_line_height(style.size_px)
+    var total = me_line_count(state.text)
+    var gw = me_gutter_width(total, size_px, opts.line_numbers)
+    var content = rect_min_max(vec2(rect.min.x + gw + opts.pad_x, rect.min.y + opts.pad_y), vec2(rect.max.x - opts.pad_x, rect.max.y - opts.pad_y))
+    var vr = visible_line_range(content.height(), state.scroll_y, line_h, total, 5)
+    let (sa, sb) = me_selection(state)
+    let (cline, _ccol) = me_line_col_at(state.text, state.caret)
+    let pdir = me_para_dir(state)
+    let pre = ime_preedit()
+    var li = vr.start
+    while li < vr.end {
+        var ls = me_line_start(state.text, li)
+        var le = me_line_end_index(state.text, ls)
+        let bidi = me_line_bidi(state, ls, le, pdir)
+        // the top of line `li`'s line box, which is what pp_text's `pos.y` means (see the
+        // contract on layout::pp_text), and the same y the current-line highlight rect uses below,
+        // so the glyphs sit inside their own highlight instead of one ascent above it.
+        var y = content.min.y - state.scroll_y + to_float(li) * line_h
+        // current-line highlight (full content width)
+        if opts.highlight_current && focused && li == cline {
+            prims.push(pp_rect(rect_min_size(vec2(content.min.x, y), vec2(content.width(), line_h)), opts.current_line_color, 0.0))
+        }
+        // selection segment on this line: on screen, through mixed directions, several pieces
+        if bidi && sa != sb && sa < le + 1 && sb > ls {
+            var bx0: Vec<Float> = vec()
+            let tc = me_line_tc(state, ls, le, content, style, pdir, bx0)
+            let spans = text_carets_sel(tc, sa - ls, sb - ls)
+            var k = 0
+            while k + 1 < spans.len() {
+                prims.push(pp_rect(rect_min_size(vec2(bx0[0] + spans[k], y), vec2(math::fmax(spans[k + 1] - spans[k], 1.0), line_h)), opts.sel_color, 0.0))
+                k = k + 2
+            }
+        }
+        else if sa != sb && sa < le + 1 && sb > ls {
+            var segs = sa
+            if segs < ls { segs = ls }
+            var sege = sb
+            if sege > le { sege = le }
+            var x0 = content.min.x - state.scroll_x + text_measure_width(state.text.slice(ls, segs), style)
+            var x1 = content.min.x - state.scroll_x + text_measure_width(state.text.slice(ls, sege), style)
+            if sb > le { x1 = x1 + size_px * 0.26 }   // selection spills past the newline, half a char
+            prims.push(pp_rect(rect_min_size(vec2(x0, y), vec2(math::fmax(x1 - x0, 1.0), line_h)), opts.sel_color, 0.0))
+        }
+        // gutter number (right-aligned)
+        if opts.line_numbers {
+            var numtext = to_str(li + 1)
+            var nw = text_measure_width(numtext, style)
+            var np = pp_text(vec2(rect.min.x + gw - nw - 6.0, y), numtext, opts.gutter_text_color, size_px)
+            prims.push(np)
+        }
+        // the lifeline rail, in its own column hard against the numbers
+        if li < opts.marks.len() {
+            if opts.marks[li].len() > 0 {
+                prims.push(pp_text(vec2(rect.min.x + 2.0, y), opts.marks[li], opts.mark_color, size_px))
+            }
+        }
+        // the line text; a line that needs bidi is drawn in the box's direction (flush right in a
+        // right-to-left box), with the input method's pre-edit spliced in at the caret, underlined
+        let composing = focused && pre.len() > 0 && li == cline
+        if bidi || composing {
+            var line = state.text.slice(ls, le)
+            var cat = state.caret - ls
+            if composing { line = line.slice(0, cat) + pre + line.slice(cat, line.len()) }
+            let tc = text_carets(line, style, pdir, false)
+            var lx = content.min.x - state.scroll_x
+            if pdir == 1 { lx = content.max.x - tc.width - state.scroll_x }
+            var tp = pp_text(vec2(lx, y), line, opts.text_color, size_px)
+            var ld = "L"
+            if tc.para_rtl { ld = "R" }
+            let nox: Vec<Float> = vec()
+            pp_text_set_lines(tp, 0, "", ld, nox)
+            if line.len() > 0 { prims.push(tp) }
+            if composing {
+                let ps = text_carets_sel(tc, cat, cat + pre.len())
+                var k = 0
+                while k + 1 < ps.len() {
+                    prims.push(pp_rect(rect_min_max(vec2(lx + ps[k], y + line_h - 2.0), vec2(lx + ps[k + 1], y + line_h - 1.0)), opts.text_color, 0.0))
+                    k = k + 2
+                }
+                if caret_on() {
+                    prims.push(pp_rect(rect_min_size(vec2(lx + text_carets_x(tc, cat + ime_preedit_cursor()), y), vec2(1.5, line_h)), opts.caret_color, 0.0))
+                }
+            }
+        }
+        else if le > ls {
+            prims.push(pp_text(vec2(content.min.x - state.scroll_x, y), state.text.slice(ls, le), opts.text_color, size_px))
+        }
+        // The span that is wrong, underlined where it actually is. Columns are measured the same
+        // way the selection is, by measuring the text up to them, so the underline sits under the
+        // glyphs at any font size rather than under a guess at their width.
+        var di = 0
+        while di < opts.diags.len() {
+            if opts.diags[di].line == li + 1 {
+                var dcol = opts.diag_warn_color
+                if opts.diags[di].sev == 1 { dcol = opts.diag_err_color }
+                let llen = le - ls
+                var d0 = opts.diags[di].col - 1
+                if d0 < 0 { d0 = 0 }
+                if d0 > llen { d0 = llen }
+                var d1 = d0 + opts.diags[di].len
+                if d1 > llen { d1 = llen }
+                if d1 > d0 {
+                    var ux0 = content.min.x - state.scroll_x + text_measure_width(state.text.slice(ls, ls + d0), style)
+                    var ux1 = content.min.x - state.scroll_x + text_measure_width(state.text.slice(ls, ls + d1), style)
+                    prims.push(pp_rect(rect_min_size(vec2(ux0, y + line_h - 2.0), vec2(math::fmax(ux1 - ux0, 2.0), 1.5)), dcol, 0.0))
+                }
+                // and the dot, in the same colour as the underline: one fact, said twice, so a
+                // diagnostic scrolled off the side of a long line is still visible in the margin.
+                var g = "▲"
+                if opts.diags[di].sev == 1 { g = "●" }
+                prims.push(pp_text(vec2(rect.min.x + 2.0, y), g, dcol, size_px))
+            }
+            di = di + 1
+        }
+        // ...and what the compiler said about this line, after it, dim enough to read past
+        if li < opts.notes.len() {
+            if opts.notes[li].len() > 0 {
+                var lw = text_measure_width(state.text.slice(ls, le), style)
+                prims.push(pp_text(vec2(content.min.x - state.scroll_x + lw + size_px * 1.5, y),
+                                   opts.notes[li], opts.note_color, size_px))
+            }
+        }
+        li = li + 1
+    }
+    // the caret, in its on phase only (while composing, the pre-edit's cursor above is the caret)
+    if focused && caret_on() && pre.len() == 0 {
+        var cpos = me_caret_pos(state, content, size_px)
+        prims.push(pp_rect(rect_min_size(cpos, vec2(1.5, line_h)), opts.caret_color, 0.0))
+    }
+    return prims
+}

@@ -1,0 +1,129 @@
+import "std/rand" as rand
+
+// xoshiro256** seeded by splitmix64(12345); first three next_u64 outputs.
+fn test_determinism_exact() {
+    var r = rand::seeded(12345)
+    let a = r.next_u64()
+    let b = r.next_u64()
+    let c = r.next_u64()
+    assert_eq(a, 0 - 4725905248023948133)
+    assert_eq(b, 2398916695208396998)
+    assert_eq(c, 0 - 676359223724682360)
+}
+
+// two generators built from the same seed produce identical sequences.
+fn test_same_seed_match() {
+    var r1 = rand::seeded(99)
+    var r2 = rand::seeded(99)
+    var i = 0
+    while i < 50 {
+        let x = r1.next_u64()
+        let y = r2.next_u64()
+        assert_eq(x, y)
+        i = i + 1
+    }
+}
+
+// different seeds yield different first outputs.
+fn test_different_seeds_differ() {
+    var ra = rand::seeded(1)
+    var rb = rand::seeded(2)
+    let x = ra.next_u64()
+    let y = rb.next_u64()
+    assert_ne(x, y)
+}
+
+// below(n) stays within [0, n) over many draws.
+fn test_below_range() {
+    var r = rand::seeded(7)
+    var i = 0
+    while i < 1000 {
+        let v = r.below(13)
+        assert_true(v >= 0)
+        assert_true(v < 13)
+        i = i + 1
+    }
+}
+
+// below with n <= 0 returns 0.
+fn test_below_nonpositive() {
+    var r = rand::seeded(7)
+    assert_eq(r.below(0), 0)
+    assert_eq(r.below(0 - 5), 0)
+}
+
+// between(lo, hi) stays within [lo, hi); degenerate range returns lo.
+fn test_between_range() {
+    var r = rand::seeded(42)
+    var i = 0
+    while i < 1000 {
+        let v = r.between(100, 110)
+        assert_true(v >= 100)
+        assert_true(v < 110)
+        i = i + 1
+    }
+    assert_eq(r.between(5, 5), 5)
+    assert_eq(r.between(9, 3), 9)
+}
+
+// float01 stays within [0, 1).
+fn test_float01_range() {
+    var r = rand::seeded(2024)
+    var i = 0
+    while i < 1000 {
+        let f = r.float01()
+        assert_true(f >= 0.0)
+        assert_true(f < 1.0)
+        i = i + 1
+    }
+}
+
+// flip produces both outcomes.
+fn test_flip_both() {
+    var r = rand::seeded(5)
+    var heads = 0
+    var tails = 0
+    var i = 0
+    while i < 200 {
+        let b = r.flip()
+        if b { heads = heads + 1 } else { tails = tails + 1 }
+        i = i + 1
+    }
+    assert_true(heads > 0)
+    assert_true(tails > 0)
+}
+
+// shuffle preserves the multiset: same count and same sum before and after.
+fn test_shuffle_preserves() {
+    var r = rand::seeded(123)
+    var v: Vec<Int> = vec()
+    var i = 0
+    var sum_before = 0
+    while i < 20 {
+        v.push(i * 7 + 3)
+        sum_before = sum_before + (i * 7 + 3)
+        i = i + 1
+    }
+    r.shuffle(v)
+    assert_eq(v.len(), 20)
+    var sum_after = 0
+    var j = 0
+    while j < v.len() {
+        sum_after = sum_after + v[j]
+        j = j + 1
+    }
+    assert_eq(sum_after, sum_before)
+}
+
+// pick returns a member of the Vec.
+fn test_pick_member() {
+    var r = rand::seeded(321)
+    var v: Vec<Int> = vec()
+    v.push(11)  v.push(22)  v.push(33)
+    var i = 0
+    while i < 100 {
+        let e = r.pick(v)
+        assert_true(e == 11 || e == 22 || e == 33)
+        i = i + 1
+    }
+}

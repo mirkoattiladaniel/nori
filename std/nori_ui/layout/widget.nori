@@ -1,0 +1,902 @@
+use core::*
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// immediate-mode widget toolkit (core widgets).
+//
+// Widget is a tagged union struct (a `kind` tag + every possible field) rather
+// than a ~30-variant enum, and layout dispatches with if/else on `kind`.
+// Covered: Button, SmallButton, Label, Heading, Subheading, Monospace, Link,
+// Checkbox, Slider, TextField (plain), Toggle, Dropdown, Separator, Spacer,
+// ProgressBar, NumberInput (-/+ steppers), DragValue, Badge, SelectableLabel,
+// Icon, CollapsingHeader, Radio group (per-option hit, `sub`=option), TabBar
+// (per-tab hit, `sub`=tab), color swatch and picker, tile grid, image button.
+// WidgetHitRect carries `sub` for multi-segment widgets. Output is DrawRect +
+// TextLabel + hit-rect data (no GPU).
+// ===========================================================================
+
+/// default widget row height.
+pub fn widget_row_height_const() -> Float { return 28.0 }
+/// vertical spacing between widgets.
+pub fn widget_spacing() -> Float { return 6.0 }
+/// approximate character width for widget text sizing.
+pub fn widget_char_width() -> Float { return 7.0 }
+/// checkbox side length.
+pub fn checkbox_size() -> Float { return 18.0 }
+/// slider track height.
+pub fn slider_track_h() -> Float { return 8.0 }
+/// slider thumb width.
+pub fn slider_thumb_w() -> Float { return 12.0 }
+
+// --- widget kind tags ---
+/// kind tag: clickable button.
+pub fn wk_button() -> Int { return 0 }
+/// kind tag: non-interactive label.
+pub fn wk_label() -> Int { return 1 }
+/// kind tag: section heading.
+pub fn wk_heading() -> Int { return 2 }
+/// kind tag: subheading.
+pub fn wk_subheading() -> Int { return 3 }
+/// kind tag: checkbox.
+pub fn wk_checkbox() -> Int { return 4 }
+/// kind tag: horizontal slider.
+pub fn wk_slider() -> Int { return 5 }
+/// kind tag: single-line text field.
+pub fn wk_text_field() -> Int { return 6 }
+/// kind tag: horizontal separator.
+pub fn wk_separator() -> Int { return 7 }
+/// kind tag: vertical spacer.
+pub fn wk_spacer() -> Int { return 8 }
+/// kind tag: progress bar.
+pub fn wk_progress() -> Int { return 9 }
+/// kind tag: toggle switch.
+pub fn wk_toggle() -> Int { return 10 }
+/// kind tag: dropdown (cycles selection on click).
+pub fn wk_dropdown() -> Int { return 11 }
+/// kind tag: compact button.
+pub fn wk_small_button() -> Int { return 12 }
+/// kind tag: text link.
+pub fn wk_link() -> Int { return 13 }
+/// kind tag: monospace text.
+pub fn wk_monospace() -> Int { return 14 }
+/// kind tag: number input (value with -/+ steppers).
+pub fn wk_number() -> Int { return 15 }
+/// kind tag: drag value (compact draggable number field).
+pub fn wk_drag() -> Int { return 16 }
+/// kind tag: badge (small text pill).
+pub fn wk_badge() -> Int { return 17 }
+/// kind tag: selectable label (selectable read-only text).
+pub fn wk_selectable() -> Int { return 18 }
+/// kind tag: icon (host-resolved icon key + size; non-interactive).
+pub fn wk_icon() -> Int { return 19 }
+/// kind tag: collapsing header (arrow + label; click toggles).
+pub fn wk_collapsing() -> Int { return 20 }
+/// kind tag: radio group (one selected; options stacked vertically).
+pub fn wk_radio() -> Int { return 21 }
+/// kind tag: tab bar (horizontal tabs; click selects).
+pub fn wk_tabbar() -> Int { return 22 }
+/// color swatch (square + label; click to report).
+pub fn wk_color_swatch() -> Int { return 23 }
+/// color picker (swatch + label; click opens the 2D square + hue strip popup).
+pub fn wk_color_picker() -> Int { return 24 }
+/// button with an optional icon key (host resolves the icon to an image).
+pub fn wk_image_button() -> Int { return 25 }
+/// grid of colored ASCII tiles (each cell: char + fg + bg color).
+pub fn wk_tilegrid() -> Int { return 26 }
+/// tooltip text for the preceding widget (takes no space; see tooltip_for_hovered).
+pub fn wk_tooltip() -> Int { return 27 }
+/// link with an optional URL (styled like a text link).
+pub fn wk_hyperlink() -> Int { return 28 }
+/// thin draggable resize line (vertical or horizontal).
+pub fn wk_resize_handle() -> Int { return 29 }
+/// a button with inline font overrides (family/size/bold/italic).
+pub fn wk_button_styled() -> Int { return 30 }
+/// a label with inline font overrides (family/size/bold/italic).
+pub fn wk_label_styled() -> Int { return 31 }
+
+// --- widget hit kinds ---
+/// hit kind: button click.
+pub fn whk_button() -> Int { return 0 }
+/// hit kind: checkbox toggle.
+pub fn whk_checkbox() -> Int { return 1 }
+/// hit kind: slider thumb drag.
+pub fn whk_slider_thumb() -> Int { return 2 }
+/// hit kind: slider track click.
+pub fn whk_slider_track() -> Int { return 3 }
+/// hit kind: text-field focus.
+pub fn whk_text_field() -> Int { return 4 }
+/// hit kind: dropdown click.
+pub fn whk_dropdown() -> Int { return 5 }
+/// hit kind: toggle click.
+pub fn whk_toggle() -> Int { return 6 }
+/// hit kind: link click.
+pub fn whk_link() -> Int { return 7 }
+/// hit kind: non-interactive.
+pub fn whk_noninteractive() -> Int { return 8 }
+/// hit kind: disabled widget (ignore clicks).
+pub fn whk_disabled() -> Int { return 9 }
+/// hit kind: number-input field (focus/edit).
+pub fn whk_number() -> Int { return 10 }
+/// hit kind: number-input increment button.
+pub fn whk_number_plus() -> Int { return 11 }
+/// hit kind: number-input decrement button.
+pub fn whk_number_minus() -> Int { return 12 }
+/// hit kind: drag-value field (drag to change).
+pub fn whk_drag() -> Int { return 13 }
+/// hit kind: badge click.
+pub fn whk_badge() -> Int { return 14 }
+/// hit kind: selectable-label click.
+pub fn whk_selectable() -> Int { return 15 }
+/// hit kind: collapsing-header toggle.
+pub fn whk_collapsing() -> Int { return 16 }
+/// hit kind: small-button click (distinct from a regular button).
+pub fn whk_small_button() -> Int { return 17 }
+/// hit kind: radio option click (the chosen option is in the hit's `sub`).
+pub fn whk_radio_option() -> Int { return 18 }
+/// hit kind: tab-bar tab click (the clicked tab index is in the hit's `sub`).
+pub fn whk_tabbar_tab() -> Int { return 19 }
+/// color swatch click.
+pub fn whk_color_swatch() -> Int { return 20 }
+/// color-picker swatch click (open/close the picker popup).
+pub fn whk_color_picker_swatch() -> Int { return 21 }
+/// 2D saturation/value square (click/drag sets S and V).
+pub fn whk_color_picker_square() -> Int { return 22 }
+/// hue strip (click/drag sets H).
+pub fn whk_color_picker_hue_strip() -> Int { return 23 }
+/// image-button click.
+pub fn whk_image_button() -> Int { return 24 }
+/// hyperlink click.
+pub fn whk_hyperlink() -> Int { return 25 }
+/// resize-handle drag.
+pub fn whk_resize_handle() -> Int { return 26 }
+
+/// a single cell in a TileGrid: a character + foreground + background color.
+pub struct TileGridCell { ch: Str, fg: Color, bg: Color }
+/// a fresh list of cell copies.
+pub fn tile_cells_dup(v: Vec<TileGridCell>) -> Vec<TileGridCell> {
+    var out: Vec<TileGridCell> = vec()
+    var i = 0
+    while i < v.len() { out.push(TileGridCell { ch: copy v[i].ch, fg: color_dup(v[i].fg), bg: color_dup(v[i].bg) })  i = i + 1 }
+    return out
+}
+/// build a TileGrid cell.
+pub fn tile_cell(ch: Str, copy fg: Color, copy bg: Color) -> TileGridCell { return TileGridCell { ch: copy ch, fg: fg, bg: bg } }
+
+/// a widget: a `kind` tag plus a union of all widget fields (only some apply per kind).
+pub struct Widget {
+    kind: Int,
+    id: Int,
+    label: Str,
+    text: Str,
+    value: Float,
+    vmin: Float,
+    vmax: Float,
+    step: Float,
+    checked: Bool,
+    on: Bool,
+    placeholder: Str,
+    height: Float,
+    options: Vec<Str>,
+    selected: Int,
+    col: Color,
+    gcols: Int,
+    grows: Int,
+    cell_w: Float,
+    cell_h: Float,
+    cells: Vec<TileGridCell>,
+    has_ffamily: Bool,
+    ffamily: Str,
+    has_fsize: Bool,
+    fsize: Float,
+    fbold: Bool,
+    fitalic: Bool
+}
+
+/// a blank widget with default fields (internal builder base).
+pub fn widget_blank(kind: Int) -> Widget {
+    var opts: Vec<Str> = vec()
+    var cs: Vec<TileGridCell> = vec()
+    return Widget { kind: kind, id: 0, label: "", text: "", value: 0.0, vmin: 0.0, vmax: 1.0, step: 0.0, checked: false, on: false, placeholder: "", height: 0.0, options: opts, selected: 0, col: color_black(), gcols: 0, grows: 0, cell_w: 0.0, cell_h: 0.0, cells: cs, has_ffamily: false, ffamily: "", has_fsize: false, fsize: 0.0, fbold: false, fitalic: false }
+}
+/// a clickable button.
+pub fn widget_button(id: Int, label: Str) -> Widget { var w = widget_blank(wk_button())  w.id = id  w.label = copy label  return w }
+/// a compact button.
+pub fn widget_small_button(id: Int, label: Str) -> Widget { var w = widget_blank(wk_small_button())  w.id = id  w.label = copy label  return w }
+/// a non-interactive label.
+pub fn widget_label(text: Str) -> Widget { var w = widget_blank(wk_label())  w.text = copy text  return w }
+/// a section heading.
+pub fn widget_heading(text: Str) -> Widget { var w = widget_blank(wk_heading())  w.text = copy text  return w }
+/// a subheading.
+pub fn widget_subheading(text: Str) -> Widget { var w = widget_blank(wk_subheading())  w.text = copy text  return w }
+/// monospace text.
+pub fn widget_monospace(text: Str) -> Widget { var w = widget_blank(wk_monospace())  w.text = copy text  return w }
+/// a text link.
+pub fn widget_link(id: Int, label: Str) -> Widget { var w = widget_blank(wk_link())  w.id = id  w.label = copy label  return w }
+/// a checkbox with current checked state.
+pub fn widget_checkbox(id: Int, label: Str, checked: Bool) -> Widget { var w = widget_blank(wk_checkbox())  w.id = id  w.label = copy label  w.checked = checked  return w }
+/// a horizontal slider with current value in [min, max].
+pub fn widget_slider(id: Int, label: Str, value: Float, vmin: Float, vmax: Float) -> Widget { var w = widget_blank(wk_slider())  w.id = id  w.label = copy label  w.value = value  w.vmin = vmin  w.vmax = vmax  return w }
+/// a single-line text field (plain display).
+pub fn widget_text_field(id: Int, placeholder: Str, text: Str) -> Widget { var w = widget_blank(wk_text_field())  w.id = id  w.placeholder = copy placeholder  w.text = copy text  return w }
+/// a toggle switch with current state.
+pub fn widget_toggle(id: Int, label: Str, on: Bool) -> Widget { var w = widget_blank(wk_toggle())  w.id = id  w.label = copy label  w.on = on  return w }
+/// a dropdown with options and the selected index.
+pub fn widget_dropdown(id: Int, label: Str, options: Vec<Str>, selected: Int) -> Widget { var w = widget_blank(wk_dropdown())  w.id = id  w.label = copy label  w.options = path_copy_str(options)  w.selected = selected  return w }
+/// a horizontal separator line.
+pub fn widget_separator() -> Widget { return widget_blank(wk_separator()) }
+/// vertical empty space of `height` pixels.
+pub fn widget_spacer(height: Float) -> Widget { var w = widget_blank(wk_spacer())  w.height = height  return w }
+/// a read-only progress bar with value in [0, 1].
+pub fn widget_progress(value: Float) -> Widget { var w = widget_blank(wk_progress())  w.value = value  return w }
+/// a number input: a value field flanked by `-`/`+` stepper buttons.
+pub fn widget_number(id: Int, label: Str, value: Float, vmin: Float, vmax: Float, step: Float) -> Widget {
+    var w = widget_blank(wk_number())  w.id = id  w.label = copy label  w.value = value  w.vmin = vmin  w.vmax = vmax  w.step = step  return w
+}
+/// a drag value: a compact field you drag horizontally to change `value`.
+pub fn widget_drag(id: Int, label: Str, value: Float, vmin: Float, vmax: Float, step: Float) -> Widget {
+    var w = widget_blank(wk_drag())  w.id = id  w.label = copy label  w.value = value  w.vmin = vmin  w.vmax = vmax  w.step = step  return w
+}
+/// a small text pill; `id` lets the host treat it as clickable.
+pub fn widget_badge(id: Int, text: Str) -> Widget { var w = widget_blank(wk_badge())  w.id = id  w.text = copy text  return w }
+/// read-only text the host can let the user select/copy (hover-highlighted).
+pub fn widget_selectable(id: Int, text: Str) -> Widget { var w = widget_blank(wk_selectable())  w.id = id  w.text = copy text  return w }
+/// a non-interactive icon: `icon_key` is resolved by the host, `side` is the side length in px.
+pub fn widget_icon(icon_key: Str, side: Float) -> Widget { var w = widget_blank(wk_icon())  w.text = copy icon_key  w.value = side  return w }
+/// a collapsing-section header: an arrow + label; `collapsed` chooses the arrow direction.
+pub fn widget_collapsing(id: Int, label: Str, collapsed: Bool) -> Widget { var w = widget_blank(wk_collapsing())  w.id = id  w.label = copy label  w.on = collapsed  return w }
+/// a radio group: a group `label` + vertically-stacked `options`, the `selected` one filled.
+pub fn widget_radio(id: Int, label: Str, options: Vec<Str>, selected: Int) -> Widget { var w = widget_blank(wk_radio())  w.id = id  w.label = copy label  w.options = path_copy_str(options)  w.selected = selected  return w }
+/// a horizontal tab bar: `tabs` shown side by side, the `selected` one highlighted.
+pub fn widget_tabbar(id: Int, tabs: Vec<Str>, selected: Int) -> Widget { var w = widget_blank(wk_tabbar())  w.id = id  w.options = path_copy_str(tabs)  w.selected = selected  return w }
+/// a color swatch: a colored square + `label`; click reports (e.g. to open a picker).
+pub fn widget_color_swatch(id: Int, label: Str, col: Color) -> Widget { var w = widget_blank(wk_color_swatch())  w.id = id  w.label = copy label  w.col = color_dup(col)  return w }
+/// a color picker: a swatch + `label`; click opens the 2D square + hue strip (see layout_color_picker_popup).
+pub fn widget_color_picker(id: Int, label: Str, col: Color) -> Widget { var w = widget_blank(wk_color_picker())  w.id = id  w.label = copy label  w.col = color_dup(col)  return w }
+/// a button with an optional icon key (`icon_key` resolved by the host); good for toolbars.
+pub fn widget_image_button(id: Int, label: Str, icon_key: Str) -> Widget { var w = widget_blank(wk_image_button())  w.id = id  w.label = copy label  w.text = copy icon_key  return w }
+/// a grid of colored ASCII tiles: `cols`x`rows` cells of `cell_w`x`cell_h`, row-major in `cells`.
+pub fn widget_tilegrid(cols: Int, rows: Int, cell_w: Float, cell_h: Float, cells: Vec<TileGridCell>) -> Widget {
+    var w = widget_blank(wk_tilegrid())  w.gcols = cols  w.grows = rows  w.cell_w = cell_w  w.cell_h = cell_h  w.cells = tile_cells_dup(cells)  return w
+}
+/// tooltip text shown for the immediately-preceding widget when it is hovered (takes no layout space).
+pub fn widget_tooltip(text: Str) -> Widget { var w = widget_blank(wk_tooltip())  w.text = copy text  return w }
+/// a link with an optional `url` (empty = none); the host opens the URL on click.
+pub fn widget_hyperlink(id: Int, label: Str, url: Str) -> Widget { var w = widget_blank(wk_hyperlink())  w.id = id  w.label = copy label  w.text = copy url  return w }
+/// a thin draggable resize line; `vertical` chooses a vertical (6px-wide) vs horizontal (6px-tall) bar.
+pub fn widget_resize_handle(id: Int, vertical: Bool) -> Widget { var w = widget_blank(wk_resize_handle())  w.id = id  w.on = vertical  return w }
+/// a button with inline font overrides: empty `font_family` = default, `font_size` <= 0 = default.
+pub fn widget_button_styled(id: Int, label: Str, font_family: Str, font_size: Float, bold: Bool, italic: Bool) -> Widget {
+    var w = widget_blank(wk_button_styled())  w.id = id  w.label = copy label
+    if font_family.len() > 0 { w.has_ffamily = true  w.ffamily = copy font_family }
+    if font_size > 0.0 { w.has_fsize = true  w.fsize = font_size }
+    w.fbold = bold  w.fitalic = italic  return w
+}
+/// a label with inline font overrides: empty `font_family` = default, `font_size` <= 0 = default.
+pub fn widget_label_styled(text: Str, font_family: Str, font_size: Float, bold: Bool, italic: Bool) -> Widget {
+    var w = widget_blank(wk_label_styled())  w.text = copy text
+    if font_family.len() > 0 { w.has_ffamily = true  w.ffamily = copy font_family }
+    if font_size > 0.0 { w.has_fsize = true  w.fsize = font_size }
+    w.fbold = bold  w.fitalic = italic  return w
+}
+
+/// the laid-out row height of `w` given the theme base row height.
+pub fn widget_row_height(w: Widget, row_h_base: Float) -> Float {
+    if w.kind == wk_spacer() { return w.height }
+    if w.kind == wk_heading() { return row_h_base + 4.0 }
+    if w.kind == wk_subheading() { return row_h_base + 2.0 }
+    if w.kind == wk_small_button() { return math::fmax(row_h_base * 0.75, 20.0) }
+    if w.kind == wk_icon() { return math::fmax(w.value, 16.0) }
+    if w.kind == wk_radio() { return math::fmax(to_float(w.options.len()) * (row_h_base + 2.0), row_h_base) }   // one row per option
+    if w.kind == wk_tilegrid() { return math::fmax(to_float(w.grows) * w.cell_h, row_h_base) }
+    if w.kind == wk_tooltip() { return 0.0 }
+    if w.kind == wk_resize_handle() { return 6.0 }
+    if w.kind == wk_button_styled() || w.kind == wk_label_styled() { if w.has_fsize { return math::fmax(row_h_base, w.fsize + 10.0) }  return row_h_base }
+    return row_h_base
+}
+
+/// total vertical height to display all widgets (for scroll clamping).
+pub fn content_height(widgets: Vec<Widget>, theme: Theme) -> Float {
+    if widgets.len() == 0 { return 0.0 }
+    var item_y = theme.spacing.item_spacing.y
+    var row_h_base = math::fmax(theme.spacing.interact_size.y, 16.0)
+    var total = 0.0
+    var i = 0
+    while i < widgets.len() {
+        var row_h = widget_row_height(widgets[i], row_h_base)
+        total = total + row_h
+        if row_h > 0.0 { total = total + item_y }
+        i = i + 1
+    }
+    return total
+}
+
+/// one hit-test rect: widget index, id, rect, and hit kind.
+pub struct WidgetHitRect { index: Int, id: Int, rect: Rect, kind: Int, sub: Int }
+/// a WidgetHitRect of its own.
+pub fn widget_hit_dup(h: WidgetHitRect) -> WidgetHitRect { return WidgetHitRect { index: h.index, id: h.id, rect: rect_dup(h.rect), kind: h.kind, sub: h.sub } }
+/// the output of layout_widgets: solid rects, text labels, and hit rects.
+pub struct LayoutWidgetsResult { rects: Vec<DrawRect>, labels: Vec<TextLabel>, hits: Vec<WidgetHitRect> }
+
+/// true if index `i` is in the disabled list.
+pub fn widget_is_disabled(disabled: Vec<Int>, i: Int) -> Bool { return ints_contains(disabled, i) }
+
+/// text-field editing state for the focused field: caret blink/position + an optional selection range.
+pub struct TextFieldFocus {
+    has_focus: Bool,
+    index: Int,
+    caret_visible: Bool,
+    cursor: Int,
+    has_selection: Bool,
+    sel_start: Int,
+    sel_end: Int
+}
+/// no field focused (the default; plain text-field rendering).
+pub fn text_field_focus_none() -> TextFieldFocus { return TextFieldFocus { has_focus: false, index: -1, caret_visible: false, cursor: 0, has_selection: false, sel_start: 0, sel_end: 0 } }
+/// field `index` focused with caret at `cursor` (blink toggled by `caret_visible`), no selection.
+pub fn text_field_focus(index: Int, caret_visible: Bool, cursor: Int) -> TextFieldFocus { return TextFieldFocus { has_focus: true, index: index, caret_visible: caret_visible, cursor: cursor, has_selection: false, sel_start: 0, sel_end: 0 } }
+/// field `index` focused with caret + a highlighted selection [sel_start, sel_end).
+pub fn text_field_focus_sel(index: Int, caret_visible: Bool, cursor: Int, sel_start: Int, sel_end: Int) -> TextFieldFocus { return TextFieldFocus { has_focus: true, index: index, caret_visible: caret_visible, cursor: cursor, has_selection: true, sel_start: sel_start, sel_end: sel_end } }
+
+/// lay out widgets vertically in `content_rect`, producing draw rects, labels, and hit rects.
+/// `has_hovered`/`hovered_index` mark the hovered row; `disabled` lists disabled indices.
+pub fn layout_widgets(content_rect: Rect, widgets: Vec<Widget>, theme: Theme, has_hovered: Bool, hovered_index: Int, scroll_offset: Float, disabled: Vec<Int>) -> LayoutWidgetsResult {
+    return layout_widgets_focus(content_rect, widgets, theme, has_hovered, hovered_index, scroll_offset, disabled, text_field_focus_none())
+}
+
+/// like `layout_widgets`, but a focused TextField gets a focus ring, selection highlight, and a
+/// blinking caret inserted at the cursor (per `focus`).
+pub fn layout_widgets_focus(content_rect: Rect, widgets: Vec<Widget>, theme: Theme, has_hovered: Bool, hovered_index: Int, scroll_offset: Float, disabled: Vec<Int>, focus: TextFieldFocus) -> LayoutWidgetsResult {
+    var rects: Vec<DrawRect> = vec()
+    var labels: Vec<TextLabel> = vec()
+    var hits: Vec<WidgetHitRect> = vec()
+    var w_inc = copy theme.widgets.inactive.bg_fill
+    var w_hov = theme.widgets.hovered.bg_fill
+    var w_act = copy theme.widgets.active.bg_fill
+    var w_non = theme.widgets.noninteractive.bg_fill
+    var sp = theme.spacing
+    var item_y = sp.item_spacing.y
+    var item_x = sp.item_spacing.x
+    var btn_pad_x = sp.button_padding.x
+    var slider_label_w = math::fmax(sp.text_edit_width, 40.0)
+    var row_h_base = math::fmax(sp.interact_size.y, 16.0)
+    var y = content_rect.min.y + item_y - scroll_offset
+    var x = content_rect.min.x + item_x
+    var max_w = math::fmax(content_rect.width() - 2.0 * item_x, 0.0)
+
+    var i = 0
+    while i < widgets.len() {
+        var w = widgets[i]
+        var dis = widget_is_disabled(disabled, i)
+        var hov = has_hovered && hovered_index == i && !dis
+        var row_h = widget_row_height(w, row_h_base)
+        var adv = row_h                                  // vertical advance (row_h for all but TileGrid)
+        var adv_item = item_y                            // inter-widget gap (0 for Tooltip, which takes no space)
+        var k = w.kind
+
+        if k == wk_button() || k == wk_small_button() || k == wk_link() {
+            var label_w = math::fmax(to_float(w.label.len()) * widget_char_width() + btn_pad_x * 2.0, 60.0)
+            if k == wk_small_button() { label_w = math::fmax(to_float(w.label.len()) * widget_char_width() + btn_pad_x, 40.0) }
+            var ww = math::fmin(label_w, max_w)
+            var rect = rect_min_size(vec2(x, y), vec2(ww, row_h))
+            var lab_x = x + btn_pad_x
+            if k == wk_link() { lab_x = x }                  // links are not boxed, so no inset
+            if k != wk_link() {
+                var color = color_dup(w_inc)
+                if dis { color = w_non } else if hov { color = w_hov }
+                rects.push(DrawRect { rect: rect_dup(rect), color: color_dup(color) })
+            }
+            var blab = text_label(lab_x, y + (row_h - 16.0) / 2.0, w.label)
+            if k == wk_link() { blab.font_italic = true }
+            labels.push(blab)
+            var hk = whk_button()
+            if k == wk_small_button() { hk = whk_small_button() }
+            if k == wk_link() { hk = whk_link() }
+            if dis { hk = whk_disabled() }
+            var hitrect = rect_dup(rect)
+            if k == wk_link() { hitrect = rect_min_size(vec2(x, y), vec2(max_w, row_h)) }   // full-width clickable
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(hitrect), kind: hk, sub: 0 })
+        } else if k == wk_label() || k == wk_heading() || k == wk_subheading() || k == wk_monospace() || k == wk_separator() || k == wk_spacer() {
+            if k == wk_separator() {
+                var line_y = y + row_h / 2.0 - 1.0
+                rects.push(DrawRect { rect: rect_min_size(vec2(x, line_y), vec2(max_w, 2.0)), color: color_dup(w_inc) })
+            } else if k != wk_spacer() {
+                var cy = y + (row_h_base - 16.0) / 2.0
+                if k == wk_heading() { cy = y + (row_h - 16.0) / 2.0 }
+                if k == wk_subheading() { cy = y + (row_h - 14.0) / 2.0 }
+                var lab = text_label(x, cy, w.text)
+                if k == wk_heading() { lab.font_bold = true }
+                labels.push(lab)
+            }
+            hits.push(WidgetHitRect { index: i, id: i, rect: rect_min_size(vec2(x, y), vec2(max_w, row_h)), kind: whk_noninteractive(), sub: 0 })
+        } else if k == wk_checkbox() {
+            var box_rect = rect_min_size(vec2(x, y + (row_h - checkbox_size()) / 2.0), vec2(checkbox_size(), checkbox_size()))
+            var box_fill = color_dup(w_inc)
+            if dis { box_fill = w_non }
+            rects.push(DrawRect { rect: rect_dup(box_rect), color: color_dup(box_fill) })
+            if w.checked {
+                var pad = 4.0
+                rects.push(DrawRect { rect: rect_min_size(vec2(box_rect.min.x + pad, box_rect.min.y + pad), vec2(checkbox_size() - 2.0 * pad, checkbox_size() - 2.0 * pad)), color: color_dup(w_act) })
+            }
+            labels.push(text_label(box_rect.max.x + item_x, y + (row_h - 16.0) / 2.0, w.label))
+            var hk = whk_checkbox()
+            if dis { hk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_min_size(vec2(x, y), vec2(max_w, row_h)), kind: hk, sub: 0 })
+        } else if k == wk_slider() {
+            var range = math::fmax(w.vmax - w.vmin, 0.001)
+            var t = math::fclamp((w.value - w.vmin) / range, 0.0, 1.0)
+            var track_w = math::fmax(max_w - slider_label_w, 40.0)
+            var track_rect = rect_min_size(vec2(x + slider_label_w, y + (row_h - slider_track_h()) / 2.0), vec2(track_w, slider_track_h()))
+            var track_fill = color_dup(w_inc)
+            if dis { track_fill = w_non }
+            rects.push(DrawRect { rect: rect_dup(track_rect), color: color_dup(track_fill) })
+            var thumb_x = track_rect.min.x + t * (track_rect.width() - slider_thumb_w())
+            var thumb_h = math::fmin(row_h - 4.0, 20.0)
+            var thumb_rect = rect_min_size(vec2(thumb_x, y + (row_h - math::fmin(row_h, 20.0)) / 2.0), vec2(slider_thumb_w(), thumb_h))
+            var thumb_fill = color_dup(w_inc)
+            if dis { thumb_fill = w_non } else if hov { thumb_fill = w_hov }
+            rects.push(DrawRect { rect: rect_dup(thumb_rect), color: color_dup(thumb_fill) })
+            labels.push(text_label(x, y + (row_h - 16.0) / 2.0, w.label))
+            var hk = whk_slider_thumb()
+            if dis { hk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(thumb_rect), kind: hk, sub: 0 })
+            var tk = whk_slider_track()
+            if dis { tk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(track_rect), kind: tk, sub: 0 })
+        } else if k == wk_text_field() {
+            var rect = rect_min_size(vec2(x, y), vec2(max_w, row_h))
+            rects.push(DrawRect { rect: rect_dup(rect), color: color_dup(theme.visuals.input_bg) })
+            var focused = focus.has_focus && focus.index == i
+            var char_w = widget_char_width()
+            var tlen = w.text.len()
+            // selection highlight (start < end, within bounds)
+            if focused && focus.has_selection && focus.sel_start < focus.sel_end && focus.sel_end <= tlen {
+                var text_left = x + item_x
+                var sel_left = text_left + to_float(focus.sel_start) * char_w
+                var sel_w = math::fmin(to_float(focus.sel_end - focus.sel_start) * char_w, rect.max.x - sel_left)
+                if sel_w > 0.0 {
+                    rects.push(DrawRect { rect: rect_min_size(vec2(sel_left, y + (row_h - 16.0) / 2.0), vec2(sel_w, 16.0)), color: color_dup(theme.visuals.selection_bg) })
+                }
+            }
+            // focus ring (four edges)
+            if focused {
+                var ring = 2.0
+                var strc = copy theme.visuals.selection_stroke.color
+                rects.push(DrawRect { rect: rect_min_size(rect.min, vec2(rect.width(), ring)), color: copy strc })
+                rects.push(DrawRect { rect: rect_min_size(vec2(rect.min.x, rect.max.y - ring), vec2(rect.width(), ring)), color: copy strc })
+                rects.push(DrawRect { rect: rect_min_size(rect.min, vec2(ring, rect.height())), color: copy strc })
+                rects.push(DrawRect { rect: rect_min_size(vec2(rect.max.x - ring, rect.min.y), vec2(ring, rect.height())), color: copy strc })
+            }
+            var disp = w.text
+            if disp.len() == 0 { disp = w.placeholder }
+            if focused {
+                var pos = focus.cursor
+                if pos > tlen { pos = tlen }
+                if pos < 0 { pos = 0 }
+                if tlen == 0 {
+                    if focus.caret_visible { disp = "|" } else { disp = "" }
+                } else if focus.caret_visible {
+                    disp = w.text.slice(0, pos) + ("|" + w.text.slice(pos, tlen))
+                } else {
+                    disp = w.text
+                }
+            }
+            labels.push(text_label(x + item_x, y + (row_h - 16.0) / 2.0, disp))
+            var hk = whk_text_field()
+            if dis { hk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(rect), kind: hk, sub: 0 })
+        } else if k == wk_progress() {
+            var t = math::fclamp(w.value, 0.0, 1.0)
+            var bar_h = math::fmin(row_h * 0.4, 10.0)
+            var bar_y = y + (row_h - bar_h) / 2.0
+            rects.push(DrawRect { rect: rect_min_size(vec2(x, bar_y), vec2(max_w, bar_h)), color: color_dup(w_inc) })
+            var fill_w = math::fmax(max_w * t, 0.0)
+            if fill_w > 0.0 { rects.push(DrawRect { rect: rect_min_size(vec2(x, bar_y), vec2(fill_w, bar_h)), color: color_dup(w_act) }) }
+            hits.push(WidgetHitRect { index: i, id: i, rect: rect_min_size(vec2(x, y), vec2(max_w, row_h)), kind: whk_noninteractive(), sub: 0 })
+        } else if k == wk_toggle() {
+            var knob_w = row_h * 0.9
+            var track_w = knob_w * 1.8
+            var track_rect = rect_min_size(vec2(x, y + (row_h - slider_track_h()) / 2.0), vec2(track_w, slider_track_h()))
+            var tcol = color_dup(w_inc)
+            if w.on { tcol = w_act }
+            rects.push(DrawRect { rect: rect_dup(track_rect), color: color_dup(tcol) })
+            var knob_x = track_rect.min.x
+            if w.on { knob_x = track_rect.max.x - knob_w }
+            var knob_h = row_h * 0.7
+            var knob_y = y + (row_h - knob_h) / 2.0
+            rects.push(DrawRect { rect: rect_min_size(vec2(knob_x, knob_y), vec2(knob_w, knob_h)), color: color_dup(w_inc) })
+            labels.push(text_label(track_rect.max.x + item_x, y + (row_h - 16.0) / 2.0, w.label))
+            var hk = whk_toggle()
+            if dis { hk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_min_size(vec2(x, y), vec2(max_w, row_h)), kind: hk, sub: 0 })
+        } else if k == wk_dropdown() {
+            var current = "-"
+            if w.selected >= 0 && w.selected < w.options.len() { current = w.options[w.selected] }
+            var rect = rect_min_size(vec2(x, y), vec2(max_w, row_h))
+            var color = color_dup(w_inc)
+            if dis { color = w_non } else if hov { color = w_hov }
+            rects.push(DrawRect { rect: rect_dup(rect), color: color_dup(color) })
+            labels.push(text_label(x + btn_pad_x, y + (row_h - 16.0) / 2.0, w.label + ": " + current))
+            var hk = whk_dropdown()
+            if dis { hk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(rect), kind: hk, sub: 0 })
+        } else if k == wk_number() {
+            labels.push(text_label(x, y + (row_h - 16.0) / 2.0, w.label))
+            var lab_w = to_float(w.label.len()) * widget_char_width() + item_x
+            var btn = row_h
+            var plus_rect = rect_min_size(vec2(x + max_w - btn, y), vec2(btn, row_h))
+            var minus_rect = rect_min_size(vec2(x + max_w - 2.0 * btn, y), vec2(btn, row_h))
+            var field_x = x + lab_w
+            var field_w = math::fmax((x + max_w - 2.0 * btn) - field_x, 20.0)
+            var field_rect = rect_min_size(vec2(field_x, y), vec2(field_w, row_h))
+            rects.push(DrawRect { rect: rect_dup(field_rect), color: color_dup(theme.visuals.input_bg) })
+            var bcol = color_dup(w_inc)
+            if dis { bcol = w_non } else if hov { bcol = w_hov }
+            rects.push(DrawRect { rect: rect_dup(minus_rect), color: color_dup(bcol) })
+            rects.push(DrawRect { rect: rect_dup(plus_rect), color: color_dup(bcol) })
+            labels.push(text_label(field_x + item_x, y + (row_h - 16.0) / 2.0, to_str(w.value)))
+            labels.push(text_label(minus_rect.min.x + btn / 2.0 - 3.0, y + (row_h - 16.0) / 2.0, "-"))
+            labels.push(text_label(plus_rect.min.x + btn / 2.0 - 3.0, y + (row_h - 16.0) / 2.0, "+"))
+            var fk = whk_number()
+            var pk = whk_number_plus()
+            var mk = whk_number_minus()
+            if dis { fk = whk_disabled()  pk = whk_disabled()  mk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(field_rect), kind: fk, sub: 0 })
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(minus_rect), kind: mk, sub: 0 })
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(plus_rect), kind: pk, sub: 0 })
+        } else if k == wk_drag() {
+            labels.push(text_label(x, y + (row_h - 16.0) / 2.0, w.label))
+            var lab_w = to_float(w.label.len()) * widget_char_width() + item_x
+            var field_x = x + lab_w
+            var field_w = math::fmax(x + max_w - field_x, 30.0)
+            var field_rect = rect_min_size(vec2(field_x, y), vec2(field_w, row_h))
+            var color = color_dup(w_inc)
+            if dis { color = w_non } else if hov { color = w_hov }
+            rects.push(DrawRect { rect: rect_dup(field_rect), color: color_dup(color) })
+            labels.push(text_label(field_x + item_x, y + (row_h - 16.0) / 2.0, to_str(w.value)))
+            var hk = whk_drag()
+            if dis { hk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(field_rect), kind: hk, sub: 0 })
+        } else if k == wk_badge() {
+            var tw = math::fmax(to_float(w.text.len()) * widget_char_width() + 12.0, 24.0)   // 6px inner pad each side, floor 24
+            var bh = 20.0
+            var rect = rect_min_size(vec2(x, y + (row_h - bh) / 2.0), vec2(tw, bh))
+            rects.push(DrawRect { rect: rect_dup(rect), color: color_dup(theme.widgets.inactive.bg_stroke.color) })
+            labels.push(text_label(x + 6.0, y + (row_h - 16.0) / 2.0, w.text))
+            var hk = whk_badge()
+            if dis { hk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(rect), kind: hk, sub: 0 })
+        } else if k == wk_selectable() {
+            var rect = rect_min_size(vec2(x, y), vec2(max_w, row_h))
+            if hov { rects.push(DrawRect { rect: rect_dup(rect), color: color_dup(theme.widgets.hovered.weak_bg_fill) }) }
+            labels.push(text_label(x, y + (row_h - 16.0) / 2.0, w.text))
+            var hk = whk_selectable()
+            if dis { hk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(rect), kind: hk, sub: 0 })
+        } else if k == wk_icon() {
+            var sz = w.value
+            if sz <= 0.0 { sz = row_h * 0.8 }
+            var irect = rect_min_size(vec2(x, y + (row_h - sz) / 2.0), vec2(sz, sz))
+            rects.push(DrawRect { rect: rect_dup(irect), color: color_dup(w_inc) })
+            labels.push(text_label(irect.max.x + item_x, y + (row_h - 16.0) / 2.0, w.text))
+            hits.push(WidgetHitRect { index: i, id: i, rect: rect_min_size(vec2(x, y), vec2(max_w, row_h)), kind: whk_noninteractive(), sub: 0 })
+        } else if k == wk_collapsing() {
+            var cw = math::fmin(math::fmax(to_float(w.label.len()) * widget_char_width() + 20.0, 80.0), max_w)
+            var rect = rect_min_size(vec2(x, y), vec2(cw, row_h))
+            var color = color_dup(w_inc)
+            if dis { color = w_non } else if hov { color = w_hov }
+            rects.push(DrawRect { rect: rect_dup(rect), color: color_dup(color) })
+            var arrow = "v "
+            if w.on { arrow = "> " }
+            var clab = text_label(x + btn_pad_x, y + (row_h - 16.0) / 2.0, arrow + w.label)
+            clab.font_bold = true
+            labels.push(clab)
+            var hk = whk_collapsing()
+            if dis { hk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(rect), kind: hk, sub: 0 })
+        } else if k == wk_radio() {
+            labels.push(text_label(x, y + (row_h - 16.0) / 2.0, w.label))
+            var dot_r = 5.0
+            var oi = 0
+            while oi < w.options.len() {
+                var oy = y + to_float(oi) * (row_h_base + 2.0)
+                var dot_cx = x + checkbox_size() + item_x + dot_r
+                var dot_cy = oy + (row_h_base - 14.0) / 2.0 + 7.0
+                var dot_rect = rect_min_size(vec2(dot_cx - dot_r, dot_cy - dot_r), vec2(dot_r * 2.0, dot_r * 2.0))
+                rects.push(DrawRect { rect: rect_dup(dot_rect), color: color_dup(w_inc) })
+                if oi == w.selected {
+                    rects.push(DrawRect { rect: rect_min_size(vec2(dot_cx - dot_r * 0.5, dot_cy - dot_r * 0.5), vec2(dot_r, dot_r)), color: color_dup(w_act) })
+                }
+                labels.push(text_label(dot_rect.max.x + item_x, oy + (row_h_base - 16.0) / 2.0, w.options[oi]))
+                var hk = whk_radio_option()
+                if dis { hk = whk_disabled() }
+                hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_min_size(vec2(x, oy), vec2(max_w, row_h_base)), kind: hk, sub: oi })
+                oi = oi + 1
+            }
+        } else if k == wk_tabbar() {
+            var pad = 4.0
+            var tx = x
+            var ti = 0
+            while ti < w.options.len() {
+                var tw = math::fmin(math::fmax(to_float(w.options[ti].len()) * widget_char_width() + pad * 2.0, 40.0), max_w - (tx - x))
+                if tw <= 0.0 { ti = w.options.len() } else {
+                    var tab_rect = rect_min_size(vec2(tx, y), vec2(tw, row_h))
+                    var tcol = color_dup(w_inc)
+                    if dis { tcol = w_non } else if ti == w.selected { tcol = w_act } else if hov { tcol = w_hov }
+                    rects.push(DrawRect { rect: rect_dup(tab_rect), color: color_dup(tcol) })
+                    labels.push(text_label(tx + pad, y + (row_h - 14.0) / 2.0, w.options[ti]))
+                    var hk = whk_tabbar_tab()
+                    if dis { hk = whk_disabled() }
+                    hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(tab_rect), kind: hk, sub: ti })
+                    tx = tx + tw
+                    ti = ti + 1
+                }
+            }
+        } else if k == wk_color_swatch() {
+            var swatch_size = math::fmin(row_h - 4.0, 24.0)
+            var swatch_rect = rect_min_size(vec2(x, y + (row_h - swatch_size) / 2.0), vec2(swatch_size, swatch_size))
+            rects.push(DrawRect { rect: rect_dup(swatch_rect), color: color_dup(w.col) })
+            labels.push(text_label(swatch_rect.max.x + item_x, y + (row_h - 16.0) / 2.0, w.label))
+            var hk = whk_color_swatch()
+            if dis { hk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_min_size(vec2(x, y), vec2(max_w, row_h)), kind: hk, sub: 0 })
+        } else if k == wk_color_picker() {
+            var swatch_size = math::fmin(row_h_base - 4.0, 24.0)
+            var swatch_rect = rect_min_size(vec2(x, y + (row_h_base - swatch_size) / 2.0), vec2(swatch_size, swatch_size))
+            rects.push(DrawRect { rect: rect_dup(swatch_rect), color: color_dup(w.col) })
+            labels.push(text_label(swatch_rect.max.x + item_x, y + (row_h_base - 16.0) / 2.0, w.label))
+            var hk = whk_color_picker_swatch()
+            if dis { hk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_min_size(vec2(x, y), vec2(max_w, row_h_base)), kind: hk, sub: 0 })
+        } else if k == wk_image_button() {
+            var label_w = math::fmax(to_float(w.label.len()) * widget_char_width() + btn_pad_x * 2.0 + 24.0, 60.0)
+            var ww = math::fmin(label_w, max_w)
+            var rect = rect_min_size(vec2(x, y), vec2(ww, row_h))
+            var color = color_dup(w_inc)
+            if dis { color = w_non } else if hov { color = w_hov }
+            rects.push(DrawRect { rect: rect_dup(rect), color: color_dup(color) })
+            labels.push(text_label(x + btn_pad_x, y + (row_h - 16.0) / 2.0, w.label))
+            var hk = whk_image_button()
+            if dis { hk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(rect), kind: hk, sub: 0 })
+        } else if k == wk_tilegrid() {
+            var grid_w = to_float(w.gcols) * w.cell_w
+            var grid_h = to_float(w.grows) * w.cell_h
+            adv = grid_h                                 // advances by the raw grid height, not row_h
+            var font_size = math::fmax(w.cell_h - 2.0, 8.0)
+            var row = 0
+            while row < w.grows {
+                var col = 0
+                while col < w.gcols {
+                    var idx = row * w.gcols + col
+                    if idx < w.cells.len() {
+                        var cell = w.cells[idx]
+                        var cx = x + to_float(col) * w.cell_w
+                        var cy = y + to_float(row) * w.cell_h
+                        if cell.bg.a > 0 { rects.push(DrawRect { rect: rect_min_size(vec2(cx, cy), vec2(w.cell_w, w.cell_h)), color: color_dup(cell.bg) }) }
+                        if cell.ch.len() > 0 && cell.ch != " " {
+                            var lab = text_label(cx + 1.0, cy + 1.0, cell.ch)
+                            lab.has_font_family = true
+                            lab.font_family = "monospace"
+                            lab.has_font_size = true
+                            lab.font_size = font_size
+                            lab.color = some_color(cell.fg)
+                            labels.push(lab)
+                        }
+                    }
+                    col = col + 1
+                }
+                row = row + 1
+            }
+            hits.push(WidgetHitRect { index: i, id: i, rect: rect_min_size(vec2(x, y), vec2(math::fmin(grid_w, max_w), grid_h)), kind: whk_noninteractive(), sub: 0 })
+        } else if k == wk_hyperlink() {
+            var rect = rect_min_size(vec2(x, y), vec2(max_w, row_h))
+            labels.push(text_label(x, y + (row_h - 16.0) / 2.0, w.label))
+            var hk = whk_hyperlink()
+            if dis { hk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(rect), kind: hk, sub: 0 })
+        } else if k == wk_resize_handle() {
+            var handle_w = 6.0
+            var handle_h = row_h
+            if !w.on { handle_w = max_w  handle_h = 6.0 }         // w.on == vertical
+            var rect = rect_min_size(vec2(x, y), vec2(handle_w, handle_h))
+            var color = color_dup(w_inc)
+            if dis { color = w_non } else if hov { color = w_hov }
+            rects.push(DrawRect { rect: rect_dup(rect), color: color_dup(color) })
+            var hk = whk_resize_handle()
+            if dis { hk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(rect), kind: hk, sub: 0 })
+        } else if k == wk_button_styled() {
+            var label_w = math::fmax(to_float(w.label.len()) * widget_char_width() + btn_pad_x * 2.0, 60.0)
+            var ww = math::fmin(label_w, max_w)
+            var rect = rect_min_size(vec2(x, y), vec2(ww, row_h))
+            var color = color_dup(w_inc)
+            if dis { color = w_non } else if hov { color = w_hov }
+            rects.push(DrawRect { rect: rect_dup(rect), color: color_dup(color) })
+            var lab = text_label(x + btn_pad_x, y + (row_h - 16.0) / 2.0, w.label)
+            if w.has_ffamily { lab.has_font_family = true  lab.font_family = copy w.ffamily }
+            if w.has_fsize { lab.has_font_size = true  lab.font_size = w.fsize }
+            lab.font_bold = w.fbold
+            lab.font_italic = w.fitalic
+            labels.push(lab)
+            var hk = whk_button()
+            if dis { hk = whk_disabled() }
+            hits.push(WidgetHitRect { index: i, id: w.id, rect: rect_dup(rect), kind: hk, sub: 0 })
+        } else if k == wk_label_styled() {
+            var lab = text_label(x, y + (row_h_base - 16.0) / 2.0, w.text)
+            if w.has_ffamily { lab.has_font_family = true  lab.font_family = copy w.ffamily }
+            if w.has_fsize { lab.has_font_size = true  lab.font_size = w.fsize }
+            lab.font_bold = w.fbold
+            lab.font_italic = w.fitalic
+            labels.push(lab)
+            hits.push(WidgetHitRect { index: i, id: i, rect: rect_min_size(vec2(x, y), vec2(max_w, row_h)), kind: whk_noninteractive(), sub: 0 })
+        } else if k == wk_tooltip() {
+            hits.push(WidgetHitRect { index: i, id: i, rect: rect_min_size(vec2(x, y), vec2(0.0, 0.0)), kind: whk_noninteractive(), sub: 0 })
+            adv = 0.0
+            adv_item = 0.0
+        }
+        y = y + adv + adv_item
+        i = i + 1
+    }
+    return LayoutWidgetsResult { rects: rects, labels: labels, hits: hits }
+}
+
+/// hit-test laid-out widgets at `cursor`; returns the matching hit (index -1 if none, last match wins).
+pub fn hit_test_widgets(cursor: Vec2, hits: Vec<WidgetHitRect>) -> WidgetHitRect {
+    var i = 0
+    while i < hits.len() { if hits[i].rect.contains(cursor) { return widget_hit_dup(hits[i]) }  i = i + 1 }
+    return WidgetHitRect { index: -1, id: 0, rect: rect_min_max(vec2_zero(), vec2_zero()), kind: whk_noninteractive(), sub: 0 }
+}
+
+/// the tooltip text for the widget at `hovered_index`: the text of an immediately-following Tooltip
+/// widget, or "" if the next widget isn't a Tooltip (or there is none).
+pub fn tooltip_for_hovered(widgets: Vec<Widget>, hovered_index: Int) -> Str {
+    var n = hovered_index + 1
+    if n < 0 || n >= widgets.len() { return "" }
+    var nx = widgets[n]
+    if nx.kind == wk_tooltip() { return copy nx.text }
+    return ""
+}
+
+/// vertical scrollbar track width.
+pub fn scrollbar_track_width() -> Float { return 10.0 }
+/// minimum scrollbar thumb height.
+pub fn scrollbar_thumb_min_h() -> Float { return 24.0 }
+
+/// where the thumb of a `scrollbar { }` node sits in its track.
+///
+/// One place, because two would drift. The library paints the bar and the host hit-tests it, and a
+/// thumb drawn a few pixels from where it is grabbed is the kind of wrongness that reads as the
+/// pointer being inaccurate rather than as a bug. `content`/`view`/`offset` are the plugin's own
+/// units; only their ratios are used.
+pub fn scrollbar_node_thumb(track: Rect, content: Float, vw: Float, offset: Float) -> Rect {
+    if content <= 0.0 { return rect_dup(track) }
+    if vw <= 0.0 { return rect_dup(track) }
+    if content <= vw { return rect_dup(track) }
+    let rng = content - vw
+    var off = offset
+    if off < 0.0 { off = 0.0 }
+    if off > rng { off = rng }
+    var th = math::fmax(track.height() * (vw / content), scrollbar_thumb_min_h())
+    if th > track.height() { th = track.height() }
+    let ty = track.min.y + (off / rng) * (track.height() - th)
+    return rect_min_size(vec2(track.min.x, ty), vec2(track.width(), th))
+}
+
+/// a vertical scrollbar layout: the track rect plus an optional thumb rect.
+pub struct ScrollbarLayout { track_rect: Rect, has_thumb: Bool, thumb_rect: Rect }
+
+/// compute the vertical scrollbar for `content_rect`; thumb absent when content fits the viewport.
+pub fn scrollbar_layout(content_rect: Rect, content_height_px: Float, scroll_offset: Float, visible_height: Float) -> ScrollbarLayout {
+    var tw = scrollbar_track_width()
+    var track_rect = rect_min_size(vec2(content_rect.max.x - tw, content_rect.min.y), vec2(tw, content_rect.height()))
+    if content_height_px <= 0.0 || visible_height <= 0.0 || content_height_px <= visible_height {
+        return ScrollbarLayout { track_rect: track_rect, has_thumb: false, thumb_rect: rect_min_max(vec2_zero(), vec2_zero()) }
+    }
+    var thumb_ratio = math::fmin(visible_height / content_height_px, 1.0)
+    var thumb_h = math::fmin(math::fmax(track_rect.height() * thumb_ratio, scrollbar_thumb_min_h()), track_rect.height())
+    var rng = content_height_px - visible_height
+    var t = 0.0
+    if rng > 0.0 { t = math::fclamp(scroll_offset / rng, 0.0, 1.0) }
+    var thumb_y = track_rect.min.y + t * (track_rect.height() - thumb_h)
+    return ScrollbarLayout { track_rect: rect_dup(track_rect), has_thumb: true, thumb_rect: rect_min_size(vec2(track_rect.min.x, thumb_y), vec2(tw, thumb_h)) }
+}
+
+// ---- color picker popup (Photoshop-style 2D S/V square + vertical hue bar) ----
+
+/// the laid-out color-picker popup: draw commands + the square/hue rects for hit-testing.
+pub struct ColorPickerPopup { commands: Vec<DrawCommand>, square_rect: Rect, hue_rect: Rect }
+
+pub fn picker_square_size() -> Float { return 120.0 }
+pub fn picker_hue_bar_width() -> Float { return 16.0 }
+pub fn picker_popup_padding() -> Float { return 8.0 }
+pub fn picker_popup_gap() -> Float { return 4.0 }
+/// total (width, height) of the floating color-picker popup.
+pub fn color_picker_popup_size() -> Vec2 {
+    var w = picker_popup_padding() * 2.0 + picker_square_size() + picker_popup_gap() + picker_hue_bar_width()
+    var h = picker_popup_padding() * 2.0 + picker_square_size()
+    return vec2(w, h)
+}
+
+/// contrasting stroke color (white on dark, black on light) by luminance.
+fn picker_contrast_color(c: Color) -> Color {
+    var intensity = (to_float(c.r) * 0.299 + to_float(c.g) * 0.587 + to_float(c.b) * 0.114) / 255.0
+    if intensity < 0.5 { return color_white() }
+    return color_black()
+}
+
+/// lay out the floating color-picker popup: a 4x4 HSV gradient S/V square with a marker + a 36-segment
+/// hue strip with a marker. Returns the draw commands and the square/hue rects for hit-testing.
+pub fn layout_color_picker_popup(popup_rect: Rect, col: Color) -> ColorPickerPopup {
+    var cmds: Vec<DrawCommand> = vec()
+    var pad = picker_popup_padding()
+    var hue_bar_w = picker_hue_bar_width()
+    var available = math::fmax(popup_rect.width() - (pad * 2.0 + picker_popup_gap() + hue_bar_w), 0.0)
+    var square_size = math::fmax(math::fmin(picker_square_size(), available), 40.0)
+    var square_rect = rect_min_size(vec2(popup_rect.min.x + pad, popup_rect.min.y + pad), vec2(square_size, square_size))
+    var hue_rect = rect_min_max(vec2(square_rect.max.x + picker_popup_gap(), square_rect.min.y), vec2(square_rect.max.x + picker_popup_gap() + hue_bar_w, square_rect.max.y))
+    var hue_bar_h = hue_rect.height()
+
+    var hsv = rgb_to_hsv(col.r, col.g, col.b)
+    var h = hsv.h
+    // 4x4 grid so the gradient is computed in HSV space (avoids gray/mud in the middle)
+    var gridn = 4
+    var cell_w = square_size / to_float(gridn)
+    var cell_h = square_size / to_float(gridn)
+    var cy2 = 0
+    while cy2 < gridn {
+        var cx2 = 0
+        while cx2 < gridn {
+            var s0 = to_float(cx2) / to_float(gridn)
+            var s1 = to_float(cx2 + 1) / to_float(gridn)
+            var v0 = 1.0 - to_float(cy2 + 1) / to_float(gridn)
+            var v1 = 1.0 - to_float(cy2) / to_float(gridn)
+            var cell_rect = rect_min_size(vec2(square_rect.min.x + to_float(cx2) * cell_w, square_rect.min.y + to_float(cy2) * cell_h), vec2(cell_w, cell_h))
+            cmds.push(dc_gradient_rect(cell_rect, hsv_to_rgb(h, s0, v1), hsv_to_rgb(h, s1, v1), hsv_to_rgb(h, s0, v0), hsv_to_rgb(h, s1, v0), 0.0))
+            cx2 = cx2 + 1
+        }
+        cy2 = cy2 + 1
+    }
+    var border = color_rgb(70, 70, 75)
+    cmds.push(dc_rect_filled(rect_min_size(square_rect.min, vec2(square_size, 1.0)), border, 0.0))
+    cmds.push(dc_rect_filled(rect_min_size(vec2(square_rect.min.x, square_rect.max.y - 1.0), vec2(square_size, 1.0)), border, 0.0))
+    cmds.push(dc_rect_filled(rect_min_size(square_rect.min, vec2(1.0, square_size)), border, 0.0))
+    cmds.push(dc_rect_filled(rect_min_size(vec2(square_rect.max.x - 1.0, square_rect.min.y), vec2(1.0, square_size)), border, 0.0))
+
+    // S/V marker (contrasting ring around the current color)
+    var cur_s = hsv.s
+    var cur_v = hsv.v
+    var marker_cx = square_rect.min.x + cur_s * square_size
+    var marker_cy = square_rect.min.y + (1.0 - cur_v) * square_size
+    var marker_r = math::fmax(square_size / 14.0, 4.0)
+    var mrgb = hsv_to_rgb(h, cur_s, cur_v)
+    var mo_x = math::fclamp(marker_cx - marker_r, square_rect.min.x, square_rect.max.x - 2.0 * marker_r)
+    var mo_y = math::fclamp(marker_cy - marker_r, square_rect.min.y, square_rect.max.y - 2.0 * marker_r)
+    var marker_outer = rect_min_size(vec2(mo_x, mo_y), vec2(2.0 * marker_r, 2.0 * marker_r))
+    var marker_inner = rect_min_size(vec2(marker_outer.min.x + 1.5, marker_outer.min.y + 1.5), vec2(math::fmax(2.0 * marker_r - 3.0, 0.0), math::fmax(2.0 * marker_r - 3.0, 0.0)))
+    cmds.push(dc_rect_filled(marker_outer, picker_contrast_color(mrgb), 0.0))
+    cmds.push(dc_rect_filled(marker_inner, mrgb, 0.0))
+
+    // hue strip: 36 rainbow segments
+    var hue_segments = 36
+    var seg_h = hue_bar_h / to_float(hue_segments)
+    var seg = 0
+    while seg < hue_segments {
+        var h_seg = (to_float(seg) + 0.5) / to_float(hue_segments) * 360.0
+        var seg_rect = rect_min_size(vec2(hue_rect.min.x, hue_rect.min.y + to_float(seg) * seg_h), vec2(hue_bar_w, seg_h + 0.5))
+        cmds.push(dc_rect_filled(seg_rect, hsv_to_rgb(h_seg, 1.0, 1.0), 0.0))
+        seg = seg + 1
+    }
+    cmds.push(dc_rect_filled(rect_min_size(hue_rect.min, vec2(hue_bar_w, 1.0)), border, 0.0))
+    cmds.push(dc_rect_filled(rect_min_size(vec2(hue_rect.min.x, hue_rect.max.y - 1.0), vec2(hue_bar_w, 1.0)), border, 0.0))
+
+    // hue marker at the current hue
+    var hrgb = hsv_to_rgb(h, 1.0, 1.0)
+    var hue_marker_h = 4.0
+    var hue_marker_y = math::fclamp(hue_rect.min.y + (h / 360.0) * hue_bar_h - hue_marker_h / 2.0, hue_rect.min.y, hue_rect.max.y - hue_marker_h)
+    var hue_marker_rect = rect_min_size(vec2(hue_rect.min.x, hue_marker_y), vec2(hue_bar_w, hue_marker_h))
+    cmds.push(dc_rect_filled(rect_min_size(vec2(hue_rect.min.x - 1.0, math::fmax(hue_marker_rect.min.y - 1.0, hue_rect.min.y)), vec2(hue_bar_w + 2.0, hue_marker_h + 2.0)), picker_contrast_color(hrgb), 0.0))
+    cmds.push(dc_rect_filled(hue_marker_rect, hrgb, 0.0))
+
+    return ColorPickerPopup { commands: cmds, square_rect: square_rect, hue_rect: hue_rect }
+}

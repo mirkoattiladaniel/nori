@@ -1,0 +1,91 @@
+// Native tests for std/font's line breaking (UAX #14): run with
+//   noric --test std/font/linebreak_test.nori compiler/runtime.nori --import-root .
+//
+// LineBreakTest.txt (Unicode 16, committed zstd-compressed) is run whole.
+import "std/font" as font
+import "std/strutil" as su
+import "std/archive" as ar
+
+fn hexnum(h: Str) -> Int {
+    var v = 0
+    var k = 0
+    while k < h.len() {
+        let c = ord(h.at(k))
+        var n = 0
+        if c >= 48 && c <= 57 { n = c - 48 } else if c >= 97 && c <= 102 { n = c - 87 } else if c >= 65 && c <= 70 { n = c - 55 }
+        v = v * 16 + n
+        k = k + 1
+    }
+    return v
+}
+
+fn test_line_break_test() {
+    let text = ar::zstd_decompress(read_file("std/font/testdata/LineBreakTest.txt.zst"))
+    assert_true(text.len() > 3000000)
+    var pos = 0
+    var cases = 0
+    var fails = 0
+    var shown = 0
+    while pos < text.len() {
+        var e = pos
+        while e < text.len() && text.at(e) != '\n' { e = e + 1 }
+        let line = text.slice(pos, e)
+        pos = e + 1
+        if line.len() == 0 || line.at(0) == '#' { continue }
+        var hash = 0
+        while hash < line.len() && line.at(hash) != '#' { hash = hash + 1 }
+        let body = su::trim(line.slice(0, hash))
+        let toks = su::split(body, " ")
+        // tokens alternate: mark cp mark cp ... mark   (× = no break, ÷ = break)
+        var cps: Vec<Int> = vec()
+        var want: Vec<Int> = vec()
+        var t = 0
+        while t < toks.len() {
+            let tk = toks[t]
+            if tk.len() == 0 { t = t + 1  continue }
+            if tk == "×" { want.push(0) } else if tk == "÷" { want.push(1) } else { cps.push(hexnum(tk)) }
+            t = t + 1
+        }
+        let got = font::line_breaks(cps)
+        var ok = got.len() == want.len()
+        var i = 1                                                       // the start (sot) is never a break
+        while ok && i < want.len() {
+            var g = 0
+            if got[i] != font::LBK_NONE() { g = 1 }
+            if g != want[i] { ok = false }
+            i = i + 1
+        }
+        cases = cases + 1
+        if !ok {
+            fails = fails + 1
+            if shown < 15 {
+                var gs = ""
+                i = 0
+                while i < got.len() { gs = gs + to_str(got[i]) + " "  i = i + 1 }
+                printl("FAIL ${line}")
+                printl("   got ${gs}")
+                shown = shown + 1
+            }
+        }
+    }
+    printl("LineBreakTest: ${cases} cases, ${fails} failures")
+    assert_true(cases > 15000)
+    assert_eq(fails, 0)
+}
+
+fn test_break_offsets() {
+    let b = font::line_break_offsets("Hello world, foo-bar")
+    // after "Hello " (6), after "world, " (13), after "foo-" (17), end (20)
+    assert_eq(b.len(), 4)
+    assert_eq(b[0], 6)
+    assert_eq(b[1], 13)
+    assert_eq(b[2], 17)
+    assert_eq(b[3], 20)
+    // a hard break is mandatory
+    let cps = font::utf8_codepoints("a\nb")
+    let br = font::line_breaks(cps)
+    assert_eq(br[2], font::LBK_MANDATORY())
+    // CJK breaks between ideographs; Thai (SA) does not break inside a word without a dictionary
+    let cj = font::line_break_offsets("日本語")
+    assert_eq(cj.len(), 3)
+}

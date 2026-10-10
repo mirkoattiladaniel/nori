@@ -1,0 +1,680 @@
+use core::*
+import "std/math" as math
+import "std/parse" as parse
+
+// ===========================================================================
+// `.ui` widget-family node parsers: divider, checkbox, slider, dropdown.
+//
+// A sibling root file of std/nori_ui/layout, so it shares one scope with
+// dsl.nori and calls dsl_value / dsl_fail / dsl_str_of / ... directly, and every
+// `pub` item still exports at `ui::layout::`.
+//
+// Contract: `dsl_node_body` has already consumed the element name and its
+// opening `{`. Each parser owns its own
+// attribute table and its own error text.
+// ===========================================================================
+
+// ---- theme constants ------------------------------------------------------
+// widget.nori reads these off the Theme; the `.ui` overlay path carries no Theme,
+// so the geometry is derived from `spacing_default()`
+// (core/theme.nori) and the numbers are frozen here as named helpers.
+
+/// `theme.spacing.item_spacing.x` (widget.nori), spacing_default 10.0.
+fn dw_item_x() -> Float { return 10.0 }
+/// `theme.spacing.button_padding.x` (widget.nori), spacing_default 10.0.
+fn dw_btn_pad_x() -> Float { return 10.0 }
+/// the 40px floor on a slider track: widget.nori's `fmax(max_w - slider_label_w, 40.0)`.
+fn dw_min_track_w() -> Float { return 40.0 }
+/// widget.nori's label line box: labels are centred on a 16px line.
+fn dw_line_box() -> Float { return 16.0 }
+/// the gap between a dropdown's trigger and its open option list. The `.ui` language has no popup layout of
+/// its own, so this is an extension; 2px is chosen so the
+/// trigger's 1px border and the panel's 1px border do not share a row of pixels.
+fn dw_popup_gap() -> Float { return 2.0 }
+
+// ---- value helpers with this family's exact error text ------------------------
+// Nori's shared dsl_* helpers are close but not identical (dsl_str_of says
+// "must be a string or ident", this family says "must be string or
+// ident"), and several fields here are strictly Number/Bool where the shared
+// helper coerces. The text is part of the language, so these are local.
+
+/// String-or-ident value, with this family's message.
+fn dw_str_of(inout p: DslP, v: DslValue, label: Str) -> Str {
+    if v.kind == 0 || v.kind == 3 { return copy v.s }
+    dsl_fail(p, (label + " must be string or ident"))
+    return ""
+}
+/// a Bool-only field: slider/dropdown `fill_w` take no number coercion,
+/// unlike checkbox's `value_bool`.
+fn dw_bool_strict(inout p: DslP, v: DslValue, label: Str) -> Bool {
+    if v.kind == 2 { return v.b }
+    dsl_fail(p, (label + " must be true or false"))
+    return false
+}
+/// Class list value. Note the two distinct messages.
+fn dw_classes(inout p: DslP, v: DslValue) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    if v.kind != 4 { dsl_fail(p, "classes must be [...]")  return out }
+    var i = 0
+    while i < v.arr.len() {
+        var e = v.arr[i]
+        if e.kind != 0 && e.kind != 3 { dsl_fail(p, "class names must be strings or identifiers")  return out }
+        // an empty name is no class: it is how a component parameter switches one off (`[tb, $state]`)
+        if e.s.len() > 0 { out.push(copy e.s) }
+        i = i + 1
+    }
+    return out
+}
+/// Cross-axis value. Ident-only; the non-ident message
+/// omits `start`, and is reproduced as is.
+fn dw_cross(inout p: DslP, v: DslValue) -> Int {
+    if v.kind == 3 {
+        if (v.s == "stretch") { return cross_stretch() }
+        if (v.s == "start") { return cross_start() }
+        if (v.s == "center") { return cross_center() }
+        if (v.s == "end") { return cross_end() }
+        dsl_fail(p, ("unknown cross_align " + dw_dq(v.s)))
+        return cross_stretch()
+    }
+    dsl_fail(p, "cross_align must be stretch, center, or end")
+    return cross_stretch()
+}
+/// Four-byte colour value. dsl_color does the hex/array work; only
+/// the fallthrough message differs from Nori's, so it is checked here first.
+fn dw_color(inout p: DslP, v: DslValue) -> Color {
+    var is_hex = (v.kind == 3 || v.kind == 0) && v.s.len() > 0 && ord(v.s.at(0)) == 35
+    if is_hex || v.kind == 4 { return dsl_color(p, v) }
+    dsl_fail(p, "expected [r,g,b,a] or #RRGGBB/#RRGGBBAA")
+    return color_transparent()
+}
+/// A double-quoted debug string. The quotes are part of
+/// every `unknown <kind> field "X"` message.
+fn dw_dq(s: Str) -> Str { return (chr(34) + (s + chr(34))) }
+/// `unknown <kind> field "<name>"`.
+fn dw_unknown(kindname: Str, name: Str) -> Str { return ("unknown " + (kindname + (" field " + dw_dq(name)))) }
+/// Identifier. Nori's dsl_ident says "expected an
+/// identifier"; this family says "expected identifier", and this keeps that text.
+fn dw_ident(inout p: DslP) -> Str {
+    var out = dsl_probe_ident(p)
+    if out.len() == 0 { dsl_fail(p, "expected identifier") }
+    return out
+}
+/// Style A `:` enforcement: a manual peek, used by divider / slider / dropdown.
+fn dw_colon_a(inout p: DslP, kindname: Str) {
+    dsl_skip(p)
+    if dsl_peek(p) == 58 { dsl_bump(p)  return }
+    dsl_fail(p, ("expected `:` in " + (kindname + " node")))
+}
+/// A char in debug form: single quotes, with the usual escapes. Bytes >= 0x80
+/// are a UTF-8 lead/continuation byte here, not a char (Nori's scanner is
+/// byte-oriented), so they are emitted raw.
+fn dw_char_dq(c: Int) -> Str {
+    if c == 10 { return "'\\n'" }
+    if c == 13 { return "'\\r'" }
+    if c == 9 { return "'\\t'" }
+    if c == 92 { return "'\\\\'" }
+    if c == 39 { return "'\\''" }
+    return ("'" + (chr(c) + "'"))
+}
+/// Style B `:` enforcement: an expect-colon check, used by checkbox.
+fn dw_colon_b(inout p: DslP) {
+    dsl_skip(p)
+    var c = dsl_peek(p)
+    if c == 58 { dsl_bump(p)  return }
+    if c < 0 { dsl_fail(p, "expected ':', found end of file")  return }
+    dsl_fail(p, ("expected ':', found " + dw_char_dq(c)))
+}
+/// does `s` look like a length literal: `[-]digits[.digits]` plus an optional
+/// `%`/`vw`/`vh`/`ui` suffix, or the bare word `ui`? A strict length parse
+/// rejects anything else, but Nori's `ui_length_parse` is lenient:
+/// `parse_unit_num` accepts any non-empty string and `parse_float_sub` yields 0
+/// (runtime_document.nori), so `h: bogus` would silently become `Px(0)`.
+/// That helper lives in a file this family does not own, so the strictness is
+/// imposed here rather than by changing it.
+fn dw_looks_like_length(s: Str) -> Bool {
+    var t = nui_trim(s)
+    if t.len() == 0 { return false }
+    if (nui_lower(t) == "ui") { return true }
+    var n = t.len()
+    if nui_ends_with(t, "%") { n = n - 1 }
+    else if nui_ends_with(nui_lower(t), "vw") || nui_ends_with(nui_lower(t), "vh") || nui_ends_with(nui_lower(t), "ui") { n = n - 2 }
+    if n == 0 { return false }
+    var i = 0
+    if ord(t.at(0)) == 45 || ord(t.at(0)) == 43 { i = 1 }
+    var digits = 0
+    var dots = 0
+    while i < n {
+        var c = ord(t.at(i))
+        if dsl_is_digit(c) { digits = digits + 1 }
+        else if c == 46 { dots = dots + 1 }
+        else { return false }
+        i = i + 1
+    }
+    return digits > 0 && dots <= 1
+}
+/// Length value. Only `divider`'s `h` uses it;
+/// every other height in this family is a plain f32, so `slider { h: 50% }`
+/// is an error while `divider { h: 50% }` is valid.
+fn dw_length(inout p: DslP) -> UiLength {
+    dsl_skip(p)
+    var c = dsl_peek(p)
+    if c == 45 || dsl_is_digit(c) {
+        var n = dsl_number(p)
+        if p.failed[0] == 1 { return ui_px(0.0) }
+        return dsl_length_suffix(p, n)
+    }
+    var v = dsl_value(p)
+    if p.failed[0] == 1 { return ui_px(0.0) }
+    if v.kind == 0 || v.kind == 3 {
+        if (v.s == "fill") { dsl_fail(p, "length: use fill_w / fill_h instead of `fill`")  return ui_px(0.0) }
+        if dw_looks_like_length(v.s) {
+            var lp = ui_length_parse(v.s)
+            if lp.ok { return sink lp.len }
+        }
+        dsl_fail(p, ("invalid length: " + dw_dq(v.s)))
+        return ui_px(0.0)
+    }
+    dsl_fail(p, "length must be a number or length")
+    return ui_px(0.0)
+}
+/// An f32 to index conversion: NaN and every negative saturate to zero, and the
+/// rest truncate toward zero. `selected: -3` is silently `0`.
+fn dw_as_usize(f: Float) -> Int {
+    if !(f > 0.0) { return 0 }
+    return to_int(f)
+}
+
+// ---- the four parsers -----------------------------------------------------
+
+/// parse one widget-family node body. `kindname` is the element as written
+/// (`divider` maps to nk_rect with an implicit class, so it is not recoverable
+/// from `kind` alone); `kind` is what up_kind returned.
+fn dsl_widgets_node(inout p: DslP, kindname: Str, kind: Int) -> UiNode {
+    if (kindname == "divider") { return dw_divider_node(p) }
+    if kind == nk_checkbox() { return dw_checkbox_node(p) }
+    if kind == nk_slider() { return dw_slider_node(p) }
+    if kind == nk_scrollbar() { return dw_scrollbar_node(p) }
+    return dw_dropdown_node(p)
+}
+
+/// `divider { }`. Pure sugar: it produces a Rect with
+/// a pre-seeded `"divider"` class. No `id`, no `class` (singular), no required
+/// attributes, and `classes:` appends rather than replaces.
+fn dw_divider_node(inout p: DslP) -> UiNode {
+    var node = ui_node_blank(nk_rect())
+    node.fill_w = true
+    node.fill_h = false
+    node.w = ui_px(0.0)
+    node.h = ui_px(1.0)
+    var cls: Vec<Str> = vec()
+    cls.push("divider")                               // implicit class, pre-seeded
+    node.classes = cls
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 { dsl_bump(p)  return node }
+        var name = dw_ident(p)
+        if p.failed[0] == 1 { return node }
+        dw_colon_a(p, "divider")
+        if p.failed[0] == 1 { return node }
+        if (name == "h") { node.h = dw_length(p) }
+        else {
+            var v = dsl_value(p)
+            if p.failed[0] == 1 { return node }
+            if (name == "color") { node.has_color = true  node.color = rgba_pack(dw_color(p, v)) }
+            else if (name == "classes") {
+                var extra = dw_classes(p, v)
+                if p.failed[0] == 1 { return node }
+                var ci = 0
+                while ci < extra.len() { node.classes.push(sink extra[ci])  ci = ci + 1 }
+            }
+            else if (name == "radius") { node.radius = dsl_num_of(p, v, "radius") }
+            else { dsl_fail(p, dw_unknown("divider", name))  return node }
+        }
+        if p.failed[0] == 1 { return node }
+    }
+    return node
+}
+
+/// `checkbox { }`. Style B `:`; `id` required.
+fn dw_checkbox_node(inout p: DslP) -> UiNode {
+    var node = ui_node_blank(nk_checkbox())
+    node.fill_w = true
+    node.h = ui_px(28.0)
+    var have_id = false
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 {
+            dsl_bump(p)
+            // This is raised at the closing brace, so the
+            // reported line:col is the position after the block.
+            if !have_id { dsl_fail(p, "checkbox requires id:") }
+            return node
+        }
+        var name = dw_ident(p)
+        if p.failed[0] == 1 { return node }
+        dw_colon_b(p)
+        if p.failed[0] == 1 { return node }
+        var v = dsl_value(p)
+        if p.failed[0] == 1 { return node }
+        if (name == "bind") { node.bind = dw_str_of(p, v, "bind") }
+        else if (name == "bind_visible") { node.bind_visible = dw_str_of(p, v, "bind_visible") }
+        else if (name == "bind_disabled") { node.bind_disabled = dw_str_of(p, v, "bind_disabled") }
+        else if (name == "id") { node.id = dw_str_of(p, v, "checkbox id")  have_id = true }
+        else if (name == "label") { node.text = dw_str_of(p, v, "checkbox label") }
+        else if (name == "checked") { node.checked = dsl_bool_of(p, v, "checked") }
+        else if (name == "classes") { node.classes = dw_classes(p, v) }
+        else if (name == "class") {
+            var nc: Vec<Str> = vec()
+            nc.push(dw_str_of(p, v, "class"))
+            node.classes = nc
+        }
+        else if (name == "height") || (name == "h") { node.h = ui_px(dsl_num_of(p, v, "height")) }
+        else if (name == "fill_w") { node.fill_w = dsl_bool_of(p, v, "fill_w") }
+        else if (name == "align_self") { node.has_align_self = true  node.align_self = dw_cross(p, v) }
+        else if (name == "tab_index") || (name == "focus_order") { node.has_tab_index = true  node.tab_index = to_int(dsl_num_of(p, v, "tab_index")) }
+        else { dsl_fail(p, dw_unknown("checkbox", name))  return node }
+        if p.failed[0] == 1 { return node }
+    }
+    return node
+}
+
+/// `scrollbar { }`: a bar for content the plugin scrolls itself. See `nk_scrollbar`.
+///
+///     scrollbar { id: transcript content: 412 view: 26 offset: 300 on_scroll: "chat/scroll" }
+///
+/// `content`, `view` and `offset` are the plugin's own units and only ever divided by each other:
+/// the thumb is `view / content` of the track and sits `offset / (content - view)` along it. When
+/// someone moves it the panel is sent `<on_scroll>:<offset>` with the new offset in those same
+/// units, rounded; a scroll position is a row or a line, not a fraction of one.
+///
+/// It carries no state. The plugin owns the offset, is told the new one, and draws the next frame
+/// with it, the same bargain `code_editor` makes with `caret:` and `scroll_y:`, and the reason
+/// either can be driven from a plugin that re-emits its whole document every frame.
+fn dw_scrollbar_node(inout p: DslP) -> UiNode {
+    var node = ui_node_blank(nk_scrollbar())
+    node.w = ui_px(scrollbar_track_width())
+    node.fill_h = true
+    var have_id = false
+    var have_on = false
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 {
+            dsl_bump(p)
+            if !have_id { dsl_fail(p, "scrollbar requires id:") }
+            // ...and somewhere to send it. A bar that cannot report where it was dragged to is a
+            // picture of a bar; the plugin owns the offset and has no other way to hear about it.
+            if !have_on { dsl_fail(p, "scrollbar requires on_scroll:") }
+            return node
+        }
+        var name = dw_ident(p)
+        if p.failed[0] == 1 { return node }
+        dw_colon_a(p, "scrollbar")
+        if p.failed[0] == 1 { return node }
+        var v = dsl_value(p)
+        if p.failed[0] == 1 { return node }
+        if (name == "id") { node.id = dw_str_of(p, v, "scrollbar id")  have_id = true }
+        // content -> vmax, view -> vmin, offset -> value_f: the slider's own three fields, which
+        // are the three numbers a slider has and the three a scrollbar has. Named here so the
+        // mapping is written down in the one place that does it.
+        else if (name == "content") { node.vmax = dsl_num_of(p, v, "content") }
+        else if (name == "view") { node.vmin = dsl_num_of(p, v, "view") }
+        else if (name == "offset") { node.value_f = dsl_num_of(p, v, "offset") }
+        else if (name == "on_scroll") { node.on_click = dw_str_of(p, v, "on_scroll")  have_on = true }
+        else if (name == "width") || (name == "w") { node.w = ui_px(dsl_num_of(p, v, "width")) }
+        else if (name == "height") || (name == "h") { node.h = ui_px(dsl_num_of(p, v, "height"))  node.fill_h = false }
+        else if (name == "fill_h") { node.fill_h = dsl_bool_of(p, v, "fill_h") }
+        else if (name == "track_color") { node.has_track_color = true  node.track_color = rgba_pack(dw_color(p, v)) }
+        else if (name == "fill_color") { node.has_fill_color = true  node.fill_color = rgba_pack(dw_color(p, v)) }
+        else if (name == "classes") { node.classes = dw_classes(p, v) }
+        else if (name == "class") {
+            var nc: Vec<Str> = vec()
+            nc.push(dw_str_of(p, v, "class"))
+            node.classes = nc
+        }
+        else { dsl_fail(p, dw_unknown("scrollbar", name))  return node }
+        if p.failed[0] == 1 { return node }
+    }
+    return node
+}
+
+/// `slider { }`. Style A `:`; `id` required. No
+/// `label` and no `tab_index` (the `.ui` slider has neither, and
+/// slider is the one non-focusable kind here). `value` and `knob_r`
+/// are not clamped at parse time; clamping happens at paint.
+fn dw_slider_node(inout p: DslP) -> UiNode {
+    var node = ui_node_blank(nk_slider())
+    node.fill_w = true
+    node.h = ui_px(32.0)
+    var have_id = false
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 {
+            dsl_bump(p)
+            if !have_id { dsl_fail(p, "slider requires id:") }
+            return node
+        }
+        var name = dw_ident(p)
+        if p.failed[0] == 1 { return node }
+        dw_colon_a(p, "slider")
+        if p.failed[0] == 1 { return node }
+        var v = dsl_value(p)
+        if p.failed[0] == 1 { return node }
+        if (name == "id") { node.id = dw_str_of(p, v, "slider id")  have_id = true }
+        else if (name == "value") { node.value_f = dsl_num_of(p, v, "slider value") }
+        else if (name == "height") || (name == "h") { node.h = ui_px(dsl_num_of(p, v, "slider height")) }
+        else if (name == "track_h") { node.has_track_h = true  node.track_h = dsl_num_of(p, v, "track_h") }
+        else if (name == "knob_r") { node.has_knob_r = true  node.knob_r = dsl_num_of(p, v, "knob_r") }
+        else if (name == "track_color") { node.has_track_color = true  node.track_color = rgba_pack(dw_color(p, v)) }
+        else if (name == "fill_color") { node.has_fill_color = true  node.fill_color = rgba_pack(dw_color(p, v)) }
+        else if (name == "knob_color") { node.has_knob_color = true  node.knob_color = rgba_pack(dw_color(p, v)) }
+        else if (name == "classes") { node.classes = dw_classes(p, v) }
+        else if (name == "class") {
+            var nc: Vec<Str> = vec()
+            nc.push(dw_str_of(p, v, "class"))
+            node.classes = nc
+        }
+        else if (name == "fill_w") { node.fill_w = dw_bool_strict(p, v, "fill_w") }
+        else if (name == "align_self") { node.has_align_self = true  node.align_self = dw_cross(p, v) }
+        else if (name == "bind") { node.bind = dw_str_of(p, v, "bind") }
+        else if (name == "bind_visible") { node.bind_visible = dw_str_of(p, v, "bind_visible") }
+        else if (name == "bind_disabled") { node.bind_disabled = dw_str_of(p, v, "bind_disabled") }
+        else { dsl_fail(p, dw_unknown("slider", name))  return node }
+        if p.failed[0] == 1 { return node }
+    }
+    return node
+}
+
+/// `dropdown { }`. Style A `:`; `id` required. No
+/// `label`. `selected` is neither bounds-checked nor sign-checked: it goes
+/// through an f32-to-index conversion, which saturates a negative to 0.
+fn dw_dropdown_node(inout p: DslP) -> UiNode {
+    var node = ui_node_blank(nk_dropdown())
+    node.fill_w = true
+    node.h = ui_px(38.0)
+    node.has_item_height = true
+    node.item_height = 34.0
+    var have_id = false
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 {
+            dsl_bump(p)
+            if !have_id { dsl_fail(p, "dropdown requires id:") }
+            return node
+        }
+        var name = dw_ident(p)
+        if p.failed[0] == 1 { return node }
+        dw_colon_a(p, "dropdown")
+        if p.failed[0] == 1 { return node }
+        var v = dsl_value(p)
+        if p.failed[0] == 1 { return node }
+        if (name == "bind") { node.bind = dw_str_of(p, v, "bind") }
+        else if (name == "bind_visible") { node.bind_visible = dw_str_of(p, v, "bind_visible") }
+        else if (name == "bind_disabled") { node.bind_disabled = dw_str_of(p, v, "bind_disabled") }
+        else if (name == "id") { node.id = dw_str_of(p, v, "dropdown id")  have_id = true }
+        else if (name == "options") {
+            if v.kind != 4 { dsl_fail(p, "dropdown options must be an array")  return node }
+            var opts: Vec<Str> = vec()
+            var oi = 0
+            while oi < v.arr.len() {
+                var e = v.arr[oi]
+                if e.kind != 0 && e.kind != 3 { dsl_fail(p, "dropdown options must be strings")  return node }
+                opts.push(copy e.s)
+                oi = oi + 1
+            }
+            node.options = opts
+        }
+        else if (name == "selected") { node.selected = dw_as_usize(dsl_num_of(p, v, "selected")) }
+        else if (name == "open") { node.open = dsl_bool_of(p, v, "open") }
+        else if (name == "height") || (name == "h") { node.h = ui_px(dsl_num_of(p, v, "height")) }
+        else if (name == "item_height") { node.has_item_height = true  node.item_height = dsl_num_of(p, v, "item_height") }
+        else if (name == "classes") { node.classes = dw_classes(p, v) }
+        else if (name == "class") {
+            var nc: Vec<Str> = vec()
+            nc.push(dw_str_of(p, v, "class"))
+            node.classes = nc
+        }
+        else if (name == "fill_w") { node.fill_w = dw_bool_strict(p, v, "fill_w") }
+        else if (name == "align_self") { node.has_align_self = true  node.align_self = dw_cross(p, v) }
+        else if (name == "tab_index") || (name == "focus_order") { node.has_tab_index = true  node.tab_index = to_int(dsl_num_of(p, v, "tab_index")) }
+        else { dsl_fail(p, dw_unknown("dropdown", name))  return node }
+        if p.failed[0] == 1 { return node }
+    }
+    return node
+}
+
+// ---- measure --------------------------------------------------------------
+
+/// the closed-trigger label of a dropdown: `options[selected]` plus the
+/// open/closed arrow. An out-of-range `selected`
+/// renders an empty label rather than erroring.
+fn dw_dropdown_label(node: UiNode) -> Str {
+    var sel = ""
+    if node.selected >= 0 && node.selected < node.options.len() { sel = node.options[node.selected] }
+    if node.open { return (sel + " ▴") }
+    return (sel + " ▾")
+}
+
+/// intrinsic size of checkbox / slider / dropdown (see nodes_ext.nori).
+/// The width formulas are inlined from widget.nori's monolithic
+/// `layout_widgets_focus` chain, which has no reusable width function.
+/// Each is cited at its use site.
+fn ui_measure_widgets(node: UiNode, ctx: LayoutLengthContext) -> Vec2 {
+    var k = node.kind
+    var h = ui_length_resolve(node.h, ctx, 1)
+    if k == nk_checkbox() {
+        if h <= 0.0 { h = 28.0 }
+        // widget.nori: the box is `checkbox_size()` wide at the row origin;
+        // the label starts at `box_rect.max.x + item_spacing.x`.
+        return vec2(checkbox_size() + dw_item_x() + overlay_text_width(node.text, node.size_px), h)
+    }
+    if k == nk_scrollbar() {
+        // As tall as it is given (a bar's whole job is to be the height of what it scrolls) and
+        // exactly a track wide, so it fits the gutter every other scrollbar in this library uses.
+        var sw = ui_length_resolve(node.w, ctx, 0)
+        if sw <= 0.0 { sw = scrollbar_track_width() }
+        return vec2(sw, h)
+    }
+    if k == nk_slider() {
+        if h <= 0.0 { h = 32.0 }
+        // widget.nori: `track_w = fmax(max_w - slider_label_w, 40.0)`. The `.ui`
+        // slider has no `label` attribute at all, so the slider_label_w gutter
+        // collapses to 0 and the intrinsic width is the bare 40px track floor.
+        return vec2(dw_min_track_w(), h)
+    }
+    if h <= 0.0 { h = 38.0 }
+    // widget.nori: the trigger is a full-width box with the label inset by
+    // `button_padding.x`; the intrinsic width is that label plus both insets,
+    // the same shape as the button branch there.
+    return vec2(overlay_text_width(dw_dropdown_label(node), node.size_px) + dw_btn_pad_x() * 2.0, h)
+}
+
+// ---- layout + paint -------------------------------------------------------
+// Colours are literals at the paint site, as the nk_button arm already
+// does (runtime_document.nori); no Theme is threaded
+// through ComputedOverlay. The literals are the `.ui` palette,
+// since widget.nori's are Theme lookups with no `.ui` counterpart.
+
+/// paint + hit checkbox / slider / dropdown (see nodes_ext.nori).
+fn ui_layout_widgets(inout node: UiNode, rect: Rect, ctx: LayoutLengthContext, inout out: ComputedOverlay) {
+    var k = node.kind
+    if k == nk_checkbox() { dw_paint_checkbox(node, rect, out)  return }
+    if k == nk_slider() { dw_paint_slider(node, rect, out)  return }
+    if k == nk_scrollbar() { dw_paint_scrollbar(node, rect, out)  return }
+    dw_paint_dropdown(node, rect, ctx, out)
+}
+
+/// follows widget.nori: box + 4px-inset tick + label, one full-row hit.
+fn dw_paint_checkbox(node: UiNode, rect: Rect, inout out: ComputedOverlay) {
+    var row_h = rect.height()
+    var bs = checkbox_size()
+    var box = rect_min_size(vec2(rect.min.x, rect.min.y + (row_h - bs) / 2.0), vec2(bs, bs))
+    var boxc = color_rgba(30, 30, 38, 255)
+    if node.checked { boxc = color_rgba(92, 150, 92, 255) }
+    out.prims.push(pp_rect(box, boxc, 3.0))
+    out.prims.push(pp_border(box, color_rgba(120, 120, 140, 220), 1.0))
+    if node.checked {
+        var pad = 4.0                                 // inner tick, 4px pad
+        out.prims.push(pp_rect(rect_min_size(vec2(box.min.x + pad, box.min.y + pad), vec2(bs - 2.0 * pad, bs - 2.0 * pad)), color_rgba(245, 250, 245, 255), 0.0))
+    }
+    if node.text.len() > 0 {
+        var tcol = color_white()
+        if node.has_color { tcol = rgba_color(node.color) }
+        // widget.nori: label at `box_rect.max.x + item_spacing.x`, centred on a 16px line box.
+        out.prims.push(pp_text(vec2(box.max.x + dw_item_x(), rect.min.y + (row_h - dw_line_box()) / 2.0), node.text, tcol, node.size_px))
+    }
+    // widget.nori: full-row hit. Event `check:ID:VALUE`, VALUE being the toggled
+    // state: `check:<id>:<!checked>`.
+    if !node.disabled {
+        var nv = "true"
+        if node.checked { nv = "false" }
+        out.hits.push(HitRegion { id: copy node.id, on_click: ("check:" + (node.id + (":" + nv))), rect: rect_dup(rect) })
+    }
+}
+
+/// follows widget.nori: track + thumb, two hits (thumb then track there;
+/// reversed here because overlay_hit_test walks backwards).
+/// Track, thumb, and one hit region carrying everything the host needs to move it.
+///
+/// The payload goes in the action the way `text_input` puts its value there: the host is handed a
+/// rectangle and a description of what it means, and needs to know nothing else about the panel.
+/// The host does the arithmetic because the host is what has the pointer.
+fn dw_paint_scrollbar(node: UiNode, rect: Rect, inout out: ComputedOverlay) {
+    let content = node.vmax
+    // `vw` and not `view`: `view` is the language's borrow qualifier, and a local of that name
+    // parses as the start of a type.
+    let vw = node.vmin
+    var off = node.value_f
+    var tc = color_rgba(0, 0, 0, 40)
+    if node.has_track_color { tc = rgba_color(node.track_color) }
+    out.prims.push(pp_rect(rect_dup(rect), tc, 3.0))
+    // Nothing to scroll, nothing to grab. A thumb that fills its track is a control that answers
+    // every gesture with no movement, which reads as broken rather than as full.
+    if content <= 0.0 { return }
+    if vw <= 0.0 { return }
+    if content <= vw { return }
+    let rng = content - vw
+    if off < 0.0 { off = 0.0 }
+    if off > rng { off = rng }
+    var fc = color_rgba(77, 86, 102, 255)
+    if node.has_fill_color { fc = rgba_color(node.fill_color) }
+    out.prims.push(pp_rect(scrollbar_node_thumb(rect, content, vw, off), fc, 3.0))
+    // `scrollbar:<content>:<view>:<offset>:<on_scroll>`: the numbers whole, because they are the
+    // plugin's units and a scroll position is a row and not a fraction of one.
+    var act = "scrollbar:"
+    act = act + to_str(to_int(content))
+    act = act + ":"
+    act = act + to_str(to_int(vw))
+    act = act + ":"
+    act = act + to_str(to_int(off))
+    act = act + ":"
+    act = act + node.on_click
+    out.hits.push(HitRegion { id: copy node.id, on_click: act, rect: rect_dup(rect) })
+}
+
+fn dw_paint_slider(node: UiNode, rect: Rect, inout out: ComputedOverlay) {
+    var row_h = rect.height()
+    var th = 6.0
+    if node.has_track_h { th = node.track_h }
+    // The `.ui` slider carries no label, so widget.nori's `slider_label_w`
+    // gutter is 0 and the track spans the whole node rect; the 40px floor stays.
+    var track_w = math::fmax(rect.width(), dw_min_track_w())
+    var track = rect_min_size(vec2(rect.min.x, rect.min.y + (row_h - th) / 2.0), vec2(track_w, th))
+    var tc = color_rgba(52, 50, 72, 255)
+    if node.has_track_color { tc = rgba_color(node.track_color) }
+    out.prims.push(pp_rect(track, tc, th * 0.5))
+    var v = math::fclamp(node.value_f, 0.0, 1.0)
+    var fill_end = math::fmax(v * track_w, th * 2.0)
+    var fc = color_rgba(100, 140, 220, 255)
+    if node.has_fill_color { fc = rgba_color(node.fill_color) }
+    out.prims.push(pp_rect(rect_min_size(track.min, vec2(fill_end, th)), fc, th * 0.5))
+    var kr = th * 1.8
+    if node.has_knob_r { kr = node.knob_r }
+    kr = math::fmax(kr, 5.0)
+    var kd = kr * 2.0
+    var kx = track.min.x + v * (track.width() - kd)   // thumb_x
+    var kh = math::fmin(row_h - 4.0, 20.0)            // thumb_h
+    var ky = rect.min.y + (row_h - math::fmin(row_h, 20.0)) / 2.0
+    var kc = color_rgba(230, 236, 255, 255)
+    if node.has_knob_color { kc = rgba_color(node.knob_color) }
+    var knob = rect_min_size(vec2(kx, ky), vec2(kd, kh))
+    out.prims.push(pp_rect(knob, kc, kr))
+    // Event `"id:VALUE"`. Largest (track) pushed first, smallest
+    // (knob) second; overlay_hit_test walks backwards, so the knob wins. This is
+    // the opposite order to widget.nori, whose hit test is first-match.
+    if !node.disabled {
+        var ev = (node.id + (":" + to_str(v)))
+        out.hits.push(HitRegion { id: copy node.id, on_click: copy ev, rect: track })
+        out.hits.push(HitRegion { id: copy node.id, on_click: ev, rect: knob })
+    }
+}
+
+/// the resolved option-row height of a dropdown: `item_height.unwrap_or(34.0)`,
+/// floored at 1px so a `item_height: 0` cannot collapse every row onto one
+/// line and make the option hits indistinguishable.
+fn dw_item_h(node: UiNode) -> Float {
+    var ih = 34.0
+    if node.has_item_height { ih = node.item_height }
+    return math::fmax(ih, 1.0)
+}
+
+/// the panel rect of an open dropdown's option list: full trigger width, `options.len()` rows of
+/// `item_height`, `dw_popup_gap()` below the trigger, or the same distance above it when the list
+/// would run off the bottom of the viewport and there is room above.
+///
+/// The viewport's top edge is taken as y = 0: `LayoutLengthContext` carries the viewport's extents
+/// and not its origin (length_context_root, runtime_document.nori), and every entry point
+/// lays the root into a rect whose min is the viewport's min. Flipping is therefore decided against
+/// [0, ctx.viewport_h].
+fn dw_dropdown_popup_rect(node: UiNode, rect: Rect, ctx: LayoutLengthContext) -> Rect {
+    var ih = dw_item_h(node)
+    var total = ih * to_float(node.options.len())
+    var gap = dw_popup_gap()
+    var y = rect.max.y + gap
+    if y + total > ctx.viewport_h && rect.min.y - gap - total >= 0.0 { y = rect.min.y - gap - total }
+    return rect_min_size(vec2(rect.min.x, y), vec2(rect.width(), total))
+}
+
+/// follows widget.nori: the closed trigger, plus the open option list.
+///
+/// The trigger goes into the ordinary `prims`/`hits`; the option list goes into the overlay's popup
+/// layer (`out.pop_prims` / `out.pop_hits`), which merge_clipped_overlay carries through every
+/// enclosing scroll/overflow viewport uncut and overlay_flush_popups appends last. That is what
+/// makes a dropdown near the bottom of a scroll pane able to drop its list past the pane's edge and
+/// over whatever is drawn beneath it.
+fn dw_paint_dropdown(node: UiNode, rect: Rect, ctx: LayoutLengthContext, inout out: ComputedOverlay) {
+    var row_h = rect.height()
+    var trigger = rect_min_size(rect.min, vec2(rect.width(), row_h))
+    var bg = color_rgba(38, 38, 50, 255)
+    if node.has_bg { bg = rgba_color(node.bg) }
+    out.prims.push(pp_rect(trigger, bg, 6.0))
+    out.prims.push(pp_border(trigger, color_rgba(70, 70, 90, 255), 1.0))
+    var tcol = color_white()
+    if node.has_color { tcol = rgba_color(node.color) }
+    // widget.nori: label inset by button_padding.x, centred on a 16px line box.
+    out.prims.push(pp_text(vec2(rect.min.x + dw_btn_pad_x(), rect.min.y + (row_h - dw_line_box()) / 2.0), dw_dropdown_label(node), tcol, node.size_px))
+    // widget.nori: trigger hit, the bare `"id"`; option N emits `"id:N"`.
+    if !node.disabled { out.hits.push(HitRegion { id: copy node.id, on_click: copy node.id, rect: trigger }) }
+    if !node.open || node.options.len() == 0 { return }
+    dw_paint_dropdown_popup(node, rect, ctx, tcol, out)
+}
+
+/// the open option list. Emitted into the popup layer only.
+fn dw_paint_dropdown_popup(node: UiNode, rect: Rect, ctx: LayoutLengthContext, copy tcol: Color, inout out: ComputedOverlay) {
+    var panel = dw_dropdown_popup_rect(node, rect, ctx)
+    var ih = dw_item_h(node)
+    // the panel is opaque: it is what makes the list legible over the content it covers.
+    out.pop_prims.push(pp_rect(panel, color_rgba(30, 30, 40, 255), 6.0))
+    out.pop_prims.push(pp_border(panel, color_rgba(90, 90, 115, 255), 1.0))
+    var i = 0
+    while i < node.options.len() {
+        var row = rect_min_size(vec2(panel.min.x, panel.min.y + to_float(i) * ih), vec2(panel.width(), ih))
+        if i == node.selected {
+            // the selected row is marked with a filled highlight, inset 2px so the panel's rounded
+            // border still reads at the first and last row.
+            out.pop_prims.push(pp_rect(rect_min_size(vec2(row.min.x + 2.0, row.min.y + 2.0), vec2(math::fmax(row.width() - 4.0, 0.0), math::fmax(ih - 4.0, 0.0))), color_rgba(70, 96, 156, 255), 4.0))
+        }
+        out.pop_prims.push(pp_text(vec2(panel.min.x + dw_btn_pad_x(), row.min.y + (ih - dw_line_box()) / 2.0), node.options[i], tcol, node.size_px))
+        if !node.disabled { out.pop_hits.push(HitRegion { id: copy node.id, on_click: (node.id + (":" + to_str(i))), rect: row }) }
+        i = i + 1
+    }
+}

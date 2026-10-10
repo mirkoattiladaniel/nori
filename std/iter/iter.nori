@@ -1,0 +1,134 @@
+//! std/iter: functional operations over Vec<T> driven by closures (`|x| ...`). Each takes a Vec plus one
+//! or more `Fn` closures and returns a fresh Vec or a value; the input is never mutated. The Vec-returning
+//! ops (vmap/vfilter/vsort) recover the concrete element type at the call site, so `vmap(words, ...)[i]`
+//! is a Str. fold/sum accumulate into an Int.
+//!
+//! Closure params default to Int; annotate the param for Str/Float elements (`|w: Str| ...`). Use `slen`
+//! for string length (`len` is Vec-only).
+//!
+//!   import "std/iter" as it
+//!   let evens = it::vfilter(xs, |x| x % 2 == 0)
+//!   let doubled = it::vmap(xs, |x| x * 2)
+//!   let total = it::vfold(xs, 0, |acc, x| acc + x)
+//!   let longish = it::vfilter(words, |w: Str| slen(w) > 4)
+
+/// map: a new Vec with f applied to every element.
+pub fn vmap<T>(v: Vec<T>, f: Fn(T) -> T) -> Vec<T> {
+    var out: Vec<T> = vec()
+    var i = 0
+    while i < v.len() { out.push(f(v[i]))  i = i + 1 }
+    return out
+}
+
+/// filter: a new Vec of the elements for which pred returns true.
+pub fn vfilter<T>(v: Vec<T>, pred: Fn(T) -> Bool) -> Vec<T> {
+    var out: Vec<T> = vec()
+    var i = 0
+    while i < v.len() { if pred(v[i]) { out.push(copy v[i]) }  i = i + 1 }
+    return out
+}
+
+/// fold: thread an Int accumulator left-to-right through f(acc, elem).
+pub fn vfold<T>(v: Vec<T>, init: Int, f: Fn(Int, T) -> Int) -> Int {
+    var acc = init
+    var i = 0
+    while i < v.len() { acc = f(acc, v[i])  i = i + 1 }
+    return acc
+}
+
+/// sum of an Int Vec (vfold with +).
+pub fn vsum(v: Vec<Int>) -> Int {
+    var acc = 0
+    var i = 0
+    while i < v.len() { acc = acc + v[i]  i = i + 1 }
+    return acc
+}
+
+/// count elements satisfying pred.
+pub fn vcount<T>(v: Vec<T>, pred: Fn(T) -> Bool) -> Int {
+    var n = 0
+    var i = 0
+    while i < v.len() { if pred(v[i]) { n = n + 1 }  i = i + 1 }
+    return n
+}
+
+/// any / all: short-circuiting existential / universal quantifiers.
+pub fn vany<T>(v: Vec<T>, pred: Fn(T) -> Bool) -> Bool {
+    var i = 0
+    while i < v.len() { if pred(v[i]) { return true }  i = i + 1 }
+    return false
+}
+/// all: true iff pred holds for every element (short-circuits on the first false).
+pub fn vall<T>(v: Vec<T>, pred: Fn(T) -> Bool) -> Bool {
+    var i = 0
+    while i < v.len() { if !pred(v[i]) { return false }  i = i + 1 }
+    return true
+}
+
+/// sort: a new Vec ordered by the comparator `less(a, b) -> Bool` (true when a should come before b).
+/// Stable insertion sort; O(n^2) worst case.
+pub fn vsort<T>(v: Vec<T>, less: Fn(T, T) -> Bool) -> Vec<T> {
+    var out: Vec<T> = vec()
+    var i = 0
+    while i < v.len() { out.push(copy v[i])  i = i + 1 }
+    var n = out.len()
+    var a = 1
+    while a < n {
+        var key = sink out[a]
+        var b = a - 1
+        while b >= 0 && less(key, out[b]) { out[b + 1] = sink out[b]  b = b - 1 }
+        out[b + 1] = key
+        a = a + 1
+    }
+    return out
+}
+
+/// an iterator yielding Int elements: call `has_next`, then `next` to advance and return the element.
+/// Elements are Int; Str/struct elements flow through as i64 handles if cast.
+pub trait Iterator { fn has_next(self) -> Bool  fn next(self) -> Int }
+
+/// a half-open integer range [lo, hi) as an Iterator.
+pub struct Range { cur: Int, end: Int }
+/// make a Range iterator over [lo, hi).
+pub fn range(lo: Int, hi: Int) -> Range { return Range { cur: lo, end: hi } }
+impl Iterator for Range {
+    /// true while the range has elements left.
+    fn has_next(self) -> Bool { return self.cur < self.end }
+    /// the current element; advances the cursor.
+    fn next(inout self) -> Int { var v = self.cur  self.cur = self.cur + 1  return v }
+}
+
+/// sum of all elements an iterator yields (consumes it).
+pub fn isum<I: Iterator>(it: I) -> Int { var s = 0  while it.has_next() { s = s + it.next() }  return s }
+/// number of elements an iterator yields (consumes it).
+pub fn icount<I: Iterator>(inout it: I) -> Int { var n = 0  while it.has_next() { var _x = it.next()  n = n + 1 }  return n }
+/// collect an iterator's elements into a fresh Vec<Int>.
+pub fn icollect<I: Iterator>(inout it: I) -> Vec<Int> { var v: Vec<Int> = vec()  while it.has_next() { v.push(it.next()) }  return v }
+
+// ── lazy iterators: structural. Any struct with `fn next(self) -> Option<T>` is
+// foreach-able; these are the std building blocks. No intermediate Vec is materialized.
+
+/// a lazy half-open Int range: `foreach i in it::lazy(0, n) { … }`-style via a bound var.
+pub struct Lazy { cur: Int, hi: Int }
+/// lazy(lo, hi): yields lo, lo+1, …, hi-1 on demand.
+pub fn lazy(lo: Int, hi: Int) -> Lazy { return Lazy { cur: lo, hi: hi } }
+impl Lazy {
+    fn next(inout self) -> Option<Int> {
+        if self.cur >= self.hi { return Option::None }
+        self.cur = self.cur + 1
+        return Option::Some(self.cur - 1)
+    }
+}
+
+/// a lazy iterator over a Str's raw bytes (what `s.at(i)` returns), with no Vec materialized.
+/// For characters (Unicode scalars) use `std/unicode`'s `chars(s)`.
+pub struct Bytes { s: view Str, i: Int }
+/// a `Bytes` iterator over `s`, for `foreach b in bytes(s)`.
+pub fn bytes(s: Str) -> Bytes { return Bytes { s: s, i: 0 } }
+impl Bytes {
+    fn next(inout self) -> Option<Byte> {
+        if self.i >= self.s.len() { return Option::None }
+        self.i = self.i + 1
+        return Option::Some(self.s.at(self.i - 1))
+    }
+}

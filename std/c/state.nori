@@ -1,0 +1,299 @@
+// The front end's working state: one record threaded through the preprocessor, the parser and the
+// evaluator as `inout s: St`. Tokens are packed into one Int each (see ctk_* below) and every
+// spelling is interned, so the hot paths compare Ints and index Vecs.
+
+// token kinds
+global TK_IDENT: Int = 1
+global TK_NUM: Int = 2
+global TK_CHAR: Int = 3
+global TK_STR: Int = 4
+global TK_PUNCT: Int = 5
+global TK_OTHER: Int = 6
+global TK_PARAM: Int = 7     // a macro parameter in a stored body; the id is the parameter's index
+global TK_STRFY: Int = 8     // `#param` in a stored body; the id is the parameter's index
+global TK_SENT: Int = 9      // the end of a token list being expanded on its own
+global TK_EOF: Int = 10
+
+// token flags
+global TF_BOL: Int = 1       // first token on its line
+global TF_SPACE: Int = 2     // whitespace precedes it
+
+// macro kinds
+global MK_OBJECT: Int = 0
+global MK_FUNCTION: Int = 1
+global MK_BUILTIN: Int = 2
+
+// conditional states
+global CS_ACTIVE: Int = 0    // in the branch being taken
+global CS_SEEKING: Int = 1   // no branch taken yet
+global CS_DONE: Int = 2      // a branch was taken; the rest are skipped
+
+// storage-class bits of a declaration
+global ST_TYPEDEF: Int = 1
+global ST_EXTERN: Int = 2
+global ST_STATIC: Int = 4
+global ST_INLINE: Int = 8
+
+fn ctk_make(id: Int, kind: Int, flags: Int) -> Int { return id | (kind << 32) | (flags << 40) }
+fn ctk_id(t: Int) -> Int { return t & 0xFFFFFFFF }
+fn ctk_kind(t: Int) -> Int { return (t >> 32) & 255 }
+fn ctk_flags(t: Int) -> Int { return (t >> 40) & 255 }
+fn ctk_with_flags(t: Int, flags: Int) -> Int { return (t & 1099511627775) | (flags << 40) }
+
+// a file read and lexed once; `guard` is the include-guard macro's name id, or -1
+struct FileToks {
+    path: Str,
+    dir: Str,
+    fileno: Int,
+    toks: Vec<Int>,
+    lines: Vec<Int>,
+    guard: Int,
+    once: Bool,
+}
+
+struct St {
+    unit: Unit,
+    // interned spellings
+    names: Vec<Str>,
+    ids: Map<Str, Int>,
+    punct1: Vec<Int>,
+    // include search
+    dirs: Vec<Str>,
+    fcache: Map<Str, Int>,
+    ftoks: Vec<FileToks>,
+    // the include stack: file cache index, cursor, search-path index it was found at, and the
+    // conditional depth when it was entered
+    fr_file: Vec<Int>,
+    fr_pos: Vec<Int>,
+    fr_dir: Vec<Int>,
+    fr_cond: Vec<Int>,
+    // macros: name id -> index, -1 once undefined
+    mac_of: Map<Int, Int>,
+    m_name: Vec<Int>,
+    m_kind: Vec<Int>,
+    m_nparams: Vec<Int>,
+    m_variadic: Vec<Bool>,
+    m_start: Vec<Int>,
+    m_len: Vec<Int>,
+    m_loc: Vec<Int>,
+    // a function-like macro's parameter names: mparams[m_pstart[m] .. + m_nparams[m]]
+    m_pstart: Vec<Int>,
+    mparams: Vec<Int>,
+    mbody: Vec<Int>,
+    counter: Int,
+    // hide sets: a linked list of macro names; 0 is the empty set
+    hs_name: Vec<Int>,
+    hs_next: Vec<Int>,
+    hs_cache: Map<Int, Int>,
+    // tokens pushed back in front of the input, top of stack first
+    pk: Vec<Int>,
+    pl: Vec<Int>,
+    ph: Vec<Int>,
+    // the token just read
+    ct: Int,
+    cl: Int,
+    chs: Int,
+    cdepth: Int,
+    // conditional stack
+    conds: Vec<Int>,
+    in_if: Bool,
+    // preprocessed output
+    ot: Vec<Int>,
+    ol: Vec<Int>,
+    // scratch expansion output (a stack discipline: callers truncate back to their mark)
+    tt: Vec<Int>,
+    tl: Vec<Int>,
+    th: Vec<Int>,
+    // #pragma pack: the value in effect from output index pack_at[i] on
+    pack_at: Vec<Int>,
+    pack_val: Vec<Int>,
+    pack_stack: Vec<Int>,
+    pack_cur: Int,
+    // parser cursor over tokens (the preprocessed unit, or a line being evaluated)
+    xt: Vec<Int>,
+    xl: Vec<Int>,
+    xp: Int,
+    perr: Bool,
+    perr_msg: Str,
+    // parser tables
+    typedef_of: Map<Int, Int>,
+    tag_rec: Map<Int, Int>,
+    tag_enum: Map<Int, Int>,
+    econst: Map<Int, Int>,
+    fn_of: Map<Int, Int>,
+    var_of: Map<Int, Int>,
+    ptr_cache: Map<Int, Int>,
+    rec_ty: Vec<Int>,
+    enum_ty: Vec<Int>,
+    td_ty: Vec<Int>,
+    n_anon: Int,
+    va_list_ty: Int,
+    // declaration specifier / declarator / attribute results
+    ds_ty: Int,
+    ds_st: Int,
+    dn_name: Int,
+    dn_ty: Int,
+    at_packed: Bool,
+    at_align: Int,
+    at_mode: Int,
+    at_vector: Int,
+    in_params: Int,
+    knr: Bool,
+    // evaluator
+    ev_sz: Int,
+    ev_uns: Bool,
+    ev_fail: Bool,
+    ev_pp: Bool,
+    ev_skip: Int,
+    ev_isf: Bool,
+    ev_fv: Float,
+    // the x86_64-w64-mingw32 target: its va_list and bitfield layout
+    win: Bool,
+}
+
+fn cst_new(opts: Options) -> St {
+    let u = Unit { files: vec(), types: vec(), functions: vec(), records: vec(), enums: vec(), typedefs: vec(), variables: vec(), constants: vec(), notes: vec() }
+    if opts.target == "windows" { u.long_size = 4 }
+    var s = St {
+        unit: u, names: vec(), ids: map(), punct1: vec(), dirs: vec(), fcache: map(), ftoks: vec(),
+        fr_file: vec(), fr_pos: vec(), fr_dir: vec(), fr_cond: vec(),
+        mac_of: map(), m_name: vec(), m_kind: vec(), m_nparams: vec(), m_variadic: vec(), m_start: vec(), m_len: vec(), m_loc: vec(), m_pstart: vec(), mparams: vec(), mbody: vec(), counter: 0,
+        hs_name: vec(), hs_next: vec(), hs_cache: map(),
+        pk: vec(), pl: vec(), ph: vec(), ct: 0, cl: 0, chs: 0, cdepth: 0,
+        conds: vec(), in_if: false, ot: vec(), ol: vec(), tt: vec(), tl: vec(), th: vec(),
+        pack_at: vec(), pack_val: vec(), pack_stack: vec(), pack_cur: 0,
+        xt: vec(), xl: vec(), xp: 0, perr: false, perr_msg: "",
+        typedef_of: map(), tag_rec: map(), tag_enum: map(), econst: map(), fn_of: map(), var_of: map(), ptr_cache: map(),
+        rec_ty: vec(), enum_ty: vec(), td_ty: vec(), n_anon: 0, va_list_ty: 0 - 1,
+        ds_ty: 0, ds_st: 0, dn_name: 0, dn_ty: 0, at_packed: false, at_align: 0, at_mode: 0, at_vector: 0, in_params: 0, knr: false,
+        ev_sz: 8, ev_uns: false, ev_fail: false, ev_pp: false, ev_skip: 0, ev_isf: false, ev_fv: 0.0,
+        win: opts.target == "windows",
+    }
+    foreach d in opts.include_dirs { s.dirs.push(copy d) }
+    foreach d2 in opts.system_dirs { s.dirs.push(copy d2) }
+    var i = 0
+    while i < 256 { s.punct1.push(0 - 1)  i = i + 1 }
+    // fixed names: index 0 is the empty spelling, then the list in names.nori
+    s.names.push("")
+    s.ids.put("", 0)
+    let fixed = cnm_fixed()
+    var st = 1
+    var j = 1
+    while j <= fixed.len() {
+        if j == fixed.len() || ord(fixed.at(j)) == 32 {
+            let w = fixed.slice(st, j)
+            cst_intern(s, w)
+            st = j + 1
+        }
+        j = j + 1
+    }
+    s.hs_name.push(0)
+    s.hs_next.push(0)
+    // the unqualified primitive types sit at the index equal to their kind
+    var k = 0
+    while k <= K_FLOAT16 {
+        s.unit.types.push(Type { kind: k, params: vec() })
+        k = k + 1
+    }
+    s.unit.files.push("<built-in>")
+    cpp_predefine(s, opts)
+    return s
+}
+
+// the id of a spelling, interning it on first sight
+fn cst_intern(inout s: St, w: Str) -> Int {
+    let k = s.ids[w] else (0 - 1)
+    if k >= 0 { return k }
+    let n = s.names.len()
+    s.names.push(copy w)
+    s.ids.put(w, n)
+    return n
+}
+
+fn cst_note_at(inout s: St, file: Int, line: Int, reason: Str) {
+    s.unit.notes.push(Note { file: file, line: line, reason: copy reason })
+}
+
+// a note at a packed location (fileno << 24 | line)
+fn cst_note_loc(inout s: St, loc: Int, reason: Str) {
+    s.unit.notes.push(Note { file: loc >> 24, line: loc & 0xFFFFFF, reason: copy reason })
+}
+
+// preprocess `text` as the main file, then parse the result
+fn cst_run(inout s: St, text: Str, path: Str) -> Unit {
+    let fi = cpp_add_file_text(s, text, path)
+    cpp_push_frame(s, fi, 0 - 1)
+    cpp_run(s)
+    s.xt = sink s.ot
+    s.xl = sink s.ol
+    s.xt.push(ctk_make(0, TK_EOF, 0))
+    s.xt.push(ctk_make(0, TK_EOF, 0))
+    s.xl.push(0)
+    s.xl.push(0)
+    s.xp = 0
+    cps_unit(s)
+    ccn_constants(s)
+    return sink s.unit
+}
+
+// the spelling of a stored macro body, one space where the definition had whitespace
+fn cst_body_text(s: St, m: Int) -> Str {
+    var parts: Vec<Str> = vec()
+    let st = s.m_start[m]
+    var i = 0
+    while i < s.m_len[m] {
+        let t = s.mbody[st + i]
+        if i > 0 && (ctk_flags(t) & TF_SPACE) != 0 { parts.push(" ") }
+        let k = ctk_kind(t)
+        if k == TK_PARAM { parts.push(copy s.names[s.mparams[s.m_pstart[m] + ctk_id(t)]]) }
+        else if k == TK_STRFY { parts.push("#" + s.names[s.mparams[s.m_pstart[m] + ctk_id(t)]]) }
+        else { parts.push(copy s.names[ctk_id(t)]) }
+        i = i + 1
+    }
+    return cty_join(parts, "")
+}
+
+// preprocess `text` as the main file, parse it, and keep the token stream and the macro table
+fn cst_translate(inout s: St, text: Str, path: Str) -> Translation {
+    let fi = cpp_add_file_text(s, text, path)
+    cpp_push_frame(s, fi, 0 - 1)
+    cpp_run(s)
+    var kinds: Vec<Int> = vec()
+    var texts: Vec<Str> = vec()
+    var files: Vec<Int> = vec()
+    var lines: Vec<Int> = vec()
+    var spaced: Vec<Bool> = vec()
+    var i = 0
+    while i < s.ot.len() {
+        let t = s.ot[i]
+        kinds.push(ctk_kind(t))
+        texts.push(copy s.names[ctk_id(t)])
+        files.push(s.ol[i] >> 24)
+        lines.push(s.ol[i] & 0xFFFFFF)
+        spaced.push((ctk_flags(t) & (TF_SPACE | TF_BOL)) != 0)
+        i = i + 1
+    }
+    var macros: Vec<Macro> = vec()
+    var m = 0
+    while m < s.m_name.len() {
+        let name = s.m_name[m]
+        if s.m_kind[m] != MK_BUILTIN && (s.mac_of[name] else (0 - 1)) == m {
+            var ps: Vec<Str> = vec()
+            var p = 0
+            while p < s.m_nparams[m] { ps.push(copy s.names[s.mparams[s.m_pstart[m] + p]])  p = p + 1 }
+            let loc = s.m_loc[m]
+            macros.push(Macro { name: copy s.names[name], function: s.m_kind[m] == MK_FUNCTION, params: sink ps, variadic: s.m_variadic[m], body: cst_body_text(s, m), file: loc >> 24, line: loc & 0xFFFFFF })
+        }
+        m = m + 1
+    }
+    s.xt = sink s.ot
+    s.xl = sink s.ol
+    s.xt.push(ctk_make(0, TK_EOF, 0))
+    s.xt.push(ctk_make(0, TK_EOF, 0))
+    s.xl.push(0)
+    s.xl.push(0)
+    s.xp = 0
+    cps_unit(s)
+    ccn_constants(s)
+    return Translation { unit: sink s.unit, kinds: sink kinds, texts: sink texts, files: sink files, lines: sink lines, spaced: sink spaced, macros: sink macros }
+}

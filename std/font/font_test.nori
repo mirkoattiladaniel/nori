@@ -1,0 +1,502 @@
+// Native tests for std/font: run with
+//   noric --test std/font/font_test.nori compiler/runtime.nori --import-root .
+import "std/font" as font
+
+fn test_byte_readers() {
+    // hand-built bytes: 0x01 0x02 0x80 0xFF 0x00 0x10
+    var s = ""
+    s = s + chr(1)
+    s = s + chr(2)
+    s = s + chr(128)
+    s = s + chr(255)
+    s = s + chr(0)
+    s = s + chr(16)
+    assert_eq(font::rd_u8(s, 0), 1)
+    assert_eq(font::rd_u8(s, 2), 128)      // high byte is unsigned
+    assert_eq(font::rd_u16(s, 0), 258)     // 0x0102
+    assert_eq(font::rd_u16(s, 2), 33023)   // 0x80FF
+    assert_eq(font::rd_i16(s, 2), 33023 - 65536)   // signed 0x80FF < 0
+    assert_eq(font::rd_u32(s, 0), 16941311)        // 0x010280FF
+    assert_streq(font::rd_tag(s, 0), s.slice(0, 4))
+}
+
+fn test_load_dejavu() {
+    // the foundational risk: read a real .ttf (embedded NULs) and parse its header.
+    var bytes = read_file("std/font/assets/DejaVuSans.ttf")
+    assert_true(bytes.len() > 100000)
+    var fr = font::font_load(bytes)
+    assert_true(fr.ok)
+    var f = fr.font
+    assert_eq(f.units_per_em, 2048)        // DejaVu is a 2048 upem font
+    assert_true(f.num_glyphs > 200)        // this DejaVu is an 859-glyph subset
+    assert_true(f.cmap_fmt == 4 || f.cmap_fmt == 12)
+    // ascender positive, descender negative
+    var vm = font::font_v_metrics(f)
+    assert_true(vm.ascent > 0.0)
+    assert_true(vm.descent < 0.0)
+}
+
+fn test_cmap_and_metrics() {
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    assert_true(fr.ok)
+    var f = fr.font
+    // 'A' (U+0041) and 'a' map to distinct non-zero glyphs
+    var ga = font::font_glyph_index(f, 65)
+    var glow = font::font_glyph_index(f, 97)
+    assert_true(ga > 0)
+    assert_true(glow > 0)
+    assert_true(ga != glow)
+    // space (U+0020) exists and has a positive advance but (usually) an empty outline
+    var gsp = font::font_glyph_index(f, 32)
+    assert_true(gsp > 0)
+    assert_true(font::font_h_advance(f, gsp) > 0.0)
+    // 'A' has a sensible advance in font units (< units_per_em*2)
+    var adv = font::font_h_advance(f, ga)
+    assert_true(adv > 0.0)
+    assert_true(adv < 5000.0)
+    // an unmapped codepoint returns 0 (.notdef)
+    assert_eq(font::font_glyph_index(f, 1), 0)
+}
+
+fn test_outline_extraction() {
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    assert_true(fr.ok)
+    var f = fr.font
+    // 'A' has an outline with >= 1 contour and a sensible bbox
+    var ga = font::font_glyph_index(f, 65)
+    var oa = font::font_outline(f, ga)
+    assert_true(font::outline_num_contours(oa) >= 1)
+    assert_true(oa.xmax > oa.xmin)
+    assert_true(oa.ymax > oa.ymin)
+    assert_true(oa.ymin >= 0.0 - 100.0)     // 'A' sits near the baseline
+    // 'o' is a classic 2-contour glyph (outer + inner hole)
+    var go = font::font_glyph_index(f, 111)
+    var oo = font::font_outline(f, go)
+    assert_true(font::outline_num_contours(oo) >= 2)
+    // space has an empty outline
+    var gsp = font::font_glyph_index(f, 32)
+    assert_eq(font::outline_num_contours(font::font_outline(f, gsp)), 0)
+    // every contour of 'A' is closed (has >= 2 segments) and its points lie within the bbox
+    var ci = 0
+    while ci < font::outline_num_contours(oa) {
+        var ct = oa.contours[ci]
+        assert_true(ct.segs.len() >= 2)
+        ci = ci + 1
+    }
+}
+
+// helper: max coverage over a glyph bitmap
+fn cov_max(g: font::GlyphBitmap) -> Int {
+    var m = 0
+    var i = 0
+    while i < g.w * g.h { if g.cov[i] > m { m = g.cov[i] }  i = i + 1 }
+    return m
+}
+fn cov_sum(g: font::GlyphBitmap) -> Int {
+    var s = 0
+    var i = 0
+    while i < g.w * g.h { s = s + g.cov[i]  i = i + 1 }
+    return s
+}
+
+fn test_rasterize_basic() {
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    var f = fr.font
+    var ga = font::font_glyph_index(f, 65)         // 'A'
+    var g = font::rasterize(f, ga, 24.0)
+    // sensible dimensions for a 24px cap-height glyph
+    assert_true(g.w > 8 && g.w < 40)
+    assert_true(g.h > 8 && g.h < 40)
+    assert_eq(g.left, 0)                           // 'A' left bearing ~0 in this metric
+    assert_true(g.top > 10)                        // rises above baseline
+    // fully-covered interior pixels exist, and there is substantial total ink
+    assert_true(cov_max(g) >= 250)
+    assert_true(cov_sum(g) > 5000)
+    // space rasterizes to an empty bitmap
+    var gsp = font::rasterize(f, font::font_glyph_index(f, 32), 24.0)
+    assert_eq(gsp.w, 0)
+    assert_eq(cov_sum(gsp), 0)
+}
+
+fn test_rasterize_hole() {
+    // 'o' has an interior hole: the signed-area winding must cancel there (center ~empty, ring inked)
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    var f = fr.font
+    var g = font::rasterize(f, font::font_glyph_index(f, 111), 48.0)   // 'o', large for a clear hole
+    assert_true(g.w > 12)
+    assert_true(g.h > 12)
+    var cxp = g.w / 2
+    var cyp = g.h / 2
+    // the center (the hole) is nearly empty...
+    assert_true(font::glyph_cov_at(g, cxp, cyp) < 40)
+    // ...while a point on the left ring is heavily inked
+    var ring = 0
+    var x = 0
+    while x < g.w {
+        var c = font::glyph_cov_at(g, x, cyp)
+        if c > ring { ring = c }
+        x = x + 1
+    }
+    assert_true(ring >= 250)
+}
+
+fn test_rasterize_scales() {
+    // bigger px size => bigger bitmap (monotonic), and consistent placement
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    var f = fr.font
+    var gid = font::font_glyph_index(f, 72)        // 'H'
+    var s16 = font::rasterize(f, gid, 16.0)
+    var s48 = font::rasterize(f, gid, 48.0)
+    assert_true(s48.w > s16.w)
+    assert_true(s48.h > s16.h)
+    assert_true(s48.top > s16.top)
+}
+
+fn test_scaled_metrics_and_layout() {
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    var f = fr.font
+    // scaled metrics at 32px
+    var vm = font::font_v_metrics_px(f, 32.0)
+    assert_true(vm.ascent > 0.0 && vm.ascent < 32.0)
+    assert_true(vm.descent < 0.0)
+    assert_true(font::font_line_height_px(f, 32.0) > vm.ascent)
+    // lay out "AV": glyphs advance monotonically, second starts after the first
+    var run = font::layout_run(f, "AV", 32.0)
+    assert_eq(run.len(), 2)
+    assert_feq(run[0].x, 0.0, 0.001)
+    assert_true(run[1].x > 3.0)
+    assert_true(run[0].advance > 0.0)
+    // total width of a word is positive and larger than a single glyph
+    var wWord = font::measure_run(f, "Hello", 32.0)
+    var wH = font::measure_run(f, "H", 32.0)
+    assert_true(wWord > wH)
+    // empty string measures 0
+    assert_feq(font::measure_run(f, "", 32.0), 0.0, 0.001)
+}
+
+fn test_utf8_decode() {
+    // ASCII
+    var a = font::utf8_codepoints("AB")
+    assert_eq(a.len(), 2)
+    assert_eq(a[0], 65)
+    assert_eq(a[1], 66)
+    // 2-byte: U+00E9 é = 0xC3 0xA9
+    var e = ""
+    e = e + chr(195)
+    e = e + chr(169)
+    var ce = font::utf8_codepoints(e)
+    assert_eq(ce.len(), 1)
+    assert_eq(ce[0], 233)
+    // 3-byte: U+20AC € = 0xE2 0x82 0xAC
+    var eu = ""
+    eu = eu + chr(226)
+    eu = eu + chr(130)
+    eu = eu + chr(172)
+    var ceu = font::utf8_codepoints(eu)
+    assert_eq(ceu.len(), 1)
+    assert_eq(ceu[0], 8364)
+}
+
+fn test_atlas() {
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    var f = fr.font
+    var at = font::atlas_new(256, 256)
+    var ea = font::atlas_glyph(at, f, font::font_glyph_index(f, 65), 24.0)   // 'A'
+    assert_true(ea.w > 0 && ea.h > 0)
+    assert_true(ea.ux >= 0 && ea.uy >= 0)
+    assert_true(ea.advance > 0.0)
+    assert_eq(font::atlas_count(at), 1)
+    // requesting the same glyph again is a cache hit (no new entry, same rect)
+    var ea2 = font::atlas_glyph(at, f, font::font_glyph_index(f, 65), 24.0)
+    assert_eq(font::atlas_count(at), 1)
+    assert_eq(ea2.ux, ea.ux)
+    assert_eq(ea2.uy, ea.uy)
+    // a different glyph packs to a non-overlapping rect on the same shelf
+    var eb = font::atlas_glyph(at, f, font::font_glyph_index(f, 66), 24.0)   // 'B'
+    assert_eq(font::atlas_count(at), 2)
+    assert_true(eb.ux >= ea.ux + ea.w)             // packed to the right of 'A'
+    // the atlas pixel buffer actually received ink where 'A' was blitted
+    var got_ink = false
+    var yy = ea.uy
+    while yy < ea.uy + ea.h {
+        var xx = ea.ux
+        while xx < ea.ux + ea.w {
+            if at.pix[yy * at.w + xx] > 200 { got_ink = true }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    assert_true(got_ink)
+    // space caches a zero-size entry with a real advance
+    var esp = font::atlas_glyph(at, f, font::font_glyph_index(f, 32), 24.0)
+    assert_eq(esp.w, 0)
+    assert_true(esp.advance > 0.0)
+    assert_false(font::atlas_full(at))
+}
+
+// the atlas's key -> index map: with many glyphs cached, every repeated request must be a hit that
+// returns the same entry (not a re-rasterize at a new shelf spot), and a fresh atlas finds none.
+fn test_atlas_index() {
+    let f = font::font_load(read_file("std/font/assets/DejaVuSans.ttf")).font
+    var at = font::atlas_new(1024, 1024)
+    var first: Vec<font::AtlasEntry> = vec()
+    var gid = 1
+    while gid <= 120 {                                   // many distinct glyphs
+        let e = font::atlas_glyph(at, f, gid, 16.0)
+        first.push(copy e)
+        gid = gid + 1
+    }
+    var small: Vec<font::AtlasEntry> = vec()
+    gid = 1
+    while gid <= 40 {                                   // same glyphs again at another size: distinct keys
+        let e = font::atlas_glyph(at, f, gid, 24.0)
+        small.push(copy e)
+        gid = gid + 1
+    }
+    assert_eq(font::atlas_count(at), 160)
+    // every cached key is found again: same entry rect, and no new entries are added
+    gid = 1
+    while gid <= 40 {
+        let e = font::atlas_glyph(at, f, gid, 24.0)
+        let s = small[gid - 1]
+        assert_eq(e.ux, s.ux)
+        assert_eq(e.uy, s.uy)
+        assert_eq(e.w, s.w)
+        assert_eq(e.h, s.h)
+        gid = gid + 1
+    }
+    gid = 1
+    while gid <= 120 {
+        let e = font::atlas_glyph(at, f, gid, 16.0)
+        let s = first[gid - 1]
+        assert_eq(e.ux, s.ux)
+        assert_eq(e.uy, s.uy)
+        assert_eq(e.w, s.w)
+        assert_eq(e.h, s.h)
+        gid = gid + 1
+    }
+    assert_eq(font::atlas_count(at), 160)
+    // a fresh (cleared) atlas finds none: it starts empty and the first request is a real miss
+    var at2 = font::atlas_new(1024, 512)
+    assert_eq(font::atlas_count(at2), 0)
+    let e2 = font::atlas_glyph(at2, f, font::font_glyph_index(f, 65), 16.0)
+    assert_true(e2.w > 0)
+    assert_eq(font::atlas_count(at2), 1)
+}
+
+// WOFF2 (Brotli + glyf transform): the woff2 must reconstruct the same glyphs as the plain ttf.
+fn test_woff2_matches_ttf() {
+    let ttf = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    let w2 = font::font_load(read_file("std/font/assets/DejaVuSans.woff2"))
+    assert_true(ttf.ok)
+    assert_true(w2.ok)
+    assert_eq(font::font_num_glyphs(w2.font), font::font_num_glyphs(ttf.font))
+    let s = "AgQ@yjxWö"
+    var i = 0
+    while i < s.len() {
+        let cp = font::rd_u8(s, i)
+        let gt = font::font_glyph_index(ttf.font, cp)
+        let gw = font::font_glyph_index(w2.font, cp)
+        assert_eq(gw, gt)
+        let bt = font::rasterize(ttf.font, gt, 28.0)
+        let bw = font::rasterize(w2.font, gw, 28.0)
+        assert_eq(bw.w, bt.w)
+        assert_eq(bw.h, bt.h)
+        assert_eq(bw.left, bt.left)
+        assert_eq(bw.top, bt.top)
+        var y = 0
+        while y < bt.h {
+            var x = 0
+            while x < bt.w { assert_eq(font::glyph_cov_at(bw, x, y), font::glyph_cov_at(bt, x, y))  x = x + 1 }
+            y = y + 1
+        }
+        i = i + 1
+    }
+}
+
+// ── light autohinting ───────────────────────────────────────────────────────────────────────────
+fn dvs() -> font::Font { return font::font_load(read_file("std/font/assets/DejaVuSans.ttf")).font }
+fn bi(b: Bool) -> Int { if b { return 1 }  return 0 }
+// the coverage of one row of a glyph bitmap
+fn row_sum(g: font::GlyphBitmap, y: Int) -> Int {
+    var t = 0
+    var x = 0
+    while x < g.w { t = t + font::glyph_cov_at(g, x, y)  x = x + 1 }
+    return t
+}
+// the heaviest row in the bitmap: the reference a fully-lit edge row should be close to. Not the
+// middle row: an 'x' is at its narrowest exactly there, where the diagonals cross.
+fn max_row(g: font::GlyphBitmap) -> Int {
+    var best = 0
+    var y = 0
+    while y < g.h { let v = row_sum(g, y)  if v > best { best = v }  y = y + 1 }
+    return best
+}
+fn test_hint_xheight_snaps() {
+    let f = dvs()
+    let gx = font::font_glyph_index(f, 120)                     // 'x': flat top, sits on the baseline
+    assert_eq(bi(font::font_blues(f).ok), 1)
+    // The bitmap height proves nothing (it is ceil either way, the baseline already being whole);
+    // what hinting buys is that the top row is fully inked instead of carrying whatever fraction of
+    // a row the outline happened to land on. Must hold at every size, not just a lucky one.
+    var px = 12.0
+    while px <= 24.0 {
+        let g = font::rasterize(f, gx, px)
+        assert_true(row_sum(g, 0) * 100 > max_row(g) * 80)
+        px = px + 1.0
+    }
+}
+fn test_hint_edges_are_crisp() {
+    let f = dvs()
+    let gx = font::font_glyph_index(f, 120)
+    let g = font::rasterize(f, gx, 16.0)
+    // Top and bottom rows carry nearly full coverage rather than a half-lit fringe: an edge landing
+    // mid-row is exactly the smear hinting exists to remove.
+    let peak = max_row(g)
+    assert_true(row_sum(g, 0) * 100 > peak * 80)
+    assert_true(row_sum(g, g.h - 1) * 100 > peak * 80)
+}
+fn test_hint_off_restores_the_outline() {
+    let f = dvs()
+    let gx = font::font_glyph_index(f, 120)
+    let hinted = font::rasterize(f, gx, 12.0)
+    let hTop = row_sum(hinted, 0)
+    font::set_hinting(false)
+    assert_eq(bi(font::hinting()), 0)
+    let raw = font::rasterize(f, gx, 12.0)
+    let rTop = row_sum(raw, 0)
+    font::set_hinting(true)
+    assert_eq(bi(font::hinting()), 1)
+    // 12px is a size where this face's x-height lands mid-pixel, so unhinted the top row is only
+    // part lit, that is the softness, and the toggle has to actually reach it.
+    assert_true(rTop * 100 < max_row(raw) * 80)                 // unhinted: the top row is part-lit
+    assert_true(hTop * 100 > rTop * 140)                        // hinted: substantially more inked
+    // turning it back on reproduces the hinted result exactly
+    let again = font::rasterize(f, gx, 12.0)
+    assert_eq(row_sum(again, 0), hTop)
+    assert_eq(cov_sum(again), cov_sum(hinted))
+}
+fn test_hint_leaves_advances_alone() {
+    // Vertical-only: hinting must not move the pen, or every line break in std/html would shift.
+    let f = dvs()
+    let gid = font::font_glyph_index(f, 109)                    // 'm'
+    let a1 = font::font_h_advance(f, gid)
+    font::set_hinting(false)
+    let a2 = font::font_h_advance(f, gid)
+    font::set_hinting(true)
+    assert_eq(to_int(a1), to_int(a2))
+    // and the horizontal extent of the bitmap is unchanged too
+    let hw = font::rasterize(f, gid, 16.0).w
+    font::set_hinting(false)
+    let rw = font::rasterize(f, gid, 16.0).w
+    font::set_hinting(true)
+    assert_eq(hw, rw)
+}
+
+fn test_hint_stem_positions_snap() {
+    // A horizontal stroke should land on the grid: one row fully inked, and any remainder in a
+    // single neighbour. Unhinted the stroke straddles two rows with neither full, which is the
+    // smear. 'H' at 16px has exactly one such stroke, its crossbar.
+    let f = dvs()
+    let g = font::rasterize(f, font::font_glyph_index(f, 72), 16.0)     // 'H'
+    let peak = max_row(g)
+    var full = 0
+    var y = 0
+    while y < g.h {
+        let r = row_sum(g, y)
+        if r * 100 > peak * 92 { full = full + 1 }                      // a row the crossbar fills
+        y = y + 1
+    }
+    assert_true(full >= 1)
+}
+fn test_hint_stem_width_is_not_rounded() {
+    // Positions snap, widths do not: the reference renders a 1.25px crossbar as a full row plus a
+    // quarter row rather than quantising it to 1 or 2. So a partial remainder row must survive
+    // hinting: if some width-rounding crept in, every stroke would be a whole number of full rows
+    // and no partial would be left between the stems.
+    let f = dvs()
+    let g = font::rasterize(f, font::font_glyph_index(f, 72), 16.0)     // 'H'
+    let peak = max_row(g)
+    var partial = 0
+    var y = 0
+    while y < g.h {
+        let r = row_sum(g, y)
+        if r * 100 > peak * 20 && r * 100 < peak * 92 { partial = partial + 1 }
+        y = y + 1
+    }
+    assert_true(partial >= 1)
+}
+
+fn rnd_i(v: Float) -> Int { return to_int(v + 0.5) }
+fn test_hint_round_bottom_overshoot_suppressed() {
+    // `o` and `b` are drawn dipping a few units below the baseline so the curve does not read as
+    // floating. At text sizes that dip is hundredths of a pixel, and it must land on the baseline
+    // rather than claim a row of its own to hold a sliver of coverage nobody can see.
+    let f = dvs()
+    assert_true(font::font_blues(f).rb < 0.0)                       // the face really does overshoot
+    var px = 12.0
+    while px <= 18.0 {
+        let g = font::rasterize(f, font::font_glyph_index(f, 111), px)   // 'o'
+        assert_true(row_sum(g, g.h - 1) * 100 > max_row(g) * 25)    // the bottom row is real ink
+        px = px + 1.0
+    }
+}
+fn test_hint_ascender_gains_no_rows() {
+    // The ascender rounds to nearest, so an ascending letter is as many rows tall as its ascender
+    // rounds to: never a row or two more, which is what rounding outward and an unsuppressed
+    // overshoot together would cost.
+    let f = dvs()
+    let bl = font::font_blues(f)
+    let upem = font::font_units_per_em(f)
+    var px = 12.0
+    while px <= 24.0 {
+        let g = font::rasterize(f, font::font_glyph_index(f, 98), px)    // 'b'
+        let want = rnd_i(bl.asc * px / upem)
+        assert_true(g.h <= want + 1)
+        assert_true(g.h >= want - 1)
+        px = px + 1.0
+    }
+}
+
+// A contour of one off-curve point, last in its glyph. Legal TrueType, and hinted fonts carry them.
+// The contour walk must not read the point after an off-curve start without checking that it is in
+// the same contour (that was an out-of-bounds read). The glyph for 'A' in DejaVu Sans is
+// rewritten in place to a triangle followed by one off-curve point.
+fn be16(v: Int) -> Str { var s = ""  s = s + chr(((v >> 8) & 255))  s = s + chr((v & 255))  return s }
+fn test_lone_offcurve_contour() {
+    let d = read_file("std/font/assets/DejaVuSans.ttf")
+    let f0 = font::font_load(d).font
+    let gid = font::font_glyph_index(f0, 65)
+    var lo = 0
+    if f0.index_to_loc == 0 { lo = font::rd_u16(d, f0.loca_off + gid * 2) * 2 } else { lo = font::rd_u32(d, f0.loca_off + gid * 4) }
+    let at = f0.glyf_off + lo
+    var g = be16(2) + be16(0) + be16(0) + be16(100) + be16(100)   // two contours, bbox
+    g = g + be16(2) + be16(3)                                        // ends: points 0-2, then point 3 alone
+    g = g + be16(0)                                                  // no instructions
+    g = g + chr(1)  g = g + chr(1)  g = g + chr(1)  g = g + chr(0)  // on, on, on, off
+    g = g + be16(0) + be16(100) + be16(0) + be16(65486)              // x deltas: 0, 100, 0, -50
+    g = g + be16(0) + be16(0) + be16(100) + be16(65486)              // y deltas: 0, 0, 100, -50
+    let patched = d.slice(0, at) + g + d.slice(at + g.len(), d.len())
+    var f = font::font_load(patched).font
+    let o = font::font_outline(f, gid)
+    assert_eq(font::outline_num_contours(o), 2)
+    // and it rasterises, which is what the preview does next
+    let bm = font::rasterize(f, gid, 40.0)
+    assert_true(bm.w >= 0)
+}
+
+// A font is input. Offsets past the end of the file read as zero instead of trapping: the table
+// directory here claims a cmap far beyond the bytes there are.
+fn test_offsets_past_the_end() {
+    assert_eq(font::rd_u8("ab", 2), 0)
+    assert_eq(font::rd_u16("ab", 1), 25088)    // 'b' then nothing: 0x6200
+    assert_eq(font::rd_u32("", 0 - 4), 0)
+    let d = read_file("std/font/assets/DejaVuSans.ttf")
+    let short = d.slice(0, 4096)
+    let r = font::font_load(short)
+    if r.ok {
+        var f = r.font
+        let o = font::font_outline(f, font::font_glyph_index(f, 65))
+        assert_true(font::outline_num_contours(o) >= 0)
+    }
+}

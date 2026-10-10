@@ -1,0 +1,74 @@
+//! std/geometry, frustum.nori: the six clip planes of a view-projection and the culling tests
+//! built on them.
+//!
+//! Written for a **0..1 clip-space depth**, the wgpu/WebGPU convention that
+//! `std/math`'s projections produce (not OpenGL's -1..1).
+
+import "std/math" as m
+
+/// the six clip planes of a view-projection, each oriented so that inside is a positive distance.
+pub struct Frustum { left: Plane, right: Plane, bottom: Plane, top: Plane, near: Plane, far: Plane }
+
+/// the six clip planes of a view-projection matrix (Gribb-Hartmann), each normalized and oriented
+/// so that a point inside has a positive distance from all six.
+///
+/// Written for a **0..1 depth** clip volume: the near plane is row 2 of the matrix on its own,
+/// where an OpenGL -1..1 volume would use `row3 + row2`. Pass the same matrix you upload as the
+/// camera's view-projection and the frustum matches what the GPU will clip against.
+pub fn frustum_from_mat4(vp: m::Mat4) -> Frustum {
+    // row i of a column-major matrix is the i-th component of each column
+    let r0 = m::vec4(vp.x_axis.x, vp.y_axis.x, vp.z_axis.x, vp.w_axis.x)
+    let r1 = m::vec4(vp.x_axis.y, vp.y_axis.y, vp.z_axis.y, vp.w_axis.y)
+    let r2 = m::vec4(vp.x_axis.z, vp.y_axis.z, vp.z_axis.z, vp.w_axis.z)
+    let r3 = m::vec4(vp.x_axis.w, vp.y_axis.w, vp.z_axis.w, vp.w_axis.w)
+    return Frustum {
+        left: plane_from_vec4(m::vec4_add(r3, r0)),
+        right: plane_from_vec4(m::vec4_sub(r3, r0)),
+        bottom: plane_from_vec4(m::vec4_add(r3, r1)),
+        top: plane_from_vec4(m::vec4_sub(r3, r1)),
+        near: plane_from_vec4(r2),
+        far: plane_from_vec4(m::vec4_sub(r3, r2)) }
+}
+/// a Vec4 of coefficients (a, b, c, d) read as the plane `ax + by + cz + d == 0`, normalized.
+pub fn plane_from_vec4(c: m::Vec4) -> Plane { return plane_normalize(Plane { normal: m::vec4_truncate(c), d: c.w }) }
+/// false when the box is entirely outside the frustum (the cull test).
+///
+/// Conservative: a box straddling two planes' outsides without crossing the frustum can still
+/// answer true. That costs a few extra draws and never drops a visible one, which is the usual trade for a
+/// per-object cull; an exact test costs more than the draw it saves.
+pub fn frustum_intersects_aabb(f: Frustum, a: Aabb) -> Bool {
+    if geom_plane_rejects_aabb(f.left, a) { return false }
+    if geom_plane_rejects_aabb(f.right, a) { return false }
+    if geom_plane_rejects_aabb(f.bottom, a) { return false }
+    if geom_plane_rejects_aabb(f.top, a) { return false }
+    if geom_plane_rejects_aabb(f.near, a) { return false }
+    if geom_plane_rejects_aabb(f.far, a) { return false }
+    return true
+}
+/// true when the box is entirely on the plane's negative side.
+fn geom_plane_rejects_aabb(pl: Plane, a: Aabb) -> Bool {
+    // only the corner furthest along the normal matters: if even that one is behind the plane, all
+    // eight are, and it is picked per-axis without enumerating them
+    var p = copy a.min
+    if pl.normal.x >= 0.0 { p.x = a.max.x }
+    if pl.normal.y >= 0.0 { p.y = a.max.y }
+    if pl.normal.z >= 0.0 { p.z = a.max.z }
+    return plane_signed_distance(pl, p) < 0.0
+}
+/// false when the sphere is entirely outside the frustum.
+pub fn frustum_intersects_sphere(f: Frustum, s: Sphere) -> Bool {
+    let r = 0.0 - s.radius
+    if plane_signed_distance(f.left, s.center) < r { return false }
+    if plane_signed_distance(f.right, s.center) < r { return false }
+    if plane_signed_distance(f.bottom, s.center) < r { return false }
+    if plane_signed_distance(f.top, s.center) < r { return false }
+    if plane_signed_distance(f.near, s.center) < r { return false }
+    if plane_signed_distance(f.far, s.center) < r { return false }
+    return true
+}
+/// true when the point is inside all six planes.
+pub fn frustum_contains_point(f: Frustum, p: m::Vec3) -> Bool {
+    return plane_signed_distance(f.left, p) >= 0.0 && plane_signed_distance(f.right, p) >= 0.0
+        && plane_signed_distance(f.bottom, p) >= 0.0 && plane_signed_distance(f.top, p) >= 0.0
+        && plane_signed_distance(f.near, p) >= 0.0 && plane_signed_distance(f.far, p) >= 0.0
+}

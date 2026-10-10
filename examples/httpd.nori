@@ -1,0 +1,32 @@
+// An HTTP server in a few lines, on std/http (pure Nori, no C): routing, a path parameter, a query
+// string, JSON, and a 404.
+//
+//   httpd [PORT]       listens on 127.0.0.1:PORT (default 8080) until you stop it
+//
+//   curl localhost:8080/
+//   curl localhost:8080/hello/Nori
+//   curl 'localhost:8080/add?a=2&b=3'
+//   curl localhost:8080/nothing        # 404
+import "std/http" as http
+
+struct Site {}
+
+impl http::Handler for Site {
+    fn handle(self, req: http::Request) -> http::Response {
+        if req.path == "/" { return http::html("<h1>Nori</h1>") }
+        let r = http::route(req, "GET", "/hello/:name")
+        if r.ok { return http::text("hello, ${http::param(r, "name")}") }
+        if req.path == "/add" {
+            let sum = parse_int(http::req_query(req, "a")) + parse_int(http::req_query(req, "b"))
+            return http::json("{\"sum\": ${sum}}")
+        }
+        return http::not_found()
+    }
+}
+
+fn main() -> Int {
+    var port = 8080
+    if argc() > 0 { port = parse_int(arg(0)) }
+    printl("listening on 127.0.0.1:${port}")
+    return http::serve(http::loopback(), port, Site {})
+}

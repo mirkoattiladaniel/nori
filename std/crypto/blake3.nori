@@ -1,0 +1,479 @@
+// BLAKE3 (the BLAKE3 specification, 2020): hash, keyed hash, key derivation, and an
+// extendable output.
+//
+// This is not a widening or narrowing of the BLAKE2b in crypto.nori, and no code is shared with
+// it. BLAKE2b is a 64-bit sequential hash; BLAKE3 is a 32-bit Merkle tree. The compression
+// function is a recognisable relative (the same G, the same column/diagonal pattern), but the
+// rotations differ, there are 7 rounds instead of 12, the message permutation is its own table,
+// and everything above the compression function (chunks, chaining values, parent nodes, the
+// root) has no counterpart in BLAKE2 at all. Adapting the BLAKE2b code would give
+// something that passes on short inputs and is wrong from 1025 bytes upward.
+//
+// The shape of the algorithm, because the flag bits are meaningless without it:
+//
+//   * The input is cut into chunks of 1024 bytes, each chunk into 16 blocks of 64 bytes.
+//     Chunk `i` is compressed with the counter set to `i`, its first block carrying CHUNK_START
+//     and its last CHUNK_END. The 8-word result is that chunk's chaining value (CV).
+//   * The chunk CVs are the leaves of a binary tree. Two adjacent subtree CVs are merged by one
+//     compression of their 16 words as the message, with the PARENT flag and counter 0.
+//   * The tree is left-full: every left subtree covers a power-of-two number of chunks. That is
+//     what makes the stack merge below correct, and it is why the counter is the chunk index and
+//     never a block or node index.
+//   * The final compression at the top (of the root parent node, or of the last block of the
+//     only chunk when the input is 1024 bytes or less) additionally carries ROOT. Because ROOT
+//     is only applied at the end, an input's CV as a subtree differs from its hash, which is
+//     what stops a tree of one chunk from colliding with that chunk's own hash.
+//   * The root compression's counter restarts at 0 and then counts output blocks, and the full
+//     16-word state (not the 8-word XOR) is the output. That is the extendable output: block
+//     `j` of the digest stream is the root compression with counter `j`.
+//
+// Keyed hashing replaces the IV with the 8 key words and sets KEYED_HASH on every compression.
+// `derive_key` is two passes: hash the context string with DERIVE_KEY_CONTEXT to get 32 key
+// words' worth of material, then keyed-hash the key material with DERIVE_KEY_MATERIAL.
+//
+// Arithmetic. Nori's Int is i64 and BLAKE3 is 32-bit, so every add is masked with 0xffffffff
+// and every rotation is a shift pair masked the same way. The masks are needed: an
+// unmasked add is invisible for one round and wrong by the end of seven. Adds are written as
+// `(a + b + c) & 0xffffffff`; the unmasked intermediate is at most 3*2^32, which is far inside
+// i64 and so cannot trip an overflow check.
+
+// ---- constants -------------------------------------------------------------------------------
+
+/// the BLAKE3 initialisation vector: the same eight words as SHA-256's, the fractional parts of
+/// the square roots of the first eight primes.
+fn b3_iv() -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    v.push(0x6a09e667)  v.push(0xbb67ae85)  v.push(0x3c6ef372)  v.push(0xa54ff53a)
+    v.push(0x510e527f)  v.push(0x9b05688c)  v.push(0x1f83d9ab)  v.push(0x5be0cd19)
+    return v
+}
+
+// the flag bits. They are a bitmask on one compression, not a mode: a single-block, single-chunk
+// input carries CHUNK_START|CHUNK_END|ROOT all at once.
+fn b3_chunk_start() -> Int { return 1 }
+fn b3_chunk_end() -> Int { return 2 }
+fn b3_parent() -> Int { return 4 }
+fn b3_root() -> Int { return 8 }
+fn b3_keyed_hash() -> Int { return 16 }
+fn b3_derive_key_context() -> Int { return 32 }
+fn b3_derive_key_material() -> Int { return 64 }
+
+/// the seven message permutations, flattened to 112 entries. Round `r` reads at offset `r * 16`.
+///
+/// Written row per row rather than as one expression for the same reason BLAKE2b's sigma is: a
+/// transcription slip here changes the digest and is caught by nothing but a test vector, so the
+/// table is laid out to be compared against the specification by eye.
+fn b3_schedule() -> Vec<Int> {
+    var s: Vec<Int> = vec()
+    var t = "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    t = t + ",2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8"
+    t = t + ",3,4,10,12,13,2,7,14,6,5,9,0,11,15,8,1"
+    t = t + ",10,7,12,9,14,3,13,15,4,0,11,2,5,8,1,6"
+    t = t + ",12,13,9,11,15,10,14,8,7,2,5,3,0,1,6,4"
+    t = t + ",9,14,11,5,8,12,15,1,13,3,0,10,2,6,4,7"
+    t = t + ",11,15,5,0,1,9,8,6,14,10,2,12,3,4,7,13"
+    var cur = 0
+    var have = false
+    var i = 0
+    while i < t.len() {
+        let c = ord(t.at(i))
+        if c == 44 { s.push(cur)  cur = 0  have = false }
+        else { cur = ((cur * 10) + (c - 48))  have = true }
+        i = i + 1
+    }
+    if have { s.push(cur) }
+    return s
+}
+
+// ---- the compression function ------------------------------------------------------------------
+
+/// rotate right within 32 bits. `n` is 16, 12, 8 or 7 here and never 0, so the left half never
+/// shifts by 32.
+fn b3_rotr32(x: Int, n: Int) -> Int { return (((x >> n) | (x << (32 - n))) & 0xffffffff) }
+
+fn b3_g(inout v: Vec<Int>, a: Int, b: Int, c: Int, d: Int, x: Int, y: Int) {
+    v[a] = ((v[a] + v[b]) + x) & 0xffffffff
+    v[d] = b3_rotr32(v[d] ^ v[a], 16)
+    v[c] = (v[c] + v[d]) & 0xffffffff
+    v[b] = b3_rotr32(v[b] ^ v[c], 12)
+    v[a] = ((v[a] + v[b]) + y) & 0xffffffff
+    v[d] = b3_rotr32(v[d] ^ v[a], 8)
+    v[c] = (v[c] + v[d]) & 0xffffffff
+    v[b] = b3_rotr32(v[b] ^ v[c], 7)
+}
+
+/// the full 16-word state after seven rounds. Every caller wants a different slice of this: a
+/// chaining value is the first eight words XORed with the last eight, and an output block is all
+/// sixteen with the second half XORed against the input CV. Returning the state rather than
+/// either result is what lets one function serve both without a mode flag.
+///
+/// `cv` is 8 words, `m` is the 16 little-endian message words, `counter` is 64-bit (split across
+/// state words 12 and 13), `block_len` is 1..64 and `flags` the bitmask above.
+fn b3_compress(cv: Vec<Int>, m: Vec<Int>, counter: Int, block_len: Int, flags: Int) -> Vec<Int> {
+    let iv = b3_iv()
+    let sched = b3_schedule()
+    var v: Vec<Int> = vec()
+    var i = 0
+    while i < 8 { v.push(cv[i])  i = i + 1 }
+    v.push(iv[0])  v.push(iv[1])  v.push(iv[2])  v.push(iv[3])
+    v.push(counter & 0xffffffff)
+    v.push((counter >> 32) & 0xffffffff)
+    v.push(block_len & 0xffffffff)
+    v.push(flags & 0xffffffff)
+    var r = 0
+    while r < 7 {
+        let o = r * 16
+        b3_g(v, 0, 4,  8, 12, m[sched[o]],       m[sched[o + 1]])
+        b3_g(v, 1, 5,  9, 13, m[sched[o + 2]],   m[sched[o + 3]])
+        b3_g(v, 2, 6, 10, 14, m[sched[o + 4]],   m[sched[o + 5]])
+        b3_g(v, 3, 7, 11, 15, m[sched[o + 6]],   m[sched[o + 7]])
+        b3_g(v, 0, 5, 10, 15, m[sched[o + 8]],   m[sched[o + 9]])
+        b3_g(v, 1, 6, 11, 12, m[sched[o + 10]],  m[sched[o + 11]])
+        b3_g(v, 2, 7,  8, 13, m[sched[o + 12]],  m[sched[o + 13]])
+        b3_g(v, 3, 4,  9, 14, m[sched[o + 14]],  m[sched[o + 15]])
+        r = r + 1
+    }
+    return v
+}
+
+/// the 8-word chaining value: the halves of the state XORed together.
+fn b3_cv_of(state: Vec<Int>) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    var i = 0
+    while i < 8 { out.push(state[i] ^ state[i + 8])  i = i + 1 }
+    return out
+}
+
+/// the 16 little-endian words of the 64 bytes of `buf` starting at `off`, zero-padded past `end`.
+///
+/// The padding is why a short final block still hashes correctly: BLAKE3 does not pad with a
+/// length or a 1 bit the way SHA-2 does; the true length goes into the state's `block_len` word
+/// instead, and the tail of the block is simply zeros.
+fn b3_words_at(buf: Str, off: Int, end: Int) -> Vec<Int> {
+    var m: Vec<Int> = vec()
+    var i = 0
+    while i < 16 {
+        let p = off + (i * 4)
+        var w = 0
+        var k = 3
+        while k >= 0 {
+            var b = 0
+            if (p + k) < end { b = ord(buf.at(p + k)) }
+            w = ((w << 8) | b)
+            k = k - 1
+        }
+        m.push(w)
+        i = i + 1
+    }
+    return m
+}
+
+fn b3_le32_bytes(x: Int) -> Str {
+    var out = ""
+    var i = 0
+    while i < 4 { out = (out + chr((x >> (i * 8)) & 255))  i = i + 1 }
+    return out
+}
+
+// ---- chunks and the tree -------------------------------------------------------------------
+
+/// the chaining value of one whole chunk: bytes [off, end) of `data`, which must be a full 1024
+/// bytes unless this is the last chunk of the input.
+///
+/// A chunk of 0 bytes only happens for an empty input, and then this compresses one
+/// empty block: the empty input is one chunk of one block, not zero
+/// blocks. The `n == 0` guard below implements that; without it the loop runs zero times
+/// and returns the key as the CV, which is a different (wrong) digest.
+fn b3_chunk_cv(data: Str, off: Int, end: Int, counter: Int, key: Vec<Int>, flags: Int) -> Vec<Int> {
+    var cv = copy key
+    let n = end - off
+    var p = 0
+    var first = true
+    while p < n || (p == 0 && n == 0) {
+        var blen = n - p
+        if blen > 64 { blen = 64 }
+        var f = flags
+        if first { f = f | b3_chunk_start() }
+        if (p + blen) >= n { f = f | b3_chunk_end() }
+        let m = b3_words_at(data, off + p, off + p + blen)
+        cv = b3_cv_of(b3_compress(cv, m, counter, blen, f))
+        first = false
+        p = p + 64
+        if n == 0 { p = 1 }   // no `break` in Nori: force the empty-input loop to run exactly once
+    }
+    return cv
+}
+
+/// the 16 message words of a parent node: the left child's 8 CV words then the right child's.
+fn b3_parent_words(l: Vec<Int>, r: Vec<Int>) -> Vec<Int> {
+    var m: Vec<Int> = vec()
+    var i = 0
+    while i < 8 { m.push(l[i])  i = i + 1 }
+    i = 0
+    while i < 8 { m.push(r[i])  i = i + 1 }
+    return m
+}
+
+// ---- the incremental hasher ---------------------------------------------------------------
+
+/// an in-progress BLAKE3 hash. Create with `b3_new` / `b3_new_keyed`, feed with `update`, read
+/// with `digest` / `hex` / `xof`.
+///
+/// `stack` is the CVs of completed left subtrees, flattened 8 words per entry. `chunks` is how
+/// many chunks have been absorbed, and its popcount is how many entries the stack holds.
+/// That identity is the whole merging rule: after finishing chunk number `t`, merge the top
+/// two entries once for every trailing zero bit of `t`, which is the same as saying a subtree is
+/// closed as soon as it is full. `buf` holds the bytes of the chunk in progress, so that
+/// `update` can be called with any chunking the caller likes and produce the same digest.
+pub struct B3 {
+    key: Vec<Int>,
+    flags: Int,
+    stack: Vec<Int>,
+    chunks: Int,
+    buf: Str
+}
+
+/// a hasher for the plain, unkeyed hash.
+pub fn b3_new() -> B3 {
+    let k = b3_iv()
+    var st: Vec<Int> = vec()
+    return B3 { key: k, flags: 0, stack: st, chunks: 0, buf: "" }
+}
+
+/// a hasher keyed with exactly 32 raw bytes. A wrong-length key returns an unkeyed hasher rather
+/// than silently truncating or zero-extending, which would make two different keys agree.
+pub fn b3_new_keyed(key32: Str) -> B3 {
+    if key32.len() != 32 { return b3_new() }
+    var k: Vec<Int> = vec()
+    var i = 0
+    while i < 8 {
+        let p = i * 4
+        var w = 0
+        var j = 3
+        while j >= 0 { w = ((w << 8) | ord(key32.at(p + j)))  j = j - 1 }
+        k.push(w)
+        i = i + 1
+    }
+    var st: Vec<Int> = vec()
+    return B3 { key: k, flags: b3_keyed_hash(), stack: st, chunks: 0, buf: "" }
+}
+
+fn b3_new_with(copy key: Vec<Int>, flags: Int) -> B3 {
+    var st: Vec<Int> = vec()
+    return B3 { key: key, flags: flags, stack: st, chunks: 0, buf: "" }
+}
+
+impl B3 {
+    fn push_cv(inout self, cv: Vec<Int>) {
+        var i = 0
+        while i < 8 { self.stack.push(cv[i])  i = i + 1 }
+    }
+
+    // absorb the finished chunk sitting in `buf` and merge whatever subtrees it completes.
+    fn absorb_chunk(inout self) {
+        let cv = b3_chunk_cv(self.buf, 0, self.buf.len(), self.chunks, self.key, self.flags)
+        self.buf = ""
+        self.chunks = self.chunks + 1
+        self.push_cv(cv)
+        // merge once per trailing zero bit of the new chunk count: chunk index 3 (count 4 =
+        // 0b100) closes two subtrees, index 0 (count 1) closes none.
+        var t = self.chunks
+        while (t & 1) == 0 && self.stack.len() >= 16 {
+            let n = self.stack.len()
+            var l: Vec<Int> = vec()
+            var r: Vec<Int> = vec()
+            var i = 0
+            while i < 8 { l.push(self.stack[(n - 16) + i])  r.push(self.stack[(n - 8) + i])  i = i + 1 }
+            i = 0
+            while i < 16 { self.stack.pop()  i = i + 1 }
+            let m = b3_parent_words(l, r)
+            self.push_cv(b3_cv_of(b3_compress(self.key, m, 0, 64, self.flags | b3_parent())))
+            t = t >> 1
+        }
+    }
+
+    /// feed more input. Any split of the same bytes across calls gives the same digest.
+    pub fn update(inout self, data: Str) {
+        var p = 0
+        let n = data.len()
+        while p < n {
+            var take = 1024 - self.buf.len()
+            if take > (n - p) { take = n - p }
+            self.buf = self.buf + data.slice(p, p + take)
+            p = p + take
+            // a full buffer is only absorbed once we know more input follows: the last chunk
+            // must stay unabsorbed so that it can be finalised with ROOT.
+            if self.buf.len() == 1024 && p < n { self.absorb_chunk() }
+        }
+    }
+
+    /// `len` bytes of the extendable output, as raw bytes. `digest()` is `xof(32)`.
+    ///
+    /// Not `inout`: reading the output never disturbs the hasher, so `update` may continue after
+    /// an `xof` and further output stays consistent with the longer input.
+    pub fn xof(self, len: Int) -> Str {
+        if len <= 0 { return "" }
+        // the root compression's inputs: either the last chunk's final block, or the topmost
+        // parent node. Everything still on the stack is merged here, right to left.
+        var root_cv = self.key
+        var root_m: Vec<Int> = vec()
+        var root_len = 0
+        var root_flags = self.flags
+        let n = self.stack.len()
+        if n == 0 {
+            // one chunk or less in total: the root compression is the last block of that chunk,
+            // so it must be reached from inside the chunk rather than by hashing the chunk and
+            // then compressing again.
+            let b = self.buf
+            let bn = b.len()
+            var cv = copy self.key
+            var off = 0
+            var first = true
+            // every block but the last, absorbed normally
+            while (bn - off) > 64 {
+                var f = self.flags
+                if first { f = f | b3_chunk_start() }
+                cv = b3_cv_of(b3_compress(cv, b3_words_at(b, off, off + 64), 0, 64, f))
+                first = false
+                off = off + 64
+            }
+            var blen = bn - off
+            var f = self.flags | b3_chunk_end()
+            if first { f = f | b3_chunk_start() }
+            root_cv = sink cv
+            root_m = b3_words_at(b, off, off + blen)
+            root_len = blen
+            root_flags = f
+        } else {
+            // the trailing chunk becomes a CV like any other, then the stack collapses right to
+            // left. The counter for the trailing chunk is `chunks`, which is its index because
+            // `chunks` counts only the chunks already absorbed.
+            var right = b3_chunk_cv(self.buf, 0, self.buf.len(), self.chunks, self.key, self.flags)
+            var i = n
+            while i >= 8 {
+                var l: Vec<Int> = vec()
+                var j = 0
+                while j < 8 { l.push(self.stack[(i - 8) + j])  j = j + 1 }
+                let m = b3_parent_words(l, right)
+                root_cv = self.key
+                root_len = 64
+                root_flags = self.flags | b3_parent()
+                // every merge but the outermost produces an ordinary CV; the outermost is left
+                // for the ROOT compression below, so only compress here when more remain.
+                if i > 8 { right = b3_cv_of(b3_compress(self.key, m, 0, 64, self.flags | b3_parent())) }
+                root_m = sink m
+                i = i - 8
+            }
+        }
+        // stream output blocks: counter counts blocks, and the state is emitted in full.
+        var out = ""
+        var blk = 0
+        while out.len() < len {
+            let s = b3_compress(root_cv, root_m, blk, root_len, root_flags | b3_root())
+            var i = 0
+            while i < 8 { out = out + b3_le32_bytes(s[i] ^ s[i + 8])  i = i + 1 }
+            i = 0
+            while i < 8 { out = out + b3_le32_bytes(s[i + 8] ^ root_cv[i])  i = i + 1 }
+            blk = blk + 1
+        }
+        return out.slice(0, len)
+    }
+
+    /// the 32 raw digest bytes.
+    pub fn digest(self) -> Str { return self.xof(32) }
+
+    /// the 32-byte digest as 64 lowercase hex characters.
+    pub fn hex(self) -> Str { return b3_hex_of(self.digest()) }
+}
+
+fn b3_hex_of(s: Str) -> Str {
+    let d = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        let b = ord(s.at(i))
+        out = out + d.slice((b >> 4) & 15, ((b >> 4) & 15) + 1)
+        out = out + d.slice(b & 15, (b & 15) + 1)
+        i = i + 1
+    }
+    return out
+}
+
+// ---- the one-shot surface ----------------------------------------------------------------
+
+/// BLAKE3 of `data`: 32 raw digest bytes.
+pub fn blake3_raw(data: Str) -> Str {
+    var h = b3_new()
+    h.update(data)
+    return h.digest()
+}
+
+/// BLAKE3 of `data` as 64 lowercase hex characters, the form `b3sum` prints and the form the
+/// rest of std/crypto returns a digest in.
+pub fn blake3(data: Str) -> Str { return b3_hex_of(blake3_raw(data)) }
+
+/// `len` bytes of BLAKE3's extendable output over `data`, as raw bytes. `len` may exceed 32:
+/// BLAKE3 is an XOF, and the first 32 bytes of any longer output are `blake3_raw`.
+pub fn blake3_xof(data: Str, len: Int) -> Str {
+    var h = b3_new()
+    h.update(data)
+    return h.xof(len)
+}
+
+/// keyed BLAKE3 (a MAC) under a 32-byte `key`: 32 raw bytes. A key of any other length is
+/// rejected with "" rather than being stretched into a different key.
+pub fn blake3_keyed_raw(key32: Str, data: Str) -> Str {
+    if key32.len() != 32 { return "" }
+    var h = b3_new_keyed(key32)
+    h.update(data)
+    return h.digest()
+}
+
+/// keyed BLAKE3 as lowercase hex, or "" if the key is not 32 bytes.
+pub fn blake3_keyed(key32: Str, data: Str) -> Str {
+    let r = blake3_keyed_raw(key32, data)
+    if r.len() == 0 { return "" }
+    return b3_hex_of(r)
+}
+
+/// derive `len` bytes of key material from `key_material` under the application `context`.
+///
+/// `context` must be a hardcoded, globally unique string; the spec is emphatic that it is not a
+/// runtime value, not a salt and not a secret. Its whole job is to make two applications' keys
+/// unrelated even from the same input material.
+pub fn blake3_derive_key(context: Str, key_material: Str, len: Int) -> Str {
+    var ch = b3_new_with(b3_iv(), b3_derive_key_context())
+    ch.update(context)
+    let ck = ch.xof(32)
+    var kw: Vec<Int> = vec()
+    var i = 0
+    while i < 8 {
+        let p = i * 4
+        var w = 0
+        var j = 3
+        while j >= 0 { w = ((w << 8) | ord(ck.at(p + j)))  j = j - 1 }
+        kw.push(w)
+        i = i + 1
+    }
+    var mh = b3_new_with(kw, b3_derive_key_material())
+    mh.update(key_material)
+    return mh.xof(len)
+}
+
+/// BLAKE3 of the file at `path` as lowercase hex, or "" if it cannot be read.
+///
+/// The compressor is fed in 64 KiB pieces, but `read_file` loads the file whole first, so this
+/// is not a streaming hash and memory use grows with the file size.
+pub fn blake3_file(path: Str) -> Str {
+    if !is_file(path) { return "" }
+    let f = read_file(path)
+    var h = b3_new()
+    var p = 0
+    while p < f.len() {
+        var take = 65536
+        if take > (f.len() - p) { take = f.len() - p }
+        h.update(f.slice(p, p + take))
+        p = p + take
+    }
+    return h.hex()
+}

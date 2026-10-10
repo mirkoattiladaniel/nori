@@ -1,0 +1,341 @@
+use core::*
+import "std/math" as math
+
+// ===========================================================================
+// layout/surface: the host-drawn hole in a document, made usable.
+//
+// `surface { id: "viewport" fill_w: true fill_h: true }` declares a hole that
+// the host fills, and `ui_layout_node` emits a SurfaceRegion for it, clipped by
+// any enclosing scroll viewport (merge_clipped_overlay). This file consumes
+// those regions: lookup, placeholder fills, interaction sensing and scoped
+// gizmo drawing. The GPU texture-view blit itself is left to the host.
+//
+// The boundary: a plugin never touches the GPU. It punches a named hole in its
+// document, reads the screen rect back out, allocates an interaction rect over
+// it for orbit / WASD / zoom / picking, draws gizmos scoped to it, and the host
+// fills the hole. The two host entry points are surface_screen_rect and
+// allocate_rect (which resolves to interact_rect_id_at_pointer), and a 3D
+// scene-viewer plugin uses both.
+//
+// This is a root file of layout/ rather than part of runtime_document.nori for
+// the same reason as nodes_ext.nori: it shares the one module scope (so it calls
+// pp_rect / merge_clipped_overlay / rect_min_max with no imports and its `pub`
+// items still export at ui::layout::), without growing the file every other
+// module imports.
+//
+// The eventual texture-view blit consumes `SurfaceBlit { id, rect, texture }`,
+// a screen rect and an opaque Int handle, nothing else. `surface_draw_list`
+// already produces that list; a GPU host walks it and blits, a CPU host
+// ignores it and gets the placeholder fills that come back in the same struct.
+// No plugin-visible API changes when a GPU host is added.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// surface_screen_rect
+// ---------------------------------------------------------------------------
+
+/// the answer to a surface lookup: `found` plus the screen rect (zero-sized on a miss).
+/// A struct rather than Option<Rect> so a caller can ask `.found` without a match, and so a
+/// miss still carries the id it failed to find for an error message.
+pub struct SurfaceLookup { found: Bool, id: Str, rect: Rect }
+
+/// a clear miss: found = false, an empty rect, the id that was not there.
+pub fn surface_miss(id: Str) -> SurfaceLookup { return SurfaceLookup { found: false, id: copy id, rect: rect_min_max(vec2_zero(), vec2_zero()) } }
+
+/// the screen rect of the surface named `id`, offsetting the document-local rect by the panel
+/// origin (`ox`, `oy`). The rects in `surfaces` are
+/// already clipped by any enclosing scroll viewport, so a surface scrolled half out of view
+/// reports the visible half, which is what a blit and a hit test both want.
+pub fn surface_screen_rect(surfaces: Vec<SurfaceRegion>, ox: Float, oy: Float, id: Str) -> SurfaceLookup {
+    var i = 0
+    while i < surfaces.len() {
+        if surfaces[i].id == id {
+            var r = surfaces[i].rect
+            return SurfaceLookup { found: true, id: copy id, rect: rect_min_max(vec2(r.min.x + ox, r.min.y + oy), vec2(r.max.x + ox, r.max.y + oy)) }
+        }
+        i = i + 1
+    }
+    return surface_miss(id)
+}
+
+/// `surface_screen_rect` against an overlay's surfaces, in the overlay's own coordinates.
+pub fn surface_rect_of(overlay: ComputedOverlay, id: Str) -> SurfaceLookup { return surface_screen_rect(overlay.surfaces, 0.0, 0.0, id) }
+
+/// how many surfaces the overlay declared.
+pub fn surface_count(overlay: ComputedOverlay) -> Int { return overlay.surfaces.len() }
+
+/// the id of the i-th surface ("" when out of range), for a host enumerating holes to fill.
+pub fn surface_id_at(overlay: ComputedOverlay, i: Int) -> Str {
+    if i < 0 || i >= overlay.surfaces.len() { return "" }
+    return copy overlay.surfaces[i].id
+}
+
+// ---------------------------------------------------------------------------
+// consuming ComputedOverlay.surfaces in the host draw path
+// ---------------------------------------------------------------------------
+
+/// binding kind: 0 unbound (placeholder fill), 1 a host texture handle, 2 a flat colour.
+pub fn sfb_unbound() -> Int { return 0 }
+/// binding kind 1: the host has a texture (or texture view) for this hole.
+pub fn sfb_texture() -> Int { return 1 }
+/// binding kind 2: the host wants a flat colour in this hole (a viewport that has not rendered yet).
+pub fn sfb_color() -> Int { return 2 }
+
+/// what the host has for one named hole.
+pub struct SurfaceBinding { id: Str, kind: Int, texture: Int, color: Color }
+/// a SurfaceBinding of its own.
+pub fn surface_binding_dup(b: SurfaceBinding) -> SurfaceBinding { return SurfaceBinding { id: copy b.id, kind: b.kind, texture: b.texture, color: color_dup(b.color) } }
+/// the host's whole table of hole contents, id-keyed.
+pub struct SurfaceBindings { items: Vec<SurfaceBinding> }
+
+/// an empty binding table.
+pub fn surface_bindings() -> SurfaceBindings { var v: Vec<SurfaceBinding> = vec()  return SurfaceBindings { items: v } }
+
+/// the colour drawn into a hole nothing is bound to: visible, so an unfilled viewport is a bug
+/// you can see rather than a black rectangle indistinguishable from a rendered night scene.
+pub fn surface_placeholder_color() -> Color { return color_rgb(24, 24, 32) }
+
+fn sfb_set(inout b: SurfaceBindings, bind: SurfaceBinding) {
+    var i = 0
+    while i < b.items.len() { if b.items[i].id == bind.id { b.items[i] = surface_binding_dup(bind)  return }  i = i + 1 }
+    b.items.push(surface_binding_dup(bind))
+}
+
+/// bind a host texture handle to a hole. The handle is opaque here: this module never
+/// dereferences it, and nothing about it reaches the plugin that declared the hole.
+pub fn surface_bind_texture(inout b: SurfaceBindings, id: Str, texture: Int) { sfb_set(b, SurfaceBinding { id: copy id, kind: sfb_texture(), texture: texture, color: surface_placeholder_color() }) }
+/// bind a flat colour to a hole.
+pub fn surface_bind_color(inout b: SurfaceBindings, id: Str, copy color: Color) { sfb_set(b, SurfaceBinding { id: copy id, kind: sfb_color(), texture: 0, color: color }) }
+/// drop a binding (the hole falls back to the placeholder fill).
+pub fn surface_unbind(inout b: SurfaceBindings, id: Str) {
+    var keep: Vec<SurfaceBinding> = vec()
+    var i = 0
+    while i < b.items.len() { if b.items[i].id != id { keep.push(sink b.items[i]) }  i = i + 1 }
+    b.items = keep
+}
+/// the binding for `id`, or an `sfb_unbound` one carrying the placeholder colour.
+pub fn surface_binding_of(b: SurfaceBindings, id: Str) -> SurfaceBinding {
+    var i = 0
+    while i < b.items.len() { if b.items[i].id == id { return surface_binding_dup(b.items[i]) }  i = i + 1 }
+    return SurfaceBinding { id: copy id, kind: sfb_unbound(), texture: 0, color: surface_placeholder_color() }
+}
+
+/// one texture-view blit the host owes: where (already clipped, already in screen space) and what.
+/// This is the whole contract a GPU host has to satisfy.
+pub struct SurfaceBlit { id: Str, rect: Rect, texture: Int }
+/// the result of consuming an overlay's surfaces: blits for the GPU layer, fill prims for
+/// everything else. A CPU-only host uses `prims` and ignores `blits`; both are already clipped.
+pub struct SurfaceDrawList { blits: Vec<SurfaceBlit>, prims: Vec<PaintPrimitive> }
+
+/// consume `overlay.surfaces`: every hole becomes either a blit (texture-bound) or a fill prim
+/// (colour-bound or unbound), in screen space at panel origin (`ox`, `oy`).
+pub fn surface_draw_list(overlay: ComputedOverlay, b: SurfaceBindings, ox: Float, oy: Float) -> SurfaceDrawList {
+    var blits: Vec<SurfaceBlit> = vec()
+    var prims: Vec<PaintPrimitive> = vec()
+    var i = 0
+    while i < overlay.surfaces.len() {
+        var sr = overlay.surfaces[i]
+        var rect = rect_min_max(vec2(sr.rect.min.x + ox, sr.rect.min.y + oy), vec2(sr.rect.max.x + ox, sr.rect.max.y + oy))
+        var bind = surface_binding_of(b, sr.id)
+        if bind.kind == sfb_texture() {
+            blits.push(SurfaceBlit { id: copy sr.id, rect: rect, texture: bind.texture })
+        } else {
+            prims.push(pp_rect(rect, bind.color, 0.0))
+        }
+        i = i + 1
+    }
+    return SurfaceDrawList { blits: blits, prims: prims }
+}
+
+/// consume the surfaces straight into the overlay's own prim list, and hand back the blits.
+/// This needs no renderer change: paint_cpu and paint_gpu already walk `overlay.prims`,
+/// so a placeholder or colour-bound hole draws with nothing added to either backend.
+///
+/// Ordering: the fills are appended, so they draw last. That is right for a viewport hole (the
+/// usual case: a full-panel surface with nothing over it but gizmos, which this file draws after).
+/// A host with document chrome on top of a hole should call `surface_draw_list` instead and draw
+/// its prims before the overlay's.
+pub fn surface_paint_into(inout overlay: ComputedOverlay, b: SurfaceBindings) -> Vec<SurfaceBlit> {
+    var dl = surface_draw_list(overlay, b, 0.0, 0.0)
+    var i = 0
+    while i < dl.prims.len() { overlay.prims.push(sink dl.prims[i])  i = i + 1 }
+    return sink dl.blits
+}
+
+// ---------------------------------------------------------------------------
+// interaction sensing over a surface rect (allocate_rect)
+// ---------------------------------------------------------------------------
+//
+// The model is not reduced to a Bool. Sense is a five-value
+// ladder and `Sense::at_least` is monotonic in exactly this order, so the
+// integer comparison below is the match arm table.
+
+/// sense nothing: the rect is geometry only.
+pub fn surface_sense_none() -> Int { return 0 }
+/// report hover.
+pub fn surface_sense_hover() -> Int { return 1 }
+/// report hover + click.
+pub fn surface_sense_click() -> Int { return 2 }
+/// report hover + click + drag.
+pub fn surface_sense_drag() -> Int { return 3 }
+/// report everything: what a 3D viewport wants (SDK_SENSE_CLICK_AND_DRAG).
+pub fn surface_sense_click_and_drag() -> Int { return 4 }
+
+/// the pointer state a host carries across frames. `dragging_id` is the drag-ownership latch:
+/// once a drag starts on a rect it keeps receiving the delta
+/// even when the pointer leaves, which is what an orbit drag needs.
+pub struct SurfaceInput { has_mouse: Bool, mouse: Vec2, delta: Vec2, down: Bool, pressed: Bool, released: Bool, has_press_origin: Bool, press_origin: Vec2, dragging_id: Str }
+
+/// a fresh pointer state: no pointer yet, nothing held, nothing dragging.
+pub fn surface_input_new() -> SurfaceInput { return SurfaceInput { has_mouse: false, mouse: vec2_zero(), delta: vec2_zero(), down: false, pressed: false, released: false, has_press_origin: false, press_origin: vec2_zero(), dragging_id: "" } }
+
+/// feed one frame of raw pointer input; derives delta, the press/release edges, and the press
+/// origin. The origin is not cleared on release: the click check below reads it on
+/// the release frame, and clearing it there would let a press-elsewhere/release-here through.
+pub fn surface_input_frame(inout inp: SurfaceInput, copy mouse: Vec2, down: Bool) {
+    var was = inp.down
+    var d = vec2_zero()
+    if inp.has_mouse { d = vec2(mouse.x - inp.mouse.x, mouse.y - inp.mouse.y) }
+    inp.delta = d
+    inp.pressed = down && !was
+    inp.released = (!down) && was
+    inp.down = down
+    if inp.pressed { inp.has_press_origin = true  inp.press_origin = copy mouse }
+    inp.mouse = mouse
+    inp.has_mouse = true
+}
+
+/// the pointer left the window: hover and drag both stop.
+pub fn surface_input_leave(inout inp: SurfaceInput) { inp.has_mouse = false  inp.delta = vec2_zero()  inp.pressed = false  inp.released = false  inp.down = false  inp.dragging_id = "" }
+
+/// what an allocated rect reports this frame, including
+/// `local`, the pointer in rect-local coordinates. A picker needs pixel-in-viewport, and
+/// recomputing it at every call site is how off-by-a-panel-origin bugs get written.
+pub struct SurfaceResponse { id: Str, found: Bool, hovered: Bool, clicked: Bool, dragged: Bool, changed: Bool, drag_started: Bool, drag_delta: Vec2, local: Vec2, rect: Rect }
+
+/// an all-false response (an unknown surface, or a rect that senses nothing).
+pub fn surface_response_none(id: Str) -> SurfaceResponse { return SurfaceResponse { id: copy id, found: false, hovered: false, clicked: false, dragged: false, changed: false, drag_started: false, drag_delta: vec2_zero(), local: vec2_zero(), rect: rect_min_max(vec2_zero(), vec2_zero()) } }
+
+/// allocate an interaction rect and sense it: the press-origin gate, the drag-ownership latch, and
+/// `changed = clicked || dragged`.
+pub fn surface_allocate_rect(inout inp: SurfaceInput, id: Str, rect: Rect, sense: Int) -> SurfaceResponse {
+    var r = surface_response_none(id)
+    r.found = true
+    r.rect = rect_dup(rect)
+    if sense <= surface_sense_none() { return r }
+    var hit_in = inp.has_mouse && rect.contains(inp.mouse)
+    if inp.has_mouse { r.local = vec2(inp.mouse.x - rect.min.x, inp.mouse.y - rect.min.y) }
+    // a click needs the press to have started here too, not just the release.
+    var press_ok = (!inp.has_press_origin) || rect.contains(inp.press_origin)
+    var can_drag = sense >= surface_sense_drag()
+    var was_dragging = id.len() > 0 && inp.dragging_id == id
+    var is_dragging = can_drag && inp.down && (was_dragging || (hit_in && inp.pressed))
+    if is_dragging {
+        inp.dragging_id = copy id
+    } else {
+        if (!inp.down) && was_dragging { inp.dragging_id = "" }
+    }
+    r.hovered = hit_in && sense >= surface_sense_hover()
+    r.clicked = hit_in && sense >= surface_sense_click() && inp.released && press_ok
+    r.dragged = was_dragging && inp.down && (inp.delta.x != 0.0 || inp.delta.y != 0.0)
+    if was_dragging { r.drag_delta = copy inp.delta }
+    r.drag_started = hit_in && can_drag && inp.pressed && (!was_dragging)
+    r.changed = r.clicked || r.dragged
+    return r
+}
+
+/// find the named hole in `overlay` and sense it, in one call. The rect comes from `surface_screen_rect`, so it is the clipped
+/// rect: a surface scrolled half out of its viewport senses only the half you can see, and a
+/// press in the scrolled-away part lands on nothing.
+pub fn surface_sense(overlay: ComputedOverlay, ox: Float, oy: Float, id: Str, inout inp: SurfaceInput, sense: Int) -> SurfaceResponse {
+    var look = surface_screen_rect(overlay.surfaces, ox, oy, id)
+    if !look.found { return surface_response_none(id) }
+    return surface_allocate_rect(inp, id, look.rect, sense)
+}
+
+/// the event string for a surface interaction: extra information rides in the
+/// string, `HitRegion` does not grow fields. `surface_event("viewport", "click")` -> "surface:viewport:click".
+pub fn surface_event(id: Str, kind: Str) -> Str { return (("surface:" + id) + ":") + kind }
+
+/// push a whole-surface HitRegion carrying `event`, so a host that routes everything through
+/// `overlay_hit_test` can reach a surface too. Returns false when the id is unknown.
+///
+/// `overlay_hit_test` walks backwards, so the last push wins: call this first and push any
+/// smaller gizmo hits after it, never the other way round.
+pub fn surface_push_hit(inout overlay: ComputedOverlay, ox: Float, oy: Float, id: Str, event: Str) -> Bool {
+    var look = surface_screen_rect(overlay.surfaces, ox, oy, id)
+    if !look.found { return false }
+    overlay.hits.push(HitRegion { id: copy id, on_click: copy event, rect: sink look.rect })
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// immediate draw calls scoped to a surface (gizmos)
+// ---------------------------------------------------------------------------
+//
+// Scoped means clipped. A gizmo drawn at the edge of a viewport must be cut off
+// at the viewport edge, not allowed to paint over the toolbar above it, and
+// the clip is the surface's already-clipped rect, so a scrolled-away viewport
+// takes its gizmos with it. The clipping is not reimplemented here: flush hands
+// the batch to `merge_clipped_overlay`, the same function that clips a scroll
+// region's children, so the two can never drift apart.
+
+/// an immediate-mode painter bound to one surface. Draw into it, then flush it into the overlay.
+pub struct SurfacePainter { id: Str, found: Bool, clip: Rect, prims: Vec<PaintPrimitive> }
+
+/// a painter clipped to the named surface. `found` is false for an unknown id, and every draw
+/// call on such a painter is a no-op: a missing hole draws nothing rather than
+/// scribbling on the panel at (0,0).
+pub fn surface_painter(overlay: ComputedOverlay, ox: Float, oy: Float, id: Str) -> SurfacePainter {
+    var look = surface_screen_rect(overlay.surfaces, ox, oy, id)
+    var v: Vec<PaintPrimitive> = vec()
+    return SurfacePainter { id: copy id, found: look.found, clip: sink look.rect, prims: v }
+}
+
+/// a filled rect gizmo.
+pub fn surface_fill(inout p: SurfacePainter, rect: Rect, copy color: Color, radius: Float) { if p.found { p.prims.push(pp_rect(rect, color, radius)) } }
+/// a stroked rect gizmo (a selection box, a bounds outline).
+pub fn surface_stroke(inout p: SurfacePainter, rect: Rect, copy color: Color, border_w: Float) { if p.found { p.prims.push(pp_border(rect, color, border_w)) } }
+/// a text gizmo (an axis label, a coordinate readout). `pos` is the text box top-left, not a
+/// baseline, the same meaning a kind-2 PaintPrimitive's `pos` carries everywhere (see the
+/// contract on layout::pp_text); the painters add the font's ascent.
+pub fn surface_label(inout p: SurfacePainter, copy pos: Vec2, text: Str, copy color: Color, size_px: Float) { if p.found { p.prims.push(pp_text(pos, text, color, size_px)) } }
+
+/// an axis-aligned line gizmo of thickness `w` (a grid line, a gizmo axis), as a thin filled rect.
+/// PaintPrimitive has no line kind and adding one would mean touching both backends.
+pub fn surface_line(inout p: SurfacePainter, copy a: Vec2, copy b: Vec2, w: Float, copy color: Color) {
+    if !p.found { return }
+    var hw = math::fmax(w, 0.5) / 2.0
+    var min_x = math::fmin(a.x, b.x)
+    var max_x = math::fmax(a.x, b.x)
+    var min_y = math::fmin(a.y, b.y)
+    var max_y = math::fmax(a.y, b.y)
+    if max_y - min_y <= max_x - min_x {
+        var cy = (a.y + b.y) / 2.0
+        p.prims.push(pp_rect(rect_min_max(vec2(min_x, cy - hw), vec2(max_x, cy + hw)), color, 0.0))
+    } else {
+        var cx = (a.x + b.x) / 2.0
+        p.prims.push(pp_rect(rect_min_max(vec2(cx - hw, min_y), vec2(cx + hw, max_y)), color, 0.0))
+    }
+}
+
+/// how many gizmos are queued (none of them clipped yet).
+pub fn surface_painter_len(p: SurfacePainter) -> Int { return p.prims.len() }
+
+/// clip the queued gizmos to the surface rect and append them to `overlay.prims`; returns how
+/// many survived the clip. The painter is emptied, so a painter can be reused across passes.
+///
+/// Delegates to `merge_clipped_overlay`: rect/border prims are intersected with the surface rect
+/// (and dropped when fully outside), text prims keep their anchor but carry `has_clip`/`clip` for
+/// the backend to scissor (and are dropped when the anchor itself is outside).
+pub fn surface_painter_flush(inout p: SurfacePainter, inout overlay: ComputedOverlay) -> Int {
+    if !p.found { return 0 }
+    var child = overlay_child(overlay)
+    var i = 0
+    while i < p.prims.len() { child.prims.push(sink p.prims[i])  i = i + 1 }
+    var before = overlay.prims.len()
+    merge_clipped_overlay(overlay, sink child, p.clip)
+    var fresh: Vec<PaintPrimitive> = vec()
+    p.prims = fresh
+    return overlay.prims.len() - before
+}

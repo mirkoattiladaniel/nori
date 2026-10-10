@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Line\sOne\sTwo\nSecond\q\sQ\tTab\rCR\\Bk
+Terminal=True
+NoDisplay=False
+Categories=;A;B;C;;
+Keywords=;k1;;k2;
+MimeType=
+OnlyShowIn=;
+UnknownEscape=\q\z

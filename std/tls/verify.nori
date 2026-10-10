@@ -1,0 +1,508 @@
+// Certificate chain validation and hostname matching (RFC 5280, RFC 6125).
+//
+// This is the file that decides whether to trust a server, and every other part of the TLS client
+// exists to bring bytes here intact. A mistake in the record layer produces a connection that does
+// not work; a mistake here produces one that works perfectly with the wrong party.
+//
+// Two rules shape everything below.
+//
+// A chain is not a list: it is a path that must be built. A server sends certificates in whatever
+// order it likes, may include ones that belong to no path, and may omit ones it should have sent.
+// So nothing here trusts the order or the membership of what arrived: it starts at the leaf and
+// walks to a trust anchor, using the sent certificates only as candidates.
+//
+// Every link is checked, not just the signature. A signature says one key signed one body. It does
+// not say the signer was allowed to sign certificates, that either party was in date, or that the
+// name on the leaf is the name that was asked for. Those are separate checks and each has its own
+// history of being skipped.
+
+import "std/os" as os
+import "std/encoding" as enc
+import "std/strutil" as strutil
+import "std/crypto" as crypto
+import "std/dl" as dl
+
+/// The roots a chain may terminate at. Nothing is trusted that is not in here.
+pub struct TrustStore { certs: Vec<Cert> }
+
+/// How many certificates a path may contain, leaf and anchor included.
+///
+/// Not a performance limit. Without one, a set of certificates that issue each other in a cycle
+/// makes path building run forever, and a server chooses what it sends.
+pub fn max_chain_depth() -> Int { return 10 }
+
+/// An empty trust store. Nothing is trusted until roots are added, and a chain checked
+/// against an empty store is refused rather than accepted.
+pub fn trust_store_new() -> TrustStore {
+    var c: Vec<Cert> = vec()
+    return TrustStore { certs: c }
+}
+/// how many roots the store holds
+pub fn trust_count(ts: TrustStore) -> Int { return ts.certs.len() }
+
+/// Add every certificate in a PEM bundle. Returns how many parsed.
+///
+/// Entries that do not parse are skipped rather than fatal: a system bundle is a large file
+/// maintained by someone else, and refusing to start because one of two hundred roots uses
+/// something unusual would be worse than proceeding with the rest.
+pub fn trust_add_pem(inout ts: TrustStore, pem: Str) -> Int {
+    var added = 0
+    var pos = 0
+    let begin = "-----BEGIN CERTIFICATE-----"
+    let end = "-----END CERTIFICATE-----"
+    while true {
+        let b = find_from(pem, begin, pos)
+        if b < 0 { return added }
+        let bodystart = (b + begin.len())
+        let e = find_from(pem, end, bodystart)
+        if e < 0 { return added }
+        let der = enc::b64_decode(strip_space(pem.slice(bodystart, e)))
+        pos = (e + end.len())
+        if der.len() > 0 {
+            let c = parse_cert(der)
+            if c.err.len() == 0 { ts.certs.push(c)  added = added + 1 }
+        }
+    }
+    return added
+}
+
+fn find_from(s: Str, needle: Str, from: Int) -> Int {
+    if needle.len() == 0 { return 0 - 1 }
+    var i = from
+    while (i + needle.len()) <= s.len() {
+        if s.slice(i, (i + needle.len())) == needle { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+fn strip_space(s: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        let c = ord(s.at(i))
+        if c > 32 { out = (out + chr(c)) }
+        i = i + 1
+    }
+    return out
+}
+
+/// Add one DER-encoded certificate (the raw bytes, not base64). Returns 1 when it parsed, else 0.
+/// This is what a platform store hands out, where a PEM file is what a Unix system keeps on disk.
+pub fn trust_add_der(inout ts: TrustStore, der: Str) -> Int {
+    let c = parse_cert(der)
+    if c.err.len() > 0 { return 0 }
+    ts.certs.push(c)
+    return 1
+}
+
+/// Load a PEM bundle from a file.
+pub fn trust_add_file(inout ts: TrustStore, path: Str) -> Int {
+    if !os::path_exists(path) { return 0 }
+    return trust_add_pem(ts, read_file(path))
+}
+
+/// Load a directory of PEM files, as Android's `/system/etc/security/cacerts` is arranged: one
+/// certificate per file, named by a hash of its subject.
+pub fn trust_add_dir(inout ts: TrustStore, dir: Str) -> Int {
+    if !os::path_exists(dir) { return 0 }
+    var added = 0
+    let names = os::read_dir(dir)
+    var i = 0
+    while i < names.len() {
+        let n = names[i]
+        if !(n == ".") { if !(n == "..") {
+            added = (added + trust_add_file(ts, ((dir + "/") + n)))
+        } }
+        i = i + 1
+    }
+    return added
+}
+
+// Windows keeps its roots in a store, not in a file. There is no ca-certificates.crt to read, so the
+// roots come from crypt32's "ROOT" store, the same set the rest of the system trusts, including
+// whatever an administrator has added. crypt32 is reached through std/dl rather than linked, so no
+// program has to name it in its manifest to make HTTPS work, and a machine without it degrades to
+// "no roots" instead of failing to start.
+cfg(windows) {
+fn win_load_roots(inout ts: TrustStore) -> Int {
+    let h = dl::load("crypt32.dll")
+    if h == 0 { return 0 }
+    let fopen = dl::sym(h, "CertOpenSystemStoreA")
+    let fnext = dl::sym(h, "CertEnumCertificatesInStore")
+    let fclose = dl::sym(h, "CertCloseStore")
+    if fopen == 0 || fnext == 0 || fclose == 0 { return 0 }
+    let name = os::os_cstr("ROOT")
+    let store = dl::call2(fopen, 0, name)
+    if store == 0 { unsafe { free(name) }  return 0 }
+    // NORI_TRACE=1 names each certificate as it is read. A store is the machine's, not the program's:
+    // it can hold one this parser has never seen, and "it crashed while loading the roots" does not
+    // say which of two hundred did it.
+    let tr = os::env_or("NORI_TRACE", "") == "1"
+    var n = 0
+    var ctx = dl::call2(fnext, store, 0)
+    var guard = 0
+    while ctx != 0 && guard < 8192 {
+        // CERT_CONTEXT { DWORD dwCertEncodingType@0; BYTE* pbCertEncoded@8; DWORD cbCertEncoded@16; … }
+        var pb = 0
+        var cb = 0
+        unsafe { pb = peek(ctx + 8)  cb = peek32(ctx + 16) }
+        if pb != 0 && cb > 0 {
+            if tr { printl("trust: root " + to_str(guard) + ", " + to_str(cb) + " bytes") }
+            var der = ""
+            unsafe {
+                var i = 0
+                while i < cb { der = (der + chr(peek8(pb + i)))  i = i + 1 }
+            }
+            n = n + trust_add_der(ts, der)
+        }
+        ctx = dl::call2(fnext, store, ctx)          // frees the context it is handed
+        guard = guard + 1
+    }
+    let _c = dl::call2(fclose, store, 0)
+    unsafe { free(name) }
+    return n
+}
+}
+
+/// Load the system trust store from wherever this platform keeps it. Returns how many roots.
+///
+/// `SSL_CERT_FILE` and `SSL_CERT_DIR` are honoured first because that is how every other TLS
+/// client on the machine can be pointed at a different set, and a client that ignores them is one
+/// that cannot be tested against a private CA.
+pub fn trust_load_system(inout ts: TrustStore) -> Int {
+    let f = os::env_or("SSL_CERT_FILE", "")
+    if f.len() > 0 { return trust_add_file(ts, f) }
+    let d = os::env_or("SSL_CERT_DIR", "")
+    if d.len() > 0 { return trust_add_dir(ts, d) }
+    var n = 0
+    cfg(windows) {
+        n = win_load_roots(ts)
+        if n > 0 { return n }
+    }
+    n = trust_add_file(ts, "/etc/ssl/certs/ca-certificates.crt")
+    if n > 0 { return n }
+    n = trust_add_file(ts, "/etc/pki/tls/certs/ca-bundle.crt")
+    if n > 0 { return n }
+    n = trust_add_file(ts, "/etc/ssl/cert.pem")
+    if n > 0 { return n }
+    cfg(android) {
+        n = trust_add_dir(ts, "/system/etc/security/cacerts")
+        if n > 0 { return n }
+    }
+    return trust_add_dir(ts, "/etc/ssl/certs")
+}
+
+// ---- hostname matching (RFC 6125) ----------------------------------------------------------------
+
+fn lower(s: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        var c = ord(s.at(i))
+        if c >= 65 { if c <= 90 { c = (c + 32) } }
+        out = (out + chr(c))
+        i = i + 1
+    }
+    return out
+}
+
+fn count_labels(s: Str) -> Int {
+    if s.len() == 0 { return 0 }
+    var n = 1
+    var i = 0
+    while i < s.len() { if ord(s.at(i)) == 46 { n = n + 1 }  i = i + 1 }
+    return n
+}
+
+/// Does a presented name from a certificate match the host asked for?
+///
+/// A wildcard is allowed only as an entire leftmost label: `*.example.com`, never `w*.example.com`
+/// and never `*.com`. The partial forms are permitted by RFC 6125 and rejected by every browser,
+/// because `w*.example.com` matching `www.example.com` also matches names the issuer never
+/// considered. A bare `*` matches nothing at all.
+///
+/// A wildcard matches exactly one label. `*.example.com` covers `a.example.com` and must not cover
+/// `a.b.example.com`: the classic mistake, and the one that turns a certificate for a subdomain
+/// into a certificate for everything under it.
+pub fn name_matches(presented: Str, host: Str) -> Bool {
+    let p = lower(presented)
+    let h = lower(host)
+    if p.len() == 0 { return false }
+    if h.len() == 0 { return false }
+    if has_nul_str(p) { return false }
+    if p == h { return true }
+    if ord(p.at(0)) != 42 { return false }                 // no wildcard: an exact match was needed
+    // the wildcard must be the whole first label, so the second character is the dot
+    if p.len() < 3 { return false }
+    if ord(p.at(1)) != 46 { return false }
+    let suffix = p.slice(1, p.len())                        // ".example.com"
+    // at least two labels must remain, so `*.com` cannot be issued as a match for everything
+    if count_labels(suffix.slice(1, suffix.len())) < 2 { return false }
+    if h.len() <= suffix.len() { return false }
+    if !(h.slice((h.len() - suffix.len()), h.len()) == suffix) { return false }
+    // and the part the wildcard stands for must be a single label
+    let head = h.slice(0, (h.len() - suffix.len()))
+    if head.len() == 0 { return false }
+    var i = 0
+    while i < head.len() { if ord(head.at(i)) == 46 { return false }  i = i + 1 }
+    return true
+}
+
+fn has_nul_str(s: Str) -> Bool {
+    var i = 0
+    while i < s.len() { if ord(s.at(i)) == 0 { return true }  i = i + 1 }
+    return false
+}
+
+// Is `h` an IP literal? Then it must be matched against an iPAddress entry and never a name.
+fn host_as_ip(h: Str) -> Str {
+    // IPv4 only; an IPv6 literal reaches here bracketed or not, and either way this client does
+    // not currently connect to one, so refusing is honest.
+    var parts = strutil::split(h, ".")
+    if parts.len() != 4 { return "" }
+    var out = ""
+    var i = 0
+    while i < 4 {
+        let p = parts[i]
+        if p.len() == 0 { return "" }
+        if p.len() > 3 { return "" }
+        var v = 0
+        var j = 0
+        while j < p.len() {
+            let c = ord(p.at(j))
+            if c < 48 { return "" }
+            if c > 57 { return "" }
+            v = ((v * 10) + (c - 48))
+            j = j + 1
+        }
+        if v > 255 { return "" }
+        out = (out + chr(v))
+        i = i + 1
+    }
+    return out
+}
+
+/// Is this certificate valid for `host`? "" means yes, otherwise the reason.
+///
+/// The subjectAltName extension is required. The Common Name fallback was deprecated in 2011 and
+/// removed from browsers years ago, and honouring it here would mean accepting certificates that
+/// no other modern client accepts, including ones where the CN says something the CA never
+/// validated as a hostname.
+pub fn check_hostname(c: Cert, host: Str) -> Str {
+    if host.len() == 0 { return "no hostname to check against" }
+    let ip = host_as_ip(host)
+    if ip.len() == 4 {
+        var i = 0
+        while i < c.ip_addresses.len() {
+            if c.ip_addresses[i] == ip { return "" }
+            i = i + 1
+        }
+        return "the certificate lists no matching IP address"
+    }
+    if c.dns_names.len() == 0 {
+        return "the certificate has no subjectAltName, and the Common Name fallback is not accepted"
+    }
+    var i = 0
+    while i < c.dns_names.len() {
+        if name_matches(c.dns_names[i], host) { return "" }
+        i = i + 1
+    }
+    return ("the certificate is not valid for " + host)
+}
+
+// ---- chain building ------------------------------------------------------------------------------
+
+// Names are compared as their exact DER encoding. Two names that differ in encoding are different
+// names here even if they would print the same, because comparing decoded strings
+// means deciding how to normalise them, and every normalisation is somewhere two distinct names
+// become one.
+fn name_eq(a: Str, b: Str) -> Bool { return a == b }
+
+fn is_self_issued(c: Cert) -> Bool { return name_eq(c.subject, c.issuer) }
+
+// May `issuer` sign `subject`? Everything except the signature itself.
+fn may_sign(issuer: Cert, now: Int) -> Str {
+    if !cert_time_valid(issuer, now) { return "an intermediate certificate is expired or not yet valid" }
+    // basicConstraints is what separates a CA from a leaf. A certificate without it is not a CA,
+    // and treating one as a CA is the flaw that let any leaf certificate sign for any
+    // site, which is the failure this check exists for.
+    if !issuer.has_basic_constraints { return "a certificate in the chain is not marked as a CA" }
+    if !issuer.is_ca { return "a certificate in the chain is not marked as a CA" }
+    // keyUsage, when present, must allow certificate signing.
+    if issuer.key_usage >= 0 {
+        if (issuer.key_usage & key_usage_cert_sign()) == 0 {
+            return "a CA in the chain is not permitted to sign certificates"
+        }
+    }
+    return ""
+}
+
+/// Validate `chain` (leaf first, as TLS sends it) against `ts`, for `host`, at `now`.
+///
+/// "" means the chain is good. Anything else names the first reason it is not, and it names it,
+/// because a validator that answers only yes or no cannot be debugged and cannot be trusted to be
+/// failing for the reason you think.
+pub fn verify_chain(chain: Vec<Str>, ts: TrustStore, host: Str, now: Int) -> Str {
+    if chain.len() == 0 { return "the server sent no certificates" }
+    if trust_count(ts) == 0 { return "no trust anchors are loaded" }
+
+    var certs: Vec<Cert> = vec()
+    var i = 0
+    while i < chain.len() {
+        let c = parse_cert(chain[i])
+        if c.err.len() > 0 { return ("a certificate did not parse: " + c.err) }
+        certs.push(c)
+        i = i + 1
+    }
+
+    let leaf = certs[0]
+    if !cert_time_valid(leaf, now) {
+        if now < leaf.not_before { return "the certificate is not yet valid" }
+        return "the certificate has expired"
+    }
+    let hn = check_hostname(leaf, host)
+    if hn.len() > 0 { return hn }
+    // A leaf presented for server authentication must be allowed to be one. An absent EKU means
+    // unrestricted, which is legal; a present one that omits serverAuth is a certificate issued
+    // for something else entirely.
+    if leaf.has_eku {
+        if !leaf.eku_server_auth { return "the certificate is not valid for server authentication" }
+    }
+
+    // Walk from the leaf toward an anchor. `depth` counts the certificates below the current one,
+    // which is what pathLenConstraint bounds.
+    var current = leaf
+    var depth = 0
+    var used: Vec<Int> = vec()
+    i = 0
+    while i < certs.len() { used.push(0)  i = i + 1 }
+    used[0] = 1
+
+    while depth < max_chain_depth() {
+        // The current certificate may be a trust anchor. Servers routinely send the root, and a
+        // cross-signed copy of a root is a different certificate with the same subject and key,
+        // so the path ends here whether or not anything can be found to have signed this one.
+        var t = 0
+        while t < ts.certs.len() {
+            let root = ts.certs[t]
+            if name_eq(root.subject, current.subject) {
+                if root.spki_raw == current.spki_raw {
+                    if cert_time_valid(root, now) { return "" }
+                }
+            }
+            t = t + 1
+        }
+
+        // Otherwise a trust anchor that signed it. Anchors are tried before the sent certificates
+        // so a server cannot extend a path past an anchor by including a cross-signed copy of it.
+        //
+        // A root that matches by name but cannot be used records why, for the same reason the
+        // candidate loop below does: "no issuer found" is a misleading answer when the issuer was
+        // found and rejected; a SHA-1-signed link, for instance, is refused here and would
+        // otherwise be reported as a missing certificate.
+        var anchor_why = ""
+        var a = 0
+        while a < ts.certs.len() {
+            let anchor = ts.certs[a]
+            if name_eq(anchor.subject, current.issuer) {
+                // Distinct names throughout: Nori has no block shadowing, so two `let bad` in one
+                // function are one binding and the checker rejects the second.
+                let anchor_bad = may_sign(anchor, now)
+                if anchor_bad.len() > 0 {
+                    if anchor_why.len() == 0 { anchor_why = sink anchor_bad }
+                } else {
+                    let sigbad = verify_signed_by(current, anchor)
+                    if sigbad.len() > 0 {
+                        if anchor_why.len() == 0 { anchor_why = ("a link in the chain did not verify: " + sigbad) }
+                    } else { return "" }
+                }
+            }
+            a = a + 1
+        }
+
+        // otherwise, an intermediate from what the server sent
+        //
+        // When a candidate matches by name but cannot be used, the reason it cannot is far more
+        // useful than "no issuer found", which sends someone looking for a missing
+        // certificate that was in fact sent and rejected. So the most specific rejection seen is
+        // remembered and reported if nothing else works.
+        var found = 0 - 1
+        var why = ""
+        var j = 0
+        while j < certs.len() {
+            if used[j] == 0 {
+                let cand = certs[j]
+                if name_eq(cand.subject, current.issuer) {
+                    // `cand_bad` and not `bad`: Nori has no block shadowing, so a second `bad`
+                    // here would be the same binding as the anchor loop's above.
+                    let cand_bad = may_sign(cand, now)
+                    if cand_bad.len() > 0 {
+                        if why.len() == 0 { why = sink cand_bad }
+                    } else {
+                        // pathLenConstraint limits how many non-self-issued intermediates may
+                        // appear below this CA. Omitting this check is what lets a CA constrained
+                        // to issue only leaves issue another CA instead.
+                        var too_deep = false
+                        if cand.path_len >= 0 { if depth > cand.path_len { too_deep = true } }
+                        if too_deep {
+                            if why.len() == 0 { why = "a CA in the chain signed more intermediates than its pathLenConstraint allows" }
+                        } else {
+                            let sigbad = verify_signed_by(current, cand)
+                            if sigbad.len() > 0 { if why.len() == 0 { why = ("a link in the chain did not verify: " + sigbad) } }
+                            else { found = j  j = certs.len() }
+                        }
+                    }
+                }
+            }
+            j = j + 1
+        }
+        if found < 0 {
+            if why.len() > 0 { return copy why }
+            if anchor_why.len() > 0 { return copy anchor_why }
+            // Nothing even matched by name. Distinguish the two ways that happens, because they
+            // mean very different things to whoever reads the error.
+            if is_self_issued(current) { return "the chain ends in a root this client does not trust" }
+            return "the chain is incomplete — no certificate was sent for its issuer"
+        }
+        used[found] = 1
+        current = certs[found]
+        if !is_self_issued(current) { depth = depth + 1 }
+    }
+    return "the certificate chain is too long"
+}
+
+// The system trust store is read once, not once per connection. It is a file on one platform and a
+// store enumerated through crypt32 on another, and either way it is the same hundred-odd
+// certificates, which would be parsed again for every handshake (a page that opens ten connections
+// would pay for it ten times). The set a machine trusts does not change while a program runs.
+//
+// `frozen` is what lets a handshake inside a concurrent task read it: the promise is that every
+// write happens before the program's first task, and the compiler verifies that by reachability, so
+// nothing here may fill it lazily. `preload_system_trust` is the write, and a program that fetches
+// from several tasks at once calls it first.
+frozen global g_sys_ts: TrustStore
+frozen global g_sys_ts_n: Int = 0
+
+/// Read the system trust store into memory, so that every later verification uses that copy instead
+/// of parsing a hundred-odd certificates again. Returns how many roots it holds (0 = none found).
+///
+/// Call it once, at startup, before spawning anything that fetches: it is the only writer of the
+/// shared store, and its being the only one is what makes concurrent handshakes race-free. Calling
+/// it is optional (`verify_chain_system` reads its own copy when the store is empty), but then
+/// every connection pays for the store again.
+pub fn preload_system_trust() -> Int {
+    if g_sys_ts_n != 0 { return g_sys_ts_n }
+    g_sys_ts = trust_store_new()
+    let n = trust_load_system(g_sys_ts)
+    g_sys_ts_n = n
+    return n
+}
+
+/// Validate a chain against the system trust store at the current time. The form a caller wants.
+pub fn verify_chain_system(chain: Vec<Str>, host: Str, now: Int) -> Str {
+    if g_sys_ts_n > 0 { return verify_chain(chain, g_sys_ts, host, now) }
+    var ts = trust_store_new()
+    let n = trust_load_system(ts)
+    if n == 0 { return "no system trust store could be loaded" }
+    return verify_chain(chain, ts, host, now)
+}

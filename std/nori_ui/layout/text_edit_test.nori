@@ -1,0 +1,219 @@
+// Native tests for editing text in every script (layout/text_edit.nori and the editors on it):
+// carets between grapheme clusters, Backspace and Delete, visual arrow movement through bidi text,
+// hit testing and selection on screen, and the input method's pre-edit. Run with
+//   noric --test std/nori_ui/layout/text_edit_test.nori compiler/runtime.nori --import-root .
+import "std/nori_ui" as ui
+import "std/font" as font
+
+fn load(path: Str) -> font::Font {
+    let fr = font::font_load(read_file(path))
+    assert_true(fr.ok)
+    return copy fr.font
+}
+fn install() {
+    ui::layout::text_engine_reset()
+    var lat = load("std/font/assets/DejaVuSans.ttf")
+    var ar = load("std/font/assets/NotoSansArabic-subset.ttf")
+    var de = load("std/font/assets/NotoSansDevanagari-subset.ttf")
+    ui::layout::text_engine_set_font(lat)
+    ui::layout::text_engine_add_fallback(ar)
+    ui::layout::text_engine_add_fallback(de)
+}
+fn vhas(v: Vec<Int>, x: Int) -> Bool { var i = 0  while i < v.len() { if v[i] == x { return true }  i = i + 1 }  return false }
+
+fn acute() -> Str { return "é" }        // e + U+0301 combining acute accent
+fn family() -> Str { return "👨‍👩‍👧" }
+fn conjunct() -> Str { return "क्षत्रिय" }
+
+// walk Right from 0 to the end and Left back, checking every stop is a cluster boundary
+fn walk(text: Str) -> Int {
+    let gs = font::grapheme_offsets(text)
+    var f = ui::layout::field_new(text, 0)
+    var steps = 0
+    while f.caret < text.len() && steps < 100 {
+        let before = f.caret
+        let _r = ui::layout::field_key(f, 65363, 0)
+        assert_true(f.caret > before)
+        assert_true(vhas(gs, f.caret))
+        steps = steps + 1
+    }
+    var back = 0
+    while f.caret > 0 && back < 100 {
+        let _r = ui::layout::field_key(f, 65361, 0)
+        assert_true(vhas(gs, f.caret))
+        back = back + 1
+    }
+    assert_eq(back, steps)
+    return steps
+}
+
+fn test_the_caret_moves_by_cluster() {
+    assert_eq(walk("a" + acute() + "x"), 3)
+    assert_eq(walk(family()), 1)
+    assert_eq(walk("🇭🇺🇭🇺"), 2)
+    assert_eq(walk(conjunct()), font::grapheme_offsets(conjunct()).len() - 1)
+    assert_eq(walk("ab\r\ncd"), 5)                             // CR LF is one stop
+    // a click inside a cluster lands on its start
+    var f = ui::layout::field_new(acute() + "x", 0)
+    ui::layout::field_place(f, 2, false)                        // the middle of the accent
+    assert_eq(f.caret, 0)
+}
+
+fn test_backspace_takes_a_code_point_delete_a_cluster() {
+    // a vowel sign is corrected without retyping its consonant
+    var f = ui::layout::field_new("कि", 6)
+    ui::layout::field_backspace(f)
+    assert_streq(f.text, "क")
+    // an accent comes off its letter
+    var g = ui::layout::field_new(acute(), 3)
+    ui::layout::field_backspace(g)
+    assert_streq(g.text, "e")
+    // an emoji sequence, a flag and CR LF go whole
+    var h = ui::layout::field_new("x" + family(), 1 + family().len())
+    ui::layout::field_backspace(h)
+    assert_streq(h.text, "x")
+    var k = ui::layout::field_new("🇭🇺", 8)
+    ui::layout::field_backspace(k)
+    assert_streq(k.text, "")
+    var a = ui::layout::area_new("ab\r\n", 4)
+    ui::layout::area_backspace(a)
+    assert_streq(ui::layout::area_text(a), "ab")
+    // Delete takes the cluster after the caret, whole
+    var d = ui::layout::field_new("कि" + "x", 0)
+    ui::layout::field_delete(d)
+    assert_streq(d.text, "x")
+    var e = ui::layout::field_new(acute() + "x", 0)
+    ui::layout::field_delete(e)
+    assert_streq(e.text, "x")
+}
+
+// the screen x (unit widths) of every caret position a walk visits
+fn xs_of_walk(text: Str, dir: Int, delta: Int, from: Int) -> Vec<Float> {
+    let tc = ui::layout::text_carets(text, ui::layout::text_measure_style(1.0), dir, true)
+    var out: Vec<Float> = vec()
+    var i = from
+    out.push(ui::layout::text_carets_x(tc, i))
+    var n = 0
+    while n < 50 {
+        let j = ui::layout::text_move_visual(text, i, delta, dir)
+        if j == i || j < 0 || j > text.len() { n = 50 } else {
+            // stay on this line: stop at the line's edge
+            let x = ui::layout::text_carets_x(tc, j)
+            if (delta > 0 && x <= out[out.len() - 1]) || (delta < 0 && x >= out[out.len() - 1]) { n = 50 } else { out.push(x)  i = j }
+        }
+        n = n + 1
+    }
+    return out
+}
+
+fn test_arrows_move_visually_through_bidi_text() {
+    // a left-to-right paragraph with an Arabic word in it: Right always moves right on screen, and
+    // inside the Arabic word that is backwards through the string
+    let mixed = "abc " + "ابج" + " def"
+    let r = xs_of_walk(mixed, 2, 1, 0)
+    assert_eq(r.len(), font::grapheme_offsets(mixed).len())    // every stop, left to right
+    var i = 1
+    while i < r.len() { assert_true(r[i] > r[i - 1])  i = i + 1 }
+    // a right-to-left paragraph: its start is at the right, so Left from the start walks forward
+    let ar = "ابج " + "abc"
+    let l = xs_of_walk(ar, 2, 0 - 1, 0)
+    assert_true(l.len() >= 6)
+    i = 1
+    while i < l.len() { assert_true(l[i] < l[i - 1])  i = i + 1 }
+    // in the field editor: Right in an Arabic value moves the caret back through the string
+    var f = ui::layout::field_new("ابج", 6)
+    f.dir = 2
+    let _k = ui::layout::field_key(f, 65363, 0)
+    assert_eq(f.caret, 4)
+    // a left-to-right line moves logically, as it always has
+    var g = ui::layout::field_new("abc", 0)
+    let _k2 = ui::layout::field_key(g, 65363, 0)
+    assert_eq(g.caret, 1)
+}
+
+fn test_hit_and_selection_on_screen() {
+    install()
+    let st = ui::layout::text_measure_style(16.0)
+    let text = "abc " + "السلام" + " def"
+    let tc = ui::layout::text_carets(text, st, 2, false)
+    assert_true(tc.bidi)
+    assert_false(tc.para_rtl)
+    // the Arabic word's logical start (byte 4) is drawn at its right end, its end at its left
+    let s = ui::layout::text_carets_x(tc, 4)
+    let e = ui::layout::text_carets_x(tc, 4 + "السلام".len())
+    assert_true(s > e)
+    // a click at the right end of the word puts the caret at its start
+    assert_eq(ui::layout::text_carets_hit(tc, s - 0.5), 4)
+    // selecting the word is one span; a selection from "b" into the word is two pieces on screen
+    let one = ui::layout::text_carets_sel(tc, 4, 4 + "السلام".len())
+    assert_eq(one.len(), 2)
+    assert_feq(one[0], e, 0.01)
+    assert_feq(one[1], s, 0.01)
+    let two = ui::layout::text_carets_sel(tc, 1, 6)
+    assert_eq(two.len(), 4)
+    // a right-to-left field starts at the right: a click near the right edge is the start
+    let fw = 200.0
+    let at = ui::layout::field_hit_dir("السلام", 0, fw - ui::layout::field_pad() - 1.0, fw, 16.0, 2)
+    assert_eq(at, 0)
+    let at2 = ui::layout::field_hit_dir("السلام", 0, fw - 150.0, fw, 16.0, 2)
+    assert_eq(at2, "السلام".len())
+    // widths are the shaped ones: the stops span the whole shaped line
+    assert_feq(tc.width, ui::layout::text_measure_width(text, st), 0.5)
+}
+
+fn test_the_ime_preedit_is_drawn_underlined_at_the_caret() {
+    install()
+    ui::layout::set_focused_widget("f")
+    ui::layout::set_ime_preedit("かな", 0, 6)
+    var r = ui::layout::dsl_parse_document("column { padding: 0 text_input { bind: v id: f value: \"ab\" caret: 1 w: 200 } }")
+    assert_true(r.ok)
+    let ov = ui::layout::doc_layout(r.doc, ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(300.0, 40.0)))
+    var shown = false
+    var underline = false
+    var i = 0
+    while i < ov.prims.len() {
+        if ov.prims[i].kind == 2 && ov.prims[i].text == "aかなb" { shown = true }
+        if ov.prims[i].kind == 0 && ov.prims[i].rect.height() <= 1.01 && ov.prims[i].rect.width() > 5.0 { underline = true }
+        i = i + 1
+    }
+    assert_true(shown)
+    assert_true(underline)
+    ui::layout::set_ime_preedit("", 0, 0)
+    let ov2 = ui::layout::doc_layout(r.doc, ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(300.0, 40.0)))
+    var plain = false
+    i = 0
+    while i < ov2.prims.len() { if ov2.prims[i].kind == 2 && ov2.prims[i].text == "ab" { plain = true }  i = i + 1 }
+    assert_true(plain)
+    ui::layout::set_focused_widget("")
+}
+
+fn test_a_right_to_left_text_area() {
+    install()
+    var st = ui::layout::multiline_edit_new("السلام\nعليكم")
+    st.caret = 0
+    let rect = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(300.0, 100.0))
+    var opts = ui::layout::multiline_paint_opts()
+    opts.line_numbers = false
+    let prims = ui::layout::layout_multiline_edit(st, rect, 16.0, true, opts)
+    // both lines are flush right and run right to left
+    var n = 0
+    var i = 0
+    while i < prims.len() {
+        if prims[i].kind == 2 {
+            assert_streq(prims[i].line_dir, "R")
+            let w = ui::layout::text_measure_width(prims[i].text, ui::layout::text_measure_style(16.0))
+            assert_true(prims[i].pos.x + w > 280.0)
+            n = n + 1
+        }
+        i = i + 1
+    }
+    assert_eq(n, 2)
+    // the caret at the start of the text sits at the right edge
+    let content = ui::core::rect_min_max(ui::core::vec2(8.0, 8.0), ui::core::vec2(292.0, 92.0))
+    let cp = ui::layout::me_caret_pos(st, content, 16.0)
+    assert_true(cp.x > 285.0)
+    // Down then Up comes back to a cluster boundary
+    ui::layout::me_move_down(st, false)
+    ui::layout::me_move_up(st, false)
+    assert_true(vhas(font::grapheme_offsets(st.text), st.caret))
+}

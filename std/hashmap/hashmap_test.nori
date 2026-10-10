@@ -1,0 +1,125 @@
+import "std/hashmap" as hm
+
+fn test_put_get() {
+    var m = hm::intmap_new()
+    m.put(1, 10)
+    m.put(2, 20)
+    assert_eq(m.get_or(1, -1), 10)
+    assert_eq(m.get_or(2, -1), 20)
+    assert_eq(m.get_or(99, -1), -1)   // absent -> dflt
+}
+
+fn test_overwrite() {
+    var m = hm::intmap_new()
+    m.put(5, 50)
+    assert_eq(m.get_or(5, -1), 50)
+    m.put(5, 555)
+    assert_eq(m.get_or(5, -1), 555)
+    assert_eq(m.size(), 1)            // overwrite does not grow size
+}
+
+fn test_contains_remove() {
+    var m = hm::intmap_new()
+    m.put(3, 30)
+    assert_true(m.contains(3))
+    assert_false(m.contains(4))
+    var r = m.remove(3)
+    assert_true(r)
+    assert_false(m.contains(3))
+    assert_eq(m.get_or(3, -7), -7)    // get_or after remove -> dflt
+    var r2 = m.remove(3)
+    assert_false(r2)                  // already gone
+}
+
+fn test_size() {
+    var m = hm::intmap_new()
+    assert_eq(m.size(), 0)
+    m.put(1, 1)  m.put(2, 2)  m.put(3, 3)
+    assert_eq(m.size(), 3)
+    m.put(2, 22)
+    assert_eq(m.size(), 3)            // still 3 after overwrite
+    m.remove(1)
+    assert_eq(m.size(), 2)
+}
+
+fn test_growth() {
+    var m = hm::intmap_new()
+    var i = 0
+    while i < 200 { m.put(i, i * 7)  i = i + 1 }
+    assert_eq(m.size(), 200)
+    // all retrievable with correct values after several rehashes
+    var j = 0
+    while j < 200 {
+        assert_eq(m.get_or(j, -1), j * 7)
+        j = j + 1
+    }
+    assert_eq(m.get_or(200, -1), -1)
+    assert_eq(m.keys().len(), 200)
+}
+
+fn test_collisions() {
+    // with cap 8, keys 0,8,16,24 all hash-collide on the low bits but mixing
+    // spreads them; regardless, linear probing must find them all.
+    var m = hm::intmap_new()
+    m.put(0, 100)
+    m.put(8, 108)
+    m.put(16, 116)
+    m.put(24, 124)
+    assert_eq(m.get_or(0, -1), 100)
+    assert_eq(m.get_or(8, -1), 108)
+    assert_eq(m.get_or(16, -1), 116)
+    assert_eq(m.get_or(24, -1), 124)
+    assert_eq(m.size(), 4)
+}
+
+fn test_negative_keys() {
+    var m = hm::intmap_new()
+    m.put(-1, 11)
+    m.put(-100, 22)
+    m.put(-999999, 33)
+    assert_eq(m.get_or(-1, 0), 11)
+    assert_eq(m.get_or(-100, 0), 22)
+    assert_eq(m.get_or(-999999, 0), 33)
+    assert_true(m.contains(-1))
+    assert_false(m.contains(-2))
+    assert_true(m.remove(-100))
+    assert_eq(m.get_or(-100, 0), 0)
+}
+
+fn test_set_basic() {
+    var s = hm::intset_new()
+    assert_true(s.add(7))
+    assert_false(s.add(7))            // dup -> false
+    assert_eq(s.size(), 1)            // size unchanged after dup
+    assert_true(s.add(8))
+    assert_eq(s.size(), 2)
+    assert_true(s.contains(7))
+    assert_false(s.contains(9))
+    assert_true(s.remove(7))
+    assert_false(s.contains(7))
+    assert_false(s.remove(7))
+    assert_eq(s.size(), 1)
+}
+
+fn test_set_items() {
+    var s = hm::intset_new()
+    var i = 0
+    while i < 50 { s.add(i * 3)  i = i + 1 }
+    assert_eq(s.size(), 50)
+    assert_eq(s.items().len(), 50)     // items length matches size
+    var j = 0
+    while j < 50 {
+        assert_true(s.contains(j * 3))
+        j = j + 1
+    }
+    assert_false(s.contains(1))
+}
+
+fn test_set_negative() {
+    var s = hm::intset_new()
+    assert_true(s.add(-5))
+    assert_true(s.add(-10))
+    assert_false(s.add(-5))
+    assert_eq(s.size(), 2)
+    assert_true(s.contains(-10))
+}

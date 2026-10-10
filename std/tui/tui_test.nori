@@ -1,0 +1,181 @@
+import "std/tui" as tui
+import "std/strutil" as su
+
+// build ESC ("" + chr(27)) the same way std/tui does.
+fn ESC() -> Str { return "" + chr(27) }
+
+// ---------------- ANSI builders ----------------
+
+// a handle raw_enter never gave is refused, not dereferenced (it segfaulted)
+fn test_raw_exit_zero() {
+    assert_eq(tui::raw_exit(0), 0 - 1)
+}
+fn test_esc() {
+    assert_streq(tui::esc(), ESC())
+    assert_eq((tui::esc()).len(), 1)
+    assert_eq(ord((tui::esc()).at(0)), 27)
+}
+
+fn test_reset() {
+    assert_streq(tui::reset(), ESC() + "[0m")
+}
+
+fn test_clear() {
+    assert_streq(tui::clear(), ESC() + "[2J" + ESC() + "[H")
+}
+
+fn test_home() {
+    assert_streq(tui::home(), ESC() + "[H")
+}
+
+fn test_move_to() {
+    assert_streq(tui::move_to(3, 5), ESC() + "[3;5H")
+}
+
+fn test_move_to_one() {
+    assert_streq(tui::move_to(1, 1), ESC() + "[1;1H")
+}
+
+fn test_fg() {
+    assert_streq(tui::fg(32), ESC() + "[32m")
+}
+
+fn test_bg() {
+    // bg adds 10 to the code
+    assert_streq(tui::bg(32), ESC() + "[42m")
+}
+
+fn test_hide_cursor() {
+    assert_streq(tui::hide_cursor(), ESC() + "[?25l")
+}
+
+fn test_show_cursor() {
+    assert_streq(tui::show_cursor(), ESC() + "[?25h")
+}
+
+fn test_alt_enter() {
+    assert_streq(tui::alt_enter(), ESC() + "[?1049h")
+}
+
+fn test_alt_exit() {
+    assert_streq(tui::alt_exit(), ESC() + "[?1049l")
+}
+
+// ---------------- color constants ----------------
+
+fn test_colors() {
+    assert_eq(tui::BLACK(), 30)
+    assert_eq(tui::RED(), 31)
+    assert_eq(tui::GREEN(), 32)
+    assert_eq(tui::YELLOW(), 33)
+    assert_eq(tui::BLUE(), 34)
+    assert_eq(tui::MAGENTA(), 35)
+    assert_eq(tui::CYAN(), 36)
+    assert_eq(tui::WHITE(), 37)
+    assert_eq(tui::DEFAULT(), 39)
+}
+
+fn test_fg_green() {
+    assert_streq(tui::fg(tui::GREEN()), ESC() + "[32m")
+}
+
+// ---------------- Screen buffer ----------------
+
+fn test_screen_dims() {
+    var s = tui::screen(40, 10)
+    assert_eq(s.w, 40)
+    assert_eq(s.h, 10)
+    assert_eq(s.cells.len(), 400)
+    assert_eq(s.colors.len(), 400)
+}
+
+fn test_screen_cell_default() {
+    var s = tui::screen(5, 5)
+    assert_streq(s.cells[0], " ")
+    assert_eq(s.colors[0], 39)
+}
+
+fn test_put() {
+    var s = tui::screen(10, 3)
+    s.put(2, 1, "hi", tui::GREEN())
+    // row 1, col 2 -> idx 1*10 + 2 = 12
+    assert_streq(s.cells[12], "h")
+    assert_streq(s.cells[13], "i")
+    assert_eq(s.colors[12], 32)
+    assert_eq(s.colors[13], 32)
+}
+
+fn test_put_out_of_bounds() {
+    var s = tui::screen(5, 2)
+    // writing past the right edge must be ignored (no crash, cells unchanged)
+    s.put(4, 0, "abc", tui::RED())
+    assert_streq(s.cells[4], "a")   // only the in-bounds cell is written
+}
+
+fn test_cell() {
+    var s = tui::screen(4, 4)
+    s.cell(1, 2, "X", tui::CYAN())
+    assert_streq(s.cells[2 * 4 + 1], "X")
+    assert_eq(s.colors[2 * 4 + 1], 36)
+}
+
+fn test_cell_oob_ignored() {
+    var s = tui::screen(4, 4)
+    s.cell(0 - 1, 0, "X", tui::RED())   // negative x ignored
+    s.cell(0, 0 - 1, "Y", tui::RED())   // negative y ignored
+    s.cell(99, 0, "Z", tui::RED())      // beyond width ignored
+    // nothing wrote into the buffer
+    assert_streq(s.cells[0], " ")
+}
+
+fn test_wipe() {
+    var s = tui::screen(4, 4)
+    s.put(0, 0, "hello", tui::GREEN())
+    s.wipe()
+    assert_streq(s.cells[0], " ")
+    assert_eq(s.colors[0], 39)
+}
+
+fn test_box() {
+    var s = tui::screen(6, 4)
+    s.box(0, 0, 6, 4, tui::WHITE())
+    // corners are '+'
+    assert_streq(s.cells[0], "+")                       // top-left (0,0)
+    assert_streq(s.cells[5], "+")                       // top-right (5,0)
+    assert_streq(s.cells[3 * 6 + 0], "+")               // bottom-left (0,3)
+    assert_streq(s.cells[3 * 6 + 5], "+")               // bottom-right (5,3)
+    // a top edge cell is '-'
+    assert_streq(s.cells[1], "-")
+    // a left edge cell is '|'
+    assert_streq(s.cells[1 * 6 + 0], "|")
+}
+
+fn test_frame_nonempty() {
+    var s = tui::screen(4, 2)
+    let f = s.frame()
+    assert_true(f.len() > 0)
+}
+
+fn test_frame_contains_clear_and_reset() {
+    var s = tui::screen(3, 2)
+    let f = s.frame()
+    // frame starts with clear() and ends with reset()
+    assert_true(su::contains(f, tui::clear()))
+    assert_true(su::contains(f, tui::reset()))
+}
+
+fn test_frame_contains_content() {
+    var s = tui::screen(10, 2)
+    s.put(0, 0, "ZZ", tui::RED())
+    let f = s.frame()
+    assert_true(su::contains(f, "ZZ"))
+    // the red foreground code appears
+    assert_true(su::contains(f, tui::fg(tui::RED())))
+}
+
+fn test_frame_contains_move_to() {
+    var s = tui::screen(3, 3)
+    let f = s.frame()
+    // each row is positioned absolutely; row 1 col 1 must appear
+    assert_true(su::contains(f, tui::move_to(1, 1)))
+}

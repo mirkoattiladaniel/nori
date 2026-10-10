@@ -1,0 +1,123 @@
+// std/crypto/md5.nori: MD5 (RFC 1321), for the places a format names it: the freedesktop thumbnail
+// specification files a thumbnail under the MD5 of its file's URI, and other programs must find it there.
+// Not for security: MD5 is broken as a hash against an adversary; use sha256 or blake3 for anything that is.
+//
+// Little-endian words, four rounds of sixteen steps (RFC 1321 §3.4); the sine table T[1..64] of §3.4 written
+// out. 32-bit arithmetic in Int, masked after each sum.
+
+fn md5_t(i: Int) -> Int {
+    if i < 16 {
+        if i < 4 { if i == 0 { return 0xd76aa478 }  if i == 1 { return 0xe8c7b756 }  if i == 2 { return 0x242070db }  return 0xc1bdceee }
+        if i < 8 { if i == 4 { return 0xf57c0faf }  if i == 5 { return 0x4787c62a }  if i == 6 { return 0xa8304613 }  return 0xfd469501 }
+        if i < 12 { if i == 8 { return 0x698098d8 }  if i == 9 { return 0x8b44f7af }  if i == 10 { return 0xffff5bb1 }  return 0x895cd7be }
+        if i == 12 { return 0x6b901122 }  if i == 13 { return 0xfd987193 }  if i == 14 { return 0xa679438e }  return 0x49b40821
+    }
+    if i < 32 {
+        if i < 20 { if i == 16 { return 0xf61e2562 }  if i == 17 { return 0xc040b340 }  if i == 18 { return 0x265e5a51 }  return 0xe9b6c7aa }
+        if i < 24 { if i == 20 { return 0xd62f105d }  if i == 21 { return 0x02441453 }  if i == 22 { return 0xd8a1e681 }  return 0xe7d3fbc8 }
+        if i < 28 { if i == 24 { return 0x21e1cde6 }  if i == 25 { return 0xc33707d6 }  if i == 26 { return 0xf4d50d87 }  return 0x455a14ed }
+        if i == 28 { return 0xa9e3e905 }  if i == 29 { return 0xfcefa3f8 }  if i == 30 { return 0x676f02d9 }  return 0x8d2a4c8a
+    }
+    if i < 48 {
+        if i < 36 { if i == 32 { return 0xfffa3942 }  if i == 33 { return 0x8771f681 }  if i == 34 { return 0x6d9d6122 }  return 0xfde5380c }
+        if i < 40 { if i == 36 { return 0xa4beea44 }  if i == 37 { return 0x4bdecfa9 }  if i == 38 { return 0xf6bb4b60 }  return 0xbebfbc70 }
+        if i < 44 { if i == 40 { return 0x289b7ec6 }  if i == 41 { return 0xeaa127fa }  if i == 42 { return 0xd4ef3085 }  return 0x04881d05 }
+        if i == 44 { return 0xd9d4d039 }  if i == 45 { return 0xe6db99e5 }  if i == 46 { return 0x1fa27cf8 }  return 0xc4ac5665
+    }
+    if i < 52 { if i == 48 { return 0xf4292244 }  if i == 49 { return 0x432aff97 }  if i == 50 { return 0xab9423a7 }  return 0xfc93a039 }
+    if i < 56 { if i == 52 { return 0x655b59c3 }  if i == 53 { return 0x8f0ccc92 }  if i == 54 { return 0xffeff47d }  return 0x85845dd1 }
+    if i < 60 { if i == 56 { return 0x6fa87e4f }  if i == 57 { return 0xfe2ce6e0 }  if i == 58 { return 0xa3014314 }  return 0x4e0811a1 }
+    if i == 60 { return 0xf7537e82 }  if i == 61 { return 0xbd3af235 }  if i == 62 { return 0x2ad7d2bb }  return 0xeb86d391
+}
+
+// the rotation of step i (§3.4: each round's four amounts, repeated)
+fn md5_s(i: Int) -> Int {
+    let k = i % 4
+    if i < 16 { if k == 0 { return 7 }  if k == 1 { return 12 }  if k == 2 { return 17 }  return 22 }
+    if i < 32 { if k == 0 { return 5 }  if k == 1 { return 9 }  if k == 2 { return 14 }  return 20 }
+    if i < 48 { if k == 0 { return 4 }  if k == 1 { return 11 }  if k == 2 { return 16 }  return 23 }
+    if k == 0 { return 6 }  if k == 1 { return 10 }  if k == 2 { return 15 }  return 21
+}
+
+fn md5_rotl(x: Int, n: Int) -> Int { return ((x << n) | (x >> (32 - n))) & 0xffffffff }
+
+// the padded message's byte p: the data, then 0x80, zeros, and the bit length as 64 bits little-endian
+fn md5_byte(data: Str, n: Int, ln: Int, p: Int) -> Int {
+    if p < n { return ord(data.at(p)) }
+    if p == n { return 128 }
+    if p >= ln - 8 { return ((n * 8) >> ((p - (ln - 8)) * 8)) & 255 }
+    return 0
+}
+
+fn md5_words(data: Str) -> Vec<Int> {
+    let n = data.len()
+    let ln = ((n + 8) / 64 + 1) * 64
+    var a0 = 0x67452301
+    var b0 = 0xefcdab89
+    var c0 = 0x98badcfe
+    var d0 = 0x10325476
+    var m = fill(16, 0)
+    var blk = 0
+    while blk < ln / 64 {
+        var t = 0
+        while t < 16 {
+            let p = blk * 64 + t * 4
+            m[t] = md5_byte(data, n, ln, p) | (md5_byte(data, n, ln, p + 1) << 8) | (md5_byte(data, n, ln, p + 2) << 16) | (md5_byte(data, n, ln, p + 3) << 24)
+            t = t + 1
+        }
+        var a = a0
+        var b = b0
+        var c = c0
+        var d = d0
+        var i = 0
+        while i < 64 {
+            var f = 0
+            var g = 0
+            if i < 16 { f = (b & c) | ((~ b) & d)  g = i }
+            else if i < 32 { f = (d & b) | ((~ d) & c)  g = (5 * i + 1) % 16 }
+            else if i < 48 { f = b ^ c ^ d  g = (3 * i + 5) % 16 }
+            else { f = c ^ (b | ((~ d) & 0xffffffff))  g = (7 * i) % 16 }
+            f = (f + a + md5_t(i) + m[g]) & 0xffffffff
+            a = d
+            d = c
+            c = b
+            b = (b + md5_rotl(f, md5_s(i))) & 0xffffffff
+            i = i + 1
+        }
+        a0 = (a0 + a) & 0xffffffff
+        b0 = (b0 + b) & 0xffffffff
+        c0 = (c0 + c) & 0xffffffff
+        d0 = (d0 + d) & 0xffffffff
+        blk = blk + 1
+    }
+    var out: Vec<Int> = vec()
+    out.push(a0)  out.push(b0)  out.push(c0)  out.push(d0)
+    return out
+}
+
+/// MD5 of `data` as 32 lowercase hex digits (RFC 1321's digest bytes, in order). Not for security.
+pub fn md5(data: Str) -> Str {
+    let w = md5_words(data)
+    let hx = "0123456789abcdef"
+    var s = ""
+    foreach x in w {
+        var k = 0
+        while k < 4 {
+            let b = (x >> (k * 8)) & 255
+            s = s + hx.slice(b / 16, b / 16 + 1) + hx.slice(b % 16, b % 16 + 1)
+            k = k + 1
+        }
+    }
+    return s
+}
+
+/// MD5 of `data` as its 16 raw digest bytes.
+pub fn md5_raw(data: Str) -> Str {
+    let w = md5_words(data)
+    var s = ""
+    foreach x in w {
+        var k = 0
+        while k < 4 { s = s + chr((x >> (k * 8)) & 255)  k = k + 1 }
+    }
+    return s
+}

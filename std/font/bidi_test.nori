@@ -1,0 +1,132 @@
+// Native tests for std/font's bidi (UAX #9): run with
+//   noric --test std/font/bidi_test.nori compiler/runtime.nori --import-root .
+//
+// BidiCharacterTest.txt (Unicode 16, committed zstd-compressed) is run whole: every line's resolved
+// paragraph level, per-character levels and visual order must match.
+import "std/font" as font
+import "std/strutil" as su
+import "std/archive" as ar
+
+fn hexnum(h: Str) -> Int {
+    var v = 0
+    var k = 0
+    while k < h.len() {
+        let c = ord(h.at(k))
+        var n = 0
+        if c >= 48 && c <= 57 { n = c - 48 } else if c >= 97 && c <= 102 { n = c - 87 } else if c >= 65 && c <= 70 { n = c - 55 }
+        v = v * 16 + n
+        k = k + 1
+    }
+    return v
+}
+
+fn test_bidi_character_test() {
+    let text = ar::zstd_decompress(read_file("std/font/testdata/BidiCharacterTest.txt.zst"))
+    assert_true(text.len() > 6000000)
+    var pos = 0
+    var cases = 0
+    var fails = 0
+    var shown = 0
+    while pos < text.len() {
+        var e = pos
+        while e < text.len() && text.at(e) != '\n' { e = e + 1 }
+        let line = text.slice(pos, e)
+        pos = e + 1
+        if line.len() == 0 || line.at(0) == '#' { continue }
+        let f = su::split(line, ";")
+        if f.len() < 5 { continue }
+        var cps: Vec<Int> = vec()
+        let hx = su::split(f[0], " ")
+        var i = 0
+        while i < hx.len() { if hx[i].len() > 0 { cps.push(hexnum(hx[i])) }  i = i + 1 }
+        let dirf = parse_int(f[1])
+        var dir = font::BIDI_AUTO()
+        if dirf == 0 { dir = font::BIDI_LTR() } else if dirf == 1 { dir = font::BIDI_RTL() }
+        let r = font::bidi_resolve(cps, dir)
+        var ok = r.para_level == parse_int(f[2])
+        var got = ""
+        i = 0
+        while i < cps.len() {
+            var s = "x"
+            if r.levels[i] >= 0 { s = to_str(r.levels[i]) }
+            if i > 0 { got = got + " " }
+            got = got + s
+            i = i + 1
+        }
+        if !(got == f[3]) { ok = false }
+        let ord_ = font::bidi_visual_order(r, 0, cps.len())
+        var go = ""
+        i = 0
+        while i < ord_.len() { if i > 0 { go = go + " " }  go = go + to_str(ord_[i])  i = i + 1 }
+        if !(go == f[4]) { ok = false }
+        cases = cases + 1
+        if !ok {
+            fails = fails + 1
+            if shown < 12 {
+                printl("FAIL ${line}")
+                printl("   got para ${r.para_level} levels [${got}] order [${go}]")
+                shown = shown + 1
+            }
+        }
+    }
+    printl("BidiCharacterTest: ${cases} cases, ${fails} failures")
+    assert_true(cases > 90000)
+    assert_eq(fails, 0)
+}
+
+// FriBidi (oracle/bidi.c) on mixed-script sentences: the same paragraph level, the same levels for
+// every character that survives X9, the same visual order (X9's removed characters left out).
+fn test_bidi_matches_fribidi() {
+    let cases = su::split(read_file("std/font/testdata/bidi_cases.txt"), "\n")
+    let exp = su::split(read_file("std/font/testdata/bidi_expected.txt"), "\n")
+    var ran = 0
+    var fails = 0
+    var ci = 0
+    var ei = 0
+    while ci < cases.len() {
+        let line = cases[ci]
+        ci = ci + 1
+        if line.len() == 0 || su::starts_with(line, "#") { continue }
+        let f = su::split(line, "\t")
+        while ei < exp.len() && !(exp[ei] == "case " + f[0]) { ei = ei + 1 }
+        assert_true(ei + 3 < exp.len())
+        let want_para = parse_int(exp[ei + 1].slice(5, exp[ei + 1].len()))
+        let want_lv = su::split(exp[ei + 2].slice(7, exp[ei + 2].len()), " ")
+        let want_ord = su::split(exp[ei + 3].slice(6, exp[ei + 3].len()), " ")
+        var cps: Vec<Int> = vec()
+        let hx = su::split(f[2], " ")
+        var i = 0
+        while i < hx.len() { cps.push(hexnum(hx[i]))  i = i + 1 }
+        var dir = font::BIDI_AUTO()
+        if f[1] == "ltr" { dir = font::BIDI_LTR() } else if f[1] == "rtl" { dir = font::BIDI_RTL() }
+        let r = font::bidi_resolve(cps, dir)
+        var ok = r.para_level == want_para
+        i = 0
+        while i < cps.len() {
+            if r.levels[i] >= 0 && r.levels[i] != parse_int(want_lv[i]) { ok = false }
+            i = i + 1
+        }
+        // FriBidi's order includes the X9-removed characters; drop them before comparing
+        var wo: Vec<Int> = vec()
+        i = 0
+        while i < want_ord.len() { let k = parse_int(want_ord[i])  if r.levels[k] >= 0 { wo.push(k) }  i = i + 1 }
+        let go = font::bidi_visual_order(r, 0, cps.len())
+        if go.len() != wo.len() { ok = false }
+        i = 0
+        while ok && i < go.len() { if go[i] != wo[i] { ok = false }  i = i + 1 }
+        ran = ran + 1
+        if !ok {
+            fails = fails + 1
+            var gl = ""
+            i = 0
+            while i < cps.len() { gl = gl + " " + to_str(r.levels[i])  i = i + 1 }
+            var gs = ""
+            i = 0
+            while i < go.len() { gs = gs + " " + to_str(go[i])  i = i + 1 }
+            printl("FRIBIDI MISMATCH ${f[0]}: want para ${want_para} [${exp[ei + 2]}] [${exp[ei + 3]}]; got para ${r.para_level} [${gl}] [${gs}]")
+        }
+    }
+    printl("FriBidi: ${ran} cases, ${fails} mismatches")
+    assert_eq(fails, 0)
+    assert_true(ran >= 15)
+}

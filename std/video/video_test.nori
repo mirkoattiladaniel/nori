@@ -1,0 +1,138 @@
+// std/video: the containers and the VP9 decoder against libvpx's own decoder (vpxdec): each stream in testdata was
+// made by std/video/make_video_testdata.sh with the host's vpxenc, and decoded there by vpxdec; the numbers below are
+// its frame count and the FNV-1a of every frame's I420 planes in order. std/video must decode the same frames, bit
+// for bit (VP9's decoding process is exact).
+//   noric --test std/video/video_test.nori compiler/runtime.nori --import-root .
+import "std/video" as video
+
+// the video under test: a global (decoding is suspendable: see the threads note in video.nori)
+global V: video::Video
+global HASH: Int = 0
+global FRAMES: Int = 0
+
+fn fnv_plane(h0: Int, p: Int, w: Int, h: Int, s: Int) -> Int {
+    var hh = h0
+    var y = 0
+    unsafe { while y < h { var x = 0  while x < w { hh = ((hh ^ peek8(p + y * s + x)) * 16777619) & 4294967295  x = x + 1 }  y = y + 1 } }
+    return hh
+}
+
+/// decode the whole file (on `threads`), hashing every shown frame's planes into HASH, counting them into FRAMES
+fn decode_all(path: Str, threads: Int) {
+    V = video::video_open(path)
+    video::video_set_threads(V, threads)
+    HASH = 2166136261
+    FRAMES = 0
+    var more = video::video_ok(V)
+    if more { more = video::video_next(V) }
+    while more {
+        let d = V.vp9
+        let w = video::vp9_out_w(d)
+        let h = video::vp9_out_h(d)
+        HASH = fnv_plane(HASH, video::vp9_out_y(d), w, h, video::vp9_out_ystride(d))
+        HASH = fnv_plane(HASH, video::vp9_out_u(d), (w + 1) / 2, (h + 1) / 2, video::vp9_out_uvstride(d))
+        HASH = fnv_plane(HASH, video::vp9_out_v(d), (w + 1) / 2, (h + 1) / 2, video::vp9_out_uvstride(d))
+        FRAMES = FRAMES + 1
+        more = video::video_next(V)
+    }
+}
+
+fn check_stream(name: Str, frames: Int, hash: Int) {
+    decode_all("std/video/testdata/" + name, 1)
+    assert_streq(video::video_error(V), "")
+    assert_eq(FRAMES, frames)
+    assert_eq(HASH, hash)
+    video::video_close(V)
+}
+
+fn test_vp9_bit_exact() {
+    // key and inter frames with alt-ref (hidden frames in superframes), compound prediction, every intra mode
+    check_stream("basic.webm", 12, 1050844750)
+    // a size not a multiple of 8 (the edges' prediction and filter clipping)
+    check_stream("odd.webm", 8, 3859941723)
+    // lossless: the Walsh-Hadamard transform, 4x4 only
+    check_stream("lossless.webm", 3, 1835391427)
+    // error resilient (no backward adaptation, contexts reset) and frame parallel (no adaptation)
+    check_stream("errres.webm", 10, 712749849)
+    check_stream("fpar.webm", 10, 2976448925)
+    // segmentation: cyclic refresh (temporal map updates) and variance AQ (per-segment quantizers)
+    check_stream("aq.webm", 8, 3351731813)
+    check_stream("segq.webm", 8, 1956742339)
+    // two tile columns and two tile rows
+    check_stream("tiles.webm", 6, 2320894854)
+    // the loop filter's sharpness
+    check_stream("sharp.webm", 10, 1728629495)
+    // real-time mode (no alt-ref, its own partitioning)
+    check_stream("rt.webm", 10, 368897084)
+}
+
+fn test_vp9_threads_same() {
+    // the tiles and the loop filter's planes on threads: the same frames
+    decode_all("std/video/testdata/tiles.webm", 4)
+    assert_eq(FRAMES, 6)
+    assert_eq(HASH, 2320894854)
+    video::video_close(V)
+}
+
+fn test_containers() {
+    // the same stream in WebM, Matroska and MP4
+    let names = ["basic.webm", "basic.mkv", "basic.mp4"]
+    foreach n in names {
+        decode_all("std/video/testdata/" + n, 1)
+        assert_eq(FRAMES, 12)
+        assert_eq(HASH, 1050844750)
+        assert_streq(video::video_codec(V), "vp9")
+        assert_eq(video::video_width(V), 176)
+        assert_eq(video::video_height(V), 144)
+        video::video_close(V)
+    }
+    // MP4's frame times from stts, Matroska's from the blocks: 30 frames a second
+    V = video::video_open("std/video/testdata/basic.mp4")
+    var ok = video::video_next(V)
+    ok = video::video_next(V)
+    assert_true(ok)
+    assert_eq(video::video_pts_ms(V), 33)
+    assert_eq(video::video_frame_ms(V), 33)
+    // back to the start: the first frame again
+    let _r = video::video_rewind(V)
+    ok = video::video_next(V)
+    assert_true(ok)
+    assert_eq(video::video_pts_ms(V), 0)
+    assert_eq(video::video_frames(V), 1)
+    video::video_close(V)
+}
+
+fn test_unsupported_codec() {
+    V = video::video_open("std/video/testdata/h264.mp4")
+    assert_false(video::video_ok(V))
+    assert_streq(video::video_container(V), "mp4")
+    assert_streq(video::video_codec(V), "h264")
+    assert_streq(video::video_error(V), "H.264 video: not supported yet")
+    let ok = video::video_next(V)
+    assert_false(ok)
+    video::video_close(V)
+}
+
+fn test_broken() {
+    // cut short: the frames that are there, then the end (no read past the file)
+    decode_all("std/video/testdata/bad_truncated.webm", 1)
+    assert_true(FRAMES > 0)
+    assert_true(FRAMES < 12)
+    video::video_close(V)
+    // a frame's bytes damaged: decoding goes on or stops with an error, never a crash
+    decode_all("std/video/testdata/bad_flipped.webm", 1)
+    assert_true(FRAMES <= 12)
+    video::video_close(V)
+    // a key frame claiming 65536 x 65536: refused before anything that size is made
+    decode_all("std/video/testdata/bad_huge.webm", 1)
+    assert_eq(FRAMES, 0)
+    assert_streq(video::video_error(V), "VP9: larger than 16384 on a side")
+    video::video_close(V)
+    // not a video, and nothing
+    V = video::video_open("std/video/video.nori")
+    assert_false(video::video_ok(V))
+    video::video_close(V)
+    V = video::video_open("")
+    assert_false(video::video_ok(V))
+    video::video_close(V)
+}

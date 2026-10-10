@@ -1,0 +1,213 @@
+// std/font: Unicode character properties for shaping, bidi and line breaking.
+//
+// Every property comes out of one generated blob (data/ucd.bin, built by tools/gen_ucd.py from the
+// Unicode 16.0.0 data files): a three-level trie maps a code point to one 8-byte record holding its
+// general category, bidi class, script, line break class, combining class, joining type, east
+// asian width and a byte of binary flags. Sorted side tables hold the mirroring pairs, the paired
+// brackets, the canonical decompositions and compositions, the Indic shaper's categories, and the
+// ranges of Grapheme_Cluster_Break and Indic_Conjunct_Break.
+//
+// The blob is a string literal (include_str), read in place: no table is unpacked at start-up, and
+// a lookup is three u16 reads and a byte.
+
+global g_ucd_s1: Int = 0
+global g_ucd_s2: Int = 0
+global g_ucd_s3: Int = 0
+global g_ucd_rec: Int = 0
+global g_ucd_mir: Int = 0
+global g_ucd_nmir: Int = 0
+global g_ucd_brk: Int = 0
+global g_ucd_nbrk: Int = 0
+global g_ucd_dec: Int = 0
+global g_ucd_ndec: Int = 0
+global g_ucd_cmp: Int = 0
+global g_ucd_ncmp: Int = 0
+global g_ucd_gcb: Int = 0
+global g_ucd_ngcb: Int = 0
+global g_ucd_ready: Int = 0
+
+fn ucd_init() {
+    if g_ucd_ready != 0 { return }
+    let b = ucd_blob()
+    g_ucd_s1 = rd_u32(b, 0)   g_ucd_s2 = rd_u32(b, 4)   g_ucd_s3 = rd_u32(b, 8)
+    g_ucd_rec = rd_u32(b, 12)
+    g_ucd_mir = rd_u32(b, 20)  g_ucd_nmir = rd_u32(b, 24)
+    g_ucd_brk = rd_u32(b, 28)  g_ucd_nbrk = rd_u32(b, 32)
+    g_ucd_dec = rd_u32(b, 36)  g_ucd_ndec = rd_u32(b, 40)
+    g_ucd_cmp = rd_u32(b, 44)  g_ucd_ncmp = rd_u32(b, 48)
+    g_ucd_gcb = rd_u32(b, 64)  g_ucd_ngcb = rd_u32(b, 68)
+    g_ucd_ready = 1
+}
+
+// the blob offset of code point `cp`'s record. Anything outside Unicode reads as U+10FFFF's record
+// (unassigned, noncharacter) rather than trapping.
+fn ucd_rec(cp: Int) -> Int {
+    ucd_init()
+    var c = cp
+    if c < 0 || c > 1114111 { c = 1114111 }
+    let b = ucd_blob()
+    let i2 = rd_u16(b, g_ucd_s1 + (c >> 11) * 2)
+    let i3 = rd_u16(b, g_ucd_s2 + (i2 * 32 + ((c >> 6) & 31)) * 2)
+    let r = rd_u16(b, g_ucd_s3 + (i3 * 64 + (c & 63)) * 2)
+    return g_ucd_rec + r * 8
+}
+
+/// General_Category of `cp` (one of the GC_* constants).
+pub fn ucd_gc(cp: Int) -> Int { return rd_u8(ucd_blob(), ucd_rec(cp)) }
+/// Bidi_Class of `cp` (BC_*), with the UCD's defaults for unassigned code points (R/AL blocks).
+pub fn ucd_bidi_class(cp: Int) -> Int { return rd_u8(ucd_blob(), ucd_rec(cp) + 1) }
+/// Script of `cp` (SC_*; script_code gives its ISO 15924 code).
+pub fn ucd_script(cp: Int) -> Int { return rd_u8(ucd_blob(), ucd_rec(cp) + 2) }
+/// Line_Break class of `cp` (LB_*), with the UCD's defaults for unassigned code points.
+pub fn ucd_line_break(cp: Int) -> Int { return rd_u8(ucd_blob(), ucd_rec(cp) + 3) }
+/// Canonical_Combining_Class of `cp` (0..240).
+pub fn ucd_ccc(cp: Int) -> Int { return rd_u8(ucd_blob(), ucd_rec(cp) + 4) }
+/// Joining_Type of `cp` (JT_*: U R D C L T).
+pub fn ucd_joining_type(cp: Int) -> Int { return rd_u8(ucd_blob(), ucd_rec(cp) + 5) }
+/// East_Asian_Width of `cp` (EA_*).
+pub fn ucd_east_asian_width(cp: Int) -> Int { return rd_u8(ucd_blob(), ucd_rec(cp) + 6) }
+fn ucd_flags(cp: Int) -> Int { return rd_u8(ucd_blob(), ucd_rec(cp) + 7) }
+/// Extended_Pictographic (emoji-data.txt).
+pub fn ucd_is_extended_pictographic(cp: Int) -> Bool { return (ucd_flags(cp) & 1) != 0 }
+/// Emoji_Presentation: shown as emoji by default.
+pub fn ucd_is_emoji_presentation(cp: Int) -> Bool { return (ucd_flags(cp) & 2) != 0 }
+/// Emoji_Modifier: the five skin tones U+1F3FB..1F3FF.
+pub fn ucd_is_emoji_modifier(cp: Int) -> Bool { return (ucd_flags(cp) & 4) != 0 }
+/// Emoji_Modifier_Base: takes a skin tone.
+pub fn ucd_is_emoji_modifier_base(cp: Int) -> Bool { return (ucd_flags(cp) & 8) != 0 }
+/// Default_Ignorable_Code_Point (DerivedCoreProperties.txt).
+pub fn ucd_is_default_ignorable(cp: Int) -> Bool { return (ucd_flags(cp) & 16) != 0 }
+/// Emoji (emoji-data.txt): has an emoji form at all.
+pub fn ucd_is_emoji(cp: Int) -> Bool { return (ucd_flags(cp) & 32) != 0 }
+/// Grapheme_Extend.
+pub fn ucd_is_grapheme_extend(cp: Int) -> Bool { return (ucd_flags(cp) & 64) != 0 }
+/// Bidi_Mirrored.
+pub fn ucd_is_bidi_mirrored(cp: Int) -> Bool { return (ucd_flags(cp) & 128) != 0 }
+
+/// is `gc` one of the mark categories (Mn, Mc, Me)?
+pub fn gc_is_mark(gc: Int) -> Bool { return gc == GC_Mn() || gc == GC_Mc() || gc == GC_Me() }
+
+// binary search a sorted table of `n` records of `rsz` bytes keyed by a u32 at their start; the
+// record's offset, or -1.
+fn ucd_bsearch(base: Int, n: Int, rsz: Int, key: Int) -> Int {
+    let b = ucd_blob()
+    var lo = 0
+    var hi = n - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        let k = rd_u32(b, base + mid * rsz)
+        if k == key { return base + mid * rsz }
+        if k < key { lo = mid + 1 } else { hi = mid - 1 }
+    }
+    return 0 - 1
+}
+
+/// Bidi_Mirroring_Glyph of `cp`, or `cp` itself when it has none.
+pub fn ucd_mirror(cp: Int) -> Int {
+    ucd_init()
+    let r = ucd_bsearch(g_ucd_mir, g_ucd_nmir, 8, cp)
+    if r < 0 { return cp }
+    return rd_u32(ucd_blob(), r + 4)
+}
+/// Bidi_Paired_Bracket_Type of `cp`: 0 none, 1 open, 2 close.
+pub fn ucd_bracket_type(cp: Int) -> Int {
+    ucd_init()
+    let r = ucd_bsearch(g_ucd_brk, g_ucd_nbrk, 12, cp)
+    if r < 0 { return 0 }
+    return rd_u32(ucd_blob(), r + 8) + 1
+}
+/// Bidi_Paired_Bracket of `cp` (the other bracket of the pair), or `cp` when it is not a bracket.
+pub fn ucd_bracket_pair(cp: Int) -> Int {
+    ucd_init()
+    let r = ucd_bsearch(g_ucd_brk, g_ucd_nbrk, 12, cp)
+    if r < 0 { return cp }
+    return rd_u32(ucd_blob(), r + 4)
+}
+
+// Hangul syllables decompose and compose algorithmically (Unicode 3.12).
+fn hangul_s_base() -> Int { return 44032 }     // U+AC00
+fn hangul_l_base() -> Int { return 4352 }      // U+1100
+fn hangul_v_base() -> Int { return 4449 }      // U+1161
+fn hangul_t_base() -> Int { return 4519 }      // U+11A7
+
+/// the canonical decomposition of `ab` as at most two code points (the UCD's own one-level form;
+/// apply it again to `a` for the full decomposition). `out[0]`/`out[1]` get a and b (b = 0 for a
+/// singleton). Returns false when `ab` does not decompose.
+pub fn ucd_decompose(ab: Int, inout out: Vec<Int>) -> Bool {
+    while out.len() < 2 { out.push(0) }
+    let sidx = ab - hangul_s_base()
+    if sidx >= 0 && sidx < 11172 {
+        let ti = sidx % 28
+        if ti != 0 { out[0] = ab - ti  out[1] = hangul_t_base() + ti }
+        else { out[0] = hangul_l_base() + sidx / 588  out[1] = hangul_v_base() + (sidx % 588) / 28 }
+        return true
+    }
+    ucd_init()
+    let r = ucd_bsearch(g_ucd_dec, g_ucd_ndec, 12, ab)
+    if r < 0 { return false }
+    out[0] = rd_u32(ucd_blob(), r + 4)
+    out[1] = rd_u32(ucd_blob(), r + 8)
+    return true
+}
+/// the primary composite of `a` + `b`, or 0 when they do not compose canonically.
+pub fn ucd_compose(a: Int, b: Int) -> Int {
+    let lidx = a - hangul_l_base()
+    if lidx >= 0 && lidx < 19 {
+        let vidx = b - hangul_v_base()
+        if vidx >= 0 && vidx < 21 { return hangul_s_base() + (lidx * 21 + vidx) * 28 }
+        return 0
+    }
+    let sidx = a - hangul_s_base()
+    if sidx >= 0 && sidx < 11172 && sidx % 28 == 0 {
+        let tidx = b - hangul_t_base()
+        if tidx > 0 && tidx < 28 { return a + tidx }
+        return 0
+    }
+    ucd_init()
+    let blob = ucd_blob()
+    var lo = 0
+    var hi = g_ucd_ncmp - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        let p = g_ucd_cmp + mid * 12
+        let ka = rd_u32(blob, p)
+        let kb = rd_u32(blob, p + 4)
+        if ka == a && kb == b { return rd_u32(blob, p + 8) }
+        if ka < a || (ka == a && kb < b) { lo = mid + 1 } else { hi = mid - 1 }
+    }
+    return 0
+}
+// the (gcb, incb) range record covering `cp`, or -1: records are (lo u32, hi u32, gcb u8, incb u8)
+fn ucd_gcb_rec(cp: Int) -> Int {
+    ucd_init()
+    let b = ucd_blob()
+    var lo = 0
+    var hi = g_ucd_ngcb - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        let p = g_ucd_gcb + mid * 10
+        if cp < rd_u32(b, p) { hi = mid - 1 }
+        else if cp > rd_u32(b, p + 4) { lo = mid + 1 }
+        else { return p }
+    }
+    return 0 - 1
+}
+/// Grapheme_Cluster_Break of `cp` (one of the GCB_* constants).
+pub fn ucd_gcb(cp: Int) -> Int {
+    let s = cp - hangul_s_base()
+    if s >= 0 && s < 11172 {                    // Hangul syllables: LV every 28th, LVT between
+        if s % 28 == 0 { return GCB_LV() }
+        return GCB_LVT()
+    }
+    let r = ucd_gcb_rec(cp)
+    if r < 0 { return GCB_Other() }
+    return rd_u8(ucd_blob(), r + 8)
+}
+/// Indic_Conjunct_Break of `cp` (one of the INCB_* constants).
+pub fn ucd_incb(cp: Int) -> Int {
+    let r = ucd_gcb_rec(cp)
+    if r < 0 { return INCB_None() }
+    return rd_u8(ucd_blob(), r + 9)
+}
+/// the raw property blob, for the tests' integrity check.
+pub fn ucd_blob_for_test() -> view Str { return ucd_blob() }

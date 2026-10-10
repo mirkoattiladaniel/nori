@@ -1,0 +1,581 @@
+// std/window/__native_wayland_shell.nori: the window list a desktop shell needs, spoken over the Wayland
+// wire by __native_wayland.nori's connection code: ext_foreign_toplevel_list_v1 (every toplevel, with a
+// stable identifier) and zwlr_foreign_toplevel_management_v1 (the same toplevels with their state, and
+// the requests that act on them: activate, close, minimize, maximize).
+//
+// The list has a connection of its own. It is not a window: it has no surface and no input, and a
+// program that keeps it beside its windows waits on its socket (nwlt_fd) with theirs.
+//
+// Two protocols, one list. A compositor that speaks both (Sway, Hyprland) announces each toplevel twice,
+// once per protocol, and neither protocol names the other's object: ext has the identifier, wlr the state
+// and the actions. Each handle is kept as its own entry, and an entry of one protocol is paired with the
+// oldest unpaired entry of the other that has the same app id and title once both have sent their first
+// `done`, which is when a compositor announces a new toplevel on both, in one burst. A pairing, once
+// made, is kept through later title changes. The list a caller sees is the wlr entries (with their
+// partner's identifier) when the compositor manages toplevels, and the ext entries (with no actions)
+// when it only lists them.
+
+// The workspaces (ext_workspace_v1) ride on the same connection: a compositor that has them (Sway since
+// 1.11, Hyprland, NoriOS's own) announces each workspace with its name, its coordinates and its state,
+// and sends `done` after a batch of changes, which is when the list a caller sees changes. Groups
+// (one per output) are bound and listened to only so their handles can be destroyed; which workspaces
+// are on which output is not kept (a single-output desktop does not need it).
+cstruct NwlWsEnt { uid: Int, obj: Int, name: Int, ident: Int, coords: Int, state: Int, caps: Int, gone: Int }
+
+// One handle of either protocol, in creation order. `uid` is this list's own id for it: object ids are
+// reused once freed, a uid never is.
+cstruct NwltEnt { uid: Int, proto: Int, obj: Int, title: Int, app_id: Int, ident: Int, state: Int, done: Int, peer: Int }
+
+cstruct NwlTl {
+    c: Int, reg: Int, seat: Int, mgr: Int, extl: Int, sync_id: Int, sync_done: Int,
+    ents: Int, n: Int, cap: Int, nextuid: Int, changed: Int,
+    wsmgr: Int, wss: Int, wsn: Int, wscap: Int, wspend: Int
+}
+
+fn nwlw_ent(t: NwlTl, i: Int) -> Int { return t.wss + i * sizeof(NwlWsEnt) }
+fn nwlw_find_obj(t: NwlTl, obj: Int) -> Int {
+    var i = 0
+    while i < t.wsn {
+        let e: NwlWsEnt = nwlw_ent(t, i)
+        if e.obj == obj { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+fn nwlw_find_uid(t: NwlTl, uid: Int) -> Int {
+    var i = 0
+    while i < t.wsn {
+        let e: NwlWsEnt = nwlw_ent(t, i)
+        if e.uid == uid && e.gone == 0 { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+fn nwlw_add(t: NwlTl, obj: Int) {
+    if t.wsn == t.wscap {
+        var nc = t.wscap * 2
+        if nc < 16 { nc = 16 }
+        let ne = calloc(nc, sizeof(NwlWsEnt))
+        if t.wsn > 0 { memcpy(ne, t.wss, t.wsn * sizeof(NwlWsEnt)) }
+        if t.wss != 0 { free(t.wss) }
+        t.wss = ne
+        t.wscap = nc
+    }
+    let e: NwlWsEnt = nwlw_ent(t, t.wsn)
+    t.nextuid = t.nextuid + 1
+    e.uid = t.nextuid  e.obj = obj
+    e.name = nwu_strdup(0)  e.ident = nwu_strdup(0)  e.coords = nwu_strdup(0)
+    e.state = 0  e.caps = 0  e.gone = 0
+    t.wsn = t.wsn + 1
+}
+fn nwlw_remove(t: NwlTl, i: Int) {
+    let e: NwlWsEnt = nwlw_ent(t, i)
+    free(e.name)  free(e.ident)  free(e.coords)
+    if i + 1 < t.wsn { memmove(nwlw_ent(t, i), nwlw_ent(t, i + 1), (t.wsn - i - 1) * sizeof(NwlWsEnt)) }
+    t.wsn = t.wsn - 1
+}
+// the coordinates array (u32 each) as "x,y,…"
+fn nwlw_coords(old: Int, a: Int) -> Int {
+    free(old)
+    let bytes = peek32(a)
+    let r = malloc(bytes * 3 + 2)
+    var n = 0
+    var k = 0
+    while k + 4 <= bytes {
+        if k > 0 { poke8(r + n, 44)  n = n + 1 }
+        var v = peek32(a + 4 + k)
+        var digits = malloc(12)
+        var dn = 0
+        if v == 0 { poke8(digits, 48)  dn = 1 }
+        while v > 0 { poke8(digits + dn, 48 + v % 10)  v = v / 10  dn = dn + 1 }
+        while dn > 0 { dn = dn - 1  poke8(r + n, peek8(digits + dn))  n = n + 1 }
+        free(digits)
+        k = k + 4
+    }
+    poke8(r + n, 0)
+    return r
+}
+
+fn NWLT_WLR() -> Int { return 1 }
+fn NWLT_EXT() -> Int { return 2 }
+
+fn nwlt_ent(t: NwlTl, i: Int) -> Int { return t.ents + i * sizeof(NwltEnt) }
+
+// the entry of protocol `proto` whose object is `obj`, as an index (-1: none)
+fn nwlt_find_obj(t: NwlTl, proto: Int, obj: Int) -> Int {
+    var i = 0
+    while i < t.n {
+        let e: NwltEnt = nwlt_ent(t, i)
+        if e.proto == proto && e.obj == obj { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+fn nwlt_find_uid(t: NwlTl, uid: Int) -> Int {
+    var i = 0
+    while i < t.n {
+        let e: NwltEnt = nwlt_ent(t, i)
+        if e.uid == uid { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn nwlt_add(t: NwlTl, proto: Int, obj: Int) {
+    if t.n == t.cap {
+        var nc = t.cap * 2
+        if nc < 16 { nc = 16 }
+        let ne = calloc(nc, sizeof(NwltEnt))
+        if t.n > 0 { memcpy(ne, t.ents, t.n * sizeof(NwltEnt)) }
+        if t.ents != 0 { free(t.ents) }
+        t.ents = ne
+        t.cap = nc
+    }
+    let e: NwltEnt = nwlt_ent(t, t.n)
+    t.nextuid = t.nextuid + 1
+    e.uid = t.nextuid  e.proto = proto  e.obj = obj
+    e.title = nwu_strdup(0)  e.app_id = nwu_strdup(0)  e.ident = nwu_strdup(0)
+    e.state = 0  e.done = 0  e.peer = 0
+    t.n = t.n + 1
+}
+
+// the toplevel at index `i` is gone: its strings freed, its partner unpaired, the rest moved down
+fn nwlt_remove(t: NwlTl, i: Int) {
+    let e: NwltEnt = nwlt_ent(t, i)
+    if e.peer != 0 {
+        let pi = nwlt_find_uid(t, e.peer)
+        if pi >= 0 { let pe: NwltEnt = nwlt_ent(t, pi)  pe.peer = 0 }
+    }
+    free(e.title)  free(e.app_id)  free(e.ident)
+    if i + 1 < t.n { memmove(nwlt_ent(t, i), nwlt_ent(t, i + 1), (t.n - i - 1) * sizeof(NwltEnt)) }
+    t.n = t.n - 1
+}
+
+fn nwlt_cstr_same(a: Int, b: Int) -> Int {
+    let la = strlen(a)
+    if la != strlen(b) { return 0 }
+    if la == 0 { return 1 }
+    if memcmp(a, b, la) == 0 { return 1 }
+    return 0
+}
+
+// pair the entry at `i` (which has just sent `done`) with the oldest unpaired, done entry of the other
+// protocol that has its app id and title
+fn nwlt_pair(t: NwlTl, i: Int) {
+    let e: NwltEnt = nwlt_ent(t, i)
+    if e.peer != 0 { return }
+    var j = 0
+    while j < t.n {
+        let o: NwltEnt = nwlt_ent(t, j)
+        if o.proto != e.proto && o.peer == 0 && o.done == 1 && nwlt_cstr_same(o.app_id, e.app_id) == 1 && nwlt_cstr_same(o.title, e.title) == 1 {
+            o.peer = e.uid
+            e.peer = o.uid
+            return
+        }
+        j = j + 1
+    }
+}
+
+// a string argument at `a` as a malloc'd C string, replacing `old`
+fn nwlt_take_str(old: Int, a: Int) -> Int {
+    free(old)
+    let len = peek32(a)
+    if len <= 1 { return nwu_strdup(0) }
+    let r = malloc(len)
+    memcpy(r, a + 4, len - 1)
+    poke8(r + len - 1, 0)
+    return r
+}
+
+// the state array of a zwlr handle as bits: 1 maximized, 2 minimized, 4 activated, 8 fullscreen
+fn nwlt_state_bits(a: Int) -> Int {
+    let bytes = peek32(a)
+    var bits = 0
+    var k = 0
+    while k + 4 <= bytes {
+        let v = peek32(a + 4 + k)
+        if v < 16 { bits = bits | (1 << v) }
+        k = k + 4
+    }
+    return bits
+}
+
+fn nwlt_global(t: NwlTl, c: NwlConn, name: Int, sp: Int, ver: Int) {
+    let sl = peek32(sp) - 1
+    let s = sp + 4
+    var id = 0
+    var bver = 1
+    if nwu_mem_eq(s, sl, "wl_seat") == 1 && t.seat == 0 {
+        id = nwl_newid(c, NWK_PASSIVE())                                          // only named in activate()
+        t.seat = id
+    } else if nwu_mem_eq(s, sl, "zwlr_foreign_toplevel_manager_v1") == 1 {
+        id = nwl_newid(c, NWK_TLMGR())
+        bver = ver
+        if bver > 3 { bver = 3 }
+        t.mgr = id
+    } else if nwu_mem_eq(s, sl, "ext_foreign_toplevel_list_v1") == 1 {
+        id = nwl_newid(c, NWK_EXTLIST())
+        t.extl = id
+    } else if nwu_mem_eq(s, sl, "ext_workspace_manager_v1") == 1 {
+        id = nwl_newid(c, NWK_WSMGR())
+        t.wsmgr = id
+    }
+    if id == 0 { return }
+    nwl_begin(c, t.reg, 0)
+    nwl_u(c, name)
+    nwl_str(c, s, sl)
+    nwl_u(c, bver)
+    nwl_u(c, id)
+    nwl_end(c)
+}
+
+fn nwlt_event(t: NwlTl, c: NwlConn, obj: Int, op: Int, a: Int) {
+    let k = nwl_kind(c, obj)
+    if k == 0 { return }
+    if k == NWK_DISPLAY() {
+        if op == 0 {
+            nwu_stderr("std/window: the Wayland compositor reported a protocol error on the window list: ")
+            let sl = peek32(a + 8)
+            if sl > 1 { write(2, a + 12, sl - 1) }
+            nwu_stderr("\n")
+            c.dead = 1
+        }
+        if op == 1 { nwl_release_id(c, peek32(a)) }
+        return
+    }
+    if k == NWK_REGISTRY() {
+        if op == 0 { nwlt_global(t, c, peek32(a), a + 4, peek32(a + 8 + nwl_padded(a + 4))) }
+        return
+    }
+    if k == NWK_SYNC() {
+        if op == 0 { if obj == t.sync_id { t.sync_done = 1 }  nwl_setkind(c, obj, 0) }
+        return
+    }
+    if k == NWK_TLMGR() {
+        if op == 0 { let nid = peek32(a)  nwl_setkind(c, nid, NWK_TLHANDLE())  nwlt_add(t, NWLT_WLR(), nid) }
+        if op == 1 { nwl_setkind(c, obj, 0)  t.mgr = 0 }                          // finished
+        return
+    }
+    if k == NWK_EXTLIST() {
+        if op == 0 { let xid = peek32(a)  nwl_setkind(c, xid, NWK_EXTHANDLE())  nwlt_add(t, NWLT_EXT(), xid) }
+        if op == 1 { nwl_setkind(c, obj, 0)  t.extl = 0 }                          // finished
+        return
+    }
+    if k == NWK_WSMGR() {
+        if op == 0 { nwl_setkind(c, peek32(a), NWK_WSGROUP()) }                   // workspace_group
+        if op == 1 { let wid = peek32(a)  nwl_setkind(c, wid, NWK_WSHANDLE())  nwlw_add(t, wid)  t.wspend = 1 }
+        if op == 2 {                                                              // done: the batch applies
+            var i = 0
+            while i < t.wsn {
+                let e: NwlWsEnt = nwlw_ent(t, i)
+                if e.gone == 1 { nwlw_remove(t, i) } else { i = i + 1 }
+            }
+            if t.wspend == 1 { t.changed = 1 }
+            t.wspend = 0
+        }
+        if op == 3 { nwl_setkind(c, obj, 0)  t.wsmgr = 0  t.changed = 1 }          // finished
+        return
+    }
+    if k == NWK_WSGROUP() {
+        if op == 5 { nwl_begin(c, obj, 1)  nwl_end(c)  nwl_setkind(c, obj, 0) }  // removed: destroy
+        return
+    }
+    if k == NWK_WSHANDLE() {
+        let wi = nwlw_find_obj(t, obj)
+        if wi < 0 { return }
+        let w: NwlWsEnt = nwlw_ent(t, wi)
+        if op == 0 { w.ident = nwlt_take_str(w.ident, a) }
+        if op == 1 { w.name = nwlt_take_str(w.name, a) }
+        if op == 2 { w.coords = nwlw_coords(w.coords, a) }
+        if op == 3 { w.state = peek32(a) }
+        if op == 4 { w.caps = peek32(a) }
+        if op == 5 {                                                              // removed: destroy, drop at done
+            nwl_begin(c, obj, 0)  nwl_end(c)
+            nwl_setkind(c, obj, 0)
+            w.gone = 1
+            w.obj = 0
+        }
+        t.wspend = 1
+        return
+    }
+    if k == NWK_TLHANDLE() {
+        let i = nwlt_find_obj(t, NWLT_WLR(), obj)
+        if i < 0 { return }
+        let e: NwltEnt = nwlt_ent(t, i)
+        if op == 0 { e.title = nwlt_take_str(e.title, a) }
+        if op == 1 { e.app_id = nwlt_take_str(e.app_id, a) }
+        if op == 4 { e.state = nwlt_state_bits(a) }
+        if op == 5 { e.done = 1  t.changed = 1  nwlt_pair(t, i) }
+        if op == 6 {                                                              // closed: destroy the handle
+            nwl_begin(c, obj, 7)  nwl_end(c)
+            nwl_setkind(c, obj, 0)
+            nwlt_remove(t, i)
+            t.changed = 1
+        }
+        return
+    }
+    if k == NWK_EXTHANDLE() {
+        let xi = nwlt_find_obj(t, NWLT_EXT(), obj)
+        if xi < 0 { return }
+        let x: NwltEnt = nwlt_ent(t, xi)
+        if op == 0 {                                                              // closed
+            nwl_begin(c, obj, 0)  nwl_end(c)
+            nwl_setkind(c, obj, 0)
+            nwlt_remove(t, xi)
+            t.changed = 1
+        }
+        if op == 1 { x.done = 1  t.changed = 1  nwlt_pair(t, xi) }
+        if op == 2 { x.title = nwlt_take_str(x.title, a) }
+        if op == 3 { x.app_id = nwlt_take_str(x.app_id, a) }
+        if op == 4 { x.ident = nwlt_take_str(x.ident, a) }
+        return
+    }
+}
+
+fn nwlt_dispatch_in(t: NwlTl) {
+    let c: NwlConn = t.c
+    var going = 1
+    while going == 1 && c.ilen - c.ihead >= 8 {
+        let p = c.inb + c.ihead
+        let obj = peek32(p)
+        let hw = peek32(p + 4)
+        let size = hw / 65536
+        let op = hw & 65535
+        if size < 8 || size > NWL_BUFCAP() {
+            c.dead = 1
+            going = 0
+        } else {
+            if c.ilen - c.ihead < size { going = 0 } else {
+                c.ihead = c.ihead + size
+                nwlt_event(t, c, obj, op, p + 8)
+            }
+        }
+    }
+}
+
+fn nwlt_roundtrip(t: NwlTl) {
+    let c: NwlConn = t.c
+    let cb = nwl_newid(c, NWK_SYNC())
+    nwl_begin(c, 1, 0)  nwl_u(c, cb)  nwl_end(c)
+    t.sync_id = cb
+    t.sync_done = 0
+    var quiet = 0
+    nwl_flush(c)
+    nwlt_dispatch_in(t)
+    while t.sync_done == 0 && c.dead == 0 && quiet < 50 {
+        if nwl_read(c, 100) > 0 { quiet = 0 } else { quiet = quiet + 1 }
+        nwlt_dispatch_in(t)
+        nwl_flush(c)
+    }
+}
+
+// connect, bind the list protocols the compositor has, and take the toplevels that exist already.
+// 0 when no compositor answers or it offers neither list protocol.
+fn nwlt_open() -> Int {
+    signal(13, 1)
+    let fd = nwl_connect_socket()
+    if fd < 0 { return 0 }
+    let t: NwlTl = calloc(1, sizeof(NwlTl))
+    t.c = nwl_conn_new(fd)
+    let c: NwlConn = t.c
+    t.reg = nwl_newid(c, NWK_REGISTRY())
+    nwl_begin(c, 1, 1)  nwl_u(c, t.reg)  nwl_end(c)
+    nwlt_roundtrip(t)                                                             // the globals bound
+    if c.dead == 1 || (t.mgr == 0 && t.extl == 0 && t.wsmgr == 0) { nwlt_close(t)  return 0 }
+    nwlt_roundtrip(t)                                                             // the toplevels there are, each to its done
+    t.changed = 0                                                                 // the list as it opens is where changes count from
+    return t
+}
+
+// 1 ext list, 2 wlr management (the actions), as bits
+fn nwlt_caps(h: Int) -> Int {
+    let t: NwlTl = h
+    var r = 0
+    if t.extl != 0 { r = r | 1 }
+    if t.mgr != 0 { r = r | 2 }
+    if t.wsmgr != 0 { r = r | 4 }
+    return r
+}
+
+fn nwlt_fd(h: Int) -> Int { let t: NwlTl = h  let c: NwlConn = t.c  if c.dead == 1 { return 0 - 1 }  return c.fd }
+
+// read what has arrived without waiting and decode it: 1 when the list changed since the last call,
+// 0 when it did not, -1 when the compositor is gone
+fn nwlt_dispatch(h: Int) -> Int {
+    let t: NwlTl = h
+    let c: NwlConn = t.c
+    nwl_flush(c)
+    var rounds = 0
+    while rounds < 64 && nwl_read(c, 0) > 0 { rounds = rounds + 1  nwlt_dispatch_in(t) }
+    nwlt_dispatch_in(t)
+    nwl_flush(c)
+    if c.dead == 1 { return 0 - 1 }
+    let ch = t.changed
+    t.changed = 0
+    return ch
+}
+
+// is entry `i` one a caller sees? The wlr entries when the compositor manages toplevels, else the ext
+// ones; and only once it has sent its first done (before that it has no title)
+fn nwlt_visible(t: NwlTl, i: Int) -> Int {
+    let e: NwltEnt = nwlt_ent(t, i)
+    if e.done == 0 { return 0 }
+    if t.mgr != 0 { if e.proto == NWLT_WLR() { return 1 }  return 0 }
+    if e.proto == NWLT_EXT() { return 1 }
+    return 0
+}
+
+// the index of the `k`th visible entry (-1 past the end)
+fn nwlt_nth(t: NwlTl, k: Int) -> Int {
+    var i = 0
+    var seen = 0
+    while i < t.n {
+        if nwlt_visible(t, i) == 1 {
+            if seen == k { return i }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn nwlt_count(h: Int) -> Int {
+    let t: NwlTl = h
+    var i = 0
+    var seen = 0
+    while i < t.n { if nwlt_visible(t, i) == 1 { seen = seen + 1 }  i = i + 1 }
+    return seen
+}
+
+fn nwlt_uid(h: Int, k: Int) -> Int {
+    let t: NwlTl = h
+    let i = nwlt_nth(t, k)
+    if i < 0 { return 0 }
+    let e: NwltEnt = nwlt_ent(t, i)
+    return e.uid
+}
+fn nwlt_state(h: Int, k: Int) -> Int {
+    let t: NwlTl = h
+    let i = nwlt_nth(t, k)
+    if i < 0 { return 0 }
+    let e: NwltEnt = nwlt_ent(t, i)
+    return e.state
+}
+
+// a malloc'd copy of the `k`th toplevel's title (which 0), app id (1) or identifier (2: its own, or its
+// ext partner's)
+fn nwlt_str(h: Int, k: Int, which: Int) -> Int {
+    let t: NwlTl = h
+    let i = nwlt_nth(t, k)
+    if i < 0 { return nwu_strdup(0) }
+    let e: NwltEnt = nwlt_ent(t, i)
+    if which == 0 { return nwu_strdup(e.title) }
+    if which == 1 { return nwu_strdup(e.app_id) }
+    if e.proto == NWLT_EXT() { return nwu_strdup(e.ident) }
+    if e.peer != 0 {
+        let pi = nwlt_find_uid(t, e.peer)
+        if pi >= 0 { let pe: NwltEnt = nwlt_ent(t, pi)  return nwu_strdup(pe.ident) }
+    }
+    return nwu_strdup(0)
+}
+
+// act on the toplevel `uid`: 1 activate, 2 close, 3 minimize, 4 unminimize, 5 maximize, 6 unmaximize.
+// 1 when the request was sent; 0 when the toplevel is gone or the compositor has no management protocol
+// (or no seat, for activate).
+fn nwlt_act(h: Int, uid: Int, act: Int) -> Int {
+    let t: NwlTl = h
+    let c: NwlConn = t.c
+    let i = nwlt_find_uid(t, uid)
+    if i < 0 || c.dead == 1 { return 0 }
+    let e: NwltEnt = nwlt_ent(t, i)
+    if e.proto != NWLT_WLR() { return 0 }
+    if act == 1 {
+        if t.seat == 0 { return 0 }
+        nwl_begin(c, e.obj, 4)  nwl_u(c, t.seat)  nwl_end(c)
+    } else if act == 2 { nwl_begin(c, e.obj, 5)  nwl_end(c) }
+    else if act == 3 { nwl_begin(c, e.obj, 2)  nwl_end(c) }
+    else if act == 4 { nwl_begin(c, e.obj, 3)  nwl_end(c) }
+    else if act == 5 { nwl_begin(c, e.obj, 0)  nwl_end(c) }
+    else if act == 6 { nwl_begin(c, e.obj, 1)  nwl_end(c) }
+    else { return 0 }
+    nwl_flush(c)
+    return 1
+}
+
+// ---- the workspaces ----------------------------------------------------------------------------------
+
+// the `k`th live workspace's index (-1 past the end)
+fn nwlw_nth(t: NwlTl, k: Int) -> Int {
+    var i = 0
+    var seen = 0
+    while i < t.wsn {
+        let e: NwlWsEnt = nwlw_ent(t, i)
+        if e.gone == 0 {
+            if seen == k { return i }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+fn nwlw_count(h: Int) -> Int {
+    let t: NwlTl = h
+    var i = 0
+    var seen = 0
+    while i < t.wsn { let e: NwlWsEnt = nwlw_ent(t, i)  if e.gone == 0 { seen = seen + 1 }  i = i + 1 }
+    return seen
+}
+fn nwlw_uid(h: Int, k: Int) -> Int {
+    let t: NwlTl = h
+    let i = nwlw_nth(t, k)
+    if i < 0 { return 0 }
+    let e: NwlWsEnt = nwlw_ent(t, i)
+    return e.uid
+}
+// the state bits (1 active, 2 urgent, 4 hidden) and, shifted by 8, the capabilities (1 activate,
+// 2 deactivate, 4 remove, 8 assign)
+fn nwlw_state(h: Int, k: Int) -> Int {
+    let t: NwlTl = h
+    let i = nwlw_nth(t, k)
+    if i < 0 { return 0 }
+    let e: NwlWsEnt = nwlw_ent(t, i)
+    return e.state | (e.caps << 8)
+}
+// a malloc'd copy of the `k`th workspace's name (which 0), id (1) or coordinates "x,y" (2)
+fn nwlw_str(h: Int, k: Int, which: Int) -> Int {
+    let t: NwlTl = h
+    let i = nwlw_nth(t, k)
+    if i < 0 { return nwu_strdup(0) }
+    let e: NwlWsEnt = nwlw_ent(t, i)
+    if which == 0 { return nwu_strdup(e.name) }
+    if which == 1 { return nwu_strdup(e.ident) }
+    return nwu_strdup(e.coords)
+}
+// ask for workspace `uid` to be activated (1) or deactivated (2), then commit: 1 when sent
+fn nwlw_act(h: Int, uid: Int, act: Int) -> Int {
+    let t: NwlTl = h
+    let c: NwlConn = t.c
+    if t.wsmgr == 0 || c.dead == 1 { return 0 }
+    let i = nwlw_find_uid(t, uid)
+    if i < 0 { return 0 }
+    let e: NwlWsEnt = nwlw_ent(t, i)
+    if act == 1 { nwl_begin(c, e.obj, 1)  nwl_end(c) }
+    else if act == 2 { nwl_begin(c, e.obj, 2)  nwl_end(c) }
+    else { return 0 }
+    nwl_begin(c, t.wsmgr, 0)  nwl_end(c)                                          // commit
+    nwl_flush(c)
+    return 1
+}
+
+fn nwlt_close(h: Int) {
+    let t: NwlTl = h
+    var i = 0
+    while i < t.n { let e: NwltEnt = nwlt_ent(t, i)  free(e.title)  free(e.app_id)  free(e.ident)  i = i + 1 }
+    if t.ents != 0 { free(t.ents) }
+    var wi = 0
+    while wi < t.wsn { let we: NwlWsEnt = nwlw_ent(t, wi)  free(we.name)  free(we.ident)  free(we.coords)  wi = wi + 1 }
+    if t.wss != 0 { free(t.wss) }
+    let c: NwlConn = t.c
+    nwl_conn_free(c)
+    free(t)
+}

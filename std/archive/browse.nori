@@ -1,0 +1,1372 @@
+//! std/archive: browsing an archive without unpacking it, one file at a time.
+//!
+//!   import "std/archive" as ar
+//!   let kind = ar::archive_kind("game.zip")                  // 4 = zip
+//!   let list = ar::archive_list("game.zip")                  // every entry (dirs synthesized)
+//!   let data = ar::archive_read("game.zip", "art/logo.png")  // one file's bytes
+//!   let rc   = ar::archive_extract("game.iso", "assets", "out")  // one entry or subtree
+//!
+//! A file explorer can treat `.zip`, `.tar`, `.tar.gz`, `.tar.zst` and `.iso`
+//! as folders: list them, then drag a single file out without unpacking everything first.
+//! That is the shape of this module. It reuses the module's decoders (`gunzip_checked`,
+//! `zstd_decompress_checked`, `inflate_raw_checked` from the sibling files) but writes
+//! its own parsers from the format specifications (IEEE 1003.1 ustar/pax + the GNU
+//! `L`/`K` long-name records, PKWARE's APPNOTE.TXT for zip, ECMA-119 for ISO 9660, the
+//! Joliet UCS-2 tree, SUSP/Rock-Ridge NM/PX/TF/SL).
+//!
+//! The API:
+//!   Entry { path, size, mtime, mode, kind, link }
+//!     kind: 0 file, 1 directory, 2 symlink, 3 hard link, 4 other/unknown.
+//!     path: `/`-separated, no leading `./` or `/`, no trailing slash on directories
+//!     (a directory entry and a file entry never share a path).
+//!     Directories that exist only implicitly (a tar holding `a/b/c.txt` with no `a/`
+//!     record) are synthesized by archive_list, so a caller can walk the result as a
+//!     tree: it is sorted, and a directory sorts before everything inside it.
+//!   archive_kind(path) -> Int: sniffs by magic bytes, never the extension:
+//!     1 tar   (ustar magic at 257, or a valid old-style header checksum)
+//!     2 gzip  (1f 8b, normally a gzip-wrapped tar)
+//!     3 zstd  (28 b5 2f fd, normally a zstd-wrapped tar)
+//!     4 zip   (PK\3\4, or the empty-archive PK\5\6)
+//!     5 iso9660 (CD001 at sector 16 + 1)
+//!     -1 otherwise.
+//!     A `.tar.gz` file sniffs as gzip: the gzip code means "compressed, wraps a tar",
+//!     and archive_list/archive_read follow it.
+//!   archive_list(path) -> Vec<Entry>: every entry; empty Vec on any error (missing or
+//!     damaged archive, or decompression failure). Listing a zip or an ISO reads only
+//!     the archive's directory records, never the file data.
+//!   archive_read(path, entry) -> Str: exactly that entry's bytes, "" if the archive
+//!     cannot be opened, the entry is missing, or the archive is damaged: the error
+//!     convention the rest of std uses ("" on failure). For zip only the requested
+//!     entry is decoded; no other entry's data is touched. A directory, symlink or
+//!     hard-link entry has no byte content of its own: "" (the target is `link`).
+//!   archive_extract(path, entry, dest) -> Int: materializes one entry into `dest`
+//!     (dest must exist). A file is written to dest; a directory entry recreates the
+//!     whole subtree under dest; a symlink/hard link is recreated when it stays inside
+//!     dest. Returns: 0 ok · 1 refused (path traversal, absolute name, a link target
+//!     escaping dest, or the file is not an archive) · 2 entry not found · 3 fs error.
+//!     A refused path fails the whole call: one bad member, nothing written.
+
+import "std/os" as os
+
+// ---- scalar helpers ---------------------------------------------------------
+fn bx_rd16(s: Str, at: Int) -> Int { return ord(s.at(at)) | (ord(s.at(at + 1)) << 8) }
+fn bx_rd32(s: Str, at: Int) -> Int {
+    return ord(s.at(at)) | (ord(s.at(at + 1)) << 8) | (ord(s.at(at + 2)) << 16) | (ord(s.at(at + 3)) << 24)
+}
+fn bx_rd32be(s: Str, at: Int) -> Int {
+    return (ord(s.at(at)) << 24) | (ord(s.at(at + 1)) << 16) | (ord(s.at(at + 2)) << 8) | ord(s.at(at + 3))
+}
+fn bx_rd64lo(s: Str, at: Int) -> Int {          // a 64-bit LE field treated as a nonneg Int
+    if at + 8 > s.len() { return 0 - 1 }
+    let hi = bx_rd32(s, at + 4)
+    if hi != 0 { return 0 - 1 }
+    return bx_rd32(s, at)
+}
+fn bx_jcp(s: Str, at: Int) -> Int { return (ord(s.at(at)) << 8) | ord(s.at(at + 1)) }  // UCS-2BE char
+
+// days since 1970-01-01 -> then seconds. (Hinnant's civil-from-days inverse.)
+fn bx_days_from_civil(y: Int, m: Int, d: Int) -> Int {
+    let y2 = y - (if m <= 2 { 1 } else { 0 })
+    let era = if y2 >= 0 { y2 / 400 } else { (y2 - 399) / 400 }
+    let yoe = y2 - era * 400
+    let mp = if m > 2 { m - 3 } else { m + 9 }
+    let doy = ((153 * mp) + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return (era * 146097) + doe - 719468
+}
+
+// ---- file access by range ---------------------------------------------------
+fn bx_file_len(path: Str) -> Int { return os::file_size(path) }
+fn bx_read(path: Str, off: Int, n: Int) -> Str { return os::read_file_range(path, off, n) }
+fn bx_tail(path: Str, maxn: Int) -> Str {
+    let len = os::file_size(path)
+    if len <= 0 { return "" }
+    var want = maxn
+    if want > len { want = len }
+    return os::read_file_range(path, len - want, want)
+}
+fn bx_whole(path: Str) -> Str {
+    if !os::is_file(path) { return "" }
+    return read_file(path)
+}
+
+// ---- tar numeric fields -----------------------------------------------------
+fn bx_oct(s: Str, at: Int, n: Int) -> Int {
+    var v = 0
+    var i = 0
+    while i < n && at + i < s.len() {
+        let c = ord(s.at(at + i))
+        if c == 0 || c == 32 { break }
+        if c < 48 || c > 55 { break }
+        v = v * 8 + (c - 48)
+        i = i + 1
+    }
+    return v
+}
+fn bx_num(s: Str, at: Int, n: Int) -> Int {
+    if at >= s.len() { return 0 }
+    if (ord(s.at(at)) & 128) != 0 {                  // GNU base-256
+        var v = ord(s.at(at)) & 127
+        var i = 1
+        while i < n && at + i < s.len() { v = (v << 8) | ord(s.at(at + i))  i = i + 1 }
+        return v
+    }
+    return bx_oct(s, at, n)
+}
+fn bx_cstr(s: Str, at: Int, n: Int) -> Str {
+    var out = ""
+    var i = 0
+    while i < n && at + i < s.len() {
+        let c = ord(s.at(at + i))
+        if c == 0 { return out }
+        out = out + chr(c)
+        i = i + 1
+    }
+    return out
+}
+// a GNU long-name/long-link payload is NUL-padded to a 512 block boundary.
+fn bx_tar_nul(s: Str) -> Str {
+    var i = 0
+    while i < s.len() {
+        if ord(s.at(i)) == 0 { return s.slice(0, i) }
+        i = i + 1
+    }
+    return copy s
+}
+
+// ---- entry construction / path normalization --------------------------------
+/// one archive entry as a Files explorer would show it: `path` is `/`-separated
+/// without a leading `./` or `/`; `kind` is 0 file · 1 directory · 2 symlink ·
+/// 3 hard link · 4 other; `link` is the target for kinds 2/3 ("" otherwise);
+/// `mtime` is unix seconds; `mode` is the format's own mode (tar/zip: permission
+/// bits; ISO: the Rock Ridge st_mode when present, else a default).
+pub struct Entry { path: Str, size: Int, mtime: Int, mode: Int, kind: Int, link: Str }
+
+fn bx_new(path: Str, size: Int, mtime: Int, mode: Int, kind: Int, link: Str) -> Entry {
+    return Entry { path: copy path, size: size, mtime: mtime, mode: mode, kind: kind, link: copy link }
+}
+// listing-side name: drop "./", "/", "//", "/./"; no trailing slash.
+fn bx_norm_path(raw: Str) -> Str {
+    var s = raw
+    while s.len() > 0 && ord(s.at(0)) == 47 { s = s.slice(1, s.len()) }
+    if s.len() >= 2 && ord(s.at(0)) == 46 && ord(s.at(1)) == 47 { s = s.slice(2, s.len()) }
+    var n = s.len()
+    while n > 0 && ord(s.at(n - 1)) == 47 { n = n - 1 }
+    s = s.slice(0, n)
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        let c = ord(s.at(i))
+        if c == 47 {
+            if out.len() == 0 { i = i + 1  continue }
+            if i + 2 < s.len() && ord(s.at(i + 1)) == 46 && ord(s.at(i + 2)) == 47 {
+                i = i + 2
+                continue
+            }
+            var last = ord(out.at(out.len() - 1))
+            if !(last == 47) { out = out + chr(47) }
+        } else { out = out + chr(c) }
+        i = i + 1
+    }
+    n = out.len()
+    while n > 0 && ord(out.at(n - 1)) == 47 { n = n - 1 }
+    out = out.slice(0, n)
+    return out
+}
+fn bx_join(a: Str, b: Str) -> Str { if a.len() == 0 { return copy b }  return a + ("/" + b) }
+
+// =============================================================================
+// archive_kind: by magic bytes
+// =============================================================================
+/// the format of `path`, sniffed from magic bytes (see the module doc for codes).
+pub fn archive_kind(path: Str) -> Int {
+    let head = bx_read(path, 0, 512)
+    if head.len() >= 2 {
+        if ord(head.at(0)) == 31 && ord(head.at(1)) == 139 { return 2 }     // gzip
+    }
+    if head.len() >= 4 {
+        if ord(head.at(0)) == 40 && ord(head.at(1)) == 181 && ord(head.at(2)) == 47 && ord(head.at(3)) == 253 { return 3 }  // zstd
+    }
+    if head.len() >= 4 {
+        if ord(head.at(0)) == 80 && ord(head.at(1)) == 75 {                // 'P''K'
+            let w = bx_rd16(head, 2)
+            if w == 1027 || w == 1541 || w == 2055 { return 4 }            // PK\x03\x04 / \x05\x06 / \x07\x08
+        }
+    }
+    if bx_magic_at(path, 32769, "CD001") || bx_magic_at(path, 1, "CD001") { return 5 }
+    if head.len() < 512 { return 0 - 1 }
+    if head.slice(257, 263) == "ustar" { return 1 }
+    if bx_tar_check_ok(head) { return 1 }
+    return 0 - 1
+}
+fn bx_magic_at(path: Str, at: Int, want: Str) -> Bool {
+    let s = bx_read(path, at, want.len())
+    if s.len() < want.len() { return false }
+    var i = 0
+    while i < want.len() { if s.at(i) != want.at(i) { return false }  i = i + 1 }
+    return true
+}
+// old-style tar header validity: the checksum field (bytes 148-155 written as
+// spaces) sums to the field's octal value.
+fn bx_tar_check_ok(h: Str) -> Bool {
+    if h.len() < 512 { return false }
+    if ord(h.at(0)) == 0 { return false }        // a leading zero block is an empty tar, not a header
+    var sum = 0
+    var i = 0
+    while i < 512 {
+        if i >= 148 && i < 156 { sum = sum + 32 } else { sum = sum + ord(h.at(i)) }
+        i = i + 1
+    }
+    let wrote = bx_oct(h, 148, 8)
+    return wrote == (sum & 255) || wrote == sum
+}
+
+// =============================================================================
+// T A R  (one abstract source: raw string, or file-by-range)
+// =============================================================================
+struct BrTarSrc { d: view Str, path: view Str, mem: Bool }
+
+fn bx_ts_read(t: BrTarSrc, off: Int, n: Int) -> Str {
+    if t.mem {
+        if off >= t.d.len() { return "" }
+        if off + n > t.d.len() { return "" }
+        return t.d.slice(off, off + n)
+    }
+    return bx_read(t.path, off, n)
+}
+fn bx_ts_len(t: BrTarSrc) -> Int {
+    if t.mem { return t.d.len() }
+    return bx_file_len(t.path)
+}
+
+// walk a tar. want == "": collect every entry into `out`. want != "": stop at the
+// first member whose effective path equals it, put that member's data in `got`
+// (a zero-byte file also lands there, so len(got) > 0 = found). Returns false on a
+// damaged/truncated archive.
+fn bx_tar_walk(t: BrTarSrc, want: Str, inout out: Vec<Entry>, inout got: Vec<Str>) -> Bool {
+    let total = bx_ts_len(t)
+    var pos = 0
+    // pending overrides from a preceding pax header
+    var pax_path = ""
+    var pax_link = ""
+    var pax_size = -1
+    var pax_mtime = -1
+    var have_size = false
+    var have_mtime = false
+    var gnu_name = ""
+    var gnu_link = ""
+    while pos + 512 <= total {
+        let h = bx_ts_read(t, pos, 512)
+        if h.len() < 512 { return false }
+        if ord(h.at(0)) == 0 { break }
+        let typ = ord(h.at(156))
+        let size = bx_num(h, 124, 12)
+        if size < 0 || pos + 512 + size > total { return false }
+        let name = bx_cstr(h, 0, 100)
+        let prefix = bx_cstr(h, 345, 155)
+        let linkname = bx_cstr(h, 157, 100)
+        let mode = bx_num(h, 100, 8)
+        let mtime = bx_num(h, 136, 12)
+        if typ == 76 {                                    // 'L' GNU long name
+            gnu_name = bx_tar_nul(bx_ts_read(t, pos + 512, size))
+            pos = pos + 512 + ((size + 511) / 512) * 512
+            continue
+        }
+        if typ == 75 {                                    // 'K' GNU long link name
+            gnu_link = bx_tar_nul(bx_ts_read(t, pos + 512, size))
+            pos = pos + 512 + ((size + 511) / 512) * 512
+            continue
+        }
+        if typ == 120 || typ == 103 {                     // 'x'/'g' pax header
+            let px = bx_pax_apply(bx_ts_read(t, pos + 512, size))
+            pax_path = copy px.path
+            pax_link = copy px.link
+            have_size = px.have_size
+            pax_size = px.size
+            have_mtime = px.have_mtime
+            pax_mtime = px.mtime
+            pos = pos + 512 + ((size + 511) / 512) * 512
+            continue
+        }
+        var p = name
+        if !(prefix == "") { p = prefix + ("/" + name) }
+        if !(gnu_name == "") { p = gnu_name }
+        if !(pax_path == "") { p = pax_path }
+        var lk = linkname
+        if !(gnu_link == "") { lk = gnu_link }
+        if !(pax_link == "") { lk = pax_link }
+        var effsize = size
+        if have_size { effsize = pax_size }
+        var effmt = mtime
+        if have_mtime { effmt = pax_mtime }
+        var kind = 4
+        if typ == 48 || typ == 0 { kind = 0 }
+        else if typ == 53 { kind = 1 }
+        else if typ == 50 { kind = 2 }
+        else if typ == 49 { kind = 3 }
+        let np = bx_norm_path(p)
+        if want == "" {
+            if np.len() > 0 { out.push(bx_new(np, effsize, effmt, mode, kind, lk)) }
+        } else {
+            if np == want {
+                if kind == 0 {
+                    let data = bx_ts_read(t, pos + 512, effsize)
+                    if effsize > 0 && data.len() < effsize { return false }
+                    got.push(data)
+                } else if kind == 3 {
+                    // a hard link's data is the target member's, not present here
+                    got.push("")
+                }
+                return true
+            }
+        }
+        pos = pos + 512 + ((effsize + 511) / 512) * 512
+        gnu_name = ""
+        gnu_link = ""
+        pax_path = ""
+        pax_link = ""
+        have_size = false
+        have_mtime = false
+    }
+    return true
+}
+// pax records: bytes are `N key=value\n` repeated; returns path/linkpath/size/mtime.
+struct BxPax { path: Str, link: Str, size: Int, mtime: Int, have_size: Bool, have_mtime: Bool }
+fn bx_pax_apply(data: Str) -> BxPax {
+    var r = BxPax { path: "", link: "", size: 0 - 1, mtime: 0 - 1, have_size: false, have_mtime: false }
+    var i = 0
+    let n = data.len()
+    while i < n {
+        var j = i
+        while j < n && ord(data.at(j)) >= 48 && ord(data.at(j)) <= 57 { j = j + 1 }
+        if j == i { break }
+        var len = 0
+        var k = i
+        while k < j { len = len * 10 + (ord(data.at(k)) - 48)  k = k + 1 }
+        if len <= 0 || i + len > n { break }
+        let rec = data.slice(i, i + len)
+        var eq = 0 - 1
+        var s0 = j
+        while s0 < rec.len() { if ord(rec.at(s0)) == 61 { eq = s0  s0 = rec.len() } else { s0 = s0 + 1 } }
+        if eq > 0 {
+            let key = rec.slice(j, eq)
+            var val = rec.slice(eq + 1, rec.len())
+            var vn = val.len()
+            while vn > 0 && ord(val.at(vn - 1)) == 10 { vn = vn - 1 }
+            val = val.slice(0, vn)
+            if key == "path" { r.path = copy val }
+            if key == "linkpath" { r.link = copy val }
+            if key == "size" { r.size = parse_int_or(val, 0 - 1)  if r.size >= 0 { r.have_size = true } }
+            if key == "mtime" { r.mtime = bx_pax_time(val)  if r.mtime >= 0 { r.have_mtime = true } }
+        }
+        i = i + len
+    }
+    return r
+}
+fn bx_pax_time(v: Str) -> Int {
+    var i = 0
+    while i < v.len() {
+        let c = ord(v.at(i))
+        if c == 46 { return parse_int_or(v.slice(0, i), 0 - 1) }
+        if c == 32 || c == 9 { break }
+        i = i + 1
+    }
+    return parse_int_or(v, 0 - 1)
+}
+
+// a whole-stream tar view (decompressed gzip/zstd). Non-tar data -> empty (error).
+fn bx_tar_from_str(d: Str, want: Str, inout out: Vec<Entry>, inout got: Vec<Str>) -> Bool {
+    if d.len() == 0 { return false }
+    var first = d
+    if d.len() > 512 { first = d.slice(0, 512) }
+    var liketar = false
+    if ord(first.at(0)) == 0 { liketar = true }
+    else if first.len() >= 263 && first.slice(257, 263) == "ustar" { liketar = true }
+    else if bx_tar_check_ok(first) { liketar = true }
+    if !liketar { return false }
+    var t = BrTarSrc { d: d, path: "", mem: true }
+    return bx_tar_walk(t, want, out, got)
+}
+
+// =============================================================================
+// Z I P
+// =============================================================================
+fn bx_find_behind(data: Str, sig: Int) -> Int {
+    var at = data.len() - 22
+    var floor = 0
+    if data.len() > 65557 { floor = data.len() - 65557 }
+    while at >= floor {
+        if bx_rd32(data, at) == sig { return at }
+        at = at - 1
+    }
+    return 0 - 1
+}
+fn bx_extra_get(extra: Str, id: Int) -> Str {
+    var i = 0
+    let n = extra.len()
+    var out = ""
+    while i + 4 <= n {
+        let hid = bx_rd16(extra, i)
+        let hlen = bx_rd16(extra, i + 2)
+        if i + 4 + hlen > n { return out }
+        if hid == id { return extra.slice(i + 4, i + 4 + hlen) }
+        i = i + 4 + hlen
+    }
+    return out
+}
+
+struct BrZipCd { ok: Bool, count: Int, cdoff: Int, cdsize: Int }
+
+// the central directory location, from the end-of-central-directory (scanning back
+// past the record's own comment) with zip64 fallback. listing/offsets only.
+fn bx_zip_cd(path: Str) -> BrZipCd {
+    var r = BrZipCd { ok: false, count: 0, cdoff: 0, cdsize: 0 }
+    let tail = bx_tail(path, 65557)
+    if tail.len() < 22 { return r }
+    let eocd = bx_find_behind(tail, 101010256)          // 0x06054b50
+    if eocd < 0 { return r }
+    var count = bx_rd16(tail, eocd + 10)
+    var cdsize = bx_rd32(tail, eocd + 12)
+    var cdoff = bx_rd32(tail, eocd + 16)
+    // sentinel values -> a zip64 EOCD record precedes the ordinary one
+    if count == 65535 || cdsize == 4294967295 || cdoff == 4294967295 {
+        if eocd >= 20 && bx_rd32(tail, eocd - 20) == 117853008 {     // 0x07064b50 locator
+            let z = bx_rd64lo(tail, eocd - 12)
+            if z >= 0 && z + 56 <= tail.len() && bx_rd32(tail, z) == 101075792 {
+                if count == 65535 { count = bx_rd32(tail, z + 32) }
+                cdsize = bx_rd32(tail, z + 40)
+                cdoff = bx_rd32(tail, z + 48)
+            }
+        }
+    }
+    if cdsize < 0 || cdoff < 0 { return r }
+    r.count = count
+    r.cdsize = cdsize
+    r.cdoff = cdoff
+    r.ok = true
+    return r
+}
+
+// a zip entry name, normalized to '/' (not decoded; raw bytes either way)
+fn bx_zip_name(raw: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        let c = ord(raw.at(i))
+        if c == 92 { out = out + chr(47) } else { out = out + chr(c) }
+        i = i + 1
+    }
+    return bx_norm_path(out)
+}
+fn bx_dos_to_unix(t: Int, d: Int) -> Int {
+    let yr = ((d >> 9) & 127) + 1980
+    let mo = (d >> 5) & 15
+    let da = d & 31
+    let h = (t >> 11) & 31
+    let mi = (t >> 5) & 63
+    let se = (t & 31) * 2
+    if yr < 1900 || mo < 1 || mo > 12 || da < 1 || da > 31 { return 0 }
+    return bx_days_from_civil(yr, mo, da) * 86400 + h * 3600 + mi * 60 + se
+}
+
+// ---- listing: the central directory only, never the data --------------------
+fn bx_zip_list(path: Str) -> Vec<Entry> {
+    var out: Vec<Entry> = vec()
+    let cd = bx_zip_cd(path)
+    if !cd.ok { return out }
+    if cd.count <= 0 { return out }
+    let buf = bx_read(path, cd.cdoff, cd.cdsize + 46)
+    var p = 0
+    var i = 0
+    while i < cd.count {
+        if p + 46 > buf.len() { return out }
+        if bx_rd32(buf, p) != 33639248 { return out }        // 0x02014b50
+        let nlen = bx_rd16(buf, p + 28)
+        let elen = bx_rd16(buf, p + 30)
+        let clen = bx_rd16(buf, p + 32)
+        if p + 46 + nlen + elen + clen > buf.len() { return out }
+        let tm = bx_rd16(buf, p + 12)
+        let dt = bx_rd16(buf, p + 14)
+        let usize = bx_rd32(buf, p + 24)
+        let extattr = bx_rd32(buf, p + 38)
+        var loff = bx_rd32(buf, p + 42)
+        let raw = buf.slice(p + 46, p + 46 + nlen)
+        var us2 = usize
+        var loft = loff
+        if us2 == 4294967295 || loft == 4294967295 {
+            let zf = bx_extra_get(buf.slice(p + 46 + nlen, p + 46 + nlen + elen), 1)
+            if us2 == 4294967295 { if zf.len() >= 8 { us2 = bx_rd32(zf, 0) } }
+            if loft == 4294967295 { if zf.len() >= 24 { loft = bx_rd32(zf, 16) } }
+        }
+        // a trailing '/' on the raw name marks a directory (the normalized path
+        // drops it), so test the raw bytes first.
+        var isdir = raw.len() > 0 && ord(raw.at(raw.len() - 1)) == 47
+        let name = bx_zip_name(raw)
+        var mode = (extattr >> 16) & 65535
+        if mode == 0 {
+            if isdir { mode = 16877 } else { mode = 33188 }        // 0o040755 / 0o100644
+        }
+        var kind = 0
+        if isdir { kind = 1 }
+        else if (mode & 61440) == 40960 { kind = 2 }               // S_IFLNK out of the unix mode
+        let mt = bx_dos_to_unix(tm, dt)
+        if kind == 1 { out.push(bx_new(name, 0, mt, mode, 1, "")) }
+        else { out.push(bx_new(name, us2, mt, mode, kind, "")) }
+        p = p + 46 + nlen + elen + clen
+        i = i + 1
+    }
+    return out
+}
+
+// ---- one entry: read that local header + data only --------------------------
+struct BrZipLocal { ok: Bool, method: Int, csize: Int, usize: Int, nlen: Int, elen: Int }
+
+fn bx_zip_local(path: Str, loff: Int) -> BrZipLocal {
+    var r = BrZipLocal { ok: false, method: 0, csize: 0, usize: 0, nlen: 0, elen: 0 }
+    let lh = bx_read(path, loff, 64)
+    if lh.len() < 30 { return r }
+    if bx_rd32(lh, 0) != 67324752 { return r }                    // 0x04034b50
+    r.method = bx_rd16(lh, 8)
+    var csize = bx_rd32(lh, 18)
+    var usize = bx_rd32(lh, 22)
+    r.nlen = bx_rd16(lh, 26)
+    r.elen = bx_rd16(lh, 28)
+    if csize == 4294967295 || usize == 4294967295 {
+        let ex = bx_read(path, loff + 30 + r.nlen, 512)
+        let zf = bx_extra_get(ex, 1)
+        if zf.len() >= 16 {
+            if usize == 4294967295 { usize = bx_rd32(zf, 0) }
+            if csize == 4294967295 { csize = bx_rd32(zf, 8) }
+        }
+    }
+    r.csize = csize
+    r.usize = usize
+    r.ok = true
+    return r
+}
+
+fn bx_zip_read(path: Str, entry: Str) -> Str {
+    let cd = bx_zip_cd(path)
+    if !cd.ok { return "" }
+    if cd.count <= 0 { return "" }
+    let buf = bx_read(path, cd.cdoff, cd.cdsize + 46)
+    var p = 0
+    var i = 0
+    while i < cd.count {
+        if p + 46 > buf.len() { return "" }
+        if bx_rd32(buf, p) != 33639248 { return "" }
+        let nlen = bx_rd16(buf, p + 28)
+        let elen = bx_rd16(buf, p + 30)
+        let clen = bx_rd16(buf, p + 32)
+        if p + 46 + nlen + elen + clen > buf.len() { return "" }
+        var loff = bx_rd32(buf, p + 42)
+        if loff == 4294967295 {
+            let zf = bx_extra_get(buf.slice(p + 46 + nlen, p + 46 + nlen + elen), 1)
+            if zf.len() >= 24 { loff = bx_rd32(zf, 16) }
+        }
+        let name = bx_zip_name(buf.slice(p + 46, p + 46 + nlen))
+        if name == entry {
+            let lh = bx_zip_local(path, loff)
+            if !lh.ok { return "" }
+            let data = bx_read(path, loff + 30 + lh.nlen + lh.elen, lh.csize)
+            if data.len() < lh.csize { return "" }
+            if lh.method == 0 { return data }
+            if lh.method == 8 {
+                var r = inflate_raw_checked(data, lh.usize)
+                if r.ok {
+                    var res = ""
+                    unsafe { res = str_from_buf(inflated_ptr(r.data), inflated_len(r.data)) }
+                    inflated_free(r.data)
+                    return res
+                }
+                inflated_free(r.data)
+                return ""
+            }
+            return ""
+        }
+        p = p + 46 + nlen + elen + clen
+        i = i + 1
+    }
+    return ""
+}
+
+// =============================================================================
+// I S O  9 6 6 0  (ECMA-119 + Joliet UCS-2 + SUSP/Rock Ridge)
+// =============================================================================
+fn ISODIR() -> Int { return 2 }
+fn ISOMULTI() -> Int { return 128 }
+
+struct BrIso {
+    ok: Bool,
+    base: Int,
+    pvdroot: Int,
+    pvdrootlen: Int,
+    jolroot: Int,
+    jolrootlen: Int,
+    hasjol: Bool
+}
+
+fn bx_iso_open(path: Str) -> BrIso {
+    var c = BrIso { ok: false, base: 0, pvdroot: 0, pvdrootlen: 0, jolroot: 0, jolrootlen: 0, hasjol: false }
+    var base = -1
+    if bx_magic_at(path, 32769, "CD001") { base = 32768 }
+    else if bx_magic_at(path, 1, "CD001") { base = 0 }
+    if base < 0 { return c }
+    c.base = base
+    let d = bx_read(path, base, 8192)
+    if d.len() < 2048 { return c }
+    if ord(d.at(0)) != 1 { return c }                        // PVD = descriptor 1
+    c.pvdroot = bx_rd32(d, 158)
+    c.pvdrootlen = bx_rd32(d, 166)
+    if d.len() >= 4096 {
+        let s2 = d.slice(2048, 4096)
+        if ord(s2.at(0)) == 2 {                              // supplementary / Joliet
+            let esc = s2.slice(88, 91)
+            if bx_is_joliet(esc) {
+                c.jolroot = bx_rd32(s2, 158)
+                c.jolrootlen = bx_rd32(s2, 166)
+                c.hasjol = true
+            }
+        }
+    }
+    c.ok = true
+    return c
+}
+fn bx_is_joliet(e: Str) -> Bool {
+    if e.len() < 3 { return false }
+    if ord(e.at(0)) != 37 || ord(e.at(1)) != 47 { return false }   // '%' '/'
+    let c = ord(e.at(2))
+    return c == 64 || c == 67 || c == 68 || c == 69
+}
+
+// a raw directory record at `pos` inside `sec`.
+struct BrRec { l: Int, flags: Int, namelen: Int, name: Str, ext: Int, dlen: Int, date: Int, su: Str }
+
+fn bx_rec(path: Str, sec: Str, pos: Int) -> BrRec {
+    var r = BrRec { l: 0, flags: 0, namelen: 0, name: "", ext: 0, dlen: 0, date: 0, su: "" }
+    if pos + 34 > sec.len() { return r }
+    let l = ord(sec.at(pos))
+    if l == 0 { return r }
+    r.l = l
+    r.flags = ord(sec.at(pos + 25))
+    r.namelen = ord(sec.at(pos + 32))
+    r.ext = bx_rd32(sec, pos + 2)
+    r.dlen = bx_rd32(sec, pos + 10)
+    r.date = bx_iso_time(sec, pos + 18)
+    if pos + 33 + r.namelen > sec.len() { r.namelen = sec.len() - (pos + 33) }
+    if r.namelen < 0 { r.namelen = 0 }
+    if r.namelen > 0 { r.name = copy sec.slice(pos + 33, pos + 33 + r.namelen) }
+    // system-use area: after the identifier + its odd/even padding, but some
+    // writers (libarchive) skip the pad byte, so bx_rr_of re-aligns on demand.
+    var su_off = 33 + r.namelen
+    if su_off & 1 != 0 { su_off = su_off + 1 }
+    if pos + su_off < pos + l && pos + l <= sec.len() { r.su = copy sec.slice(pos + su_off, pos + l) }
+    return r
+}
+
+// ---- Rock Ridge / SUSP ------------------------------------------------------
+struct BrRR {
+    nm: Str,
+    has_nm: Bool,
+    mode: Int,
+    has_mode: Bool,
+    mtime: Int,
+    has_mtime: Bool,
+    link: Str,
+    has_link: Bool
+}
+fn bx_rr_new() -> BrRR {
+    return BrRR { nm: "", has_nm: false, mode: 0, has_mode: false, mtime: 0, has_mtime: false, link: "", has_link: false }
+}
+// assemble the whole SUSP area (following CE continuations in `path`) and parse it.
+fn bx_rr_of(path: Str, su: Str) -> BrRR {
+    var rr = bx_rr_new()
+    // must start at a real SUSP entry; if the writer skipped the pad byte, re-align.
+    if !bx_susp_ok(su) {
+        if su.len() >= 1 {
+            let alt = su.slice(1, su.len())
+            if bx_susp_ok(alt) { bx_susp_walk(path, alt, rr) }
+        }
+        return rr
+    }
+    bx_susp_walk(path, su, rr)
+    return rr
+}
+fn bx_susp_ok(a: Str) -> Bool {
+    if a.len() < 4 { return false }
+    let len = ord(a.at(2))
+    if len < 4 || len > a.len() { return false }
+    let sig0 = ord(a.at(0))
+    let sig1 = ord(a.at(1))
+    return sig0 >= 65 && sig0 <= 90 && sig1 >= 65 && sig1 <= 90   // uppercase pairs
+}
+// walk one SUSP area (or one CE continuation), appending to `rr`. Returns false
+// when a CE was followed (caller refetches) or the area is exhausted/damaged.
+fn bx_susp_walk(path: Str, a: Str, inout rr: BrRR) -> Bool {
+    var i = 0
+    let n = a.len()
+    while i + 4 <= n {
+        let len = ord(a.at(i + 2))
+        if len < 4 || i + len > n { return false }
+        let s2 = a.slice(i, i + 2)
+        let payload = a.slice(i + 4, i + len)
+        if s2 == "NM" {
+            if payload.len() >= 1 {
+                rr.nm = rr.nm + payload.slice(1, payload.len())
+                rr.has_nm = true
+            }
+        } else if s2 == "PX" {
+            if payload.len() >= 8 {
+                rr.mode = bx_rd32(payload, 0)
+                rr.has_mode = true
+            }
+        } else if s2 == "TF" {
+            if payload.len() >= 1 {
+                let f = ord(payload.at(0))
+                var q = 1
+                var gotm = false
+                if (f & 1) != 0 { if q + 7 <= payload.len() { rr.mtime = bx_iso_time(payload, q)  gotm = true }  q = q + 7 }
+                if (f & 2) != 0 { if q + 7 <= payload.len() { rr.mtime = bx_iso_time(payload, q)  gotm = true }  q = q + 7 }
+                if !gotm { rr.mtime = 0 }
+                rr.has_mtime = gotm
+            }
+        } else if s2 == "SL" {
+            rr.link = bx_sl_target(payload)
+            rr.has_link = true
+        } else if s2 == "CE" {
+            // continuation: fetch its bytes and parse them as more SUSP entries.
+            // CE payload: extent (both-byte 8), offset (both-byte 8), length 8.
+            if payload.len() >= 28 {
+                let ext = bx_rd32(payload, 0)
+                let off = bx_rd32(payload, 8)
+                let sl = bx_rd32(payload, 16)
+                let cont = bx_read(path, ext * 2048 + off, sl)
+                if cont.len() > 0 { bx_susp_walk(path, cont, rr) }
+            }
+            return false
+        }
+        i = i + len
+    }
+    return false
+}
+// SL payload (RRIP 4.1.3.1): one flags byte for the whole entry (bit 0: the link continues in the next SL),
+// then component records: flags, length, content. A component's flags: bit 0 it continues in the next
+// record (no "/" between), bit 1 the current directory ".", bit 2 the parent "..", bit 3 the root "/".
+fn bx_min(a: Int, b: Int) -> Int { if a < b { return a }  return b }
+fn bx_sl_target(payload: Str) -> Str {
+    var out = ""
+    var i = 1                                   // past the entry's own flags byte
+    let n = payload.len()
+    var joined = true                           // the next component follows a "/" already, or starts the target
+    while i + 2 <= n {
+        let f = ord(payload.at(i))
+        let cl = ord(payload.at(i + 1))
+        var comp = ""
+        if (f & 2) != 0 { comp = "." }
+        else if (f & 4) != 0 { comp = ".." }
+        else if (f & 8) != 0 { comp = "/" }
+        else { comp = payload.slice(i + 2, bx_min(i + 2 + cl, n)) }
+        if comp == "/" { out = "/"  joined = true }
+        else {
+            if !joined { out = out + "/" }
+            out = out + comp
+            joined = (f & 1) != 0               // a continued component goes on without a separator
+        }
+        i = i + 2 + cl
+    }
+    return out
+}
+fn bx_iso_time(s: Str, at: Int) -> Int {
+    if at + 7 > s.len() { return 0 }
+    let y = 1900 + ord(s.at(at))
+    let mo = ord(s.at(at + 1))
+    let da = ord(s.at(at + 2))
+    let h = ord(s.at(at + 3))
+    let mi = ord(s.at(at + 4))
+    let se = ord(s.at(at + 5))
+    var off = ord(s.at(at + 6))
+    if off >= 128 { off = off - 256 }
+    if y < 1970 || mo < 1 || mo > 12 || da < 1 || da > 31 { return 0 }
+    return bx_days_from_civil(y, mo, da) * 86400 + h * 3600 + mi * 60 + se - off * 900
+}
+
+// ---- names ----------------------------------------------------------------
+fn bx_iso_name(raw: Str) -> Str {
+    var n = raw.len()
+    var i = 0
+    while i < n {
+        let c = ord(raw.at(i))
+        if c == 59 && i + 1 < n { n = i  break }
+        i = i + 1
+    }
+    return raw.slice(0, n)
+}
+fn bx_joliet_name(raw: Str) -> Str {
+    var full = raw
+    var n = full.len()
+    while n >= 2 && bx_jcp(full, n - 2) == 32 { n = n - 2 }    // trim trailing UCS-2 spaces
+    var i = 0
+    var cut = n
+    while i + 2 <= n {
+        if bx_jcp(full, i) == 59 { cut = i  break }            // ';' version sep
+        i = i + 2
+    }
+    var out = ""
+    i = 0
+    while i + 2 <= cut {
+        out = out + chr(bx_jcp(full, i))
+        i = i + 2
+    }
+    return out
+}
+
+// ---- which tree to present ------------------------------------------------
+// Rock Ridge wins: if the PVD tree carries RRIP (NM/PX/TF/SL), walk the PVD tree:
+// real names, modes, times, links. Otherwise prefer Joliet names (UCS-2). Otherwise
+// plain ISO identifiers. `rr` is parsed from each record's own system-use area, so
+// records sharing an extent (hard links) can never steal each other's names.
+fn bx_iso_has_rr(path: Str, sec: Str) -> Bool {
+    var pos = 0
+    var secn = 0
+    let n = sec.len()
+    while pos + 34 <= n {
+        let l = ord(sec.at(pos))
+        if l == 0 {
+            secn = secn + 1
+            pos = secn * 2048
+            continue
+        }
+        if pos + l > n { break }
+        var rec = bx_rec(path, sec, pos)
+        if rec.l == 0 { break }
+        if rec.namelen == 1 && (rec.name.len() >= 1 && (ord(rec.name.at(0)) == 0 || ord(rec.name.at(0)) == 1)) {
+            pos = pos + l
+            continue
+        }
+        let rr = bx_rr_of(path, rec.su)
+        if rr.has_nm || rr.has_mode || rr.has_mtime || rr.has_link { return true }
+        pos = pos + l
+    }
+    return false
+}
+
+// ---- one full directory-tree walk ------------------------------------------
+// `see` tracks extents already shown so a later record sharing an extent (a
+// hard link) is reported as one, like bsdtar: kind 3, size 0, link to the
+// first path that presented the extent. Symlinks (SL) keep their own record.
+fn bx_iso_walk(path: Str, sec: Str, pfx: Str, jol: Bool, inout out: Vec<Entry>, inout see: Vec<Int>, inout seepth: Vec<Str>) {
+    var pos = 0
+    var secn = 0
+    var pending = 0                        // accumulated multi-extent size
+    var pendext = 0                        // first extent of a multi-extent file
+    let n = sec.len()
+    while pos + 34 <= n {
+        let l = ord(sec.at(pos))
+        if l == 0 {
+            secn = secn + 1
+            pos = secn * 2048
+            continue
+        }
+        if pos + l > n { break }
+        var rec = bx_rec(path, sec, pos)
+        if rec.l == 0 { break }
+        let isdir = (rec.flags & ISODIR()) != 0
+        let multi = (rec.flags & ISOMULTI()) != 0
+        let nmraw = rec.name
+        if rec.namelen == 1 && (nmraw.len() >= 1 && (ord(nmraw.at(0)) == 0 || ord(nmraw.at(0)) == 1)) {
+            pos = pos + l
+            continue
+        }
+        var rr = bx_rr_of(path, rec.su)
+        var nm = ""
+        if rr.has_nm && !(rr.nm == "") { nm = rr.nm }               // RRIP name wins
+        else if jol { nm = bx_joliet_name(nmraw) }
+        else { nm = bx_iso_name(nmraw) }
+        if nm.len() == 0 { pos = pos + l  continue }
+        let p = bx_join(pfx, bx_norm_path(nm))
+        var kind = 0
+        if isdir { kind = 1 }
+        else if rr.has_link { kind = 2 }
+        if multi {
+            if pending == 0 { pendext = rec.ext }
+            pending = pending + rec.dlen
+            pos = pos + l
+            continue
+        }
+        if pending != 0 {
+            // the final extent of a multi-extent file
+            let total = pending + rec.dlen
+            if !isdir && bx_see_take(see, seepth, pendext, total, p, bx_rec_time(rec, rr), bx_mode(rr, false), out) {
+                pos = pos + l
+                continue
+            }
+            out.push(bx_new(p, total, bx_rec_time(rec, rr), bx_mode(rr, isdir), kind, rr.link))
+            if isdir { let cd = bx_read(path, pendext * 2048, total)  if cd.len() > 0 { bx_iso_walk(path, cd, p, jol, out, see, seepth) } }
+            pending = 0
+            pos = pos + l
+            continue
+        }
+        if !isdir {
+            if bx_see_take(see, seepth, rec.ext, rec.dlen, p, bx_rec_time(rec, rr), bx_mode(rr, false), out) {
+                pos = pos + l
+                continue
+            }
+        }
+        var sz = rec.dlen
+        if kind == 2 { sz = 0 }
+        out.push(bx_new(p, sz, bx_rec_time(rec, rr), bx_mode(rr, isdir), kind, rr.link))
+        if isdir {
+            let cd = bx_read(path, rec.ext * 2048, rec.dlen)
+            if cd.len() > 0 { bx_iso_walk(path, cd, p, jol, out, see, seepth) }
+        }
+        pos = pos + l
+    }
+}
+// true when `ext` was already shown; on a repeat, push the hard-link entry there.
+fn bx_see_take(inout see: Vec<Int>, inout seepth: Vec<Str>, ext: Int, size: Int, p: Str, mt: Int, mode: Int, inout out: Vec<Entry>) -> Bool {
+    var i = 0
+    while i < see.len() {
+        if see[i] == ext {
+            out.push(bx_new(p, 0, mt, mode, 3, copy seepth[i]))
+            return true
+        }
+        i = i + 1
+    }
+    see.push(ext)
+    seepth.push(copy p)
+    return false
+}
+fn bx_rec_time(rec: BrRec, rr: BrRR) -> Int {
+    if rr.has_mtime { return rr.mtime }
+    return rec.date
+}
+fn bx_mode(rr: BrRR, isdir: Bool) -> Int {
+    if rr.has_mode { return rr.mode }
+    if isdir { return 16877 }
+    return 33188
+}
+
+// ---- find one entry and return its bytes ------------------------------------
+// `found` grows by one item when the entry is found (its bytes, possibly "" for an
+// empty file); returns the first found value. This is how a 0-byte file is told
+// apart from "not found": both come back as "", but one sets the found flag.
+fn bx_iso_find(path: Str, sec: Str, pfx: Str, jol: Bool, entry: Str, inout found: Vec<Str>) {
+    var pos = 0
+    var secn = 0
+    var pending = 0
+    var pendext = 0
+    let n = sec.len()
+    while pos + 34 <= n {
+        let l = ord(sec.at(pos))
+        if l == 0 {
+            secn = secn + 1
+            pos = secn * 2048
+            continue
+        }
+        if pos + l > n { break }
+        var rec = bx_rec(path, sec, pos)
+        if rec.l == 0 { break }
+        let isdir = (rec.flags & ISODIR()) != 0
+        let multi = (rec.flags & ISOMULTI()) != 0
+        let nmraw = rec.name
+        if rec.namelen == 1 && (nmraw.len() >= 1 && (ord(nmraw.at(0)) == 0 || ord(nmraw.at(0)) == 1)) { pos = pos + l  continue }
+        var rr = bx_rr_of(path, rec.su)
+        var nm = ""
+        if rr.has_nm && !(rr.nm == "") { nm = rr.nm }
+        else if jol { nm = bx_joliet_name(nmraw) }
+        else { nm = bx_iso_name(nmraw) }
+        let p = bx_join(pfx, bx_norm_path(nm))
+        if isdir {
+            let sub = bx_read(path, rec.ext * 2048, rec.dlen)
+            if sub.len() > 0 {
+                bx_iso_find(path, sub, p, jol, entry, found)
+                if found.len() > 0 { return }
+            }
+            pos = pos + l
+            continue
+        }
+        if p == entry {
+            if multi {
+                if pending == 0 { pendext = rec.ext }
+                pending = pending + rec.dlen
+                pos = pos + l
+                continue
+            }
+            if pending != 0 {
+                let total = pending + rec.dlen
+                let data = bx_read(path, pendext * 2048, total)
+                found.push(data)
+                return
+            }
+            let data = bx_read(path, rec.ext * 2048, rec.dlen)
+            found.push(data)
+            return
+        }
+        if pending != 0 { pending = 0 }
+        pos = pos + l
+    }
+}
+
+fn bx_iso_read(path: Str, entry: Str) -> Str {
+    let c = bx_iso_open(path)
+    if !c.ok { return "" }
+    let rd = bx_read(path, c.pvdroot * 2048, c.pvdrootlen)
+    if rd.len() < 2048 { return "" }
+    var found: Vec<Str> = vec()
+    if bx_iso_has_rr(path, rd) {
+        bx_iso_find(path, rd, "", false, entry, found)
+    } else if c.hasjol {
+        let jd = bx_read(path, c.jolroot * 2048, c.jolrootlen)
+        if jd.len() > 0 { bx_iso_find(path, jd, "", true, entry, found) }
+    } else {
+        bx_iso_find(path, rd, "", false, entry, found)
+    }
+    if found.len() > 0 { return copy found[0] }
+    return ""
+}
+fn bx_iso_list(path: Str) -> Vec<Entry> {
+    var out: Vec<Entry> = vec()
+    let c = bx_iso_open(path)
+    if !c.ok { return out }
+    let rd = bx_read(path, c.pvdroot * 2048, c.pvdrootlen)
+    if rd.len() < 2048 { return out }
+    if bx_iso_has_rr(path, rd) {
+        var se: Vec<Int> = vec()
+        var sp: Vec<Str> = vec()
+        bx_iso_walk(path, rd, "", false, out, se, sp)
+    } else if c.hasjol {
+        let jd = bx_read(path, c.jolroot * 2048, c.jolrootlen)
+        if jd.len() > 0 {
+            var se: Vec<Int> = vec()
+            var sp: Vec<Str> = vec()
+            bx_iso_walk(path, jd, "", true, out, se, sp)
+        }
+    } else {
+        var se: Vec<Int> = vec()
+        var sp: Vec<Str> = vec()
+        bx_iso_walk(path, rd, "", false, out, se, sp)
+    }
+    return out
+}
+
+// =============================================================================
+// the public entry points
+// =============================================================================
+fn bx_add_implicit(inout v: Vec<Entry>) {
+    var i = 0
+    while i < v.len() {
+        let p = v[i].path
+        var parent = bx_parent(p)
+        while parent.len() > 0 {
+            if !bx_has_path(v, parent) {
+                v.push(bx_new(parent, 0, 0, 16877, 1, ""))
+            }
+            parent = bx_parent(parent)
+        }
+        i = i + 1
+    }
+}
+fn bx_parent(p: Str) -> Str {
+    var cut = 0 - 1
+    var i = 0
+    while i < p.len() { if ord(p.at(i)) == 47 { cut = i }  i = i + 1 }
+    if cut <= 0 { return "" }
+    return p.slice(0, cut)
+}
+fn bx_has_path(v: Vec<Entry>, p: Str) -> Bool {
+    var i = 0
+    while i < v.len() { if v[i].path == p { return true }  i = i + 1 }
+    return false
+}
+fn bx_sort(inout v: Vec<Entry>) {
+    // insertion sort; ordering = byte order of path, which puts a directory (`a`)
+    // before everything inside it (`a/...`).
+    var i = 1
+    while i < v.len() {
+        var j = i
+        while j > 0 {
+            if bx_lt(v[j], v[j - 1]) {
+                let t = copy v[j]
+                v[j] = copy v[j - 1]
+                v[j - 1] = copy t
+                j = j - 1
+            } else { break }
+        }
+        i = i + 1
+    }
+}
+fn bx_lt(a: Entry, b: Entry) -> Bool {
+    var i = 0
+    let na = a.path.len()
+    let nb = b.path.len()
+    while i < na && i < nb {
+        let ca = ord(a.path.at(i))
+        let cb = ord(b.path.at(i))
+        if ca < cb { return true }
+        if ca > cb { return false }
+        i = i + 1
+    }
+    return na < nb
+}
+
+/// all entries of `path` (implicit directories synthesized, sorted). Empty on error.
+pub fn archive_list(path: Str) -> Vec<Entry> {
+    var out: Vec<Entry> = vec()
+    var g: Vec<Str> = vec()
+    let k = archive_kind(path)
+    if k == 1 {
+        let pc = copy path
+        var t = BrTarSrc { d: "", path: pc, mem: false }
+        let _w = bx_tar_walk(t, "", out, g)
+    } else if k == 2 {
+        if os::is_file(path) {
+            let r = gunzip_checked(read_file(path), 0)
+            if r.ok {
+                let n = inflated_len(r.data)
+                var s = ""
+                unsafe { s = str_from_buf(inflated_ptr(r.data), n) }
+                inflated_free(r.data)
+                let _w = bx_tar_from_str(s, "", out, g)
+            } else { inflated_free(r.data) }
+        }
+    } else if k == 3 {
+        if os::is_file(path) {
+            let r = zstd_decompress_checked(read_file(path))
+            if zstd_result_ok(r) {
+                let s = copy zstd_result_data(r)
+                zstd_result_data_free()
+                let _w = bx_tar_from_str(s, "", out, g)
+            }
+        }
+    } else if k == 4 {
+        out = copy bx_zip_list(path)
+    } else if k == 5 {
+        out = copy bx_iso_list(path)
+    } else {
+        return out
+    }
+    bx_sort(out)
+    bx_add_implicit(out)
+    bx_sort(out)
+    return out
+}
+fn zstd_result_data_free() { }
+
+/// one entry's bytes ("" = missing / damaged / not a file). See the module doc.
+pub fn archive_read(path: Str, entry: Str) -> Str {
+    let k = archive_kind(path)
+    if k == 1 {
+        var o: Vec<Entry> = vec()
+        var g: Vec<Str> = vec()
+        let pc = copy path
+        var t = BrTarSrc { d: "", path: pc, mem: false }
+        if bx_tar_walk(t, entry, o, g) { if g.len() > 0 { return copy g[0] } }
+        return ""
+    }
+    if k == 2 {
+        if os::is_file(path) {
+            let r = gunzip_checked(read_file(path), 0)
+            if r.ok {
+                let n = inflated_len(r.data)
+                var s = ""
+                unsafe { s = str_from_buf(inflated_ptr(r.data), n) }
+                inflated_free(r.data)
+                var o: Vec<Entry> = vec()
+                var g: Vec<Str> = vec()
+                if bx_tar_from_str(s, entry, o, g) { if g.len() > 0 { return copy g[0] } }
+            } else { inflated_free(r.data) }
+        }
+        return ""
+    }
+    if k == 3 {
+        if os::is_file(path) {
+            let r = zstd_decompress_checked(read_file(path))
+            if zstd_result_ok(r) {
+                let s = copy zstd_result_data(r)
+                zstd_result_data_free()
+                var o: Vec<Entry> = vec()
+                var g: Vec<Str> = vec()
+                if bx_tar_from_str(s, entry, o, g) { if g.len() > 0 { return copy g[0] } }
+            }
+        }
+        return ""
+    }
+    if k == 4 { return bx_zip_read(path, entry) }
+    if k == 5 { return bx_iso_read(path, entry) }
+    return ""
+}
+
+// =============================================================================
+// extract
+// =============================================================================
+fn bx_name_ok(p: Str) -> Bool {
+    if p.len() == 0 { return false }
+    if ord(p.at(0)) == 47 { return false }
+    var start = 0
+    var i = 0
+    let n = p.len()
+    while i <= n {
+        if i == n || ord(p.at(i)) == 47 {
+            let seg = p.slice(start, i)
+            if seg == ".." { return false }
+            if seg.len() == 0 { if i < n { return false } }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+// does target `t`, reached from the parent of `rel`, stay inside an extraction root?
+fn bx_link_ok(rel: Str, t: Str) -> Bool {
+    if t.len() == 0 { return false }
+    if ord(t.at(0)) == 47 { return false }
+    var depth = 1
+    var i = 0
+    let n = rel.len()
+    while i < n { if ord(rel.at(i)) == 47 { depth = depth + 1 }  i = i + 1 }
+    // walk the target's segments, starting at depth = how deep the entry is
+    var d = depth
+    var segs: Vec<Str> = vec()
+    var start = 0
+    i = 0
+    let tn = t.len()
+    while i <= tn {
+        if i == tn || ord(t.at(i)) == 47 {
+            if i > start {
+                segs.push(t.slice(start, i))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < segs.len() {
+        let s = segs[i]
+        if s == ".." {
+            d = d - 1
+            if d < 1 { return false }
+        } else if !(s == ".") { d = d + 1 }
+        i = i + 1
+    }
+    return true
+}
+fn bx_link_target(path: Str, e: Entry) -> Str {
+    if !(e.link == "") { return copy e.link }
+    // zip stores a symlink's target as its file data
+    return archive_read(path, e.path)
+}
+fn bx_under(p: Str, d: Str) -> Bool {
+    if d.len() == 0 { return true }
+    if p.len() <= d.len() { return false }
+    if !(p.slice(0, d.len()) == d) { return false }
+    return ord(p.at(d.len())) == 47
+}
+
+/// materialize one entry into `dest`. 0 ok; see the module doc for error codes.
+pub fn archive_extract(path: Str, entry: Str, dest: Str) -> Int {
+    if !bx_name_ok(entry) { return 1 }
+    if !os::is_dir(dest) { return 3 }
+    let k = archive_kind(path)
+    if k == 0 - 1 { return 1 }
+    let list = archive_list(path)
+    if list.len() == 0 { return 2 }
+    // the entries to materialize: the entry itself, plus everything under it if it
+    // is a directory.
+    var todo: Vec<Entry> = vec()
+    var isdir = false
+    var matched = false
+    var i = 0
+    while i < list.len() {                      // the entry first: an archive may list a directory after its contents
+        if list[i].path == entry { matched = true  todo.push(copy list[i])  if list[i].kind == 1 { isdir = true } }
+        i = i + 1
+    }
+    i = 0
+    while isdir && i < list.len() {
+        if !(list[i].path == entry) && bx_under(list[i].path, entry) { todo.push(copy list[i]) }
+        i = i + 1
+    }
+    if !matched { return 2 }
+    // directories first (parents before children), then files
+    var todo2 = bx_dir_first(todo)
+    var rc = 0
+    i = 0
+    while i < todo2.len() && rc == 0 {
+        rc = bx_materialize(path, todo2[i], entry, isdir, dest)
+        i = i + 1
+    }
+    if rc != 0 { return rc }
+    return 0
+}
+fn bx_dir_first(v: Vec<Entry>) -> Vec<Entry> {
+    var out: Vec<Entry> = vec()
+    var files: Vec<Entry> = vec()
+    var i = 0
+    while i < v.len() {
+        if v[i].kind == 1 { out.push(copy v[i]) } else { files.push(copy v[i]) }
+        i = i + 1
+    }
+    i = 0
+    while i < files.len() { out.push(copy files[i])  i = i + 1 }
+    return out
+}
+fn bx_rel(e: Entry, entry: Str, isdir: Bool) -> Str {
+    if !isdir { return copy e.path }
+    // a directory lands as dest/<its name>, and what is under it under that
+    if e.path == entry { return bx_last(e.path) }
+    return bx_last(entry) + "/" + e.path.slice(entry.len() + 1, e.path.len())
+}
+fn bx_last(p: Str) -> Str {
+    var cut = 0 - 1
+    var i = 0
+    while i < p.len() { if ord(p.at(i)) == 47 { cut = i }  i = i + 1 }
+    if cut < 0 { return copy p }
+    return p.slice(cut + 1, p.len())
+}
+fn bx_materialize(path: Str, e: Entry, entry: Str, isdir: Bool, dest: Str) -> Int {
+    let rel = bx_rel(e, entry, isdir)
+    if !bx_name_ok(rel) { return 1 }
+    let full = dest + ("/" + rel)
+    if e.kind == 1 {
+        let _ = os::make_dir_p(full)
+        return 0
+    }
+    if e.kind == 2 {
+        let t = bx_link_target(path, e)
+        if !bx_link_ok(rel, t) { return 1 }
+        let a = os::os_cstr(t)
+        let b = os::os_cstr(full)
+        let rc = to_int(symlink(a, b))
+        free(a)
+        free(b)
+        if rc != 0 { return 3 }
+        return 0
+    }
+    if e.kind == 3 {
+        // a hard link's bytes are its target member's. link(2) is not used; the target's
+        // content is materialized as a regular file instead (same bytes, one inode, and
+        // no way to reach out of dest).
+        let t = e.link
+        if !bx_link_ok(rel, t) { return 1 }
+        let data = archive_read(path, bx_norm_path(t))
+        var par2 = bx_parent(rel)
+        if !(par2 == "") { let _ = os::make_dir_p(dest + ("/" + par2)) }
+        write_file(full, data)
+        return 0
+    }
+    // regular file (and kind-4 entries copied as best effort)
+    let data = bx_any_data(path, e.path)
+    var par = bx_parent(rel)
+    if !(par == "") { let _ = os::make_dir_p(dest + ("/" + par)) }
+    write_file(full, data)
+    if e.mode != 0 {
+        let c = os::os_cstr(full)
+        let _m = to_int(chmod(c, e.mode & 4095))
+        free(c)
+    }
+    return 0
+}
+fn bx_any_data(path: Str, entry: Str) -> Str { return archive_read(path, entry) }
+
+extern fn chmod(Int, Int) -> I32
+extern fn symlink(Int, Int) -> I32
+extern fn free(Int)

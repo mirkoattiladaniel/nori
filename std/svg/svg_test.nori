@@ -1,0 +1,107 @@
+// Native tests for std/svg: run with
+//   noric --test std/svg/svg_test.nori compiler/runtime.nori --import-root .
+import "std/svg" as svg
+import "std/image" as image
+
+fn R(p: Int) -> Int { return p / 16777216 }
+fn G(p: Int) -> Int { return p / 65536 % 256 }
+fn B(p: Int) -> Int { return p / 256 % 256 }
+fn A(p: Int) -> Int { return p % 256 }
+
+fn test_fill_rect() {
+    let im = svg::rasterize("<svg viewBox=\"0 0 10 10\"><rect x=\"0\" y=\"0\" width=\"10\" height=\"10\" fill=\"#ff0000\"/></svg>", 20, 20)
+    assert_true(image::ok(im))
+    let p = image::pixel_rgba(im, 10, 10)
+    assert_eq(R(p), 255)  assert_eq(G(p), 0)  assert_eq(B(p), 0)  assert_eq(A(p), 255)
+    image::dispose(im)
+}
+
+fn test_circle_hole() {
+    let im = svg::rasterize("<svg viewBox=\"0 0 20 20\"><circle cx=\"10\" cy=\"10\" r=\"6\" fill=\"#00ff00\"/></svg>", 40, 40)
+    let ctr = image::pixel_rgba(im, 20, 20)                 // center: green
+    assert_eq(G(ctr), 255)  assert_eq(A(ctr), 255)
+    let corner = image::pixel_rgba(im, 1, 1)                // corner: transparent
+    assert_eq(A(corner), 0)
+    image::dispose(im)
+}
+
+fn test_path_triangle() {
+    let im = svg::rasterize("<svg viewBox=\"0 0 30 30\"><path d=\"M5 25 L15 5 L25 25 Z\" fill=\"rgb(10,20,240)\"/></svg>", 60, 60)
+    let p = image::pixel_rgba(im, 30, 40)                   // inside the triangle
+    assert_eq(B(p), 240)  assert_true(R(p) < 40)  assert_eq(A(p), 255)
+    image::dispose(im)
+}
+
+fn test_linear_gradient() {
+    let im = svg::rasterize("<svg viewBox=\"0 0 100 20\"><defs><linearGradient id=\"g\"><stop offset=\"0\" stop-color=\"#000000\"/><stop offset=\"1\" stop-color=\"#ffffff\"/></linearGradient></defs><rect x=\"0\" y=\"0\" width=\"100\" height=\"20\" fill=\"url(#g)\"/></svg>", 100, 20)
+    let left = image::pixel_rgba(im, 3, 10)
+    let right = image::pixel_rgba(im, 96, 10)
+    assert_true(R(left) < 40)                               // near-black on the left
+    assert_true(R(right) > 210)                             // near-white on the right
+    image::dispose(im)
+}
+
+fn test_stroke() {
+    let im = svg::rasterize("<svg viewBox=\"0 0 20 20\"><rect x=\"5\" y=\"5\" width=\"10\" height=\"10\" fill=\"none\" stroke=\"#ff0000\" stroke-width=\"2\"/></svg>", 40, 40)
+    let edge = image::pixel_rgba(im, 20, 10)                // on the top edge: red stroke
+    assert_eq(R(edge), 255)  assert_true(A(edge) > 200)
+    let inside = image::pixel_rgba(im, 20, 20)             // interior: unfilled (fill=none)
+    assert_eq(A(inside), 0)
+    image::dispose(im)
+}
+
+fn test_viewbox_scale() {
+    // a 50x50 box in a 100x100 viewBox, output 200x200 -> box occupies pixels ~[0,100)
+    let im = svg::rasterize("<svg viewBox=\"0 0 100 100\"><rect x=\"0\" y=\"0\" width=\"50\" height=\"50\" fill=\"#123456\"/></svg>", 200, 200)
+    let inbox = image::pixel_rgba(im, 50, 50)               // inside scaled box
+    assert_eq(A(inbox), 255)
+    let outbox = image::pixel_rgba(im, 150, 150)            // outside box
+    assert_eq(A(outbox), 0)
+    image::dispose(im)
+}
+
+fn test_not_svg() {
+    let im = svg::rasterize("not xml at all", 10, 10)       // non-svg -> ok image, fully transparent
+    assert_true(image::ok(im))
+    assert_eq(A(image::pixel_rgba(im, 5, 5)), 0)
+    image::dispose(im)
+}
+
+// Path data omits every separator it can, so a number may begin with '.' the instant the previous one
+// has already had its decimal point: `l10.5.5` is 10.5 then .5, not one token. Swallowing both would leave a
+// garbage coordinate and shift every later number in the path by one.
+fn test_path_number_ends_at_a_second_dot() {
+    // two triangles that must land in different corners: the second pair is written `.5.5`-style, so a
+    // greedy number scanner reads one number and puts the whole shape somewhere else.
+    let tight = svg::rasterize("<svg viewBox=\"0 0 20 20\"><path d=\"M1 1l8.5.5-8.5 8z\" fill=\"#ff0000\"/></svg>", 40, 40)
+    let spaced = svg::rasterize("<svg viewBox=\"0 0 20 20\"><path d=\"M1 1l8.5 0.5-8.5 8z\" fill=\"#ff0000\"/></svg>", 40, 40)
+    assert_true(image::ok(tight))
+    assert_true(image::ok(spaced))
+    // the two spellings are the same path, so every pixel must agree
+    var y = 0
+    var diff = 0
+    while y < 40 {
+        var x = 0
+        while x < 40 { if image::pixel_rgba(tight, x, y) != image::pixel_rgba(spaced, x, y) { diff = diff + 1 }  x = x + 1 }
+        y = y + 1
+    }
+    assert_eq(diff, 0)
+    // …and it actually drew something, or the comparison above is two blank images agreeing
+    var ink = 0
+    var y2 = 0
+    while y2 < 40 {
+        var x2 = 0
+        while x2 < 40 { if A(image::pixel_rgba(tight, x2, y2)) > 128 { ink = ink + 1 }  x2 = x2 + 1 }
+        y2 = y2 + 1
+    }
+    assert_true(ink > 40)
+    image::dispose(tight)
+    image::dispose(spaced)
+}
+fn test_path_exponent_still_parses() {
+    let im = svg::rasterize("<svg viewBox=\"0 0 20 20\"><path d=\"M1 1l1e1 0 0 1e1z\" fill=\"#0000ff\"/></svg>", 40, 40)
+    assert_true(image::ok(im))
+    let p = image::pixel_rgba(im, 18, 16)                   // user (9,8): inside the triangle (1,1)-(11,1)-(11,11)
+    assert_eq(B(p), 255)
+    image::dispose(im)
+}

@@ -1,0 +1,142 @@
+// roll: `[caps]`, compile-time capability sandboxing, and the whole-tree unsafe audit.
+//
+// One directory module of roll (see src/main.nori for the layout). It reaches the others through
+// their aliases below, and only what another module uses is `pub`. The modules import each other
+// freely (`cmds` and `deps` call in both directions); cycles between directory modules are fine.
+
+import "std/os" as os
+import "../cmds" as cmds
+import "../deps" as deps
+import "../last" as last
+import "../manifest" as manifest
+import "../ui" as ui
+import "../util" as util
+
+use cmds::*
+use deps::*
+use last::*
+use manifest::*
+use ui::*
+use util::*
+
+fn cap_in_list(cap: Str, deny: Str) -> Bool {
+    // is `cap` in the comma-separated deny list?
+    var cur = ""
+    var i = 0
+    let n = deny.len()
+    while i <= n {
+        var atsep = i == n
+        if !atsep {
+            let c = ord(deny.at(i))
+            atsep = c == 44 || c == 32 || c == 34
+        }
+        // ',' / ' ' / '"'
+        if atsep {
+            if(cur == cap) {
+                return true
+            }
+            cur = ""
+        } else { cur = (cur + deny.slice(i, i + 1)) }
+        i = i + 1
+    }
+    return false
+}
+pub fn caps_cmd() -> Int {
+    let mf = load_manifest()
+    eprintl((verb("Auditing", "1;36") + (" " + (section_get(mf, "", "name") + " capabilities (net/fs/exec/env/time/rawmem/ffi)"))))
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--caps") cmd.push(gen_root(section_get(mf, "", "entry")))
+    cmd.push("--color")
+    var ai = 1
+    while ai < argc() {
+        if(arg(ai) == "--summary") {
+            cmd.push("--summary")
+        }
+        ai = ai + 1
+    }
+    add_import_flags(cmd, mf)
+    return os::run(cmd)
+}
+pub fn caps_enforce(mf: Str) -> Int {
+    let rules = section_keys(mf, "caps")
+    if rules.len() == 0 {
+        return 0
+    }
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--caps") cmd.push(gen_root(section_get(mf, "", "entry")))
+    cmd.push("--out") cmd.push("build/caps.txt")
+    add_import_flags(cmd, mf)
+    add_native_flags(cmd, mf) // the scan has to see the project's own C: with a --cfile in the build, an
+    // extern's name stops being evidence (the C author picks both)
+    if os::run(cmd) != 0 {
+        eprintl("roll: capability scan failed")
+        return 1
+    }
+    // dep name -> source dir, for file-prefix attribution of each record
+    let locks = load_lock()
+    var lk: Vec<Str> = vec()
+    lk.push("#")
+    var dirs: Map<Str, Str> = map()
+    var names: Vec<Str> = vec()
+    resolve_graph(mf, locks, lk, dirs, names, true)
+    var bad = 0
+    let lines = last_lines(read_file("build/caps.txt"))
+    var i = 0
+    while i < lines.len() {
+        let ln = lines[i]
+        let t1 = index_of(ln, 9)
+        if t1 > 0 {
+            let cap = ln.slice(0, t1)
+            let rest = ln.slice(t1 + 1, ln.len())
+            let t2 = index_of(rest, 9)
+            if t2 > 0 {
+                let floc = rest.slice(0, t2)
+                var r = 0
+                while r < rules.len() {
+                    let nm = rules[r]
+                    if cap_in_list(cap, section_get(mf, "caps", nm)) {
+                        var hit = (nm == "program")
+                        if !hit {
+                            if dirs.has(nm) {
+                                if starts_with(floc, dirs.get(nm)) {
+                                    hit = true
+                                }
+                            }
+                        }
+                        if hit {
+                            eprintl(("capability `" + (cap + ("` denied for `" + (nm + ("`: " + (floc + (" — " + rest.slice(t2 + 1, rest.len())))))))))
+                            bad = bad + 1
+                        }
+                    }
+                    r = r + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    if bad > 0 {
+        eprintl(("roll: " + (to_str(bad) + " capability violation(s) — see [caps] in nori.manifest")))
+        return 1
+    }
+    return 0
+}
+// `roll unsafe`: audit every escape from the safe subset (`unsafe` blocks, extern items, cstruct
+// layouts) across the whole build tree (the project's own files plus std and dependencies), each at
+// its real file:line. `--summary` prints just the count line.
+pub fn unsafe_cmd() -> Int {
+    let mf = load_manifest()
+    let name = section_get(mf, "", "name")
+    eprintl((verb("Auditing", "1;36") + (" " + (name + " (unsafe blocks / extern items / cstructs)"))))
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--unsafe-report") cmd.push(gen_root(section_get(mf, "", "entry")))
+    cmd.push("--color")
+    var ai = 1
+    while ai < argc() {
+        if(arg(ai) == "--summary") {
+            cmd.push("--summary")
+        }
+        ai = ai + 1
+    }
+    add_import_flags(cmd, mf)
+    return os::run(cmd)
+}

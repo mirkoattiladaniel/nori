@@ -1,0 +1,50 @@
+// Tests for std/time: only non-flaky, monotonic-clock properties.
+// We never assert exact wall-clock values, only ordering / non-decrease.
+import "std/time" as t
+
+fn test_mono_nondecreasing() {
+    let a = t::now_ns()
+    let b = t::now_ns()
+    assert_true(b >= a)
+}
+
+fn test_sleep_advances_mono() {
+    let a = t::now_ns()
+    t::sleep_ms(5)
+    let b = t::now_ns()
+    // monotonic clock must have advanced after a real sleep.
+    assert_true(b > a)
+}
+
+fn test_now_ms_nondecreasing() {
+    let a = t::now_ms()
+    t::sleep_ms(5)
+    let b = t::now_ms()
+    assert_true(b >= a)
+}
+
+fn test_wall_clock_positive() {
+    // unix time is well past the epoch; just assert it's positive (no exact value).
+    assert_true(t::unix_secs() > 0)
+}
+
+fn test_breakdown_known_timestamp() {
+    // 1970-01-01T00:00:00Z: pure integer math, fully deterministic.
+    let dt = t::breakdown(0)
+    assert_eq(dt.year, 1970)
+    assert_eq(dt.month, 1)
+    assert_eq(dt.day, 1)
+    assert_eq(dt.hour, 0)
+    assert_eq(dt.minute, 0)
+    assert_eq(dt.second, 0)
+    assert_eq(dt.weekday, 4)        // 1970-01-01 was a Thursday (0=Sunday)
+}
+
+fn test_breakdown_one_day() {
+    // 86400s = 1970-01-02T00:00:00Z.
+    let dt = t::breakdown(86400)
+    assert_eq(dt.year, 1970)
+    assert_eq(dt.month, 1)
+    assert_eq(dt.day, 2)
+    assert_eq(dt.weekday, 5)        // Friday
+}

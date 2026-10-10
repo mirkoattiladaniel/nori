@@ -1,0 +1,94 @@
+//! std/io: the small I/O helpers not already covered by std/os + the read_file/write_file builtins:
+//! an efficient string Builder (accumulate parts, join once, which avoids O(n^2) repeated `+`), line
+//! splitting (handles LF and CRLF), and streamed file copy (chunked, never loads the whole file into
+//! memory). For env/dirs/spawn/stdin/stdout and raw fd ops see std/os.
+//!   import "std/io" as io
+//!   var b = io::builder()  io::add(b, "x=")  io::add_line(b, "1")
+//!   io::build(b)                    // "x=1\n"
+//!   io::read_lines("file.txt")     // Vec<Str>, one per line
+//!   io::copy_file("a.bin", "b.bin") // streamed 64K-at-a-time copy; creates b.bin
+
+import "std/os" as os
+
+extern fn malloc(Int) -> Int
+extern fn free(Int)
+
+pub struct Builder { parts: Vec<Str> }
+
+/// a new empty string builder.
+pub fn builder() -> Builder { var p: Vec<Str> = vec()  return Builder { parts: p } }
+/// append `s`.
+pub fn add(inout b: Builder, sink s: Str) { b.parts.push(s) }
+/// a one-character newline string (Nori `chr` returns a Char; a Vec<Str> needs a Str).
+fn nl() -> Str { return ("" + chr(10)) }
+/// append `s` followed by a newline.
+pub fn add_line(inout b: Builder, sink s: Str) { b.parts.push(s)  b.parts.push(nl()) }
+/// join everything appended so far into one string.
+pub fn build(b: Builder) -> Str {
+    var out = ""
+    var i = 0
+    while i < b.parts.len() { out = (out + b.parts[i])  i = i + 1 }
+    return out
+}
+
+/// split `s` into lines (separators removed; LF and CRLF both end a line). A trailing newline does not
+/// produce a final empty line.
+pub fn lines(s: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var start = 0
+    var i = 0
+    let n = s.len()
+    while i <= n {
+        if i == n || ord(s.at(i)) == 10 {
+            var end = i
+            if end > start { if ord(s.at(end - 1)) == 13 { end = end - 1 } }
+            if !(i == n && start == i) { out.push(s.slice(start, end)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// read file `path` and split it into lines ("" -> [] if it can't be read).
+pub fn read_lines(path: Str) -> Vec<Str> { return lines(read_file(path)) }
+
+/// copy `src` to `dst` a chunk at a time (64 KB), creating/truncating `dst` (mode 0644). It never loads
+/// the whole file into memory, so it handles files far larger than RAM. Returns true on success. This is
+/// the safe, no-`unsafe`-needed alternative to slurping a file with read_file + write_file.
+pub fn copy_file(src: Str, dst: Str) -> Bool {
+    let rfd = os::open_file(src, os::O_RDONLY(), 0)
+    if rfd < 0 { return false }
+    let wfd = os::open_file(dst, os::O_WRONLY() | os::O_CREAT() | os::O_TRUNC(), 420)   // 420 = 0644
+    if wfd < 0 { let _r = os::close_fd(rfd)  return false }
+    let cap = 65536
+    let buf = malloc(cap)
+    var ok = true
+    var going = true
+    while going {
+        let got = os::read_fd(rfd, buf, cap)
+        if got < 0 { ok = false  going = false }
+        else if got == 0 { going = false }                               // EOF
+        else { if os::write_fd(wfd, buf, got) < 0 { ok = false  going = false } }
+    }
+    free(buf)
+    let _rc = os::close_fd(rfd)
+    // close on the write side is not a formality: a networked or quota-limited filesystem reports
+    // here what it accepted into cache and could not flush. Ignoring it returns true for a copy that
+    // did not land.
+    let wc = os::close_fd(wfd)
+    if wc < 0 { ok = false }
+    return ok
+}
+
+/// append `data` to `path` (creating it if absent, mode 0644). Returns true on success.
+pub fn append_file(path: Str, data: Str) -> Bool {
+    let fd = os::open_file(path, os::O_WRONLY() | os::O_CREAT() | os::O_APPEND(), 420)
+    if fd < 0 { return false }
+    let n = data.len()
+    let buf = os::os_cstr(data)                                          // NUL-terminated, but only n bytes are written
+    let w = os::write_fd(fd, buf, n)
+    free(buf)
+    let c = os::close_fd(fd)                 // where a deferred write error surfaces; see copy_file
+    return w >= 0 && c >= 0
+}

@@ -1,0 +1,17 @@
+name = raylib-snake
+kind = bin
+version = 0.1.0
+entry = src/main.nori
+
+# Build raylib first (see README.md): raylib.h and a shared libraylib.so land in vendor/.
+# The `extern raylib "vendor/raylib.h" link "-Lvendor raylib"` line in src/main.nori does the rest:
+# bindgen reads the header and the program calls the library through its exports. The `-Lvendor` is
+# where the build finds libraylib.so, and the program records that directory, relative to itself, as its
+# run path, so `roll run` needs nothing else. The `extern c { }` helpers in src/main.nori are compiled
+# with the system C compiler into a small shared object beside the program.
+
+[profile.dev]
+opt = 0
+
+[profile.release]
+opt = 2

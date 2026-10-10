@@ -1,0 +1,18 @@
+// ── Layer 2, Token: a { kind, span }. `kind` is an Int you define (e.g. `fn K_NUM()->Int{return 1}`);
+// keep your kinds >= 0 so they never collide with TK_EOF. A lexer is language-specific: write it with
+// the Scanner and push Tokens into a Vec<Token>. ─────────────────────────────────────────────────────
+pub struct Token { kind: Int, start: Int, end: Int }
+/// a token of `kind` covering `sp`.
+pub fn token(kind: Int, sp: Span) -> Token { return Token { kind: kind, start: sp.start, end: sp.end } }
+/// a token of `kind` covering `[start, end)`, for a lexer that already has the offsets.
+pub fn token_at(kind: Int, start: Int, end: Int) -> Token { return Token { kind: kind, start: start, end: end } }
+/// the token's kind: your own Int, or `TK_EOF`.
+pub fn tok_kind(t: Token) -> Int { return t.kind }
+/// the token's span.
+pub fn tok_span(t: Token) -> Span { return span(t.start, t.end) }
+/// the token's source text. Tokens store offsets, not text, so this is where the slice happens.
+pub fn tok_text(t: Token, src: Str) -> Str { return src.slice(t.start, t.end) }
+pub fn TK_EOF() -> Int { return -1 }                       // reserved end-of-input kind
+/// an empty `TK_EOF` token at `offset`, so "past the end" still has a position to report errors at.
+pub fn eof_token(offset: Int) -> Token { return Token { kind: -1, start: offset, end: offset } }
+

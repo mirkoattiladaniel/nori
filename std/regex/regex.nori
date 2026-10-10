@@ -1,0 +1,541 @@
+//! std/regex: a small backtracking regular-expression engine. The pattern is compiled once into a
+//! node table (parallel Vec<Int> fields inside `Regex`), then matched by recursive backtracking.
+//! Worst-case backtracking is exponential in the input length for pathological patterns (e.g.
+//! `(a*)*b` on a long run of `a`s), so keep patterns simple on untrusted input.
+//!
+//!   import "std/regex" as re
+//!   var r = re::compile("^[a-z]+@[a-z]+\.[a-z]+$")
+//!   r.full("a@b.com")     // true   (whole string must match)
+//!   r.test("see a@b.com") // true   (matches somewhere; respects ^ / $)
+//!   r.find("xx cat")      // 3      (start index of first match, or -1)
+//!   re::matches("cat|dog", "hotdog")   // true
+//!
+//! Supported: literal chars; `.` (any char except newline); char classes `[...]` / negated `[^...]`
+//! with ranges (`a-z`, `0-9`); escapes `\d \D \w \W \s \S` and escaped metachars (`\. \* \( \\` …);
+//! greedy quantifiers `* + ?`; anchors `^` and `$`; alternation `|`; grouping `( … )` (non-capturing,
+//! for precedence / quantifier scope).
+//!
+//! Not supported: capturing groups / backreferences (`\1`); lazy quantifiers (`*?`); counted
+//! repetition (`{m,n}`); word boundaries (`\b`); inline flags. Groups are non-capturing.
+
+// ---- node kinds (small Int tags) ----
+fn re_K_CHAR()   -> Int { return 0 }   // a: byte value
+fn re_K_ANY()    -> Int { return 1 }   // matches any char except newline
+fn re_K_CLASS()  -> Int { return 2 }   // a: class index (into ranges/negate), see below
+fn re_K_STAR()   -> Int { return 3 }   // a: child node
+fn re_K_PLUS()   -> Int { return 4 }   // a: child node
+fn re_K_OPT()    -> Int { return 5 }   // a: child node
+fn re_K_CONCAT() -> Int { return 6 }   // a: left node, b: right node
+fn re_K_ALT()    -> Int { return 7 }   // a: left node, b: right node
+fn re_K_BOL()    -> Int { return 8 }   // ^
+fn re_K_EOL()    -> Int { return 9 }   // $
+fn re_K_EMPTY()  -> Int { return 10 }  // matches the empty string
+
+/// a compiled regular expression. The node table is stored as parallel Int Vecs; `root` is the index
+/// of the root node (or -1 if the pattern failed to parse). Character-class accepted sets live in
+/// `cls_lo`/`cls_hi`/`cls_neg`, addressed via a per-node `cstart`/`cend` range into those Vecs.
+pub struct Regex {
+    kind:   Vec<Int>
+    a:      Vec<Int>
+    b:      Vec<Int>
+    cstart: Vec<Int>     // for CLASS nodes: start index into cls_lo/cls_hi
+    cend:   Vec<Int>     // for CLASS nodes: end index (exclusive)
+    cneg:   Vec<Int>     // for CLASS nodes: 1 if negated, else 0
+    cls_lo: Vec<Int>     // flattened [lo,hi] range pairs across all classes
+    cls_hi: Vec<Int>
+    root:   Int
+    pat:    Str
+    pos:    Vec<Int>     // 1-element parse cursor (reused during compile)
+    ok:     Bool         // did the pattern parse cleanly?
+}
+
+// ---- node-table builders ----
+
+/// append a node with the given fields, returning its index.
+pub fn re_add(inout r: Regex, kind: Int, a: Int, b: Int) -> Int {
+    var idx = r.kind.len()
+    r.kind.push(kind)
+    r.a.push(a)
+    r.b.push(b)
+    r.cstart.push(0)
+    r.cend.push(0)
+    r.cneg.push(0)
+    return idx
+}
+
+// ---- parse cursor helpers ----
+
+/// byte at the cursor, or -1 at end.
+pub fn re_peek(r: Regex) -> Int {
+    if r.pos[0] < r.pat.len() { return ord(r.pat.at(r.pos[0])) }
+    return 0 - 1
+}
+/// byte one past the cursor, or -1.
+pub fn re_peek2(r: Regex) -> Int {
+    if r.pos[0] + 1 < r.pat.len() { return ord(r.pat.at(r.pos[0] + 1)) }
+    return 0 - 1
+}
+/// take the current byte and advance.
+pub fn re_take(inout r: Regex) -> Int {
+    var c = re_peek(r)
+    r.pos[0] = r.pos[0] + 1
+    return c
+}
+
+// ---- class construction ----
+
+/// append a [lo,hi] byte range to the active class' range list.
+pub fn re_cls_range(inout r: Regex, lo: Int, hi: Int) {
+    r.cls_lo.push(lo)
+    r.cls_hi.push(hi)
+}
+
+/// emit the ranges for an escape class (`d w s` etc) into the active class range list.
+/// `e` is the escape letter byte (e.g. ord('d')). Only positive ranges are added; the caller flips
+/// `cneg` for the uppercase (negated) variants.
+pub fn re_cls_escape(inout r: Regex, e: Int) {
+    if e == 100 || e == 68 {            // d / D : digits
+        re_cls_range(r, 48, 57)
+    } else if e == 119 || e == 87 {     // w / W : word chars
+        re_cls_range(r, 48, 57)
+        re_cls_range(r, 65, 90)
+        re_cls_range(r, 97, 122)
+        re_cls_range(r, 95, 95)
+    } else if e == 115 || e == 83 {     // s / S : whitespace
+        re_cls_range(r, 9, 9)
+        re_cls_range(r, 10, 10)
+        re_cls_range(r, 11, 11)
+        re_cls_range(r, 12, 12)
+        re_cls_range(r, 13, 13)
+        re_cls_range(r, 32, 32)
+    }
+}
+/// true if the escape letter byte is an uppercase (negated) class escape.
+pub fn re_escape_negates(e: Int) -> Bool { return e == 68 || e == 87 || e == 83 }
+/// true if `e` is one of the class-escape letters d/D/w/W/s/S.
+pub fn re_is_class_escape(e: Int) -> Bool {
+    return e == 100 || e == 68 || e == 119 || e == 87 || e == 115 || e == 83
+}
+
+// ---- parser: alt -> concat -> repeat -> atom ----
+
+/// parse a full alternation (lowest precedence). Returns a node index, or -1 on error.
+pub fn re_parse_alt(inout r: Regex) -> Int {
+    var left = re_parse_concat(r)
+    if left < 0 { return 0 - 1 }
+    while re_peek(r) == 124 {           // '|'
+        var _dummy = re_take(r)
+        var right = re_parse_concat(r)
+        if right < 0 { return 0 - 1 }
+        left = re_add(r, re_K_ALT(), left, right)
+    }
+    return left
+}
+
+/// parse a concatenation: a run of repeat-terms until '|', ')', or end.
+pub fn re_parse_concat(inout r: Regex) -> Int {
+    var node = 0 - 1
+    var go = true
+    while go {
+        var c = re_peek(r)
+        if c < 0 || c == 124 || c == 41 { go = false }    // end, '|', ')'
+        else {
+            var term = re_parse_repeat(r)
+            if term < 0 { return 0 - 1 }
+            if node < 0 { node = term }
+            else { node = re_add(r, re_K_CONCAT(), node, term) }
+        }
+    }
+    if node < 0 { node = re_add(r, re_K_EMPTY(), 0, 0) }
+    return node
+}
+
+/// parse an atom followed by an optional greedy quantifier (`* + ?`).
+pub fn re_parse_repeat(inout r: Regex) -> Int {
+    var atom = re_parse_atom(r)
+    if atom < 0 { return 0 - 1 }
+    var c = re_peek(r)
+    if c == 42 {                        // '*'
+        var _d1 = re_take(r)
+        return re_add(r, re_K_STAR(), atom, 0)
+    }
+    if c == 43 {                        // '+'
+        var _d2 = re_take(r)
+        return re_add(r, re_K_PLUS(), atom, 0)
+    }
+    if c == 63 {                        // '?'
+        var _d3 = re_take(r)
+        return re_add(r, re_K_OPT(), atom, 0)
+    }
+    return atom
+}
+
+/// parse a single atom: group, anchor, class, escape, '.', or literal char.
+pub fn re_parse_atom(inout r: Regex) -> Int {
+    var c = re_peek(r)
+    if c < 0 { return re_add(r, re_K_EMPTY(), 0, 0) }
+
+    if c == 40 {                                // '(' group
+        var _d = re_take(r)
+        var inner = re_parse_alt(r)
+        if inner < 0 { return 0 - 1 }
+        if re_peek(r) != 41 { return 0 - 1 }    // missing ')'
+        var _d2 = re_take(r)
+        return inner                            // non-capturing: the inner node is the group
+    }
+    if c == 94 { var _d3 = re_take(r)  return re_add(r, re_K_BOL(), 0, 0) }   // '^'
+    if c == 36 { var _d4 = re_take(r)  return re_add(r, re_K_EOL(), 0, 0) }   // '$'
+    if c == 46 { var _d5 = re_take(r)  return re_add(r, re_K_ANY(), 0, 0) }   // '.'
+    if c == 91 { return re_parse_class(r) }                                  // '['
+    if c == 92 { return re_parse_escape_atom(r) }                            // '\'
+
+    // a bare literal char
+    var _d6 = re_take(r)
+    return re_add(r, re_K_CHAR(), c, 0)
+}
+
+/// parse a backslash escape used as an atom: either a class escape (\d \w \s …) → CLASS node, or an
+/// escaped literal (\. \* \\ …) → CHAR node.
+pub fn re_parse_escape_atom(inout r: Regex) -> Int {
+    var _bs = re_take(r)                // consume '\'
+    var e = re_take(r)                  // the escaped byte
+    if e < 0 { return 0 - 1 }
+    if re_is_class_escape(e) {
+        var start = r.cls_lo.len()
+        re_cls_escape(r, e)
+        var node = re_add(r, re_K_CLASS(), 0, 0)
+        r.cstart[node] = start
+        r.cend[node] = r.cls_lo.len()
+        if re_escape_negates(e) { r.cneg[node] = 1 }
+        return node
+    }
+    // escaped literal: \n \t \r decode; everything else is the literal byte
+    if e == 110 { return re_add(r, re_K_CHAR(), 10, 0) }   // \n
+    if e == 116 { return re_add(r, re_K_CHAR(), 9, 0) }    // \t
+    if e == 114 { return re_add(r, re_K_CHAR(), 13, 0) }   // \r
+    return re_add(r, re_K_CHAR(), e, 0)
+}
+
+/// parse a `[...]` / `[^...]` character class. Cursor is on the '['.
+pub fn re_parse_class(inout r: Regex) -> Int {
+    var _d = re_take(r)                 // consume '['
+    var neg = 0
+    if re_peek(r) == 94 { var _dn = re_take(r)  neg = 1 }   // '^'
+    var start = r.cls_lo.len()
+    var go = true
+    while go {
+        var c = re_peek(r)
+        if c < 0 { return 0 - 1 }       // unterminated class
+        if c == 93 { go = false }       // ']'
+        else {
+            var lo = re_take(r)
+            if lo == 92 {               // an escape inside the class
+                var e = re_take(r)
+                if e < 0 { return 0 - 1 }
+                if re_is_class_escape(e) {
+                    // \d \w \s inside a class: splice in its ranges. (Negated escapes inside a class
+                    // are approximated as their positive ranges, a known limitation that rarely matters.)
+                    re_cls_escape(r, e)
+                } else {
+                    var lv = e
+                    if e == 110 { lv = 10 }
+                    else if e == 116 { lv = 9 }
+                    else if e == 114 { lv = 13 }
+                    re_cls_range(r, lv, lv)
+                }
+            } else {
+                // possible range lo-hi
+                if re_peek(r) == 45 && re_peek2(r) != 93 && re_peek2(r) >= 0 {
+                    var _dash = re_take(r)       // '-'
+                    var hi = re_take(r)
+                    re_cls_range(r, lo, hi)
+                } else {
+                    re_cls_range(r, lo, lo)
+                }
+            }
+        }
+    }
+    if re_peek(r) != 93 { return 0 - 1 }
+    var _dc = re_take(r)                 // consume ']'
+    var node = re_add(r, re_K_CLASS(), 0, 0)
+    r.cstart[node] = start
+    r.cend[node] = r.cls_lo.len()
+    r.cneg[node] = neg
+    return node
+}
+
+// ---- matcher ----
+
+/// does byte `ch` belong to the class node `node`?
+pub fn re_class_member(r: Regex, node: Int, ch: Int) -> Bool {
+    var i = r.cstart[node]
+    var e = r.cend[node]
+    var found = false
+    while i < e {
+        if ch >= r.cls_lo[i] && ch <= r.cls_hi[i] { found = true }
+        i = i + 1
+    }
+    if r.cneg[node] == 1 { return !found }
+    return found
+}
+
+/// try to match `node` against `s` starting at `pos`. Returns the position after a successful match,
+/// or -1 on failure. `slen(s)` is `n`. Quantifiers/alternation backtrack by trying options in turn.
+/// CONCAT threads the remainder: matching `left` then `right` from each position `left` can end at.
+pub fn re_match_node(inout r: Regex, node: Int, s: Str, pos: Int, n: Int) -> Int {
+    var k = r.kind[node]
+
+    if k == re_K_EMPTY() { return pos }
+    if k == re_K_BOL() {
+        if pos == 0 { return pos }
+        return 0 - 1
+    }
+    if k == re_K_EOL() {
+        if pos == n { return pos }
+        return 0 - 1
+    }
+    if k == re_K_CHAR() {
+        if pos < n && ord(s.at(pos)) == r.a[node] { return pos + 1 }
+        return 0 - 1
+    }
+    if k == re_K_ANY() {
+        if pos < n && ord(s.at(pos)) != 10 { return pos + 1 }
+        return 0 - 1
+    }
+    if k == re_K_CLASS() {
+        if pos < n {
+            var ch = ord(s.at(pos))
+            if re_class_member(r, node, ch) { return pos + 1 }
+        }
+        return 0 - 1
+    }
+    if k == re_K_CONCAT() {
+        // match left, then right; left may match in only one way here because the sub-nodes are atoms
+        // or already-greedy quantifiers that themselves backtrack via re_match_seq below. To get full
+        // backtracking we route CONCAT through re_match_seq, which threads a continuation.
+        return re_match_seq(r, node, s, pos, n, 0 - 1)
+    }
+    if k == re_K_ALT() {
+        var p1 = re_match_node(r, r.a[node], s, pos, n)
+        if p1 >= 0 { return p1 }
+        return re_match_node(r, r.b[node], s, pos, n)
+    }
+    if k == re_K_OPT() {
+        var p = re_match_node(r, r.a[node], s, pos, n)
+        if p >= 0 { return p }
+        return pos
+    }
+    if k == re_K_STAR() {
+        return re_match_star(r, r.a[node], s, pos, n, 0)
+    }
+    if k == re_K_PLUS() {
+        return re_match_star(r, r.a[node], s, pos, n, 1)
+    }
+    return 0 - 1
+}
+
+/// greedy repetition without a following continuation: match `child` as many times as possible, then
+/// accept. `min` is 0 for STAR, 1 for PLUS. (Used only when there is no `cont`; CONCAT-aware matching
+/// goes through re_match_seq for correct backtracking across the remainder.)
+pub fn re_match_star(inout r: Regex, child: Int, s: Str, pos: Int, n: Int, min: Int) -> Int {
+    var cur = pos
+    var count = 0
+    var go = true
+    while go {
+        var nx = re_match_node(r, child, s, cur, n)
+        if nx < 0 || nx == cur { go = false }    // fail or no progress (avoid infinite loop on empty)
+        else { cur = nx  count = count + 1 }
+    }
+    if count < min { return 0 - 1 }
+    return cur
+}
+
+// ---- continuation-threaded sequence matcher ----
+//
+// To backtrack correctly across a CONCAT (so `a*` gives back characters to whatever follows), we match
+// a node together with a "continuation": the node index that must match the remainder, or -1 for "the
+// remainder is empty (accept here)". `cont` itself can be a CONCAT, so we keep walking left.
+
+/// match `node` at `pos`, requiring `cont` to match the remainder afterwards. Returns final pos or -1.
+pub fn re_match_seq(inout r: Regex, node: Int, s: Str, pos: Int, n: Int, cont: Int) -> Int {
+    var k = r.kind[node]
+
+    if k == re_K_CONCAT() {
+        // match a-node, with continuation = (b-node then the existing cont). We encode the chained
+        // continuation by recursing: match left with a continuation of "match right then cont".
+        return re_match_seq_with(r, r.a[node], r.b[node], cont, s, pos, n)
+    }
+
+    if k == re_K_STAR() {
+        return re_match_star_cont(r, r.a[node], cont, s, pos, n, 0)
+    }
+    if k == re_K_PLUS() {
+        return re_match_star_cont(r, r.a[node], cont, s, pos, n, 1)
+    }
+    if k == re_K_OPT() {
+        // try matching child (then cont), else skip child (then cont)
+        var withp = re_match_seq(r, r.a[node], s, pos, n, cont)
+        if withp >= 0 { return withp }
+        return re_cont(r, cont, s, pos, n)
+    }
+    if k == re_K_ALT() {
+        var p1 = re_match_seq(r, r.a[node], s, pos, n, cont)
+        if p1 >= 0 { return p1 }
+        return re_match_seq(r, r.b[node], s, pos, n, cont)
+    }
+
+    // simple node: match it, then the continuation
+    var np = re_match_node(r, node, s, pos, n)
+    if np < 0 { return 0 - 1 }
+    return re_cont(r, cont, s, np, n)
+}
+
+/// match `first` with a continuation of "match `second`, then `cont`". This expresses the chained
+/// continuation needed for nested CONCAT without closures: we wrap by re-dispatching.
+pub fn re_match_seq_with(inout r: Regex, first: Int, second: Int, cont: Int, s: Str, pos: Int, n: Int) -> Int {
+    var k = r.kind[first]
+
+    if k == re_K_STAR() {
+        return re_match_star_then(r, r.a[first], second, cont, s, pos, n, 0)
+    }
+    if k == re_K_PLUS() {
+        return re_match_star_then(r, r.a[first], second, cont, s, pos, n, 1)
+    }
+    if k == re_K_OPT() {
+        var withp = re_match_seq_with(r, r.a[first], second, cont, s, pos, n)
+        if withp >= 0 { return withp }
+        return re_match_seq(r, second, s, pos, n, cont)
+    }
+    if k == re_K_ALT() {
+        var p1 = re_match_seq_with(r, r.a[first], second, cont, s, pos, n)
+        if p1 >= 0 { return p1 }
+        return re_match_seq_with(r, r.b[first], second, cont, s, pos, n)
+    }
+    if k == re_K_CONCAT() {
+        // (x y) z  ==  x (y z') ; flatten left, pushing a fresh CONCAT(b, second-as-cont), but we
+        // cannot allocate a synthetic continuation cheaply, so recurse: match a-of-first with a
+        // continuation that matches (b-of-first then second then cont). Build that via re_match_seq_with
+        // by treating b-of-first as the new "first" and chaining.
+        return re_match_seq_with(r, r.a[first], r.b[first], re_link(r, second, cont), s, pos, n)
+    }
+
+    // simple `first`: match it, then "second then cont"
+    var np = re_match_node(r, first, s, pos, n)
+    if np < 0 { return 0 - 1 }
+    return re_match_seq(r, second, s, np, n, cont)
+}
+
+/// build (or reuse) a CONCAT node linking `second` then `cont`, returning a node that means "match
+/// second, then cont". If `cont` is -1, that is just `second`.
+pub fn re_link(inout r: Regex, second: Int, cont: Int) -> Int {
+    if cont < 0 { return second }
+    return re_add(r, re_K_CONCAT(), second, cont)
+}
+
+/// run the continuation `cont` at `pos` (cont == -1 means accept here).
+pub fn re_cont(inout r: Regex, cont: Int, s: Str, pos: Int, n: Int) -> Int {
+    if cont < 0 { return pos }
+    return re_match_seq(r, cont, s, pos, n, 0 - 1)
+}
+
+/// greedy star/plus with a continuation: try the most repetitions of `child` that still let `cont`
+/// match the remainder. Recursive: match one more `child`, recurse; on failure, try `cont` here.
+pub fn re_match_star_cont(inout r: Regex, child: Int, cont: Int, s: Str, pos: Int, n: Int, min: Int) -> Int {
+    return re_star_rec(r, child, cont, 0 - 1, s, pos, n, min, 0)
+}
+
+/// star/plus with a trailing `second` node then `cont` (the CONCAT case): greedily match `child`, and
+/// the "rest" after the repetition is "match second, then cont".
+pub fn re_match_star_then(inout r: Regex, child: Int, second: Int, cont: Int, s: Str, pos: Int, n: Int, min: Int) -> Int {
+    return re_star_rec(r, child, second, cont, s, pos, n, min, 0)
+}
+
+/// the shared greedy-with-backtracking recursion. `rest`/`restcont` describe what must match after the
+/// repetition: if `rest` >= 0, run `re_match_seq(rest, …, restcont)`; if `rest` < 0, run `cont`-style
+/// (`restcont` is the continuation, which may be -1 = accept). `count` is reps so far.
+pub fn re_star_rec(inout r: Regex, child: Int, rest: Int, restcont: Int, s: Str, pos: Int, n: Int, min: Int, count: Int) -> Int {
+    // try to consume one more repetition first (greedy)
+    var nx = re_match_node(r, child, s, pos, n)
+    if nx >= 0 && nx != pos {
+        var deeper = re_star_rec(r, child, rest, restcont, s, nx, n, min, count + 1)
+        if deeper >= 0 { return deeper }
+    }
+    // can't (or backtracked): accept here if we met the minimum, then match the rest
+    if count < min { return 0 - 1 }
+    if rest >= 0 { return re_match_seq(r, rest, s, pos, n, restcont) }
+    return re_cont(r, restcont, s, pos, n)
+}
+
+// ---- compile ----
+
+/// compile pattern `pat` into a `Regex`. On a malformed pattern, `ok` is false and the regex matches
+/// nothing (`full`/`test`/`find` return false / -1).
+pub fn compile(pat: Str) -> Regex {
+    var kind: Vec<Int> = vec()
+    var a: Vec<Int> = vec()
+    var b: Vec<Int> = vec()
+    var cstart: Vec<Int> = vec()
+    var cend: Vec<Int> = vec()
+    var cneg: Vec<Int> = vec()
+    var clo: Vec<Int> = vec()
+    var chi: Vec<Int> = vec()
+    var pos: Vec<Int> = vec()
+    pos.push(0)
+    var r = Regex {
+        kind: kind, a: a, b: b,
+        cstart: cstart, cend: cend, cneg: cneg,
+        cls_lo: clo, cls_hi: chi,
+        root: 0 - 1, pat: copy pat, pos: pos, ok: false
+    }
+    var root = re_parse_alt(r)
+    if root >= 0 && r.pos[0] == pat.len() {
+        r.root = root
+        r.ok = true
+    } else {
+        r.ok = false
+        r.root = 0 - 1
+    }
+    return r
+}
+
+impl Regex {
+    /// match starting exactly at index `start`; returns the end index after the match, or -1.
+    fn match_from(self, s: Str, start: Int) -> Int {
+        if !self.ok { return 0 - 1 }
+        var n = s.len()
+        return re_match_seq(self, self.root, s, start, n, 0 - 1)
+    }
+
+    /// does the whole string match the pattern (anchored at both ends)?
+    fn full(self, s: Str) -> Bool {
+        if !self.ok { return false }
+        var n = s.len()
+        var end = re_match_seq(self, self.root, s, 0, n, 0 - 1)
+        return end == n
+    }
+
+    /// does the pattern match somewhere in `s`? Tries each start index (a leading `^` anchor makes only
+    /// start 0 viable). Returns true on the first start that matches.
+    fn test(self, s: Str) -> Bool {
+        return self.find(s) >= 0
+    }
+
+    /// the start index of the first (leftmost) match, or -1 if the pattern matches nowhere.
+    fn find(self, s: Str) -> Int {
+        if !self.ok { return 0 - 1 }
+        var n = s.len()
+        var i = 0
+        while i <= n {
+            var end = re_match_seq(self, self.root, s, i, n, 0 - 1)
+            if end >= 0 { return i }
+            i = i + 1
+        }
+        return 0 - 1
+    }
+}
+
+/// convenience: compile `pat` and test whether it matches somewhere in `s`.
+pub fn matches(pat: Str, s: Str) -> Bool {
+    var r = compile(pat)
+    return r.test(s)
+}

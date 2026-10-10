@@ -1,0 +1,29 @@
+// Tests for std/toml. Run with
+//   noric --test std/toml/toml_test.nori compiler/runtime.nori --import-root .
+import "std/toml" as toml
+
+fn sample() -> Str {
+    return "# a comment\nname = \"nori\"\nversion = 3\n\n[build]\nopt = 2\nlto = true\nflag = \"x y\"  # inline\n[deps]\njson = \"1.0\"\n"
+}
+
+fn test_root() {
+    let t = sample()
+    assert_streq(toml::get_str(t, "", "name"), "nori")
+    assert_eq(toml::get_int(t, "", "version"), 3)
+}
+
+fn test_section() {
+    let t = sample()
+    assert_eq(toml::get_int(t, "build", "opt"), 2)
+    assert_true(toml::get_bool(t, "build", "lto"))
+    assert_streq(toml::get_str(t, "build", "flag"), "x y")
+    assert_streq(toml::get_str(t, "deps", "json"), "1.0")
+}
+
+fn test_absent_and_lists() {
+    let t = sample()
+    assert_false(toml::has_key(t, "build", "missing"))
+    assert_streq(toml::get_or(t, "build", "missing", "def"), "def")
+    assert_eq((toml::sections(t)).len(), 2)
+    assert_eq((toml::section_keys(t, "build")).len(), 3)
+}

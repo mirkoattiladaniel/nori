@@ -1,0 +1,583 @@
+use core::*
+import "std/math" as math
+import "std/parse" as parse
+
+// ===========================================================================
+// `.ui` core-family node parsers: column/panel, row, scroll_column/scroll,
+// scroll_row, spacer, text, button, rect, surface.
+//
+// A sibling root file of std/nori_ui/layout, so it shares one scope with
+// dsl.nori and calls dsl_value / dsl_fail / ds_* / dw_* directly, and every
+// `pub` item still exports at `ui::layout::`.
+//
+// Each element kind has its own parser, with its own attribute set, its own
+// value strictness and its own error text. A single shared table would make
+// the language a superset: `button { padding: 4 }` and `spacer { classes: [...] }`
+// would parse, where they are `unknown ... field` errors here.
+// See also dsl_widgets.nori / dsl_input.nori / dsl_media.nori, whose helpers
+// (dw_str_of, dw_bool_strict, dw_classes, dw_cross, dw_color, dw_dq,
+// dw_unknown, dw_ident, dw_colon_a, dw_length, dw_looks_like_length) are reused
+// here rather than copied a third time.
+//
+// Contract: `dsl_node_body` has already consumed the element name and its
+// opening `{`.
+//
+// One deliberate extension: `dcn_ext` below. UiNode carries the
+// NodeStyle properties inline (tag / position / z_index / top / right / bottom
+// / left / overflow_x / overflow_y / line_height / w / h), which would otherwise
+// only be accepted inside a `stylesheet { }` rule. Those stay accepted on the seven core
+// kinds; they are not part of the per-kind tables and are marked as such at
+// every use site.
+// ===========================================================================
+
+// ---- shared value helpers (only the ones the sibling families do not have) ----
+
+/// Length value with a label. dw_length reads from the cursor; this one takes an
+/// already-parsed value and a caller-chosen label, which rect/surface `w`/`h`
+/// and the `w`/`h` extension both need.
+fn dcn_value_length(inout p: DslP, v: DslValue, label: Str) -> UiLength {
+    // Read the unit suffix sitting at the cursor, as `dsl_length` does. Without this the
+    // numeric branch would answer `ui_px(v.f)` and leave `%` / `vw` / `vh` / `ui` in the token stream, so
+    // `column { w: 50% }` would fail with `expected identifier` and `column { h: 2ui }` with
+    // ``expected `:` or `{` after "ui"`` while `rect { w: 50% }` worked, because rect/surface/
+    // image/spacer/divider go through helpers that do read the suffix. Same DSL, two answers,
+    // depending on a kind the author has no reason to connect to it.
+    if v.kind == 1 { return dsl_length_suffix(p, v.f) }
+    if v.kind == 0 || v.kind == 3 {
+        if (v.s == "fill") { dsl_fail(p, (label + ": use fill_w / fill_h instead of `fill`"))  return ui_px(0.0) }
+        if dw_looks_like_length(v.s) {
+            var lp = ui_length_parse(v.s)
+            if lp.ok { return sink lp.len }
+        }
+        dsl_fail(p, ("invalid " + (label + (": " + dw_dq(v.s)))))
+        return ui_px(0.0)
+    }
+    dsl_fail(p, (label + " must be a number or length"))
+    return ui_px(0.0)
+}
+
+/// Two-float value, the `text { anchor: [x, y] }` value.
+fn dcn_anchor(inout p: DslP, inout node: UiNode, v: DslValue) {
+    if v.kind != 4 { dsl_fail(p, "expected [x, y]")  return }
+    if v.arr.len() != 2 { dsl_fail(p, "anchor array must have 2 elements")  return }
+    if v.arr[0].kind != 1 || v.arr[1].kind != 1 { dsl_fail(p, "anchor must be numbers")  return }
+    node.has_anchor = true
+    node.anchor_x = v.arr[0].f
+    node.anchor_y = v.arr[1].f
+}
+
+/// Text decoration value. Not `ds_decoration` in dsl.nori,
+/// which serves the stylesheet and prints a message with no offending value in it; the node table
+/// has two distinct message texts. `line-through` is accepted,
+/// though only a quoted "line-through" can ever reach here: `is_ident_cont`
+/// has no `-`, so the bare spelling lexes as `line` and never gets this far.
+fn dcn_decoration(inout p: DslP, v: DslValue) -> Int {
+    if v.kind != 0 && v.kind != 3 { dsl_fail(p, "text_decoration must be an identifier")  return 0 }
+    if (v.s == "none") { return td_none() }
+    if (v.s == "underline") { return td_underline() }
+    if (v.s == "strikethrough") || (v.s == "line_through") || (v.s == "line-through") { return td_strikethrough() }
+    if (v.s == "overline") { return td_overline() }
+    dsl_fail(p, ("unknown text_decoration " + (dw_dq(v.s) + " (use none, underline, strikethrough, overline)")))
+    return 0
+}
+
+/// Gradient direction value. Returns true for horizontal.
+/// Both the wrong-kind and the unknown-word case print the same message.
+fn dcn_grad_dir(inout p: DslP, v: DslValue, field_name: Str) -> Bool {
+    if v.kind == 0 || v.kind == 3 {
+        if (v.s == "horizontal") || (v.s == "x") || (v.s == "right") || (v.s == "to_right") { return true }
+        if (v.s == "vertical") || (v.s == "y") || (v.s == "down") || (v.s == "to_bottom") { return false }
+    }
+    dsl_fail(p, (field_name + " must be horizontal or vertical"))
+    return true
+}
+
+/// `class: NAME`: one class name (String or Ident), replacing the list.
+/// The error is `class must be string or ident` on every core kind.
+fn dcn_class_one(inout p: DslP, inout node: UiNode, v: DslValue) {
+    var nc: Vec<Str> = vec()
+    nc.push(dw_str_of(p, v, "class"))
+    node.classes = nc
+}
+
+/// The Nori extension tail (see the header): the inline NodeStyle properties.
+/// Returns true when `name` was one of them. None of these is otherwise a
+/// node attribute (they live in `stylesheet { tag/class NAME { ... } }`),
+/// so this is the one place the core tables stay a superset, on purpose and in
+/// one spot rather than smeared through nine tables.
+fn dcn_ext(inout p: DslP, inout node: UiNode, name: Str, v: DslValue) -> Bool {
+    if (name == "tag") { node.tag = dw_str_of(p, v, "tag")  return true }
+    // `id` on a row / column: neither has one in its own table, and a
+    // retained document needs one: it is how a re-rendered document's nodes are matched to the
+    // ones already laid out, and how a host reaches a node to set a state class on it (a taskbar
+    // button is a row). The kinds that take `id` in their own table read it before this tail.
+    if (name == "id") { node.id = dw_str_of(p, v, "id")  return true }
+    if (name == "position") { node.position = ds_position(p, v)  return true }
+    if (name == "z_index") { node.z_index = to_int(dsl_num_of(p, v, "z_index"))  return true }
+    if (name == "top") { node.has_top = true  node.top = dsl_num_of(p, v, "top")  return true }
+    if (name == "right") { node.has_right = true  node.right = dsl_num_of(p, v, "right")  return true }
+    if (name == "bottom") { node.has_bottom = true  node.bottom = dsl_num_of(p, v, "bottom")  return true }
+    if (name == "left") { node.has_left = true  node.left = dsl_num_of(p, v, "left")  return true }
+    if (name == "overflow_x") { node.overflow_x = ds_overflow(p, v)  return true }
+    if (name == "overflow_y") { node.overflow_y = ds_overflow(p, v)  return true }
+    if (name == "line_height") { node.line_height_mult = dsl_num_of(p, v, "line_height")  return true }
+    if (name == "w") { node.w = dcn_value_length(p, v, "w")  return true }
+    if (name == "h") { node.h = dcn_value_length(p, v, "h")  return true }
+    // the text's direction (ltr / rtl / auto: the first strong character's) and language (BCP 47)
+    if (name == "dir") || (name == "direction") { node.text_dir = ds_dir(p, v)  return true }
+    if (name == "lang") { node.lang = dw_str_of(p, v, "lang")  return true }
+    // the face (text_engine.nori): a family list, a weight, a slant
+    if (name == "font_family") { node.font_family = ds_family(p, v)  return true }
+    if (name == "font_weight") { node.font_weight = ds_weight(p, v)  return true }
+    if (name == "font_style") { node.font_slant = ds_slant(p, v)  return true }
+    return false
+}
+
+// ---- dispatch ---------------------------------------------------------------
+
+/// parse one core-family node body. `kindname` is the element as written (the
+/// `panel` and `scroll` aliases collapse onto column / scroll_column, and the
+/// error text follows the canonical name in both cases: the row/column parser
+/// prints "column" for `panel`).
+fn dsl_core_node(inout p: DslP, kindname: Str, kind: Int) -> UiNode {
+    if kind == nk_column() { return dcn_row_column(p, true) }
+    if kind == nk_row() { return dcn_row_column(p, false) }
+    if kind == nk_scroll_column() { return dcn_scroll(p, false) }
+    if kind == nk_scroll_row() { return dcn_scroll(p, true) }
+    if kind == nk_spacer() { return dcn_spacer(p) }
+    if kind == nk_text() { return dcn_text(p) }
+    if kind == nk_button() { return dcn_button(p) }
+    if kind == nk_rect() { return dcn_rect(p) }
+    return dcn_surface(p)
+}
+
+// ---- column / row ----------------------------------------
+
+/// one `column` / `row` attribute. `flex_wrap` / `wrap` are guarded by
+/// `if !is_column`, so a column has no such attribute at all.
+fn dcn_ctr_attr(inout p: DslP, inout node: UiNode, kn: Str, is_column: Bool, name: Str, v: DslValue) {
+    if (name == "bind_visible") { node.bind_visible = dw_str_of(p, v, "bind_visible") }
+    else if (name == "bind_disabled") { node.bind_disabled = dw_str_of(p, v, "bind_disabled") }
+    else if (name == "gap") { node.gap = ds_strict_num(p, v, "gap") }
+    else if (name == "padding") || (name == "pad") { node.padding = ds_strict_num(p, v, "padding") }
+    else if (name == "padding_x") || (name == "pad_x") { node.has_padding_x = true  node.padding_x = ds_strict_num(p, v, "padding_x") }
+    else if (name == "padding_y") || (name == "pad_y") { node.has_padding_y = true  node.padding_y = ds_strict_num(p, v, "padding_y") }
+    else if (name == "cross_align") || (name == "align_items") { node.cross_align = dw_cross(p, v) }
+    else if (name == "main_align") || (name == "justify_content") { node.main_align = ds_main(p, v) }
+    else if (name == "bg") { node.has_bg = true  node.bg = rgba_pack(dw_color(p, v)) }
+    else if (name == "radius") { node.radius = ds_strict_num(p, v, "radius") }
+    else if (name == "border_color") { node.has_border = true  node.border_color = rgba_pack(dw_color(p, v)) }
+    else if (name == "border_w") || (name == "border_width") { node.border_w = ds_strict_num(p, v, "border_w") }
+    else if (name == "classes") { node.classes = dw_classes(p, v) }
+    else if (name == "class") { dcn_class_one(p, node, v) }
+    else if (name == "on_click") {
+        if v.kind != 0 && v.kind != 3 { dsl_fail(p, "on_click must be a string or ident")  return }
+        node.on_click = copy v.s
+    }
+    else if (name == "min_height") { node.min_height = ds_strict_num(p, v, "min_height") }
+    else if ((name == "flex_wrap") || (name == "wrap")) && !is_column { node.flex_wrap = ds_flex_wrap(p, v) }
+    else if (name == "fill_w") || (name == "fill") { node.fill_w = dsl_bool_of(p, v, "fill_w") }
+    else if (name == "fill_h") { node.fill_h = dsl_bool_of(p, v, "fill_h") }
+    else if (name == "flex_weight") || (name == "flex") { node.has_flex_weight = true  node.flex_weight = ds_strict_num(p, v, "flex_weight") }
+    else if (name == "flex_shrink") { node.has_flex_shrink = true  node.flex_shrink = ds_strict_num(p, v, "flex_shrink") }
+    else if dcn_ext(p, node, name, v) { }
+    else { dsl_fail(p, dw_unknown(kn, name)) }
+}
+
+/// `column { }` / `panel { }` / `row { }`. `:` or `{` is enforced after each name
+/// (children are allowed); no `id`, no `align_self`.
+fn dcn_row_column(inout p: DslP, is_column: Bool) -> UiNode {
+    var kind = nk_row()
+    var kn = "row"
+    if is_column { kind = nk_column()  kn = "column" }
+    var node = ui_node_blank(kind)
+    node.gap = 0.0
+    node.padding = 0.0
+    node.cross_align = cross_stretch()
+    node.main_align = main_start()
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 { dsl_bump(p)  return node }
+        var name = dw_ident(p)
+        if p.failed[0] == 1 { return node }
+        dsl_skip(p)
+        if dsl_peek(p) == 58 {
+            dsl_bump(p)
+            var v = dsl_value(p)
+            if p.failed[0] == 1 { return node }
+            dcn_ctr_attr(p, node, kn, is_column, name, v)
+        } else if dsl_peek(p) == 123 {
+            dsl_bump(p)
+            var child = dsl_node_body(p, name)
+            if p.failed[0] == 1 { return node }
+            dsl_push_child(node, sink child)
+        } else { dsl_fail(p, ("expected `:` or `{` after " + dw_dq(name)))  return node }
+        if p.failed[0] == 1 { return node }
+    }
+    return node
+}
+
+// ---- scroll_column / scroll_row -------------------------
+
+/// one `scroll_column` / `scroll_row` attribute. The min_* asymmetry is real:
+/// scroll_column takes `min_height` and scroll_row takes `min_width`,
+/// never the other way round. Neither takes `on_click`, `main_align`,
+/// `flex_weight`, `flex_shrink`, `align_self` or the `fill` alias.
+fn dcn_scroll_attr(inout p: DslP, inout node: UiNode, kn: Str, is_row: Bool, name: Str, v: DslValue) {
+    if (name == "id") {
+        if v.kind != 0 && v.kind != 3 { dsl_fail(p, "id must be a string")  return }
+        node.id = copy v.s
+    }
+    else if (name == "gap") { node.gap = ds_strict_num(p, v, "gap") }
+    else if (name == "padding") || (name == "pad") { node.padding = ds_strict_num(p, v, "padding") }
+    else if (name == "padding_x") || (name == "pad_x") { node.has_padding_x = true  node.padding_x = ds_strict_num(p, v, "padding_x") }
+    else if (name == "padding_y") || (name == "pad_y") { node.has_padding_y = true  node.padding_y = ds_strict_num(p, v, "padding_y") }
+    else if (name == "cross_align") || (name == "align_items") { node.cross_align = dw_cross(p, v) }
+    else if (name == "bg") { node.has_bg = true  node.bg = rgba_pack(dw_color(p, v)) }
+    else if (name == "radius") { node.radius = ds_strict_num(p, v, "radius") }
+    else if (name == "border_color") { node.has_border = true  node.border_color = rgba_pack(dw_color(p, v)) }
+    else if (name == "border_w") || (name == "border_width") { node.border_w = ds_strict_num(p, v, "border_w") }
+    else if (name == "classes") { node.classes = dw_classes(p, v) }
+    else if (name == "class") { dcn_class_one(p, node, v) }
+    else if (name == "fill_w") { node.fill_w = dsl_bool_of(p, v, "fill_w") }
+    else if (name == "fill_h") { node.fill_h = dsl_bool_of(p, v, "fill_h") }
+    else if ((name == "min_height") && !is_row) { node.min_height = ds_strict_num(p, v, "min_height") }
+    else if ((name == "min_width") && is_row) { node.has_min_width = true  node.min_width = ds_strict_num(p, v, "min_width") }
+    else if (name == "bind_visible") { node.bind_visible = dw_str_of(p, v, "bind_visible") }
+    else if (name == "bind_disabled") { node.bind_disabled = dw_str_of(p, v, "bind_disabled") }
+    else if dcn_ext(p, node, name, v) { }
+    else { dsl_fail(p, dw_unknown(kn, name)) }
+}
+
+/// `scroll_column { }` / `scroll { }` / `scroll_row { }`.
+fn dcn_scroll(inout p: DslP, is_row: Bool) -> UiNode {
+    var kind = nk_scroll_column()
+    var kn = "scroll_column"
+    if is_row { kind = nk_scroll_row()  kn = "scroll_row" }
+    var node = ui_node_blank(kind)
+    node.gap = 0.0
+    node.padding = 0.0
+    node.cross_align = cross_stretch()
+    node.fill_w = true
+    node.fill_h = !is_row
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 { dsl_bump(p)  return node }
+        var name = dw_ident(p)
+        if p.failed[0] == 1 { return node }
+        dsl_skip(p)
+        if dsl_peek(p) == 58 {
+            dsl_bump(p)
+            var v = dsl_value(p)
+            if p.failed[0] == 1 { return node }
+            dcn_scroll_attr(p, node, kn, is_row, name, v)
+        } else if dsl_peek(p) == 123 {
+            dsl_bump(p)
+            var child = dsl_node_body(p, name)
+            if p.failed[0] == 1 { return node }
+            dsl_push_child(node, sink child)
+        } else { dsl_fail(p, ("expected `:` or `{` after " + dw_dq(name)))  return node }
+        if p.failed[0] == 1 { return node }
+    }
+    return node
+}
+
+// ---- spacer ---------------------------------------------
+
+/// `spacer { h, w }`. Two attributes, nothing else: not `classes`, not `class`,
+/// not `id`, and none of the extension tail. A `:` is required after each name.
+/// An unset extent measures 8px at layout,
+/// which is spelled as the Px(0) blank default.
+fn dcn_spacer(inout p: DslP) -> UiNode {
+    var node = ui_node_blank(nk_spacer())
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 { dsl_bump(p)  return node }
+        var name = dw_ident(p)
+        if p.failed[0] == 1 { return node }
+        dw_colon_a(p, "spacer")
+        if p.failed[0] == 1 { return node }
+        if (name == "h") { node.h = dw_length(p) }
+        else if (name == "w") { node.w = dw_length(p) }
+        else { dsl_fail(p, dw_unknown("spacer", name))  return node }
+        if p.failed[0] == 1 { return node }
+    }
+    return node
+}
+
+// ---- text -----------------------------------------------
+
+/// one `text` attribute. The typography tail is a text table, so
+/// `rect { bold: true }` and `column { nowrap: true }` are errors on those kinds.
+///
+/// The outline / gradient / shadow / decoration tail is parsed: PaintPrimitive
+/// carries `outline_color`/`outline_w`/`has_grad`/`grad_*` and both painters
+/// render them, the shadow is stacked text primitives (push_text_shadow) and the
+/// decoration is `push_text_decorations`'s rules, so none of these is a
+/// silently-dropped no-op.
+///
+/// `font_family` / `font_weight` / `font_style` (and `dir`, `lang`) are read by the
+/// tail every core kind shares (dcn_ext): the primitive carries a font stack.
+/// Not parsed: the 16 `anim_*` attributes (nothing in the
+/// overlay path carries a clock: ComputedOverlay has no time and ui_layout_node
+/// takes no `t`; retained documents animate through `.style` instead). They stay
+/// `unknown text field "..."` rather than becoming fields nothing reads.
+fn dcn_text_attr(inout p: DslP, inout node: UiNode, name: Str, v: DslValue) {
+    if (name == "id") { node.id = dw_str_of(p, v, "id") }
+    else if (name == "text") {
+        // A quoted String is the strict form here. A bare ident is accepted as well, and the
+        // message says what the code does ("text must be a string or ident"), so a reader is not
+        // sent looking for a bug that is not there.
+        if v.kind != 0 && v.kind != 3 { dsl_fail(p, "text must be a string or ident")  return }
+        node.text = copy v.s
+    }
+    else if (name == "size_px") || (name == "font_size") { node.size_px = ds_strict_num(p, v, "size_px") }
+    else if (name == "color") || (name == "text_color") { node.has_color = true  node.color = rgba_pack(dw_color(p, v)) }
+    else if (name == "anchor") { dcn_anchor(p, node, v) }
+    else if (name == "text_align") || (name == "horizontal_align") || (name == "justify_content") { node.has_anchor = true  node.anchor_x = ds_anchor_x(p, v)  node.text_align = ds_text_align(v) }
+    else if (name == "vertical_align") || (name == "align_items") { node.has_anchor = true  node.anchor_y = ds_anchor_y(p, v) }
+    else if (name == "classes") { node.classes = dw_classes(p, v) }
+    else if (name == "class") { dcn_class_one(p, node, v) }
+    else if (name == "bold") { node.font_bold = ds_strict_bool(p, v, "bold") }
+    else if (name == "italic") { node.font_italic = ds_strict_bool(p, v, "italic") }
+    else if (name == "line_height_mult") { node.line_height_mult = ds_strict_num(p, v, "line_height_mult") }
+    else if (name == "max_width") { node.has_max_width = true  node.max_width_px = ds_strict_num(p, v, "max_width") }
+    else if (name == "min_height") { node.min_height = ds_strict_num(p, v, "min_height") }
+    else if (name == "letter_spacing") { node.has_letter_spacing = true  node.letter_spacing = ds_strict_num(p, v, "letter_spacing") }
+    else if (name == "word_spacing") { node.has_word_spacing = true  node.word_spacing = ds_strict_num(p, v, "word_spacing") }
+    else if (name == "text_transform") || (name == "transform") { node.text_transform = ds_transform(p, v) }
+    else if (name == "text_overflow") || (name == "overflow") { node.text_overflow = ds_toverflow(p, v) }
+    else if (name == "line_clamp") {
+        var lc = to_int(ds_strict_num(p, v, "line_clamp"))
+        if lc < 1 { lc = 1 }                          // floored at 1
+        node.line_clamp = lc
+    }
+    else if (name == "nowrap") { if dsl_bool_of(p, v, "nowrap") { node.wrap = false } }   // false is a no-op
+    else if (name == "wrap_text") { node.wrap = ds_strict_bool(p, v, "wrap_text") }
+    else if (name == "wrap_hard_break") { node.wrap_hard_break = ds_strict_bool(p, v, "wrap_hard_break") }
+    else if (name == "align_self") { node.has_align_self = true  node.align_self = dw_cross(p, v) }
+    // --- outline / gradient / shadow / decoration ---
+    // The outline is gated on the colour alone: the width is 0 unless
+    // outline_color is set, so a lone `text_outline_width_px` draws nothing.
+    else if (name == "text_outline_color") || (name == "outline_color") || (name == "stroke_color") { node.has_text_outline = true  node.text_outline_color = rgba_pack(dw_color(p, v)) }
+    else if (name == "text_outline_width_px") || (name == "outline_width") || (name == "stroke_width") { node.text_outline_width_px = ds_strict_num(p, v, "text_outline_width_px") }
+    // ...and the gradient on both endpoints: style_gradient matches on the pair.
+    else if (name == "text_gradient_from") { node.has_text_gradient_from = true  node.text_gradient_from = rgba_pack(dw_color(p, v)) }
+    else if (name == "text_gradient_to") { node.has_text_gradient_to = true  node.text_gradient_to = rgba_pack(dw_color(p, v)) }
+    else if (name == "text_gradient_dir") || (name == "text_gradient_direction") { node.text_gradient_horizontal = dcn_grad_dir(p, v, "text_gradient_dir") }
+    // ...and the shadow on its colour.
+    else if (name == "shadow_color") || (name == "text_shadow_color") { node.has_text_shadow = true  node.text_shadow_color = rgba_pack(dw_color(p, v)) }
+    else if (name == "shadow_blur") || (name == "text_shadow_blur") { node.shadow_blur = ds_strict_num(p, v, "shadow_blur") }
+    else if (name == "shadow_spread") || (name == "text_shadow_spread") { node.shadow_spread = ds_strict_num(p, v, "shadow_spread") }
+    else if (name == "shadow_offset_x") || (name == "text_shadow_offset_x") { node.shadow_offset_x = ds_strict_num(p, v, "shadow_offset_x") }
+    else if (name == "shadow_offset_y") || (name == "text_shadow_offset_y") { node.shadow_offset_y = ds_strict_num(p, v, "shadow_offset_y") }
+    else if (name == "text_decoration") || (name == "decoration") { node.text_decoration = dcn_decoration(p, v) }
+    else if (name == "text_decoration_color") || (name == "decoration_color") { node.has_text_decoration_color = true  node.text_decoration_color = rgba_pack(dw_color(p, v)) }
+    else if (name == "text_decoration_width_px") || (name == "decoration_width") || (name == "decoration_thickness") { node.text_decoration_width_px = ds_strict_num(p, v, "text_decoration_width_px") }
+    // --- extensions on `text` (none of these is in the per-kind table) ---
+    else if (name == "label") { node.text = dw_str_of(p, v, "label") }
+    else if (name == "wrap") { node.wrap = dsl_bool_of(p, v, "wrap") }
+    else if (name == "height") { node.h = dcn_value_length(p, v, "h") }
+    else if (name == "flex_weight") || (name == "flex") { node.has_flex_weight = true  node.flex_weight = dsl_num_of(p, v, "flex_weight") }
+    else if (name == "flex_shrink") { node.has_flex_shrink = true  node.flex_shrink = dsl_num_of(p, v, "flex_shrink") }
+    else if (name == "tab_index") || (name == "focus_order") { node.has_tab_index = true  node.tab_index = to_int(dsl_num_of(p, v, "tab_index")) }
+    else if (name == "bind_visible") { node.bind_visible = dw_str_of(p, v, "bind_visible") }
+    else if (name == "bind_disabled") { node.bind_disabled = dw_str_of(p, v, "bind_disabled") }
+    else if dcn_ext(p, node, name, v) { }
+    else { dsl_fail(p, dw_unknown("text", name)) }
+}
+
+/// `text { }`. `span { }` is its only child;
+/// the whole node is rejected at the closing brace unless it has text or spans.
+fn dcn_text(inout p: DslP) -> UiNode {
+    var node = ui_node_blank(nk_text())
+    node.has_color = false
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 {
+            dsl_bump(p)
+            if node.text.len() == 0 && node.spans.len() == 0 { dsl_fail(p, "text node requires text: and/or span { … } children") }
+            return node
+        }
+        var name = dw_ident(p)
+        if p.failed[0] == 1 { return node }
+        dsl_skip(p)
+        if dsl_peek(p) == 58 {
+            dsl_bump(p)
+            var v = dsl_value(p)
+            if p.failed[0] == 1 { return node }
+            dcn_text_attr(p, node, name, v)
+        } else if dsl_peek(p) == 123 {
+            dsl_bump(p)
+            if (name == "span") { node.spans.push(dsl_span(p)) }
+            else { dsl_fail(p, ("unknown child node " + (dw_dq(name) + " in text (expected span { … })")))  return node }
+        } else { dsl_fail(p, ("expected `:` or `{` after " + dw_dq(name)))  return node }
+        if p.failed[0] == 1 { return node }
+    }
+    return node
+}
+
+// ---- button ---------------------------------------------
+
+/// one `button` attribute. Note what is not here: `padding`, `gap`, `color`
+/// (only `text_color`), `border_*`, `w`, the `fill` alias, `min_height`, and the
+/// whole text typography tail. `label` is String-only and `fill_w` is
+/// Bool-only; the lenient coercions used elsewhere are unavailable.
+fn dcn_button_attr(inout p: DslP, inout node: UiNode, name: Str, v: DslValue) {
+    if (name == "bind_visible") { node.bind_visible = dw_str_of(p, v, "bind_visible") }
+    else if (name == "bind_disabled") { node.bind_disabled = dw_str_of(p, v, "bind_disabled") }
+    else if (name == "id") || (name == "node_id") { node.id = dw_str_of(p, v, "node_id") }
+    else if (name == "label") {
+        if v.kind != 0 { dsl_fail(p, "label must be a quoted string")  return }
+        node.text = copy v.s
+    }
+    else if (name == "on_click") { node.on_click = dw_str_of(p, v, "on_click") }
+    else if (name == "classes") { node.classes = dw_classes(p, v) }
+    else if (name == "class") { dcn_class_one(p, node, v) }
+    else if (name == "bg") { node.has_bg = true  node.bg = rgba_pack(dw_color(p, v)) }
+    // `color` is an alias for `text_color`; the button table otherwise has only
+    // `text_color`. Kept because paint_cpu's end-to-end fixture writes it.
+    else if (name == "text_color") || (name == "color") { node.has_color = true  node.color = rgba_pack(dw_color(p, v)) }
+    else if (name == "radius") { node.radius = ds_strict_num(p, v, "radius") }
+    else if (name == "height") { node.h = ui_px(ds_strict_num(p, v, "height")) }
+    else if (name == "label_size_px") || (name == "size_px") || (name == "text_size") { node.size_px = ds_strict_num(p, v, "label_size_px") }
+    else if (name == "fill_w") { node.fill_w = dw_bool_strict(p, v, "fill_w") }
+    else if (name == "flex") || (name == "flex_weight") { node.has_flex_weight = true  node.flex_weight = ds_strict_num(p, v, "flex_weight") }
+    else if (name == "flex_shrink") { node.has_flex_shrink = true  node.flex_shrink = ds_strict_num(p, v, "flex_shrink") }
+    else if (name == "label_bold") { node.font_bold = dw_bool_strict(p, v, "label_bold") }
+    else if (name == "label_italic") { node.font_italic = dw_bool_strict(p, v, "label_italic") }
+    else if (name == "label_line_height_mult") { node.line_height_mult = ds_strict_num(p, v, "label_line_height_mult") }
+    else if (name == "align_self") { node.has_align_self = true  node.align_self = dw_cross(p, v) }
+    else if (name == "tab_index") || (name == "focus_order") { node.has_tab_index = true  node.tab_index = to_int(dsl_num_of(p, v, "tab_index")) }
+    else if dcn_ext(p, node, name, v) { }
+    else { dsl_fail(p, dw_unknown("button", name)) }
+}
+
+/// `button { }`. A `:` is required, so a nested
+/// block is that same missing-`:` error rather than a "no children" message.
+/// `label:` and `on_click:` are both required, checked at the closing brace.
+fn dcn_button(inout p: DslP) -> UiNode {
+    var node = ui_node_blank(nk_button())
+    node.h = ui_px(48.0)                              // an unset height resolves to 48 at layout
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 {
+            dsl_bump(p)
+            if node.text.len() == 0 { dsl_fail(p, "button requires label:") }
+            else if node.on_click.len() == 0 { dsl_fail(p, "button requires on_click:") }
+            return node
+        }
+        var name = dw_ident(p)
+        if p.failed[0] == 1 { return node }
+        dw_colon_a(p, "button")
+        if p.failed[0] == 1 { return node }
+        var v = dsl_value(p)
+        if p.failed[0] == 1 { return node }
+        dcn_button_attr(p, node, name, v)
+        if p.failed[0] == 1 { return node }
+    }
+    return node
+}
+
+// ---- rect / surface -------------------------------------
+
+/// `w:` / `h:` on rect and surface. A leading
+/// `-`/digit goes through parse_length_value, and otherwise a bare ident `fill`
+/// sets fill_w / fill_h instead of the length (rect and surface alike). A quoted
+/// "fill" is not the bare ident and still takes the value_length error path.
+fn dcn_len_or_fill(inout p: DslP, inout node: UiNode, is_w: Bool, label: Str) {
+    dsl_skip(p)
+    var c = dsl_peek(p)
+    if c == 45 || dsl_is_digit(c) {
+        var n = dsl_number(p)
+        if p.failed[0] == 1 { return }
+        var l = dsl_length_suffix(p, n)
+        if is_w { node.w = l } else { node.h = l }
+        return
+    }
+    var v = dsl_value(p)
+    if p.failed[0] == 1 { return }
+    if v.kind == 3 && (v.s == "fill") {
+        if is_w { node.fill_w = true } else { node.fill_h = true }
+        return
+    }
+    var l2 = dcn_value_length(p, v, label)
+    if is_w { node.w = l2 } else { node.h = l2 }
+}
+
+/// one `rect` attribute (`w`/`h` handled by the caller). Nine names:
+/// no `bg`, no `id`, no `border_*`, no `on_click`, no `flex_*`.
+fn dcn_rect_attr(inout p: DslP, inout node: UiNode, name: Str, v: DslValue) {
+    if (name == "fill_w") || (name == "fill") { node.fill_w = dsl_bool_of(p, v, "fill_w") }
+    else if (name == "fill_h") { node.fill_h = dsl_bool_of(p, v, "fill_h") }
+    else if (name == "color") { node.has_color = true  node.color = rgba_pack(dw_color(p, v)) }
+    else if (name == "radius") { node.radius = ds_strict_num(p, v, "radius") }
+    else if (name == "classes") { node.classes = dw_classes(p, v) }
+    else if (name == "class") { dcn_class_one(p, node, v) }
+    else if (name == "align_self") { node.has_align_self = true  node.align_self = dw_cross(p, v) }
+    else if dcn_ext(p, node, name, v) { }
+    else { dsl_fail(p, dw_unknown("rect", name)) }
+}
+
+/// `rect { }`. A `:` is required after each name; no children; no required
+/// attributes.
+fn dcn_rect(inout p: DslP) -> UiNode {
+    var node = ui_node_blank(nk_rect())
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 { dsl_bump(p)  return node }
+        var name = dw_ident(p)
+        if p.failed[0] == 1 { return node }
+        dw_colon_a(p, "rect")
+        if p.failed[0] == 1 { return node }
+        if (name == "w") { dcn_len_or_fill(p, node, true, "w") }
+        else if (name == "h") { dcn_len_or_fill(p, node, false, "h") }
+        else {
+            var v = dsl_value(p)
+            if p.failed[0] == 1 { return node }
+            dcn_rect_attr(p, node, name, v)
+        }
+        if p.failed[0] == 1 { return node }
+    }
+    return node
+}
+
+/// one `surface` attribute (`w`/`h` handled by the caller). Rect's set plus
+/// `id`, `on_click` and the flex pair, but still no `bg` and no `border_*`.
+fn dcn_surface_attr(inout p: DslP, inout node: UiNode, name: Str, v: DslValue) {
+    if (name == "id") { node.id = dw_str_of(p, v, "id") }
+    else if (name == "on_click") { node.on_click = dw_str_of(p, v, "on_click") }
+    else if (name == "fill_w") || (name == "fill") { node.fill_w = dsl_bool_of(p, v, "fill_w") }
+    else if (name == "fill_h") { node.fill_h = dsl_bool_of(p, v, "fill_h") }
+    else if (name == "color") { node.has_color = true  node.color = rgba_pack(dw_color(p, v)) }
+    else if (name == "radius") { node.radius = ds_strict_num(p, v, "radius") }
+    else if (name == "classes") { node.classes = dw_classes(p, v) }
+    else if (name == "class") { dcn_class_one(p, node, v) }
+    else if (name == "align_self") { node.has_align_self = true  node.align_self = dw_cross(p, v) }
+    else if (name == "flex") || (name == "flex_weight") { node.has_flex_weight = true  node.flex_weight = ds_strict_num(p, v, "flex_weight") }
+    else if (name == "flex_shrink") { node.has_flex_shrink = true  node.flex_shrink = ds_strict_num(p, v, "flex_shrink") }
+    else if dcn_ext(p, node, name, v) { }
+    else { dsl_fail(p, dw_unknown("surface", name)) }
+}
+
+/// `surface { }`. A `:` is required after each name; no children.
+fn dcn_surface(inout p: DslP) -> UiNode {
+    var node = ui_node_blank(nk_surface())
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 { dsl_bump(p)  return node }
+        var name = dw_ident(p)
+        if p.failed[0] == 1 { return node }
+        dw_colon_a(p, "surface")
+        if p.failed[0] == 1 { return node }
+        if (name == "w") { dcn_len_or_fill(p, node, true, "w") }
+        else if (name == "h") { dcn_len_or_fill(p, node, false, "h") }
+        else {
+            var v = dsl_value(p)
+            if p.failed[0] == 1 { return node }
+            dcn_surface_attr(p, node, name, v)
+        }
+        if p.failed[0] == 1 { return node }
+    }
+    return node
+}

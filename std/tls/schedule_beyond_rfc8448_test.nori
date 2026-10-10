@@ -1,0 +1,83 @@
+// The parts of the TLS 1.3 key schedule that RFC 8448 does not reach, run with
+//   noric --test std/tls/schedule_beyond_rfc8448_test.nori compiler/runtime.nori --import-root .
+//
+// RFC 8448's five handshakes are good evidence for the schedule, but they are
+// still only five handshakes. None of them performs a KeyUpdate, none expands more than 48 bytes
+// under a label, and none feeds the schedule an input it should refuse. Those cases are here, and
+// every one was found by mutation testing: each corresponds to a defect that the RFC
+// vectors alone did not catch.
+//
+// The computed answers come from an independent implementation of RFC 8446 7.1 that reproduces
+// every SHA-256 answer in RFC 8448 before it is trusted. That is weaker
+// evidence than a published trace, which is why these live in their own file rather than beside
+// the RFC vectors: the two kinds should not be mistaken for one another.
+import "std/tls" as tls
+
+fn tohex(s: Str) -> Str {
+    let d = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < s.len() { let b = ord(s.at(i))  out = ((out + d.at((b >> 4))) + d.at((b & 15)))  i = i + 1 }
+    return out
+}
+// a constant-byte string, enough to pin a label, and readable in a way a hex blob is not
+fn rep(b: Int, n: Int) -> Str {
+    var out = ""
+    var i = 0
+    while i < n { out = (out + chr(b))  i = i + 1 }
+    return out
+}
+
+// The HkdfLabel length is a 16-bit field. Every length TLS itself asks for (12, 16, 32, 48) fits
+// in the low byte, so zeroing the high byte passes every RFC 8448 vector and is still wrong.
+fn test_hkdf_label_length_is_16_bit() {
+    assert_streq(tohex(tls::hkdf_label("key", "", 16)), "001009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("key", "", 255)), "00ff09746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("key", "", 256)), "010009746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("key", "", 300)), "012c09746c733133206b657900")
+    assert_streq(tohex(tls::hkdf_label("key", "", 65535)), "ffff09746c733133206b657900")
+    // a context that fills its single length byte completely
+    assert_streq(tohex(tls::hkdf_label("key", rep(65, 255), 32)), "002009746c733133206b6579ff414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141")
+}
+
+// KeyUpdate. RFC 8448 never performs one, so nothing in it pins the "traffic upd" label, which
+// is abbreviated in a way that invites being spelled out, and spelling it out breaks no RFC 8448
+// vector at all.
+fn test_key_update() {
+    // SHA-256
+    assert_streq(tohex(tls::key_update(32, rep(7, 32))), "e4e9fd5395b1b2c12d57c49ca803ccab1944c4b7404cffb80eae7a8737708e4c")
+    // and again, because a KeyUpdate chain is meant to keep going
+    assert_streq(tohex(tls::key_update(32, tls::key_update(32, rep(7, 32)))), "7f4c64e89fb7124f0c5d3f8d327b6bac8815adb33df26771bb4df02198702e12")
+    // SHA-384
+    assert_streq(tohex(tls::key_update(48, rep(7, 48))), "76eb5e0655ece81316ee028f0064bd573f0d57551094dd89316ce1d0f194da645649f31bf6f077cbf870aa584ca16022")
+    // and again, because a KeyUpdate chain is meant to keep going
+    assert_streq(tohex(tls::key_update(48, tls::key_update(48, rep(7, 48)))), "a22e25e23a82d4a4152cedd6e201a9f0f1032d2fb2475f639c65bec8740fabc93a425fe938e4c053ffbdb8b3ddf2feed")
+}
+
+// Expansions longer than one hash block, where HKDF's counter has to advance and each block is
+// chained from the last. RFC 8448 asks for at most 48 bytes, which is a single block for SHA-384
+// and two for SHA-256, so the counter is barely exercised there.
+fn test_long_expansion() {
+    assert_streq(tohex(tls::expand_label(32, rep(7, 32), "key", "", 100)), "0d875cd714c2e5b4e6cd165ca596ef05d67104b8f30f95e9f5d8f044d861d3ad43d1326ade0b0d60b45f5463a9b7430c4f962b7779cc47ed665076ee5728606bc5d95150bc11aee8789af4a0e155f8275167b72097c0c4bcfe98fb74fb5c3c5ac75b84aa")
+    assert_streq(tohex(tls::expand_label(32, rep(7, 32), "key", "", 1000)), "670c705c9691af175e80d69ed46b687ce52cdc715f20ba53cb8531ca2738994828b1782ab58226d1076acbaf939522487884c86c0953484e237f5b11fd00e72be019b98a0bbb7cadfcbe9c90096f7dd3aa9ec1296f8fb68c6c06b8b8b8294c780371eeff79a7c7c2331bdbeea3833feac095ab0c8c9e5b9920223af2f79637cab71a182c8a914b132f70c71b02d6d3586cdd73ea41ad2e674e398e4d91a0f6a3851a4976da5fbf5a7676037fd371764b49fc8369b5764467b3818e1fccf7a23f556501974b74511595ab3309a00ed2078511a9f1faa1ef8f7ac61cc95466920ae1d22833662ed266f2c13749116588b4b033fd6c5e32a8768268a939f897b1f39d12fc7ff0a7e2eca5a2220c737e0e5ec75ea4fcd46db90ed2a450874cd9fcfa1d545b987dfd588acbc1baa99ac687cfc02dead503fb6222958e6a5a8b5178db5b80a251726e5b7637b13db7632e828e2ce128b970845730c8ccceaa6ed791e933db098f40f6c9b8767a704526954164e76e13a1738aa489f0933b9b54b2bf3ce08f1aaa323d8e9837bf4f6b68239922f3338b7d3aa9edfa86147e6790b5767576d6c40e6a140f9a627973fa8b16780e0105ddd8fe5e3acce5fa8f1f8f6591394fe3cd203e44d2b1dff886d7cc70be7e65239ea4a2257b5d9516dede0d68dcbf5936d75e5a5cf4139940c3f8d71d0b410e27db57e3ce3f1f51490d8b3c6e01af598ceba96882ab0fef290aae251669ca5e29ded94fed9b38372c00e0b48a46312099314569395c30c16748a96aadab8d6bd3898c984f5ddbd70f337df5bbfc612cc28fb738239484859a33fea3629ec99626cd4470d517616d8aa3676041360412d3e558e2cea6368724ac4b4436082c1c3a96daa1daf6215903f162391fca231ebf514fa2588a6f2285099552bdae770152983c8caba29b22e63f50c99e1e7e821f68fb94b3c3e563ded645e6e09ef34de4de6e32943b8e2e35ba6ac4f7905dea164da1d613fac9984507bab3cbadfec3281c1cbe3c5eed37924af5d7f059b6b8f01e33183d24eeb0eda33b8fdb87232ca5e637ee68a6e3b6c766a2832a5684a875edb2e37f998780ea047e00723eb050b73957b725b53819036b13bc32ed1605a8a46ed6c7fa08c200f89c30ccb1bfae31aa320950da136f8b86f39f22aeaec3febb1d8c61cc6e7a6b2bace70a458f9935e4a1a6d95bbc0ad8bb62281b2e144311bbb33bd3cd8b02c58eb62d4557108141aa01e488c3203ed775f1c37591a4e7dbbe29e67b4fe6ed055398e0bf2409ec4958960b658a407051626ef1bd24c2abda6d48f502c25b908e55bbc86774b597dd0ce228dd308b157494e7664b4d3922cc66333a3b8c4310ca2562ae45d4dc7b93a0082517e2401b828a2d3ad82bb09279b140528586ac")
+    assert_streq(tohex(tls::expand_label(48, rep(7, 48), "key", "", 100)), "d0c67c7e7ed5144786961cd957b1cefb07f455adadaeabfaeb56b1efb234ac9b91c71184ffe3ea14c29c3796e067af26951c6c265659dc3fc93a873e23b9c7162ee7e61025c09dd8effb8e438a55b1d3c91e92603643b8a186c6d8fe93b0d3cd9ea5ef59")
+    assert_streq(tohex(tls::expand_label(48, rep(7, 48), "key", "", 1000)), "dcb98df1aa69a0517c3a95b3b4c6dc7fd7caf045b0e5643c73cdb4771ad12ca5e44e7db173aa99da40307efeeffbe22ddbd409fd16f622509d9a22da443ebcbb9f35f4bee758f9748b120816da2ddfa7cf527dca9aa752dbb9562182c9daf9f548fa74f475c881f6d16de8e414142f2062a0f275673ef8063ee15cae59085ca9a4c0682507d1e72a40e442fa081d9120b5730930e40ea2ce202e516f643da2967c0228180fc0b9678e698681bd78e4d5173bb27994222d5a62bbbee83f1be3505b3c4946e1ad7f2c75e75ae0a263d63ed7d508543f58d02f9d955b3672762abadf33bcf5f073b048622bf31f83eebb2fc95e63a276751646ee167d962120eb2f702379b716afe9437bc076f744e7b7d5ed23d648a424a4739a79f10b627846827c6b51755baeeea7bab9839f14b54a4d78806853446036aea80a5ab021fbbf81885cc235a9ba5d4086e66d28ab021ebfb258ee7f535d0bb40dfd6841f4d8dd4a940fe31b4746dfd10413aa18f87f851933340d626142379967fc5ab90e7fb145d5686213f81486cc536119df6e8e963489f36e576cfa0c78e2f3ea19394b402eb733a700be3c233fd62e2f116ea61417f326b6097ff6cf0c7b63052c6c4756d0ac78970e1cb07266bb7a7fc0378b80f18c96dc2be4fd9b83a47316e0348d471c06a6dcea1d830b1436ad8f9e3142edfeadee128e98d27aeecdd8af5b20e737bf138e97ab3e0b7543893e0f69ebfc55e64d111edaada8b0293e1ccca6c890aab3a3f0ef7044d4cb11bc7b84a62acd80af399e8e0b2f1ac8924e7521d5dcb3f6ed478912a0958016e726c5cbe3cf79dff99b6726ff98515bde8d928e1d7fad382983d2e8e6865eeefab493919e6b56028d33a7bd33d00875fe2c67fb2a0042ca07cba08cc161c0b12df04b05fd15a9f35c9ebc6fdb10759408f82332df724722ddc1f4d2e7220fa2c6070e65c1ca845ce7ff2ed9eda815a029d1399f92b4b0f0fbf7cfa09bccf931d8732df66db69fe9a092cefbe9c90ed43b1ae597fe9639e75ad852e0c844c3ff1aa320a4042ff14515f60d3a867515005cb30340806fb4d98e8fa0a3b178db033050fd675eb1057dc6ae590a5d2a4471547442cb7577845701c09066837ed30e2dce042e15439f5986069f4ff76550eaa0ce1e0c43af2bf24ea1d91658ad41286ab084aebe0191df623f028bedeb33fa87f5d43eb732b20eaa2a7311ba07ef2c1233d580e36d47fb82cba845d7f979eee2c2dfc313e60e89c7a6521228dc7fb17025f43d2b83347b5959f08d8345089674d6458cc811cf73df5140fd49b70416e625ddcdad086ca2a1fc8646e37c11b41571bbd5f07f1d1d4a28b8369bba93933a52c614ef38f0305fa3de2eeb211b1fc00f459547b7f8383b7d1a5de9d3504fa5")
+}
+
+// Refusals. A key schedule handed an unsupported hash must produce nothing; the one thing it
+// must never do is quietly substitute a hash it does have, because the result is a key of exactly
+// the right length that no peer will ever agree with.
+fn test_refuses_unsupported_inputs() {
+    // 20 would be SHA-1, 64 would be SHA-512: both real hashes, neither a TLS 1.3 suite
+    assert_streq(tls::expand_label(20, rep(7, 20), "key", "", 16), "")
+    assert_streq(tls::expand_label(64, rep(7, 64), "key", "", 16), "")
+    assert_streq(tls::derive_secret(0, rep(7, 32), "key", ""), "")
+    let s = tls::schedule_start(20, "")
+    assert_streq(s.early, "")
+    // a label or context too long for the single byte that describes it
+    assert_streq(tls::hkdf_label("key", rep(65, 256), 32), "")
+    assert_streq(tls::hkdf_label(rep(65, 250), "", 32), "")
+    // a length the 16-bit field cannot describe
+    assert_streq(tls::hkdf_label("key", "", 65536), "")
+    assert_streq(tls::hkdf_label("key", "", 0 - 1), "")
+}

@@ -1,0 +1,138 @@
+//! std/math, xform.nori: projections, view matrices, and the TRS Transform.
+//!
+//! Convention: everything here is right-handed with a **0..1 clip-space depth**; the
+//! wgpu/WebGPU/Direct3D convention, not OpenGL's -1..1. A point on the near plane comes out at
+//! `ndc.z == 0` and one on the far plane at `ndc.z == 1`. Feeding an OpenGL-convention projection
+//! to wgpu silently loses the near half of the depth buffer, which is why the depth range is in
+//! every one of these names' documentation rather than left to the reader.
+//!
+//! View space is right-handed too: the camera sits at the origin looking down **-Z**, with +X right
+//! and +Y up. X and Y in NDC still run -1..1.
+
+/// right-handed perspective, depth 0..1 (wgpu convention).
+///
+/// `fov_y` is the full vertical field of view in radians; `aspect` is width/height. `z_near` must
+/// be > 0: a right-handed perspective has no finite matrix through the eye point.
+pub fn perspective_rh(fov_y: Float, aspect: Float, z_near: Float, z_far: Float) -> Mat4 {
+    let h = 1.0 / tan(fov_y * 0.5)                        // cot(fov/2): the y scale
+    let w = h / aspect
+    let r = z_far / (z_near - z_far)                         // negative; maps -z_near -> 0, -z_far -> 1
+    return Mat4 { x_axis: vec4(w, 0.0, 0.0, 0.0), y_axis: vec4(0.0, h, 0.0, 0.0), z_axis: vec4(0.0, 0.0, r, -1.0), w_axis: vec4(0.0, 0.0, r * z_near, 0.0) }
+}
+/// right-handed perspective with the far plane at infinity, depth 0..1.
+///
+/// Nothing is ever clipped for being too far away, and the depth precision the far plane was
+/// costing goes back into the near range. Depth tends to 1 as z tends to -infinity.
+pub fn perspective_infinite_rh(fov_y: Float, aspect: Float, z_near: Float) -> Mat4 {
+    let h = 1.0 / tan(fov_y * 0.5)
+    let w = h / aspect
+    return Mat4 { x_axis: vec4(w, 0.0, 0.0, 0.0), y_axis: vec4(0.0, h, 0.0, 0.0), z_axis: vec4(0.0, 0.0, -1.0, -1.0), w_axis: vec4(0.0, 0.0, 0.0 - z_near, 0.0) }
+}
+/// right-handed reversed-Z infinite perspective: the near plane maps to 1 and infinity to 0.
+///
+/// The float depth buffer's exponent bunches its precision near zero, and a reversed range puts
+/// that precision at the far distances where a conventional 0..1 depth buffer has none. Pair it
+/// with a `GREATER` depth test and a clear to 0.
+pub fn perspective_infinite_reverse_rh(fov_y: Float, aspect: Float, z_near: Float) -> Mat4 {
+    let h = 1.0 / tan(fov_y * 0.5)
+    let w = h / aspect
+    return Mat4 { x_axis: vec4(w, 0.0, 0.0, 0.0), y_axis: vec4(0.0, h, 0.0, 0.0), z_axis: vec4(0.0, 0.0, 0.0, -1.0), w_axis: vec4(0.0, 0.0, z_near, 0.0) }
+}
+/// right-handed orthographic, depth 0..1 (wgpu convention).
+///
+/// The box `[left, right] x [bottom, top] x [-z_near, -z_far]` in view space maps onto the clip
+/// cube. Note the z arguments are positive distances in front of the camera, as with `perspective_rh`.
+pub fn orthographic_rh(left: Float, right: Float, bottom: Float, top: Float, z_near: Float, z_far: Float) -> Mat4 {
+    let rw = 1.0 / (right - left)
+    let rh = 1.0 / (top - bottom)
+    let r = 1.0 / (z_near - z_far)
+    return Mat4 {
+        x_axis: vec4(2.0 * rw, 0.0, 0.0, 0.0),
+        y_axis: vec4(0.0, 2.0 * rh, 0.0, 0.0),
+        z_axis: vec4(0.0, 0.0, r, 0.0),
+        w_axis: vec4(0.0 - (left + right) * rw, 0.0 - (top + bottom) * rh, r * z_near, 1.0) }
+}
+/// right-handed view matrix for a camera at `eye` looking along `dir`, with `up` as the world up hint.
+///
+/// The result maps world space into view space, where the camera is at the origin looking down -Z.
+/// `dir` and `up` must not be parallel; `up` need not be perpendicular to `dir` and need not be a
+/// unit vector; only its component perpendicular to `dir` is used.
+pub fn look_to_rh(eye: Vec3, dir: Vec3, up: Vec3) -> Mat4 {
+    let f = vec3_normalize(dir)                              // forward, in world space
+    let s = vec3_normalize(vec3_cross(f, up))                // right
+    let u = vec3_cross(s, f)                                 // true up: already unit, f and s are
+    // the basis goes in as rows (the inverse of a rotation is its transpose), and the translation
+    // is the eye expressed in that basis, negated
+    return Mat4 {
+        x_axis: vec4(s.x, u.x, 0.0 - f.x, 0.0),
+        y_axis: vec4(s.y, u.y, 0.0 - f.y, 0.0),
+        z_axis: vec4(s.z, u.z, 0.0 - f.z, 0.0),
+        w_axis: vec4(0.0 - vec3_dot(s, eye), 0.0 - vec3_dot(u, eye), vec3_dot(f, eye), 1.0) }
+}
+/// right-handed view matrix for a camera at `eye` looking at `target`. `target` lands on -Z in view space.
+pub fn look_at_rh(eye: Vec3, target: Vec3, up: Vec3) -> Mat4 { return look_to_rh(eye, vec3_sub(target, eye), up) }
+
+/// a scale/rotate/translate transform: the decomposed form of an affine `Mat4`.
+///
+/// Keeping the three parts apart is what lets an animation interpolate a rotation as a rotation
+/// (`quat_slerp`) instead of blending matrix elements, which is not a rotation in between.
+pub struct Transform { translation: Vec3, rotation: Quat, scale: Vec3 }
+
+/// the identity transform: no translation, no rotation, unit scale.
+pub fn transform_identity() -> Transform { return Transform { translation: vec3_zero(), rotation: quat_identity(), scale: vec3_one() } }
+/// a transform from its three parts.
+pub fn transform_new(translation: Vec3, rotation: Quat, scale: Vec3) -> Transform { return Transform { translation: copy translation, rotation: copy rotation, scale: copy scale } }
+/// a transform that only moves.
+pub fn transform_from_translation(t: Vec3) -> Transform { return Transform { translation: copy t, rotation: quat_identity(), scale: vec3_one() } }
+/// a transform that only rotates.
+pub fn transform_from_rotation(r: Quat) -> Transform { return Transform { translation: vec3_zero(), rotation: copy r, scale: vec3_one() } }
+/// a transform that only scales.
+pub fn transform_from_scale(s: Vec3) -> Transform { return Transform { translation: vec3_zero(), rotation: quat_identity(), scale: copy s } }
+/// the affine matrix: scale, then rotate, then translate.
+pub fn transform_to_mat4(t: Transform) -> Mat4 { return mat4_from_scale_rotation_translation(t.scale, t.rotation, t.translation) }
+/// decompose an affine matrix back into scale, rotation and translation.
+///
+/// Exact for a matrix that `transform_to_mat4` produced. A matrix carrying shear has no TRS form at
+/// all, and what comes back is the nearest one: the column lengths as the scale and the
+/// orthonormalized basis as the rotation.
+pub fn transform_from_mat4(a: Mat4) -> Transform {
+    let b = mat3_from_mat4(a)
+    var sx = vec3_length(b.x_axis)
+    let sy = vec3_length(b.y_axis)
+    let sz = vec3_length(b.z_axis)
+    // a negative determinant means one axis is mirrored. A rotation cannot mirror, so the sign has
+    // to live in the scale; by convention it goes on x, since which axis flipped is unrecoverable
+    if mat3_determinant(b) < 0.0 { sx = 0.0 - sx }
+    let rx = vec3_scale(b.x_axis, 1.0 / sx)
+    let ry = vec3_scale(b.y_axis, 1.0 / sy)
+    let rz = vec3_scale(b.z_axis, 1.0 / sz)
+    return Transform { translation: vec4_truncate(a.w_axis), rotation: quat_from_mat3(mat3_from_cols(rx, ry, rz)), scale: vec3(sx, sy, sz) }
+}
+/// `a * b` as transforms: `b` is applied first, matching `mat4_mul`.
+///
+/// Only exact when `a` has a uniform scale: a rotated non-uniform scale composed with another
+/// scale is a shear, which no TRS can hold. Compose the matrices when that matters.
+pub fn transform_mul(a: Transform, b: Transform) -> Transform {
+    return Transform {
+        translation: vec3_add(a.translation, quat_rotate_vec3(a.rotation, vec3_mul(a.scale, b.translation))),
+        rotation: quat_mul(a.rotation, b.rotation),
+        scale: vec3_mul(a.scale, b.scale) }
+}
+/// the inverse transform. Exact for a non-zero scale.
+pub fn transform_inverse(t: Transform) -> Transform {
+    let s = vec3(1.0 / t.scale.x, 1.0 / t.scale.y, 1.0 / t.scale.z)
+    let r = quat_conjugate(t.rotation)
+    return Transform { translation: vec3_mul(s, quat_rotate_vec3(r, vec3_neg(t.translation))), rotation: r, scale: s }
+}
+/// a point through the transform: scaled, rotated, then translated.
+pub fn transform_point3(t: Transform, p: Vec3) -> Vec3 { return vec3_add(t.translation, quat_rotate_vec3(t.rotation, vec3_mul(t.scale, p))) }
+/// a direction through the transform: scaled and rotated, never translated.
+pub fn transform_vector3(t: Transform, v: Vec3) -> Vec3 { return quat_rotate_vec3(t.rotation, vec3_mul(t.scale, v)) }
+/// the transform's local +X in world space.
+pub fn transform_right(t: Transform) -> Vec3 { return quat_rotate_vec3(t.rotation, vec3_x()) }
+/// the transform's local +Y in world space.
+pub fn transform_up(t: Transform) -> Vec3 { return quat_rotate_vec3(t.rotation, vec3_y()) }
+/// the transform's local -Z in world space: the direction a camera with this transform looks.
+pub fn transform_forward(t: Transform) -> Vec3 { return quat_rotate_vec3(t.rotation, vec3_neg_z()) }
+/// true when all three parts are within `eps` componentwise.
+pub fn transform_approx_eq(a: Transform, b: Transform, eps: Float) -> Bool { return vec3_approx_eq(a.translation, b.translation, eps) && quat_approx_eq(a.rotation, b.rotation, eps) && vec3_approx_eq(a.scale, b.scale, eps) }

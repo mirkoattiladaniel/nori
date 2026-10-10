@@ -1,0 +1,141 @@
+//! std/pvec: a persistent vector: a bit-partitioned trie (branching factor 32). `append` and `assoc`
+//! return a new version that shares every untouched node with the old one (they copy only the
+//! ~log32(n) nodes on the path from the root to the change), so keeping many versions (e.g. an undo
+//! history) costs O(log n) per version instead of O(n). Old versions are never mutated.
+//!
+//! Shared nodes have many owners, which no single version can be. So the nodes live in a `Trie`, an
+//! arena every version of a vector refers into by index; a version is a small scalar record (a count,
+//! a shift, a root index) that copies freely. The arena owns every node and frees them all when it
+//! dies; until then a node stays as long as the arena does, whether or not a live version still
+//! reaches it; that retention is the price of sharing, paid once per arena rather than never.
+//!
+//!   import "std/pvec" as pv
+//!   var t = pv::trie()
+//!   var a = pv::empty()
+//!   var b = pv::append(t, a, 10)     // a is still empty; b has one element (shares nothing new)
+//!   var c = pv::assoc(t, b, 0, 99)   // b unchanged; c[0] == 99, sharing b's other nodes
+//!   pv::at(t, c, 0)  pv::count(c)  pv::to_vec(t, c)
+//!
+//! To build one from data you already have, reach for `of_vec` rather than folding `append` over it:
+//! each `append` mints a fresh root-to-leaf spine, so a fold leaves n-1 intermediate versions in the
+//! arena, while `of_vec` builds the same trie bottom-up and allocates only the nodes the result keeps.
+
+/// the arena every version of a vector refers into: node `i` is `nodes[i]`, a leaf's values or a
+/// branch's child indices (`kinds[i]` = 0 leaf, 1 branch).
+pub struct Trie { nodes: Vec<Vec<Int>>, kinds: Vec<Int> }
+/// a persistent vector: element count, root bit-shift (5·(height-1)), and the root node's index
+/// (-1 for the empty vector, which owns no node).
+pub struct PVec { cnt: Int, shift: Int, root: Int }
+
+/// a fresh, empty arena.
+pub fn trie() -> Trie { return Trie { nodes: vec(), kinds: vec() } }
+/// the empty persistent vector.
+pub fn empty() -> PVec { return PVec { cnt: 0, shift: 0, root: 0 - 1 } }
+/// the number of elements.
+pub fn count(v: PVec) -> Int { return v.cnt }
+/// is it empty?
+pub fn is_empty(v: PVec) -> Bool { return v.cnt == 0 }
+/// the number of nodes the arena holds (every version's, shared ones counted once).
+pub fn node_count(t: Trie) -> Int { return t.nodes.len() }
+
+// 32^(n): the leaf capacity of a tree whose root shift is 5·(n-1).
+fn pow32(levels: Int) -> Int { var r = 1  var i = 0  while i < levels { r = r * 32  i = i + 1 }  return r }
+// a new node in the arena holding `vals`; its index
+fn mint(inout t: Trie, kind: Int, sink vals: Vec<Int>) -> Int {
+    let id = t.nodes.len()
+    t.nodes.push(vals)
+    t.kinds.push(kind)
+    return id
+}
+// a copy of node `id`'s slots with slot `idx` set to x (or appended if idx == len). O(32).
+fn slots_set(t: Trie, id: Int, idx: Int, x: Int) -> Vec<Int> {
+    var o: Vec<Int> = vec()
+    if id >= 0 {
+        var i = 0
+        while i < t.nodes[id].len() { if i == idx { o.push(x) } else { o.push(t.nodes[id][i]) }  i = i + 1 }
+    }
+    if id < 0 || idx >= t.nodes[id].len() { o.push(x) }
+    return o
+}
+fn is_branch(t: Trie, id: Int) -> Bool { if id < 0 { return false }  return t.kinds[id] == 1 }
+// a new node = `node` with index `i`'s value set to x, at `level`; path-copies (creating child nodes
+// as needed so it also serves `append` extending the vector), sharing every off-path subtree. The
+// other slots keep the same child indices, which is the structural sharing.
+fn node_assoc(inout t: Trie, node: Int, level: Int, i: Int, x: Int) -> Int {
+    if level == 0 {
+        if is_branch(t, node) { return mint(t, 0, slots_set(t, 0 - 1, (i & 31), x)) }   // shouldn't occur: a leaf where a branch was expected
+        return mint(t, 0, slots_set(t, node, (i & 31), x))
+    }
+    let sub = ((i >> level) & 31)
+    if is_branch(t, node) {
+        var child = 0 - 1
+        if sub < t.nodes[node].len() { child = t.nodes[node][sub] }
+        let nc = node_assoc(t, child, level - 5, i, x)
+        return mint(t, 1, slots_set(t, node, sub, nc))
+    }
+    // no node here (or a leaf where a branch belongs): build the branch fresh
+    let nc2 = node_assoc(t, 0 - 1, level - 5, i, x)
+    return mint(t, 1, slots_set(t, 0 - 1, sub, nc2))
+}
+/// append `x`, returning a new version that shares all of `v`'s untouched nodes.
+pub fn append(inout t: Trie, v: PVec, x: Int) -> PVec {
+    let i = v.cnt
+    var shift = v.shift
+    var root = v.root
+    if i > 0 { if i == pow32(shift / 5 + 1) {                 // root full: grow: a new root branching over the old
+        var nc: Vec<Int> = vec()
+        nc.push(root)                                        // slot 0 = the old root (shared, not copied)
+        root = mint(t, 1, nc)
+        shift = shift + 5
+    } }
+    return PVec { cnt: i + 1, shift: shift, root: node_assoc(t, root, shift, i, x) }
+}
+/// the element at index `i` (call with 0 <= i < count).
+pub fn at(t: Trie, v: PVec, i: Int) -> Int {
+    var node = v.root
+    var level = v.shift
+    while level > 0 {
+        if is_branch(t, node) { node = t.nodes[node][((i >> level) & 31)] } else { level = 5 }
+        level = level - 5
+    }
+    if node < 0 { return 0 }
+    if is_branch(t, node) { return 0 }
+    return t.nodes[node][(i & 31)]
+}
+/// a new version with index `i` replaced by `x`, sharing every other node with `v`.
+pub fn assoc(inout t: Trie, v: PVec, i: Int, x: Int) -> PVec { return PVec { cnt: v.cnt, shift: v.shift, root: node_assoc(t, v.root, v.shift, i, x) } }
+/// build a persistent vector from a Vec<Int>.
+///
+/// Built bottom-up: the leaves first, then a level of branches over them, until one node is left.
+/// The layout produced here is the one `append` would have arrived at, so appending to the result
+/// still works.
+pub fn of_vec(inout t: Trie, a: Vec<Int>) -> PVec {
+    let n = a.len()
+    if n == 0 { return empty() }
+    var cur: Vec<Int> = vec()                            // the current level's node indices, left to right
+    var i = 0
+    while i < n {
+        var vals: Vec<Int> = vec()
+        var k = 0
+        while k < 32 && i + k < n { vals.push(a[i + k])  k = k + 1 }
+        cur.push(mint(t, 0, vals))
+        i = i + 32
+    }
+    var shift = 0
+    while cur.len() > 1 {                                // fold 32 nodes at a time into the level above
+        var up: Vec<Int> = vec()
+        var j = 0
+        while j < cur.len() {
+            var ch: Vec<Int> = vec()
+            var k2 = 0
+            while k2 < 32 && j + k2 < cur.len() { ch.push(cur[j + k2])  k2 = k2 + 1 }
+            up.push(mint(t, 1, ch))
+            j = j + 32
+        }
+        cur = sink up
+        shift = shift + 5
+    }
+    return PVec { cnt: n, shift: shift, root: cur[0] }
+}
+/// materialize a persistent vector back into a Vec<Int>.
+pub fn to_vec(t: Trie, v: PVec) -> Vec<Int> { var o: Vec<Int> = vec()  var i = 0  while i < v.cnt { o.push(at(t, v, i))  i = i + 1 }  return o }

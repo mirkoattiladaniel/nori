@@ -1,0 +1,1013 @@
+// std/font: the Indic shaper (Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu,
+// Kannada, Malayalam): HarfBuzz's hb-ot-shaper-indic.
+//
+// Indic text is shaped one syllable at a time. Each character gets an Indic category (consonant,
+// matra, virama, nukta, ...) and a position class from the Unicode data; a grammar splits the run
+// into syllables; then, before the basic features run,
+//   - the base consonant is found (walking back from the end, past consonants that will take a
+//     below-base or post-base form in this font),
+//   - a syllable-initial Ra+Halant is marked to become a reph,
+//   - pre-base matras (ि) move in front of the consonants, and everything is sorted by position;
+// masks enable the per-position features (rphf on the reph, half/blwf before the base, blwf/abvf/
+// pstf after it). The basic features (nukt akhn rphf rkrf pref blwf abvf half pstf vatu cjct) then
+// run one at a time, each confined to its syllable; final reordering moves the pre-base matra and
+// the reph to where the formed glyphs say they belong; and the presentation features run.
+//
+// Tested against HarfBuzz on Devanagari (dev2). The other scripts' tables and per-script rules are
+// HarfBuzz's too, but are not oracle-tested; the Sinhala split matras and Kannada/Malayalam special
+// cases are partial.
+
+// categories
+fn IC_X() -> Int { return 0 }
+fn IC_C() -> Int { return 1 }
+fn IC_V() -> Int { return 2 }
+fn IC_N() -> Int { return 3 }
+fn IC_H() -> Int { return 4 }
+fn IC_ZWNJ() -> Int { return 5 }
+fn IC_ZWJ() -> Int { return 6 }
+fn IC_M() -> Int { return 7 }
+fn IC_SM() -> Int { return 8 }
+fn IC_A() -> Int { return 9 }
+fn IC_PLACEHOLDER() -> Int { return 10 }
+fn IC_DOTTEDCIRCLE() -> Int { return 11 }
+fn IC_RS() -> Int { return 12 }
+fn IC_MPST() -> Int { return 13 }
+fn IC_REPHA() -> Int { return 14 }
+fn IC_RA() -> Int { return 15 }
+fn IC_CM() -> Int { return 16 }
+fn IC_SYMBOL() -> Int { return 17 }
+fn IC_CS() -> Int { return 18 }
+// positions
+fn IP_START() -> Int { return 0 }
+fn IP_RA_TO_BECOME_REPH() -> Int { return 1 }
+fn IP_PRE_M() -> Int { return 2 }
+fn IP_PRE_C() -> Int { return 3 }
+fn IP_BASE_C() -> Int { return 4 }
+fn IP_AFTER_MAIN() -> Int { return 5 }
+fn IP_ABOVE_C() -> Int { return 6 }
+fn IP_BEFORE_SUB() -> Int { return 7 }
+fn IP_BELOW_C() -> Int { return 8 }
+fn IP_AFTER_SUB() -> Int { return 9 }
+fn IP_BEFORE_POST() -> Int { return 10 }
+fn IP_POST_C() -> Int { return 11 }
+fn IP_AFTER_POST() -> Int { return 12 }
+fn IP_SMVD() -> Int { return 13 }
+fn IP_END() -> Int { return 14 }
+
+fn flag(c: Int) -> Int { return 1 << c }
+fn CONSONANT_FLAGS() -> Int { return flag(1) | flag(18) | flag(15) | flag(16) | flag(2) | flag(10) | flag(11) }
+fn JOINER_FLAGS() -> Int { return flag(5) | flag(6) }
+
+// syllable types
+fn SY_CONSONANT() -> Int { return 0 }
+fn SY_VOWEL() -> Int { return 1 }
+fn SY_STANDALONE() -> Int { return 2 }
+fn SY_SYMBOL() -> Int { return 3 }
+fn SY_BROKEN() -> Int { return 4 }
+fn SY_NON_INDIC() -> Int { return 5 }
+
+// the basic and presentation features, in HarfBuzz's order (their index is the mask slot)
+fn indic_feature(i: Int) -> Str {
+    let names = "nuktakhnrphfrkrfprefblwfabvfhalfpstfvatucjctinitpresabvsblwspstshaln"
+    return names.slice(i * 4, i * 4 + 4)
+}
+fn INDIC_NUM() -> Int { return 17 }
+fn INDIC_BASIC() -> Int { return 11 }
+fn IF_NUKT() -> Int { return 0 }
+fn IF_RPHF() -> Int { return 2 }
+fn IF_PREF() -> Int { return 4 }
+fn IF_BLWF() -> Int { return 5 }
+fn IF_ABVF() -> Int { return 6 }
+fn IF_HALF() -> Int { return 7 }
+fn IF_PSTF() -> Int { return 8 }
+fn IF_VATU() -> Int { return 9 }
+fn IF_INIT() -> Int { return 11 }
+// which of them are global (on everywhere; F_GLOBAL in HarfBuzz)
+fn indic_feature_global(i: Int) -> Bool { return i == 0 || i == 1 || i == 3 || i == 9 || i == 10 || i >= 12 }
+
+// ── per-script configuration ─────────────────────────────────────────────────────────────────────
+fn RP_AFTER_MAIN() -> Int { return 5 }
+fn RP_BEFORE_SUB() -> Int { return 7 }
+fn RP_AFTER_SUB() -> Int { return 9 }
+fn RP_BEFORE_POST() -> Int { return 10 }
+fn RP_AFTER_POST() -> Int { return 12 }
+fn RM_IMPLICIT() -> Int { return 0 }
+fn RM_EXPLICIT() -> Int { return 1 }
+fn RM_LOG_REPHA() -> Int { return 2 }
+
+fn indic_virama(code: Str) -> Int {
+    if code == "Deva" { return 2381 }  if code == "Beng" { return 2509 }  if code == "Guru" { return 2637 }
+    if code == "Gujr" { return 2765 }  if code == "Orya" { return 2893 }  if code == "Taml" { return 3021 }
+    if code == "Telu" { return 3149 }  if code == "Knda" { return 3277 }  if code == "Mlym" { return 3405 }
+    return 0
+}
+fn indic_reph_pos(code: Str) -> Int {
+    if code == "Beng" { return RP_AFTER_SUB() }
+    if code == "Guru" { return RP_BEFORE_SUB() }
+    if code == "Orya" || code == "Mlym" { return RP_AFTER_MAIN() }
+    if code == "Taml" || code == "Telu" || code == "Knda" { return RP_AFTER_POST() }
+    return RP_BEFORE_POST()
+}
+fn indic_reph_mode(code: Str) -> Int {
+    if code == "Telu" { return RM_EXPLICIT() }
+    if code == "Mlym" { return RM_LOG_REPHA() }
+    return RM_IMPLICIT()
+}
+fn indic_blwf_post_only(code: Str) -> Bool { return code == "Telu" || code == "Knda" }
+fn indic_has_old_spec(code: Str) -> Bool { return indic_virama(code) != 0 }
+
+// ── the plan ─────────────────────────────────────────────────────────────────────────────────────
+// shaper_masks holds: [0..17) the feature masks (0 for global ones), then 17 = is_old_spec, and the
+// GSUB stage of rphf, pref, blwf, pstf, vatu at 18..22 (-1 when absent).
+
+fn indic_collect_features(inout fb: FB) {
+    fb_gsub_pause(fb, PAUSE_INDIC_SETUP_SYLLABLES())
+    fb_enable(fb, "locl", FF_PER_SYLLABLE())
+    fb_enable(fb, "ccmp", FF_PER_SYLLABLE())
+    fb_gsub_pause(fb, PAUSE_INDIC_INITIAL())
+    var i = 0
+    while i < INDIC_BASIC() {
+        var fl = FF_MANUAL_JOINERS() | FF_PER_SYLLABLE()
+        if indic_feature_global(i) { fl = fl | FF_GLOBAL() }
+        fb_add(fb, indic_feature(i), fl, 1)
+        fb_gsub_pause(fb, PAUSE_NONE())
+        i = i + 1
+    }
+    fb_gsub_pause(fb, PAUSE_INDIC_FINAL())
+    while i < INDIC_NUM() {
+        var fl = FF_MANUAL_JOINERS() | FF_PER_SYLLABLE()
+        if indic_feature_global(i) { fl = fl | FF_GLOBAL() }
+        fb_add(fb, indic_feature(i), fl, 1)
+        i = i + 1
+    }
+    fb_gsub_pause(fb, PAUSE_CLEAR_SYLLABLES())
+}
+fn indic_override_features(inout fb: FB) {
+    fb_add(fb, "liga", FF_GLOBAL(), 0)
+    fb_gsub_pause(fb, PAUSE_NONE())
+}
+fn indic_plan_masks(inout p: Plan) {
+    var i = 0
+    while i < INDIC_NUM() {
+        if indic_feature_global(i) { p.shaper_masks.push(0) } else { p.shaper_masks.push(plan_1_mask(p, ot_tag(indic_feature(i)))) }
+        i = i + 1
+    }
+    let code = script_code(p.script)
+    var old = 0
+    if indic_has_old_spec(code) && (p.chosen0 & 255) != 50 { old = 1 }   // not a '...2' tag
+    p.shaper_masks.push(old)
+    let feats = "rphfprefblwfpstfvatu"
+    var k = 0
+    while k < 5 { p.shaper_masks.push(plan_feature_stage(p, ot_tag(feats.slice(k * 4, k * 4 + 4))))  k = k + 1 }
+}
+fn ip_mask(p: Plan, i: Int) -> Int { return p.shaper_masks[i] }
+fn ip_old_spec(p: Plan) -> Bool { return p.shaper_masks[17] == 1 }
+
+// would the lookups of GSUB stage `stage` substitute `glyphs` (zero-context matching, as HarfBuzz
+// does for new-spec Indic)?
+fn stage_would_substitute(f: Font, p: Plan, stage: Int, glyphs: Vec<Int>, zero_context: Bool) -> Bool {
+    if stage < 0 || stage >= p.se0.len() { return false }
+    var start = 0
+    if stage > 0 { start = p.se0[stage - 1] }
+    let end = p.se0[stage]
+    var i = start
+    while i < end {
+        if lookup_would_substitute(f, p.lk0[i], glyphs, zero_context) { return true }
+        i = i + 1
+    }
+    return false
+}
+// HarfBuzz's would_apply for GSUB lookup `li` on the glyph sequence
+fn lookup_would_substitute(f: Font, li: Int, glyphs: Vec<Int>, zero_context: Bool) -> Bool {
+    let d = f.d
+    let lk = otl_lookup(d, f.gsub_off, li)
+    if lk < 0 || glyphs.len() == 0 { return false }
+    let typ = rd_u16(d, lk)
+    let n = rd_u16(d, lk + 4)
+    var s = 0
+    while s < n {
+        var st = lk + rd_u16(d, lk + 6 + s * 2)
+        var t = typ
+        if t == 7 { t = rd_u16(d, st + 2)  st = st + rd_u32(d, st + 4) }
+        if subtable_would_apply(f, t, st, glyphs, zero_context) { return true }
+        s = s + 1
+    }
+    return false
+}
+fn subtable_would_apply(f: Font, t: Int, st: Int, g: Vec<Int>, zero: Bool) -> Bool {
+    let d = f.d
+    let n = g.len()
+    let g0 = g[0]
+    if t == 1 || t == 2 || t == 3 || t == 8 { return n == 1 && ot_coverage(d, st + rd_u16(d, st + 2), g0) >= 0 }
+    if t == 4 {
+        let ci = ot_coverage(d, st + rd_u16(d, st + 2), g0)
+        if ci < 0 || ci >= rd_u16(d, st + 4) { return false }
+        let ls = st + rd_u16(d, st + 6 + ci * 2)
+        let nl = rd_u16(d, ls)
+        var i = 0
+        while i < nl {
+            let lig = ls + rd_u16(d, ls + 2 + i * 2)
+            let cc = rd_u16(d, lig + 2)
+            if cc == n {
+                var ok = true
+                var k = 1
+                while k < n { if rd_u16(d, lig + 4 + (k - 1) * 2) != g[k] { ok = false }  k = k + 1 }
+                if ok { return true }
+            }
+            i = i + 1
+        }
+        return false
+    }
+    if t == 5 || t == 6 {
+        let fmt = rd_u16(d, st)
+        if fmt == 3 {
+            if t == 5 {
+                let gc = rd_u16(d, st + 2)
+                if gc != n { return false }
+                var k = 0
+                while k < n { if ot_coverage(d, st + rd_u16(d, st + 6 + k * 2), g[k]) < 0 { return false }  k = k + 1 }
+                return true
+            }
+            let bc = rd_u16(d, st + 2)
+            let inp = st + 4 + bc * 2
+            let ic = rd_u16(d, inp)
+            let la = inp + 2 + ic * 2
+            let lac = rd_u16(d, la)
+            if zero && (bc != 0 || lac != 0) { return false }
+            if ic != n { return false }
+            var k = 0
+            while k < n { if ot_coverage(d, st + rd_u16(d, inp + 2 + k * 2), g[k]) < 0 { return false }  k = k + 1 }
+            return true
+        }
+        // formats 1 and 2: the rule set of the first glyph
+        let ci = ot_coverage(d, st + rd_u16(d, st + 2), g0)
+        if ci < 0 { return false }
+        var setno = ci
+        var icd = 0
+        var nsets = 0
+        var sets = 0
+        if t == 5 {
+            if fmt == 1 { nsets = rd_u16(d, st + 4)  sets = st + 6 }
+            else { icd = st + rd_u16(d, st + 4)  setno = ot_class(d, icd, g0)  nsets = rd_u16(d, st + 6)  sets = st + 8 }
+        } else {
+            if fmt == 1 { nsets = rd_u16(d, st + 4)  sets = st + 6 }
+            else { icd = st + rd_u16(d, st + 6)  setno = ot_class(d, icd, g0)  nsets = rd_u16(d, st + 10)  sets = st + 12 }
+        }
+        if setno >= nsets { return false }
+        let so = rd_u16(d, sets + setno * 2)
+        if so == 0 { return false }
+        let rs = st + so
+        let nr = rd_u16(d, rs)
+        var r = 0
+        while r < nr {
+            let rule = rs + rd_u16(d, rs + 2 + r * 2)
+            var inp = rule
+            var bc = 0
+            var lac = 0
+            if t == 6 {
+                bc = rd_u16(d, rule)
+                inp = rule + 2 + bc * 2
+                let icx = rd_u16(d, inp)
+                lac = rd_u16(d, inp + 2 + (icx - 1) * 2)
+            }
+            let ic = rd_u16(d, inp)
+            if !(zero && (bc != 0 || lac != 0)) && ic == n {
+                var ok = true
+                var k = 1
+                while k < n {
+                    var want = rd_u16(d, inp + 2 + (k - 1) * 2)
+                    if t == 5 { want = rd_u16(d, inp + 4 + (k - 1) * 2) }
+                    var have = g[k]
+                    if fmt == 2 { have = ot_class(d, icd, g[k]) }
+                    if have != want { ok = false }
+                    k = k + 1
+                }
+                if ok { return true }
+            }
+            r = r + 1
+        }
+        return false
+    }
+    return false
+}
+
+// ── categories ───────────────────────────────────────────────────────────────────────────────────
+
+global g_ind_off: Int = 0
+global g_ind_n: Int = 0
+global g_ind_on: Int = 0
+// (category << 8) | position of code point u
+fn indic_props(u: Int) -> Int {
+    if g_ind_on == 0 {
+        let b = ucd_blob()
+        g_ind_off = rd_u32(b, 56)
+        g_ind_n = rd_u32(b, 60)
+        g_ind_on = 1
+    }
+    let b = ucd_blob()
+    var lo = 0
+    var hi = g_ind_n - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        let r = g_ind_off + mid * 6
+        let c = rd_u32(b, r)
+        if c == u { return (rd_u8(b, r + 4) << 8) | rd_u8(b, r + 5) }
+        if c < u { lo = mid + 1 } else { hi = mid - 1 }
+    }
+    return IP_END()                                                       // category X
+}
+fn icat(b: Buf, i: Int) -> Int { return bi(b, i, F_SH1()) }
+fn ipos(b: Buf, i: Int) -> Int { return bi(b, i, F_SH2()) }
+fn set_ipos(inout b: Buf, i: Int, v: Int) { bset(b, i, F_SH2(), v) }
+fn is_consonant(b: Buf, i: Int) -> Bool { return (flag(icat(b, i)) & CONSONANT_FLAGS()) != 0 }
+fn is_joiner(b: Buf, i: Int) -> Bool { return (flag(icat(b, i)) & JOINER_FLAGS()) != 0 }
+fn is_halant(b: Buf, i: Int) -> Bool { return icat(b, i) == IC_H() }
+
+fn indic_setup_masks(f: Font, p: Plan, inout b: Buf) {
+    var i = 0
+    while i < b.len {
+        let pr = indic_props(bi(b, i, F_CP()))
+        bset(b, i, F_SH1(), pr >> 8)
+        bset(b, i, F_SH2(), pr & 255)
+        i = i + 1
+    }
+}
+
+// ── normalization hooks ──────────────────────────────────────────────────────────────────────────
+fn indic_decompose(ab: Int, inout out: Vec<Int>) -> Bool {
+    if ab == 2353 || ab == 2524 || ab == 2525 || ab == 2964 { return false }   // RRA, Bengali RRA/RHA, Tamil AU
+    return ucd_decompose(ab, out)
+}
+fn indic_compose(a: Int, b: Int) -> Int {
+    if gc_is_mark(ucd_gc(a)) { return 0 }                                // avoid recomposing split matras
+    if a == 2479 && b == 2492 { return 2527 }                             // Bengali YA + NUKTA
+    return ucd_compose(a, b)
+}
+
+// Devanagari vowel constraints (HarfBuzz's preprocess_text): an independent vowel followed by a
+// matra it should not take gets a dotted circle between them. Runs on code points, before
+// normalization.
+fn indic_preprocess(f: Font, p: Plan, inout b: Buf) {
+    if !(script_code(p.script) == "Deva") || b.len < 2 { return }
+    buf_clear_output(b)
+    let count = b.len
+    b.idx = 0
+    while b.idx + 1 < count {
+        let u = cur(b, F_CP())
+        let n1 = bi(b, b.idx + 1, F_CP())
+        var matched = false
+        if u == 2309 { matched = n1 == 2362 || n1 == 2363 || n1 == 2366 || n1 == 2373 || n1 == 2374 || n1 == 2377 || n1 == 2378 || n1 == 2379 || n1 == 2380 || n1 == 2383 || n1 == 2390 || n1 == 2391 }
+        else if u == 2310 { matched = n1 == 2362 || n1 == 2373 || n1 == 2374 || n1 == 2375 || n1 == 2376 }
+        else if u == 2313 { matched = n1 == 2369 }
+        else if u == 2319 { matched = n1 == 2373 || n1 == 2374 || n1 == 2375 }
+        else if u == 2352 {
+            if n1 == 2381 && b.idx + 2 < count && bi(b, b.idx + 2, F_CP()) == 2311 { next_glyph(b)  matched = true }
+        }
+        next_glyph(b)
+        if matched {
+            output_glyph(b, 9676)                                         // U+25CC
+            let o = b.out_len - 1
+            boset(b, o, F_UP(), bo(b, o, F_UP()) & (0 - 1 - UP_CONTINUATION()))
+            next_glyph(b)
+        }
+    }
+    while b.idx < count { next_glyph(b) }
+    buf_sync(b)
+}
+
+// ── syllables ────────────────────────────────────────────────────────────────────────────────────
+// The grammar (HarfBuzz's indic machine), matched over category bitsets of reachable end positions:
+//   c = C | Ra;  n = ((ZWNJ? RS)? (N N?)?);  z = ZWJ | ZWNJ;  reph = Ra H | Repha
+//   cn = c ZWJ? n?;  symbol = Symbol N?
+//   matra_group = z* (M | SM? MPst) N? H?;  syllable_tail = (z? SM SM? ZWNJ?)? (A | VD)*
+//   halant_group = z? H (ZWJ N?)?;  final_halant_group = halant_group | H ZWNJ
+//   halant_or_matra_group = final_halant_group | matra_group*
+//   complex_syllable_tail = (halant_group cn)* CM? halant_or_matra_group syllable_tail
+//   consonant_syllable = (Repha | CS)? cn complex_syllable_tail
+//   vowel_syllable = reph? V n? (ZWJ | complex_syllable_tail)
+//   standalone_cluster = ((Repha | CS)? PLACEHOLDER | reph? DOTTEDCIRCLE) n? complex_syllable_tail
+//   symbol_cluster = symbol syllable_tail;  broken_cluster = reph? n? complex_syllable_tail
+// The longest match wins; on a tie, the earlier rule.
+
+// one step: every position in `s` (a bitset, bit k = offset k from the syllable start) followed by a
+// character whose category is in `m`
+fn ss_sym(cats: Vec<Int>, s: Int, m: Int) -> Int {
+    var r = 0
+    var k = 0
+    while k < cats.len() && k < 62 {
+        if ((s >> k) & 1) != 0 && (flag(cats[k]) & m) != 0 { r = r | (1 << (k + 1)) }
+        k = k + 1
+    }
+    return r
+}
+fn ss_opt(cats: Vec<Int>, s: Int, m: Int) -> Int { return s | ss_sym(cats, s, m) }
+fn ss_star(cats: Vec<Int>, s: Int, m: Int) -> Int {
+    var r = s
+    var prev = 0 - 1
+    while r != prev { prev = r  r = r | ss_sym(cats, r, m) }
+    return r
+}
+fn sg_n(cats: Vec<Int>, s: Int) -> Int {
+    let t = s | ss_sym(cats, ss_opt(cats, s, flag(5)), flag(12))
+    let u = ss_sym(cats, t, flag(3))
+    return t | u | ss_sym(cats, u, flag(3))
+}
+fn sg_cn(cats: Vec<Int>, s: Int) -> Int {
+    let x = ss_sym(cats, s, flag(1) | flag(15))
+    return sg_n(cats, ss_opt(cats, x, flag(6)))
+}
+fn sg_reph(cats: Vec<Int>, s: Int) -> Int { return ss_sym(cats, ss_sym(cats, s, flag(15)), flag(4)) | ss_sym(cats, s, flag(14)) }
+fn sg_matra_group(cats: Vec<Int>, s: Int) -> Int {
+    let z = ss_star(cats, s, flag(5) | flag(6))
+    let m = ss_sym(cats, z, flag(7)) | ss_sym(cats, ss_opt(cats, z, flag(8)), flag(13))
+    let nn = ss_opt(cats, m, flag(3))
+    return ss_opt(cats, nn, flag(4))
+}
+fn sg_syllable_tail(cats: Vec<Int>, s: Int) -> Int {
+    let z = ss_opt(cats, s, flag(5) | flag(6))
+    let a = ss_sym(cats, z, flag(8))
+    let b = ss_opt(cats, ss_opt(cats, a, flag(8)), flag(5))
+    return ss_star(cats, s | b, flag(9))
+}
+fn sg_halant_group(cats: Vec<Int>, s: Int) -> Int {
+    let h = ss_sym(cats, ss_opt(cats, s, flag(5) | flag(6)), flag(4))
+    let j = ss_sym(cats, h, flag(6))
+    return h | j | ss_sym(cats, j, flag(3))
+}
+fn sg_complex_tail(cats: Vec<Int>, s: Int) -> Int {
+    var r = s
+    var prev = 0 - 1
+    while r != prev { prev = r  r = r | sg_cn(cats, sg_halant_group(cats, r)) }
+    let m = ss_opt(cats, r, flag(16))
+    // halant_or_matra_group = final_halant_group | matra_group*
+    let fh = sg_halant_group(cats, m) | ss_sym(cats, ss_sym(cats, m, flag(4)), flag(5))
+    var mg = m
+    prev = 0 - 1
+    while mg != prev { prev = mg  mg = mg | sg_matra_group(cats, mg) }
+    return sg_syllable_tail(cats, fh | mg)
+}
+fn high_bit(s: Int) -> Int {
+    var k = 62
+    while k >= 0 { if ((s >> k) & 1) != 0 { return k }  k = k - 1 }
+    return 0 - 1
+}
+// the type and length of the syllable starting at `cats[0]`
+fn match_syllable(cats: Vec<Int>, inout out: Vec<Int>) {
+    let s0 = 1
+    var best = 0
+    var btype = SY_NON_INDIC()
+    // consonant
+    let cs = sg_complex_tail(cats, sg_cn(cats, ss_opt(cats, s0, flag(14) | flag(18))))
+    var l = high_bit(cs)
+    if l > best { best = l  btype = SY_CONSONANT() }
+    // vowel
+    let v = sg_n(cats, ss_sym(cats, s0 | sg_reph(cats, s0), flag(2)))
+    let vs = ss_sym(cats, v, flag(6)) | sg_complex_tail(cats, v)
+    l = high_bit(vs)
+    if l > best { best = l  btype = SY_VOWEL() }
+    // standalone
+    let p1 = ss_sym(cats, ss_opt(cats, s0, flag(14) | flag(18)), flag(10))
+    let p2 = ss_sym(cats, s0 | sg_reph(cats, s0), flag(11))
+    let st = sg_complex_tail(cats, sg_n(cats, p1 | p2))
+    l = high_bit(st)
+    if l > best { best = l  btype = SY_STANDALONE() }
+    // symbol
+    let sy = sg_syllable_tail(cats, ss_opt(cats, ss_sym(cats, s0, flag(17)), flag(3)))
+    l = high_bit(sy)
+    if l > best { best = l  btype = SY_SYMBOL() }
+    // broken
+    let br = sg_complex_tail(cats, sg_n(cats, s0 | sg_reph(cats, s0)))
+    l = high_bit(br)
+    if l > best { best = l  btype = SY_BROKEN() }
+    if best < 1 { best = 1  btype = SY_NON_INDIC() }
+    out[0] = btype
+    out[1] = best
+}
+
+fn indic_setup_syllables(f: Font, p: Plan, inout b: Buf) {
+    var serial = 1
+    var i = 0
+    var res: Vec<Int> = vec()
+    res.push(0)
+    res.push(0)
+    while i < b.len {
+        var cats: Vec<Int> = vec()
+        var k = i
+        while k < b.len && k - i < 62 { cats.push(icat(b, k))  k = k + 1 }
+        match_syllable(cats, res)
+        if res[0] == SY_BROKEN() { b.scratch = b.scratch | SF_HAS_BROKEN_SYLLABLE() }
+        var j = i
+        while j < i + res[1] { bset(b, j, F_SYL(), (serial << 4) | res[0])  j = j + 1 }
+        serial = serial + 1
+        if serial == 16 { serial = 1 }
+        i = i + res[1]
+    }
+}
+fn SF_HAS_BROKEN_SYLLABLE() -> Int { return 64 }
+fn syllable_end(b: Buf, start: Int) -> Int {
+    let s = bi(b, start, F_SYL())
+    var e = start + 1
+    while e < b.len && bi(b, e, F_SYL()) == s { e = e + 1 }
+    return e
+}
+
+// ── initial reordering ───────────────────────────────────────────────────────────────────────────
+
+fn virama_glyph(f: Font, p: Plan) -> Int { return font_glyph_index(f, indic_virama(script_code(p.script))) }
+
+// consonant positions depend only on the plan and the glyph: cache them (Devanagari asks once per
+// consonant per syllable, and each answer is up to eight would-substitute scans)
+global g_cpos_on: Int = 0
+global g_cpos: Map<Str, Int>
+fn consonant_position_from_face(f: Font, p: Plan, consonant: Int, virama: Int) -> Int {
+    if g_cpos_on == 0 { var m: Map<Str, Int> = map()  g_cpos = m  g_cpos_on = 1 }
+    let key = p.key + "#" + to_str(consonant)
+    if g_cpos.has(key) { return g_cpos.get(key) }
+    let pos = consonant_position_uncached(f, p, consonant, virama)
+    g_cpos.put(key, pos)
+    return pos
+}
+fn consonant_position_uncached(f: Font, p: Plan, consonant: Int, virama: Int) -> Int {
+    var a: Vec<Int> = [virama, consonant]
+    var c: Vec<Int> = [consonant, virama]
+    let st_blwf = p.shaper_masks[20]
+    let st_pstf = p.shaper_masks[21]
+    let st_pref = p.shaper_masks[19]
+    let st_vatu = p.shaper_masks[22]
+    let zero = !ip_old_spec(p) && !(script_code(p.script) == "Mlym")
+    if stage_would_substitute(f, p, st_blwf, a, zero) || stage_would_substitute(f, p, st_blwf, c, zero)
+        || stage_would_substitute(f, p, st_vatu, a, zero) || stage_would_substitute(f, p, st_vatu, c, zero) { return IP_BELOW_C() }
+    if stage_would_substitute(f, p, st_pstf, a, zero) || stage_would_substitute(f, p, st_pstf, c, zero) { return IP_POST_C() }
+    if stage_would_substitute(f, p, st_pref, a, zero) || stage_would_substitute(f, p, st_pref, c, zero) { return IP_POST_C() }
+    return IP_BASE_C()
+}
+
+fn insert_dotted_circles(f: Font, inout b: Buf) {
+    if (b.scratch & SF_HAS_BROKEN_SYLLABLE()) == 0 { return }
+    let dc = font_glyph_index(f, 9676)
+    if dc == 0 { return }
+    buf_clear_output(b)
+    b.idx = 0
+    var last = 0
+    while b.idx < b.len {
+        let syl = cur(b, F_SYL())
+        if last != syl && (syl & 15) == SY_BROKEN() {
+            last = syl
+            while b.idx < b.len && cur(b, F_SYL()) == last && icat(b, b.idx) == IC_REPHA() { next_glyph(b) }
+            // a fresh record: dotted circle, the current glyph's cluster, mask and syllable
+            var src = b.idx
+            if src >= b.len { src = b.len - 1 }
+            let o = b.out_len
+            var k = 0
+            while k < K() { vput(b.out, o * K() + k, 0)  k = k + 1 }
+            boset(b, o, F_CP(), dc)
+            boset(b, o, F_ORIG(), 9676)
+            boset(b, o, F_CL(), bi(b, src, F_CL()))
+            boset(b, o, F_MASK(), bi(b, src, F_MASK()))
+            boset(b, o, F_SYL(), bi(b, src, F_SYL()))
+            boset(b, o, F_SH1(), IC_DOTTEDCIRCLE())
+            boset(b, o, F_SH2(), IP_END())
+            b.out_len = b.out_len + 1
+        } else { next_glyph(b) }
+    }
+    buf_sync(b)
+}
+
+fn indic_initial_reorder(f: Font, p: Plan, inout b: Buf) {
+    let vg = virama_glyph(f, p)
+    if vg != 0 {
+        var i = 0
+        while i < b.len {
+            if ipos(b, i) == IP_BASE_C() { set_ipos(b, i, consonant_position_from_face(f, p, bi(b, i, F_CP()), vg)) }
+            i = i + 1
+        }
+    }
+    insert_dotted_circles(f, b)
+    var start = 0
+    while start < b.len {
+        let end = syllable_end(b, start)
+        let t = bi(b, start, F_SYL()) & 15
+        if t == SY_CONSONANT() || t == SY_VOWEL() || t == SY_BROKEN() || t == SY_STANDALONE() {
+            initial_reorder_consonant_syllable(f, p, b, start, end)
+        }
+        start = end
+    }
+}
+
+// stable sort [start, end) by indic position, remembering each glyph's original offset in F_SYL
+fn sort_by_position(inout b: Buf, start: Int, end: Int) {
+    var i = start + 1
+    while i < end {
+        let pi = ipos(b, i)
+        var j = i
+        while j > start && ipos(b, j - 1) > pi { j = j - 1 }
+        if j != i { buf_move_back(b, i, j) }
+        i = i + 1
+    }
+}
+
+fn initial_reorder_consonant_syllable(f: Font, p: Plan, inout b: Buf, start: Int, end: Int) {
+    let code = script_code(p.script)
+    if code == "Knda" && start + 3 <= end && icat(b, start) == IC_RA() && icat(b, start + 1) == IC_H() && icat(b, start + 2) == IC_ZWJ() {
+        merge_clusters(b, start + 1, start + 3)
+        buf_swap(b, start + 1, start + 2)
+    }
+    let reph_mode = indic_reph_mode(code)
+    let zero = !ip_old_spec(p) && !(code == "Mlym")
+    // 1. find the base consonant
+    var base = end
+    var has_reph = false
+    var limit = start
+    if ip_mask(p, IF_RPHF()) != 0 && start + 3 <= end
+        && ((reph_mode == RM_IMPLICIT() && !is_joiner(b, start + 2)) || (reph_mode == RM_EXPLICIT() && icat(b, start + 2) == IC_ZWJ())) {
+        var g2: Vec<Int> = [bi(b, start, F_CP()), bi(b, start + 1, F_CP())]
+        var g3: Vec<Int> = [bi(b, start, F_CP()), bi(b, start + 1, F_CP()), bi(b, start + 2, F_CP())]
+        if stage_would_substitute(f, p, p.shaper_masks[18], g2, zero) || (reph_mode == RM_EXPLICIT() && stage_would_substitute(f, p, p.shaper_masks[18], g3, zero)) {
+            limit = limit + 2
+            while limit < end && is_joiner(b, limit) { limit = limit + 1 }
+            base = start
+            has_reph = true
+        }
+    } else if reph_mode == RM_LOG_REPHA() && icat(b, start) == IC_REPHA() {
+        limit = limit + 1
+        while limit < end && is_joiner(b, limit) { limit = limit + 1 }
+        base = start
+        has_reph = true
+    }
+    var i = end
+    var seen_below = false
+    var go = true
+    while go {
+        i = i - 1
+        if is_consonant(b, i) {
+            if ipos(b, i) != IP_BELOW_C() && (ipos(b, i) != IP_POST_C() || seen_below) { base = i  go = false }
+            else {
+                if ipos(b, i) == IP_BELOW_C() { seen_below = true }
+                base = i
+            }
+        } else {
+            if start < i && icat(b, i) == IC_ZWJ() && icat(b, i - 1) == IC_H() { go = false }
+        }
+        if go && i <= limit { go = false }
+    }
+    if has_reph && base == start && limit - base <= 2 { has_reph = false }
+    // positions before the base become pre-base
+    i = start
+    while i < base { if ipos(b, i) > IP_PRE_C() { set_ipos(b, i, IP_PRE_C()) }  i = i + 1 }
+    if base < end { set_ipos(b, base, IP_BASE_C()) }
+    if has_reph { set_ipos(b, start, IP_RA_TO_BECOME_REPH()) }
+    // old-spec: move the first post-base halant after the last consonant
+    if ip_old_spec(p) {
+        let disallow_double = code == "Knda"
+        i = base + 1
+        while i < end {
+            if icat(b, i) == IC_H() {
+                var j = end - 1
+                while j > i {
+                    if is_consonant(b, j) || (disallow_double && icat(b, j) == IC_H()) { break }
+                    j = j - 1
+                }
+                if icat(b, j) != IC_H() && j > i {
+                    // move i to j
+                    var k = i
+                    while k < j { buf_swap(b, k, k + 1)  k = k + 1 }
+                }
+                break
+            }
+            i = i + 1
+        }
+    }
+    // attach misc marks to the previous character so they move with it
+    var last_pos = IP_START()
+    i = start
+    while i < end {
+        let c = icat(b, i)
+        if (flag(c) & (JOINER_FLAGS() | flag(IC_N()) | flag(IC_RS()) | flag(IC_CM()) | flag(IC_H()))) != 0 {
+            set_ipos(b, i, last_pos)
+            if c == IC_H() && ipos(b, i) == IP_PRE_M() {
+                var j = i
+                while j > start {
+                    if ipos(b, j - 1) != IP_PRE_M() { set_ipos(b, i, ipos(b, j - 1))  break }
+                    j = j - 1
+                }
+            }
+        } else if ipos(b, i) != IP_SMVD() {
+            if c == IC_MPST() && i > start && icat(b, i - 1) == IC_SM() { set_ipos(b, i - 1, ipos(b, i)) }
+            last_pos = ipos(b, i)
+        }
+        i = i + 1
+    }
+    // post-base consonants own anything before them since the last consonant or matra
+    var last = base
+    i = base + 1
+    while i < end {
+        if is_consonant(b, i) {
+            var j = last + 1
+            while j < i { if ipos(b, j) < IP_SMVD() { set_ipos(b, j, ipos(b, i)) }  j = j + 1 }
+            last = i
+        } else if icat(b, i) == IC_M() || icat(b, i) == IC_MPST() { last = i }
+        i = i + 1
+    }
+    // sort, keeping each glyph's original offset in the syllable word
+    let syllable = bi(b, start, F_SYL())
+    i = start
+    while i < end { bset(b, i, F_SYL(), i - start)  i = i + 1 }
+    sort_by_position(b, start, end)
+    // find the base again; flip a left-matra sequence
+    var first_left = end
+    var last_left = end
+    base = end
+    i = start
+    while i < end {
+        if ipos(b, i) == IP_BASE_C() { base = i  break }
+        if ipos(b, i) == IP_PRE_M() {
+            if first_left == end { first_left = i }
+            last_left = i
+        }
+        i = i + 1
+    }
+    if first_left < last_left {
+        buf_reverse_range(b, first_left, last_left + 1)
+        var ii = first_left
+        var j = ii
+        while j <= last_left {
+            if icat(b, j) == IC_M() || icat(b, j) == IC_MPST() { buf_reverse_range(b, ii, j + 1)  ii = j + 1 }
+            j = j + 1
+        }
+    }
+    if ip_old_spec(p) || end - start > 127 { merge_clusters(b, base, end) }
+    else {
+        i = base
+        while i < end {
+            if bi(b, i, F_SYL()) != 255 {
+                var mn = i
+                var mx = i
+                var j = start + bi(b, i, F_SYL())
+                while j != i {
+                    if j < mn { mn = j }
+                    if j > mx { mx = j }
+                    let next = start + bi(b, j, F_SYL())
+                    bset(b, j, F_SYL(), 255)
+                    j = next
+                }
+                var lo = base
+                if mn > lo { lo = mn }
+                merge_clusters(b, lo, mx + 1)
+            }
+            i = i + 1
+        }
+    }
+    i = start
+    while i < end { bset(b, i, F_SYL(), syllable)  i = i + 1 }
+    // masks
+    i = start
+    while i < end && ipos(b, i) == IP_RA_TO_BECOME_REPH() { bset(b, i, F_MASK(), bi(b, i, F_MASK()) | ip_mask(p, IF_RPHF()))  i = i + 1 }
+    var mask = ip_mask(p, IF_HALF())
+    if !ip_old_spec(p) && !indic_blwf_post_only(code) { mask = mask | ip_mask(p, IF_BLWF()) }
+    i = start
+    while i < base { bset(b, i, F_MASK(), bi(b, i, F_MASK()) | mask)  i = i + 1 }
+    mask = ip_mask(p, IF_BLWF()) | ip_mask(p, IF_ABVF()) | ip_mask(p, IF_PSTF())
+    i = base + 1
+    while i < end { bset(b, i, F_MASK(), bi(b, i, F_MASK()) | mask)  i = i + 1 }
+    if ip_old_spec(p) && code == "Deva" {
+        i = start
+        while i + 1 < base {
+            if icat(b, i) == IC_RA() && icat(b, i + 1) == IC_H() && (i + 2 == base || icat(b, i + 2) != IC_ZWJ()) {
+                bset(b, i, F_MASK(), bi(b, i, F_MASK()) | ip_mask(p, IF_BLWF()))
+                bset(b, i + 1, F_MASK(), bi(b, i + 1, F_MASK()) | ip_mask(p, IF_BLWF()))
+            }
+            i = i + 1
+        }
+    }
+    if ip_mask(p, IF_PREF()) != 0 && base + 2 < end {
+        i = base + 1
+        while i + 1 < end {
+            var g: Vec<Int> = [bi(b, i, F_CP()), bi(b, i + 1, F_CP())]
+            if stage_would_substitute(f, p, p.shaper_masks[19], g, zero) {
+                bset(b, i, F_MASK(), bi(b, i, F_MASK()) | ip_mask(p, IF_PREF()))
+                bset(b, i + 1, F_MASK(), bi(b, i + 1, F_MASK()) | ip_mask(p, IF_PREF()))
+                break
+            }
+            i = i + 1
+        }
+    }
+    // ZWJ/ZWNJ: a ZWNJ disables half forms on what precedes it
+    i = start + 1
+    while i < end {
+        if is_joiner(b, i) {
+            let non_joiner = icat(b, i) == IC_ZWNJ()
+            var j = i
+            var more = true
+            while more {
+                j = j - 1
+                if non_joiner { bset(b, j, F_MASK(), bi(b, j, F_MASK()) & (0 - 1 - ip_mask(p, IF_HALF()))) }
+                more = j > start && !is_consonant(b, j)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ── final reordering ─────────────────────────────────────────────────────────────────────────────
+
+fn ligated_and_didnt_multiply(b: Buf, i: Int) -> Bool {
+    let gp = bi(b, i, F_GP())
+    return (gp & GP_LIGATED()) != 0 && (gp & GP_MULTIPLIED()) == 0
+}
+
+fn indic_final_reorder(f: Font, p: Plan, inout b: Buf) {
+    if b.len == 0 { return }
+    var start = 0
+    while start < b.len {
+        let end = syllable_end(b, start)
+        final_reorder_syllable(f, p, b, start, end)
+        start = end
+    }
+}
+
+fn final_reorder_syllable(f: Font, p: Plan, inout b: Buf, start: Int, end: Int) {
+    let code = script_code(p.script)
+    let vg = virama_glyph(f, p)
+    if vg != 0 {
+        var i = start
+        while i < end {
+            let gp = bi(b, i, F_GP())
+            if bi(b, i, F_CP()) == vg && (gp & GP_LIGATED()) != 0 && (gp & GP_MULTIPLIED()) != 0 {
+                bset(b, i, F_SH1(), IC_H())
+                bset(b, i, F_GP(), gp & (0 - 1 - GP_LIGATED() - GP_MULTIPLIED()))
+            }
+            i = i + 1
+        }
+    }
+    var try_pref = ip_mask(p, IF_PREF()) != 0
+    let pref_mask = ip_mask(p, IF_PREF())
+    // find the base again
+    var base = start
+    while base < end {
+        if ipos(b, base) >= IP_BASE_C() {
+            if try_pref && base + 1 < end {
+                var i = base + 1
+                while i < end {
+                    if (bi(b, i, F_MASK()) & pref_mask) != 0 {
+                        if !((bi(b, i, F_GP()) & GP_SUBSTITUTED()) != 0 && ligated_and_didnt_multiply(b, i)) {
+                            base = i
+                            while base < end && is_halant(b, base) { base = base + 1 }
+                            if base < end { set_ipos(b, base, IP_BASE_C()) }
+                            try_pref = false
+                        }
+                        break
+                    }
+                    i = i + 1
+                }
+            }
+            if code == "Mlym" {
+                var i = base + 1
+                while i < end {
+                    while i < end && is_joiner(b, i) { i = i + 1 }
+                    if i == end || !is_halant(b, i) { break }
+                    i = i + 1
+                    while i < end && is_joiner(b, i) { i = i + 1 }
+                    if i < end && is_consonant(b, i) && ipos(b, i) == IP_BELOW_C() { base = i  set_ipos(b, base, IP_BASE_C()) }
+                    i = i + 1
+                }
+            }
+            if start < base && ipos(b, base) > IP_BASE_C() { base = base - 1 }
+            break
+        }
+        base = base + 1
+    }
+    if base == end && start < base && icat(b, base - 1) == IC_ZWJ() { base = base - 1 }
+    if base < end {
+        while start < base && (icat(b, base) == IC_N() || icat(b, base) == IC_H()) { base = base - 1 }
+    }
+    // reorder the pre-base matra
+    if start + 1 < end && start < base {
+        var new_pos = base - 1
+        if base == end { new_pos = base - 2 }
+        if !(code == "Mlym") && !(code == "Taml") {
+            var searching = true
+            while searching {
+                searching = false
+                while new_pos > start && !(icat(b, new_pos) == IC_M() || icat(b, new_pos) == IC_MPST() || icat(b, new_pos) == IC_H()) { new_pos = new_pos - 1 }
+                if is_halant(b, new_pos) && ipos(b, new_pos) != IP_PRE_M() {
+                    if new_pos + 1 < end && icat(b, new_pos + 1) == IC_ZWJ() {
+                        if new_pos > start { new_pos = new_pos - 1  searching = true }
+                    }
+                } else { new_pos = start }
+            }
+        }
+        if start < new_pos && ipos(b, new_pos) != IP_PRE_M() {
+            var i = new_pos
+            while i > start {
+                if ipos(b, i - 1) == IP_PRE_M() {
+                    let old_pos = i - 1
+                    if old_pos < base && base <= new_pos { base = base - 1 }
+                    var k = old_pos
+                    while k < new_pos { buf_swap(b, k, k + 1)  k = k + 1 }
+                    var hi = base + 1
+                    if end < hi { hi = end }
+                    merge_clusters(b, new_pos, hi)
+                    new_pos = new_pos - 1
+                }
+                i = i - 1
+            }
+        } else {
+            var i = start
+            while i < base {
+                if ipos(b, i) == IP_PRE_M() {
+                    var hi = base + 1
+                    if end < hi { hi = end }
+                    merge_clusters(b, i, hi)
+                    break
+                }
+                i = i + 1
+            }
+        }
+    }
+    // reorder the reph
+    if start + 1 < end && ipos(b, start) == IP_RA_TO_BECOME_REPH() && ((icat(b, start) == IC_REPHA()) != ligated_and_didnt_multiply(b, start)) {
+        let reph_pos = indic_reph_pos(code)
+        var new_reph_pos = start
+        var found = false
+        // step 2: after the first explicit halant between the reph and the base
+        if reph_pos != RP_AFTER_POST() {
+            new_reph_pos = start + 1
+            while new_reph_pos < base && !is_halant(b, new_reph_pos) { new_reph_pos = new_reph_pos + 1 }
+            if new_reph_pos < base && is_halant(b, new_reph_pos) {
+                if new_reph_pos + 1 < base && is_joiner(b, new_reph_pos + 1) { new_reph_pos = new_reph_pos + 1 }
+                found = true
+            }
+            // step 3: after the main consonant
+            if !found && reph_pos == RP_AFTER_MAIN() {
+                new_reph_pos = base
+                while new_reph_pos + 1 < end && ipos(b, new_reph_pos + 1) <= IP_AFTER_MAIN() { new_reph_pos = new_reph_pos + 1 }
+                if new_reph_pos < end { found = true }
+            }
+            // step 4: before post-base consonants
+            if !found && reph_pos == RP_AFTER_SUB() {
+                new_reph_pos = base
+                while new_reph_pos + 1 < end && (flag(ipos(b, new_reph_pos + 1)) & (flag(IP_POST_C()) | flag(IP_AFTER_POST()) | flag(IP_SMVD()))) == 0 {
+                    new_reph_pos = new_reph_pos + 1
+                }
+                if new_reph_pos < end { found = true }
+            }
+        }
+        // step 5
+        if !found {
+            new_reph_pos = start + 1
+            while new_reph_pos < base && !is_halant(b, new_reph_pos) { new_reph_pos = new_reph_pos + 1 }
+            if new_reph_pos < base && is_halant(b, new_reph_pos) {
+                if new_reph_pos + 1 < base && is_joiner(b, new_reph_pos + 1) { new_reph_pos = new_reph_pos + 1 }
+                found = true
+            }
+        }
+        // step 6: the end of the syllable
+        if !found {
+            new_reph_pos = end - 1
+            while new_reph_pos > start && ipos(b, new_reph_pos) == IP_SMVD() { new_reph_pos = new_reph_pos - 1 }
+            if is_halant(b, new_reph_pos) {
+                var i = base + 1
+                while i < new_reph_pos {
+                    if icat(b, i) == IC_M() || icat(b, i) == IC_MPST() { new_reph_pos = new_reph_pos - 1 }
+                    i = i + 1
+                }
+            }
+        }
+        merge_clusters(b, start, new_reph_pos + 1)
+        var k = start
+        while k < new_reph_pos { buf_swap(b, k, k + 1)  k = k + 1 }
+        if start < base && base <= new_reph_pos { base = base - 1 }
+    }
+    // reorder a pre-base-reordering consonant
+    if try_pref && base + 1 < end {
+        var i = base + 1
+        while i < end {
+            if (bi(b, i, F_MASK()) & pref_mask) != 0 {
+                if ligated_and_didnt_multiply(b, i) {
+                    var new_pos = base
+                    if !(code == "Mlym") && !(code == "Taml") {
+                        while new_pos > start && !(icat(b, new_pos - 1) == IC_M() || icat(b, new_pos - 1) == IC_MPST() || icat(b, new_pos - 1) == IC_H()) { new_pos = new_pos - 1 }
+                    }
+                    if new_pos > start && is_halant(b, new_pos - 1) {
+                        if new_pos < end && is_joiner(b, new_pos) { new_pos = new_pos + 1 }
+                    }
+                    let old_pos = i
+                    merge_clusters(b, new_pos, old_pos + 1)
+                    buf_move_back(b, old_pos, new_pos)
+                    if new_pos <= base && base < old_pos { base = base + 1 }
+                }
+                break
+            }
+            i = i + 1
+        }
+    }
+    // init on a left matra at the start of a word
+    if ipos(b, start) == IP_PRE_M() {
+        var word_start = start == 0
+        if !word_start {
+            let gc = up_gc(bi(b, start - 1, F_UP()))
+            word_start = !(gc >= 1 && gc <= 12)
+        }
+        if word_start { bset(b, start, F_MASK(), bi(b, start, F_MASK()) | ip_mask(p, IF_INIT())) }
+    }
+}

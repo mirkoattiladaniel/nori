@@ -1,0 +1,239 @@
+//! std/math, vec.nori: Vec2, Vec3, Vec4.
+//!
+//! A `glam`-equivalent for Nori. Every vector is a plain struct of `Float` fields and every
+//! operation is a pure function that returns a new value: structs are handles here, so a bare
+//! second name is a view and mutating one in place would need `inout`. Returning the result keeps
+//! the whole library free of aliasing questions at the cost of nothing measurable: a Vec3 is three
+//! slots and the compiler's escape analysis frames most of them.
+//!
+//! Naming is `<type>_<op>`: `vec3_add`, `vec3_dot`, … There is no overloading, so the type is part
+//! of the name rather than inferred from the arguments.
+//!
+//! Transcendentals come from math.nori, this module's sibling root file, so they need no prefix; `sqrt`
+//! is a compiler builtin.
+
+pub struct Vec2 { x: Float, y: Float }
+pub struct Vec3 { x: Float, y: Float, z: Float }
+pub struct Vec4 { x: Float, y: Float, z: Float, w: Float }
+
+// ---------------- Vec2 ----------------
+/// a 2-vector from its components.
+pub fn vec2(x: Float, y: Float) -> Vec2 { return Vec2 { x: x, y: y } }
+/// every component the same.
+pub fn vec2_splat(s: Float) -> Vec2 { return Vec2 { x: s, y: s } }
+/// the zero vector.
+pub fn vec2_zero() -> Vec2 { return Vec2 { x: 0.0, y: 0.0 } }
+/// (1, 1).
+pub fn vec2_one() -> Vec2 { return Vec2 { x: 1.0, y: 1.0 } }
+/// (1, 0).
+pub fn vec2_x() -> Vec2 { return Vec2 { x: 1.0, y: 0.0 } }
+/// (0, 1).
+pub fn vec2_y() -> Vec2 { return Vec2 { x: 0.0, y: 1.0 } }
+/// componentwise sum.
+pub fn vec2_add(a: Vec2, b: Vec2) -> Vec2 { return Vec2 { x: a.x + b.x, y: a.y + b.y } }
+/// componentwise difference.
+pub fn vec2_sub(a: Vec2, b: Vec2) -> Vec2 { return Vec2 { x: a.x - b.x, y: a.y - b.y } }
+/// componentwise (Hadamard) product.
+pub fn vec2_mul(a: Vec2, b: Vec2) -> Vec2 { return Vec2 { x: a.x * b.x, y: a.y * b.y } }
+/// componentwise quotient.
+pub fn vec2_div(a: Vec2, b: Vec2) -> Vec2 { return Vec2 { x: a.x / b.x, y: a.y / b.y } }
+/// scale by a scalar.
+pub fn vec2_scale(a: Vec2, s: Float) -> Vec2 { return Vec2 { x: a.x * s, y: a.y * s } }
+/// negate.
+pub fn vec2_neg(a: Vec2) -> Vec2 { return Vec2 { x: -a.x, y: -a.y } }
+/// dot product.
+pub fn vec2_dot(a: Vec2, b: Vec2) -> Float { return a.x * b.x + a.y * b.y }
+/// the 2-D cross product (a scalar: the z of the 3-D cross of the lifted vectors).
+pub fn vec2_cross(a: Vec2, b: Vec2) -> Float { return a.x * b.y - a.y * b.x }
+/// squared length: no sqrt, so prefer it whenever only an ordering is needed.
+pub fn vec2_length_sq(a: Vec2) -> Float { return vec2_dot(a, a) }
+/// euclidean length.
+pub fn vec2_length(a: Vec2) -> Float { return sqrt(vec2_length_sq(a)) }
+/// squared distance between two points.
+pub fn vec2_distance_sq(a: Vec2, b: Vec2) -> Float { return vec2_length_sq(vec2_sub(a, b)) }
+/// distance between two points.
+pub fn vec2_distance(a: Vec2, b: Vec2) -> Float { return vec2_length(vec2_sub(a, b)) }
+/// unit vector in the same direction. Division by zero for the zero vector: see `vec2_normalize_or_zero`.
+pub fn vec2_normalize(a: Vec2) -> Vec2 { return vec2_scale(a, 1.0 / vec2_length(a)) }
+/// unit vector, or the zero vector when the input is (near) zero. The safe form for user data.
+pub fn vec2_normalize_or_zero(a: Vec2) -> Vec2 {
+    let l = vec2_length(a)
+    if l <= 1.0e-30 { return vec2_zero() }
+    return vec2_scale(a, 1.0 / l)
+}
+/// linear interpolation; t = 0 gives a, t = 1 gives b.
+pub fn vec2_lerp(a: Vec2, b: Vec2, t: Float) -> Vec2 { return vec2_add(a, vec2_scale(vec2_sub(b, a), t)) }
+/// componentwise minimum.
+pub fn vec2_min(a: Vec2, b: Vec2) -> Vec2 { return Vec2 { x: fmin(a.x, b.x), y: fmin(a.y, b.y) } }
+/// componentwise maximum.
+pub fn vec2_max(a: Vec2, b: Vec2) -> Vec2 { return Vec2 { x: fmax(a.x, b.x), y: fmax(a.y, b.y) } }
+/// componentwise absolute value.
+pub fn vec2_abs(a: Vec2) -> Vec2 { return Vec2 { x: fabs(a.x), y: fabs(a.y) } }
+/// componentwise floor.
+pub fn vec2_floor(a: Vec2) -> Vec2 { return Vec2 { x: floor(a.x), y: floor(a.y) } }
+/// componentwise ceil.
+pub fn vec2_ceil(a: Vec2) -> Vec2 { return Vec2 { x: ceil(a.x), y: ceil(a.y) } }
+/// true when every component is within `eps` of the other's.
+pub fn vec2_approx_eq(a: Vec2, b: Vec2, eps: Float) -> Bool { return fabs(a.x - b.x) <= eps && fabs(a.y - b.y) <= eps }
+
+// ---------------- Vec3 ----------------
+/// a 3-vector from its components.
+pub fn vec3(x: Float, y: Float, z: Float) -> Vec3 { return Vec3 { x: x, y: y, z: z } }
+/// every component the same.
+pub fn vec3_splat(s: Float) -> Vec3 { return Vec3 { x: s, y: s, z: s } }
+/// the zero vector.
+pub fn vec3_zero() -> Vec3 { return Vec3 { x: 0.0, y: 0.0, z: 0.0 } }
+/// (1, 1, 1).
+pub fn vec3_one() -> Vec3 { return Vec3 { x: 1.0, y: 1.0, z: 1.0 } }
+/// +X.
+pub fn vec3_x() -> Vec3 { return Vec3 { x: 1.0, y: 0.0, z: 0.0 } }
+/// +Y.
+pub fn vec3_y() -> Vec3 { return Vec3 { x: 0.0, y: 1.0, z: 0.0 } }
+/// +Z.
+pub fn vec3_z() -> Vec3 { return Vec3 { x: 0.0, y: 0.0, z: 1.0 } }
+/// -X.
+pub fn vec3_neg_x() -> Vec3 { return Vec3 { x: -1.0, y: 0.0, z: 0.0 } }
+/// -Y.
+pub fn vec3_neg_y() -> Vec3 { return Vec3 { x: 0.0, y: -1.0, z: 0.0 } }
+/// -Z: the direction a right-handed camera looks along.
+pub fn vec3_neg_z() -> Vec3 { return Vec3 { x: 0.0, y: 0.0, z: -1.0 } }
+/// componentwise sum.
+pub fn vec3_add(a: Vec3, b: Vec3) -> Vec3 { return Vec3 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z } }
+/// componentwise difference.
+pub fn vec3_sub(a: Vec3, b: Vec3) -> Vec3 { return Vec3 { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z } }
+/// componentwise (Hadamard) product.
+pub fn vec3_mul(a: Vec3, b: Vec3) -> Vec3 { return Vec3 { x: a.x * b.x, y: a.y * b.y, z: a.z * b.z } }
+/// componentwise quotient.
+pub fn vec3_div(a: Vec3, b: Vec3) -> Vec3 { return Vec3 { x: a.x / b.x, y: a.y / b.y, z: a.z / b.z } }
+/// scale by a scalar.
+pub fn vec3_scale(a: Vec3, s: Float) -> Vec3 { return Vec3 { x: a.x * s, y: a.y * s, z: a.z * s } }
+/// negate.
+pub fn vec3_neg(a: Vec3) -> Vec3 { return Vec3 { x: -a.x, y: -a.y, z: -a.z } }
+/// dot product.
+pub fn vec3_dot(a: Vec3, b: Vec3) -> Float { return a.x * b.x + a.y * b.y + a.z * b.z }
+/// right-handed cross product: x cross y == z.
+pub fn vec3_cross(a: Vec3, b: Vec3) -> Vec3 { return Vec3 { x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x } }
+/// squared length: no sqrt, so prefer it whenever only an ordering is needed.
+pub fn vec3_length_sq(a: Vec3) -> Float { return vec3_dot(a, a) }
+/// euclidean length.
+pub fn vec3_length(a: Vec3) -> Float { return sqrt(vec3_length_sq(a)) }
+/// squared distance between two points.
+pub fn vec3_distance_sq(a: Vec3, b: Vec3) -> Float { return vec3_length_sq(vec3_sub(a, b)) }
+/// distance between two points.
+pub fn vec3_distance(a: Vec3, b: Vec3) -> Float { return vec3_length(vec3_sub(a, b)) }
+/// unit vector in the same direction. Division by zero for the zero vector: see `vec3_normalize_or_zero`.
+pub fn vec3_normalize(a: Vec3) -> Vec3 { return vec3_scale(a, 1.0 / vec3_length(a)) }
+/// unit vector, or the zero vector when the input is (near) zero. The safe form for user data.
+pub fn vec3_normalize_or_zero(a: Vec3) -> Vec3 {
+    let l = vec3_length(a)
+    if l <= 1.0e-30 { return vec3_zero() }
+    return vec3_scale(a, 1.0 / l)
+}
+/// linear interpolation; t = 0 gives a, t = 1 gives b.
+pub fn vec3_lerp(a: Vec3, b: Vec3, t: Float) -> Vec3 { return vec3_add(a, vec3_scale(vec3_sub(b, a), t)) }
+/// componentwise minimum.
+pub fn vec3_min(a: Vec3, b: Vec3) -> Vec3 { return Vec3 { x: fmin(a.x, b.x), y: fmin(a.y, b.y), z: fmin(a.z, b.z) } }
+/// componentwise maximum.
+pub fn vec3_max(a: Vec3, b: Vec3) -> Vec3 { return Vec3 { x: fmax(a.x, b.x), y: fmax(a.y, b.y), z: fmax(a.z, b.z) } }
+/// componentwise absolute value.
+pub fn vec3_abs(a: Vec3) -> Vec3 { return Vec3 { x: fabs(a.x), y: fabs(a.y), z: fabs(a.z) } }
+/// componentwise floor.
+pub fn vec3_floor(a: Vec3) -> Vec3 { return Vec3 { x: floor(a.x), y: floor(a.y), z: floor(a.z) } }
+/// componentwise ceil.
+pub fn vec3_ceil(a: Vec3) -> Vec3 { return Vec3 { x: ceil(a.x), y: ceil(a.y), z: ceil(a.z) } }
+/// the largest component.
+pub fn vec3_max_element(a: Vec3) -> Float { return fmax(a.x, fmax(a.y, a.z)) }
+/// the smallest component.
+pub fn vec3_min_element(a: Vec3) -> Float { return fmin(a.x, fmin(a.y, a.z)) }
+/// `d` reflected about the surface whose unit normal is `n`: d - 2(d·n)n.
+pub fn vec3_reflect(d: Vec3, n: Vec3) -> Vec3 { return vec3_sub(d, vec3_scale(n, 2.0 * vec3_dot(d, n))) }
+/// the component of `a` along `b`, as a vector. `b` need not be normalized; zero `b` gives zero.
+pub fn vec3_project_onto(a: Vec3, b: Vec3) -> Vec3 {
+    let d = vec3_length_sq(b)
+    if d <= 1.0e-30 { return vec3_zero() }
+    return vec3_scale(b, vec3_dot(a, b) / d)
+}
+/// the part of `a` perpendicular to `b`.
+pub fn vec3_reject_from(a: Vec3, b: Vec3) -> Vec3 { return vec3_sub(a, vec3_project_onto(a, b)) }
+/// unsigned angle between two vectors, in radians, in [0, pi]. Zero for a zero-length input.
+pub fn vec3_angle_between(a: Vec3, b: Vec3) -> Float {
+    let d = vec3_length(a) * vec3_length(b)
+    if d <= 1.0e-30 { return 0.0 }
+    // the quotient can leave [-1,1] by an ulp on parallel inputs, and acos answers NaN there
+    return acos(fclamp(vec3_dot(a, b) / d, -1.0, 1.0))
+}
+/// true when every component is within `eps` of the other's.
+pub fn vec3_approx_eq(a: Vec3, b: Vec3, eps: Float) -> Bool { return fabs(a.x - b.x) <= eps && fabs(a.y - b.y) <= eps && fabs(a.z - b.z) <= eps }
+/// some unit vector perpendicular to `a`: for building an arbitrary basis around a direction.
+pub fn vec3_any_orthonormal(a: Vec3) -> Vec3 {
+    // cross with whichever axis `a` is least aligned to, so the cross is never near-degenerate
+    if fabs(a.x) <= fabs(a.y) && fabs(a.x) <= fabs(a.z) { return vec3_normalize(vec3_cross(a, vec3_x())) }
+    if fabs(a.y) <= fabs(a.z) { return vec3_normalize(vec3_cross(a, vec3_y())) }
+    return vec3_normalize(vec3_cross(a, vec3_z()))
+}
+
+// ---------------- Vec4 ----------------
+/// a 4-vector from its components.
+pub fn vec4(x: Float, y: Float, z: Float, w: Float) -> Vec4 { return Vec4 { x: x, y: y, z: z, w: w } }
+/// every component the same.
+pub fn vec4_splat(s: Float) -> Vec4 { return Vec4 { x: s, y: s, z: s, w: s } }
+/// the zero vector.
+pub fn vec4_zero() -> Vec4 { return Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 } }
+/// (1, 1, 1, 1).
+pub fn vec4_one() -> Vec4 { return Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 } }
+/// componentwise sum.
+pub fn vec4_add(a: Vec4, b: Vec4) -> Vec4 { return Vec4 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z, w: a.w + b.w } }
+/// componentwise difference.
+pub fn vec4_sub(a: Vec4, b: Vec4) -> Vec4 { return Vec4 { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z, w: a.w - b.w } }
+/// componentwise (Hadamard) product.
+pub fn vec4_mul(a: Vec4, b: Vec4) -> Vec4 { return Vec4 { x: a.x * b.x, y: a.y * b.y, z: a.z * b.z, w: a.w * b.w } }
+/// componentwise quotient.
+pub fn vec4_div(a: Vec4, b: Vec4) -> Vec4 { return Vec4 { x: a.x / b.x, y: a.y / b.y, z: a.z / b.z, w: a.w / b.w } }
+/// scale by a scalar.
+pub fn vec4_scale(a: Vec4, s: Float) -> Vec4 { return Vec4 { x: a.x * s, y: a.y * s, z: a.z * s, w: a.w * s } }
+/// negate.
+pub fn vec4_neg(a: Vec4) -> Vec4 { return Vec4 { x: -a.x, y: -a.y, z: -a.z, w: -a.w } }
+/// dot product.
+pub fn vec4_dot(a: Vec4, b: Vec4) -> Float { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w }
+/// squared length.
+pub fn vec4_length_sq(a: Vec4) -> Float { return vec4_dot(a, a) }
+/// euclidean length.
+pub fn vec4_length(a: Vec4) -> Float { return sqrt(vec4_length_sq(a)) }
+/// squared distance between two points.
+pub fn vec4_distance_sq(a: Vec4, b: Vec4) -> Float { return vec4_length_sq(vec4_sub(a, b)) }
+/// distance between two points.
+pub fn vec4_distance(a: Vec4, b: Vec4) -> Float { return vec4_length(vec4_sub(a, b)) }
+/// unit vector in the same direction.
+pub fn vec4_normalize(a: Vec4) -> Vec4 { return vec4_scale(a, 1.0 / vec4_length(a)) }
+/// unit vector, or the zero vector when the input is (near) zero.
+pub fn vec4_normalize_or_zero(a: Vec4) -> Vec4 {
+    let l = vec4_length(a)
+    if l <= 1.0e-30 { return vec4_zero() }
+    return vec4_scale(a, 1.0 / l)
+}
+/// linear interpolation; t = 0 gives a, t = 1 gives b.
+pub fn vec4_lerp(a: Vec4, b: Vec4, t: Float) -> Vec4 { return vec4_add(a, vec4_scale(vec4_sub(b, a), t)) }
+/// componentwise minimum.
+pub fn vec4_min(a: Vec4, b: Vec4) -> Vec4 { return Vec4 { x: fmin(a.x, b.x), y: fmin(a.y, b.y), z: fmin(a.z, b.z), w: fmin(a.w, b.w) } }
+/// componentwise maximum.
+pub fn vec4_max(a: Vec4, b: Vec4) -> Vec4 { return Vec4 { x: fmax(a.x, b.x), y: fmax(a.y, b.y), z: fmax(a.z, b.z), w: fmax(a.w, b.w) } }
+/// componentwise absolute value.
+pub fn vec4_abs(a: Vec4) -> Vec4 { return Vec4 { x: fabs(a.x), y: fabs(a.y), z: fabs(a.z), w: fabs(a.w) } }
+/// componentwise floor.
+pub fn vec4_floor(a: Vec4) -> Vec4 { return Vec4 { x: floor(a.x), y: floor(a.y), z: floor(a.z), w: floor(a.w) } }
+/// componentwise ceil.
+pub fn vec4_ceil(a: Vec4) -> Vec4 { return Vec4 { x: ceil(a.x), y: ceil(a.y), z: ceil(a.z), w: ceil(a.w) } }
+/// true when every component is within `eps` of the other's.
+pub fn vec4_approx_eq(a: Vec4, b: Vec4, eps: Float) -> Bool { return fabs(a.x - b.x) <= eps && fabs(a.y - b.y) <= eps && fabs(a.z - b.z) <= eps && fabs(a.w - b.w) <= eps }
+
+// ---------------- conversions ----------------
+/// Vec3 -> Vec4 with the given w. `w = 1` for a point, `w = 0` for a direction.
+pub fn vec3_extend(a: Vec3, w: Float) -> Vec4 { return Vec4 { x: a.x, y: a.y, z: a.z, w: w } }
+/// Vec4 -> Vec3, dropping w. No divide: see `vec4_project3` for the perspective divide.
+pub fn vec4_truncate(a: Vec4) -> Vec3 { return Vec3 { x: a.x, y: a.y, z: a.z } }
+/// Vec4 -> Vec3 through the perspective divide (xyz / w).
+pub fn vec4_project3(a: Vec4) -> Vec3 { return Vec3 { x: a.x / a.w, y: a.y / a.w, z: a.z / a.w } }
+/// Vec2 -> Vec3 with the given z.
+pub fn vec2_extend(a: Vec2, z: Float) -> Vec3 { return Vec3 { x: a.x, y: a.y, z: z } }
+/// Vec3 -> Vec2, dropping z.
+pub fn vec3_truncate(a: Vec3) -> Vec2 { return Vec2 { x: a.x, y: a.y } }

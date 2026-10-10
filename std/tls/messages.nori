@@ -1,0 +1,359 @@
+// TLS 1.3 handshake messages (RFC 8446 §4): building a ClientHello, and reading what a server
+// sends back.
+//
+// Every byte read here came from the network, so the reading half is written as a total parser:
+// `Reader` bounds-checks each read and latches an error, and once that error is set every further
+// read returns a zero value without touching the buffer. Nothing below can index past the end,
+// loop on a length it did not consume, or trap, which matters because `Str.at` out of range is a
+// trap and not an error, and a trap in a network parser is a remote crash.
+//
+// The rule that makes this work: a parse function never inspects `r.err` in the middle of its own
+// body to decide control flow. It reads what the grammar says, and checks once at the end. That
+// way a truncated message produces zeros and a clean refusal rather than a half-built value.
+
+/// A bounds-checked cursor over a byte string. `err` latches: the first failure wins, and every
+/// read after it is a no-op, so a caller can parse a whole structure and test once.
+pub struct Reader { data: view Str, pos: Int, err: Str }
+
+/// A cursor over `data`, positioned at the start and with no error yet.
+pub fn reader_new(data: Str) -> Reader { return Reader { data: data, pos: 0, err: "" } }
+/// how many bytes remain unread
+pub fn r_left(r: Reader) -> Int { return (r.data.len() - r.pos) }
+
+fn r_fail(inout r: Reader, sink why: Str) {
+    if r.err.len() == 0 { r.err = why }
+}
+/// One byte. Zero once the reader has failed, which is why `err` and not the value is what a caller tests.
+pub fn r_u8(inout r: Reader) -> Int {
+    if r.err.len() != 0 { return 0 }
+    if (r.pos + 1) > r.data.len() { r_fail(r, "truncated: wanted 1 byte")  return 0 }
+    let v = ord(r.data.at(r.pos))
+    r.pos = (r.pos + 1)
+    return v
+}
+/// A 16-bit big-endian integer: the width of nearly every length in TLS.
+pub fn r_u16(inout r: Reader) -> Int {
+    let hi = r_u8(r)
+    let lo = r_u8(r)
+    return ((hi << 8) | lo)
+}
+/// A 24-bit big-endian integer: a handshake message length, and a certificate list length.
+pub fn r_u24(inout r: Reader) -> Int {
+    let a = r_u8(r)
+    let b = r_u8(r)
+    let c = r_u8(r)
+    return (((a << 16) | (b << 8)) | c)
+}
+/// `n` bytes. Fails rather than truncating if fewer remain, and refuses a negative `n`.
+pub fn r_bytes(inout r: Reader, n: Int) -> Str {
+    if r.err.len() != 0 { return "" }
+    if n < 0 { r_fail(r, "negative length")  return "" }
+    if (r.pos + n) > r.data.len() { r_fail(r, "truncated: wanted more than the message holds")  return "" }
+    let v = r.data.slice(r.pos, (r.pos + n))
+    r.pos = (r.pos + n)
+    return v
+}
+/// a block introduced by an 8- or 16-bit length, which is how TLS spells nearly every list
+pub fn r_vec8(inout r: Reader) -> Str { let n = r_u8(r)  return r_bytes(r, n) }
+/// A block introduced by a 16-bit length.
+pub fn r_vec16(inout r: Reader) -> Str { let n = r_u16(r)  return r_bytes(r, n) }
+
+// ---- writing ------------------------------------------------------------------------------------
+
+fn u8s(n: Int) -> Str { return ("" + chr((n & 0xff))) }
+fn u16s(n: Int) -> Str { return (("" + chr(((n >> 8) & 0xff))) + chr((n & 0xff))) }
+fn u24s(n: Int) -> Str {
+    return ((("" + chr(((n >> 16) & 0xff))) + chr(((n >> 8) & 0xff))) + chr((n & 0xff)))
+}
+/// `b` behind an 8-bit length
+pub fn vec8(b: Str) -> Str { return (u8s(b.len()) + b) }
+/// `b` behind a 16-bit length
+pub fn vec16(b: Str) -> Str { return (u16s(b.len()) + b) }
+
+/// One handshake message: a one-byte type, a 24-bit length, and the body. Named `_msg` because
+/// `handshake` is the client's entry point, and the two would otherwise collide: every root file
+/// of a directory module shares one scope.
+pub fn handshake_msg(htype: Int, body: Str) -> Str { return ((u8s(htype) + u24s(body.len())) + body) }
+
+/// handshake type 1
+pub fn hs_client_hello() -> Int { return 1 }
+/// handshake type 2, also a HelloRetryRequest, which reuses this type.
+pub fn hs_server_hello() -> Int { return 2 }
+/// handshake type 4, which arrives after the handshake, under application keys.
+pub fn hs_new_session_ticket() -> Int { return 4 }
+/// handshake type 8: the first message of the server's encrypted flight.
+pub fn hs_encrypted_extensions() -> Int { return 8 }
+/// handshake type 11
+pub fn hs_certificate() -> Int { return 11 }
+/// handshake type 13, a request for a client certificate, which this client does not have.
+pub fn hs_certificate_request() -> Int { return 13 }
+/// handshake type 15
+pub fn hs_certificate_verify() -> Int { return 15 }
+/// handshake type 20
+pub fn hs_finished() -> Int { return 20 }
+/// handshake type 24: post-handshake, and ignoring one makes every later record fail.
+pub fn hs_key_update() -> Int { return 24 }
+
+/// extension 0 (RFC 6066): the host being asked for. Never an IP address.
+pub fn ext_server_name() -> Int { return 0 }
+/// extension 10: the key-exchange groups offered.
+pub fn ext_supported_groups() -> Int { return 10 }
+/// extension 13: what the client is willing to verify. Anything absent is refused by construction.
+pub fn ext_signature_algorithms() -> Int { return 13 }
+/// extension 43: where TLS 1.3 is actually negotiated, `legacy_version` having always said 1.2.
+pub fn ext_supported_versions() -> Int { return 43 }
+/// extension 51: the offered public key; in a HelloRetryRequest, a bare group with no key.
+pub fn ext_key_share() -> Int { return 51 }
+
+/// the only key-exchange group this client offers
+pub fn group_x25519() -> Int { return 29 }
+
+fn extension(etype: Int, body: Str) -> Str { return (u16s(etype) + vec16(body)) }
+
+// The signature schemes offered. This list is a policy statement, not a formality: a server
+// signs its CertificateVerify with one of these, so anything absent here is something the client
+// promises never to have to verify. RSA-PKCS1 appears only in its SHA-256/384/512 forms, and SHA-1
+// appears nowhere: offering it is how a client ends up accepting it.
+fn signature_algorithms() -> Str {
+    var b = ""
+    b = (b + u16s(0x0403))      // ecdsa_secp256r1_sha256
+    b = (b + u16s(0x0503))      // ecdsa_secp384r1_sha384
+    b = (b + u16s(0x0804))      // rsa_pss_rsae_sha256
+    b = (b + u16s(0x0805))      // rsa_pss_rsae_sha384
+    b = (b + u16s(0x0806))      // rsa_pss_rsae_sha512
+    b = (b + u16s(0x0401))      // rsa_pkcs1_sha256
+    b = (b + u16s(0x0501))      // rsa_pkcs1_sha384
+    b = (b + u16s(0x0601))      // rsa_pkcs1_sha512
+    return vec16(b)
+}
+
+/// Build a ClientHello for `host`, offering `pubkey` as an x25519 key share.
+///
+/// `random` must be 32 bytes from a cryptographic source and `session_id` 32 bytes; the session id
+/// is not used by TLS 1.3 at all, but echoing a non-empty one is what makes the exchange look like
+/// a resumed TLS 1.2 session to middleboxes that would otherwise interfere.
+///
+/// "" if an argument is the wrong length, never a partly-formed hello.
+pub fn client_hello(host: Str, random: Str, session_id: Str, pubkey: Str) -> Str {
+    if random.len() != 32 { return "" }
+    if pubkey.len() != 32 { return "" }
+    if session_id.len() > 32 { return "" }
+    if host.len() > 65530 { return "" }
+
+    var b = ""
+    b = (b + u16s(0x0303))                       // legacy_version: TLS 1.2, always
+    b = (b + random)
+    b = (b + vec8(session_id))
+    b = (b + vec16((u16s(0x1301) + u16s(0x1302))))   // AES-128-GCM-SHA256, AES-256-GCM-SHA384
+    b = (b + vec8(u8s(0)))                       // legacy_compression_methods: null only
+
+    var e = ""
+    // server_name: a list of one host_name(0) entry. An IP address must not be sent here, and a
+    // caller passing one gets a hello without the extension rather than an invalid one.
+    if host.len() > 0 {
+        if !looks_like_ip(host) {
+            e = (e + extension(ext_server_name(), vec16((u8s(0) + vec16(host)))))
+        }
+    }
+    e = (e + extension(ext_supported_groups(), vec16(u16s(group_x25519()))))
+    e = (e + extension(ext_signature_algorithms(), signature_algorithms()))
+    // supported_versions is what actually selects TLS 1.3; legacy_version above says 1.2 forever.
+    e = (e + extension(ext_supported_versions(), vec8(u16s(0x0304))))
+    e = (e + extension(ext_key_share(), vec16((u16s(group_x25519()) + vec16(pubkey)))))
+    b = (b + vec16(e))
+
+    return handshake_msg(hs_client_hello(), b)
+}
+
+// A host that is all digits and dots is an IPv4 literal, and one holding a colon is IPv6. Neither
+// belongs in server_name (RFC 6066 §3), and sending one there is a real interoperability failure
+// rather than a nicety.
+fn looks_like_ip(host: Str) -> Bool {
+    var digits_dots = true
+    var i = 0
+    while i < host.len() {
+        let c = ord(host.at(i))
+        if c == 58 { return true }                                  // ':' marks IPv6
+        if !(c == 46) { if c < 48 { digits_dots = false }  if c > 57 { digits_dots = false } }
+        i = i + 1
+    }
+    if host.len() == 0 { return false }
+    return digits_dots
+}
+
+// ---- reading ------------------------------------------------------------------------------------
+
+/// One handshake message lifted out of a buffer. `total` is how many bytes it occupied, so a
+/// caller can advance; 0 means the buffer does not yet hold a whole message.
+pub struct HsMsg { htype: Int, body: Str, total: Int, err: Str }
+
+/// The first handshake message in `buf`, if it is complete.
+///
+/// Handshake messages do not line up with records: a server routinely packs several into one
+/// record and may split one across two, so this works on a reassembled stream and reports how
+/// much it used rather than assuming a record boundary means anything.
+pub fn parse_handshake(buf: Str) -> HsMsg {
+    if buf.len() < 4 { return HsMsg { htype: 0, body: "", total: 0, err: "" } }
+    var r = reader_new(buf)
+    let t = r_u8(r)
+    let n = r_u24(r)
+    if (4 + n) > buf.len() { return HsMsg { htype: t, body: "", total: 0, err: "" } }
+    return HsMsg { htype: t, body: buf.slice(4, (4 + n)), total: (4 + n), err: "" }
+}
+
+/// What a ServerHello said. `err` is "" only if every field parsed; on failure nothing else is
+/// meaningful.
+pub struct ServerHello {
+    version: Int, random: Str, session_id: Str, cipher: Int,
+    group: Int, key_share: Str, is_hrr: Bool, err: Str
+}
+
+/// Parse a ServerHello body (the message without its four-byte handshake header).
+///
+/// The negotiated version comes from the supported_versions extension and never from
+/// `legacy_version`, which always says TLS 1.2. A server that omits the extension is not speaking
+/// TLS 1.3, and is refused here rather than downgraded.
+pub fn parse_server_hello(body: Str) -> ServerHello {
+    var sh = ServerHello { version: 0, random: "", session_id: "", cipher: 0,
+                           group: 0, key_share: "", is_hrr: false, err: "" }
+    var r = reader_new(body)
+    let _legacy = r_u16(r)                    // always 0x0303; the real version is an extension
+    sh.random = r_bytes(r, 32)
+    sh.session_id = r_vec8(r)
+    sh.cipher = r_u16(r)
+    let comp = r_u8(r)
+    let exts = r_vec16(r)
+    if r.err.len() != 0 { sh.err = copy r.err  return sh }
+    if r_left(r) != 0 { sh.err = "trailing bytes after the ServerHello extensions"  return sh }
+    if comp != 0 { sh.err = "server selected a compression method"  return sh }
+
+    sh.is_hrr = (sh.random == hrr_random())
+
+    var er = reader_new(exts)
+    while r_left(er) > 0 {
+        let et = r_u16(er)
+        let eb = r_vec16(er)
+        if er.err.len() != 0 { sh.err = copy er.err  return sh }
+        var br = reader_new(eb)
+        if et == ext_supported_versions() { sh.version = r_u16(br) }
+        if et == ext_key_share() {
+            sh.group = r_u16(br)
+            // In a HelloRetryRequest the key_share extension carries only the group the server
+            // wants, with no key behind it: the same extension number means a different thing.
+            if !sh.is_hrr { sh.key_share = r_vec16(br) }
+        }
+        if br.err.len() != 0 { sh.err = ("bad extension body: " + br.err)  return sh }
+    }
+    if er.err.len() != 0 { sh.err = copy er.err  return sh }
+
+    if sh.version != 0x0304 { sh.err = "server did not select TLS 1.3"  return sh }
+    if sh.is_hrr {
+        if sh.group == 0 { sh.err = "HelloRetryRequest without a group to retry with"  return sh }
+        return sh
+    }
+    if sh.group != group_x25519() { sh.err = "server selected a group that was not offered"  return sh }
+    if sh.key_share.len() != 32 { sh.err = "server key share is not an x25519 point"  return sh }
+    if sh.cipher != 0x1301 { if sh.cipher != 0x1302 { sh.err = "server selected a cipher suite that was not offered"  return sh } }
+    return sh
+}
+
+// `hrr_random` lives in schedule.nori, beside the transcript substitution that depends on it:
+// the two are the same fact, and splitting them is how they drift apart.
+
+/// An alert, as the peer sent it.
+pub struct Alert { level: Int, desc: Int }
+
+/// Read a two-byte alert body. A short one is reported as an internal_error(80) rather than
+/// guessed at.
+pub fn parse_alert(body: Str) -> Alert {
+    if body.len() < 2 { return Alert { level: 2, desc: 80 } }
+    return Alert { level: ord(body.at(0)), desc: ord(body.at(1)) }
+}
+/// Is this the peer closing cleanly? close_notify(0) at warning level, and nothing else.
+pub fn alert_is_close_notify(a: Alert) -> Bool { return a.desc == 0 }
+
+/// A readable name for an alert, for error messages. The number is what matters; the name is so a
+/// failure says "handshake_failure" rather than "alert 40".
+pub fn alert_name(desc: Int) -> Str {
+    if desc == 0 { return "close_notify" }
+    if desc == 10 { return "unexpected_message" }
+    if desc == 20 { return "bad_record_mac" }
+    if desc == 22 { return "record_overflow" }
+    if desc == 40 { return "handshake_failure" }
+    if desc == 42 { return "bad_certificate" }
+    if desc == 43 { return "unsupported_certificate" }
+    if desc == 44 { return "certificate_revoked" }
+    if desc == 45 { return "certificate_expired" }
+    if desc == 46 { return "certificate_unknown" }
+    if desc == 47 { return "illegal_parameter" }
+    if desc == 48 { return "unknown_ca" }
+    if desc == 49 { return "access_denied" }
+    if desc == 50 { return "decode_error" }
+    if desc == 51 { return "decrypt_error" }
+    if desc == 70 { return "protocol_version" }
+    if desc == 71 { return "insufficient_security" }
+    if desc == 80 { return "internal_error" }
+    if desc == 86 { return "inappropriate_fallback" }
+    if desc == 109 { return "missing_extension" }
+    if desc == 112 { return "unrecognized_name" }
+    if desc == 120 { return "no_application_protocol" }
+    return ("alert " + to_str(desc))
+}
+
+/// The alert record body for a fatal alert of the given description.
+pub fn alert_fatal(desc: Int) -> Str { return ((("" + chr(2)) + chr(desc))) }
+/// close_notify, at warning level, the only clean way to end a connection.
+pub fn alert_close_notify() -> Str { return ((("" + chr(1)) + chr(0))) }
+
+/// The certificates in a Certificate message, leaf first, each still DER-encoded.
+///
+/// The per-certificate extensions are parsed and discarded: they must be well-formed, but nothing
+/// in TLS 1.3 that this client cares about is carried there. Certificates themselves are not
+/// examined here: that is chain validation's job (see verify.nori), and doing any of it in this
+/// file would spread the one part of a TLS client that must be airtight across two.
+pub fn parse_certificate(body: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var r = reader_new(body)
+    let _ctx = r_vec8(r)                      // certificate_request_context: empty from a server
+    let listlen = r_u24(r)
+    if r.err.len() != 0 { return out }
+    if listlen != r_left(r) { return out }
+    while r_left(r) > 0 {
+        let n = r_u24(r)
+        let der = r_bytes(r, n)
+        let _ext = r_vec16(r)                 // per-certificate extensions: must be well-formed, unused
+        if r.err.len() != 0 {
+            var empty: Vec<Str> = vec()
+            return empty                       // a malformed list yields nothing, never a prefix
+        }
+        out.push(der)
+    }
+    return out
+}
+
+/// The algorithm and signature from a CertificateVerify body.
+pub struct CertVerify { algorithm: Int, signature: Str, err: Str }
+
+/// The signature algorithm and signature from a CertificateVerify body. Reading them is not checking them.
+pub fn parse_certificate_verify(body: Str) -> CertVerify {
+    var r = reader_new(body)
+    let alg = r_u16(r)
+    let sig = r_vec16(r)
+    if r.err.len() != 0 { return CertVerify { algorithm: 0, signature: "", err: copy r.err } }
+    if r_left(r) != 0 { return CertVerify { algorithm: 0, signature: "", err: "trailing bytes after the signature" } }
+    return CertVerify { algorithm: alg, signature: sig, err: "" }
+}
+
+/// The bytes a CertificateVerify signature is computed over (RFC 8446 §4.4.3).
+///
+/// The 64 spaces and the context string are not padding. They exist so that a signature made by a
+/// TLS server can never be mistaken for one made in another context, and so that a client
+/// signature and a server signature over the same transcript differ.
+pub fn certificate_verify_content(thash: Str, is_server: Bool) -> Str {
+    var s = ""
+    var i = 0
+    while i < 64 { s = (s + chr(32))  i = i + 1 }
+    if is_server { s = (s + "TLS 1.3, server CertificateVerify") }
+    else { s = (s + "TLS 1.3, client CertificateVerify") }
+    return ((s + chr(0)) + thash)
+}

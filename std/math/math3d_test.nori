@@ -1,0 +1,718 @@
+// Native .nori tests for std/math's 3D linear algebra: Vec2/3/4, Mat3/Mat4, Quat, Transform and
+// the projection/view matrix constructors. The scalar functions are covered by math_test.nori, this
+// file's sibling; `noric --test` runs each file on its own.
+//
+//   noric --test std/math/math3d_test.nori compiler/runtime.nori --import-root .
+//
+// Every expectation is a value computed by hand or taken from the published
+// formula, never from the implementation being tested. A round-trip (M * inverse(M) == I) only
+// proves two functions agree, so each such test is paired with a literal check: one hand-computed
+// inverse, the documented wgpu projection entries, the axis a 90-degree turn actually lands on.
+//
+// `use m::*` puts every name back unqualified, which is what keeps the arithmetic below readable.
+import "std/math" as m
+use m::*
+
+// tolerance for anything that has been through std/math's transcendentals (~1e-12 there)
+fn eps() -> Float { return 1.0e-10 }
+// tolerance for pure arithmetic, where the only error is the operations' own rounding
+fn teps() -> Float { return 1.0e-14 }
+
+fn assert_v2(got: Vec2, wx: Float, wy: Float, e: Float) {
+    assert_feq(got.x, wx, e)
+    assert_feq(got.y, wy, e)
+}
+fn assert_v3(got: Vec3, wx: Float, wy: Float, wz: Float, e: Float) {
+    assert_feq(got.x, wx, e)
+    assert_feq(got.y, wy, e)
+    assert_feq(got.z, wz, e)
+}
+fn assert_v4(got: Vec4, wx: Float, wy: Float, wz: Float, ww: Float, e: Float) {
+    assert_feq(got.x, wx, e)
+    assert_feq(got.y, wy, e)
+    assert_feq(got.z, wz, e)
+    assert_feq(got.w, ww, e)
+}
+fn assert_q(got: Quat, wx: Float, wy: Float, wz: Float, ww: Float, e: Float) {
+    assert_feq(got.x, wx, e)
+    assert_feq(got.y, wy, e)
+    assert_feq(got.z, wz, e)
+    assert_feq(got.w, ww, e)
+}
+fn assert_m3_eq(got: Mat3, want: Mat3, e: Float) { assert_true(mat3_approx_eq(got, want, e)) }
+fn assert_m4_eq(got: Mat4, want: Mat4, e: Float) { assert_true(mat4_approx_eq(got, want, e)) }
+
+// ================= Vec2 =================
+fn test_vec2_construct_and_arith() {
+    assert_v2(vec2(1.0, 2.0), 1.0, 2.0, teps())
+    assert_v2(vec2_splat(3.0), 3.0, 3.0, teps())
+    assert_v2(vec2_zero(), 0.0, 0.0, teps())
+    assert_v2(vec2_one(), 1.0, 1.0, teps())
+    assert_v2(vec2_x(), 1.0, 0.0, teps())
+    assert_v2(vec2_y(), 0.0, 1.0, teps())
+    assert_v2(vec2_add(vec2(1.0, 2.0), vec2(3.0, 5.0)), 4.0, 7.0, teps())
+    assert_v2(vec2_sub(vec2(1.0, 2.0), vec2(3.0, 5.0)), -2.0, -3.0, teps())
+    assert_v2(vec2_mul(vec2(2.0, 3.0), vec2(4.0, 5.0)), 8.0, 15.0, teps())
+    assert_v2(vec2_div(vec2(8.0, 15.0), vec2(4.0, 5.0)), 2.0, 3.0, teps())
+    assert_v2(vec2_scale(vec2(2.0, 3.0), 2.5), 5.0, 7.5, teps())
+    assert_v2(vec2_neg(vec2(2.0, -3.0)), -2.0, 3.0, teps())
+}
+fn test_vec2_geometry() {
+    assert_feq(vec2_dot(vec2(1.0, 2.0), vec2(3.0, 4.0)), 11.0, teps())
+    assert_feq(vec2_cross(vec2_x(), vec2_y()), 1.0, teps())          // +x cross +y is +1 (the z of the 3-D cross)
+    assert_feq(vec2_cross(vec2_y(), vec2_x()), -1.0, teps())
+    assert_feq(vec2_length(vec2(3.0, 4.0)), 5.0, teps())
+    assert_feq(vec2_length_sq(vec2(3.0, 4.0)), 25.0, teps())
+    assert_feq(vec2_distance(vec2(1.0, 1.0), vec2(4.0, 5.0)), 5.0, teps())
+    assert_feq(vec2_distance_sq(vec2(1.0, 1.0), vec2(4.0, 5.0)), 25.0, teps())
+    assert_v2(vec2_normalize(vec2(0.0, 4.0)), 0.0, 1.0, teps())
+    assert_v2(vec2_normalize(vec2(3.0, 4.0)), 0.6, 0.8, teps())
+    assert_v2(vec2_normalize_or_zero(vec2_zero()), 0.0, 0.0, teps())
+    assert_v2(vec2_lerp(vec2(0.0, 10.0), vec2(10.0, 20.0), 0.25), 2.5, 12.5, teps())
+    assert_v2(vec2_min(vec2(1.0, 9.0), vec2(4.0, 2.0)), 1.0, 2.0, teps())
+    assert_v2(vec2_max(vec2(1.0, 9.0), vec2(4.0, 2.0)), 4.0, 9.0, teps())
+    assert_v2(vec2_abs(vec2(-1.5, 2.5)), 1.5, 2.5, teps())
+    assert_v2(vec2_floor(vec2(1.7, -1.2)), 1.0, -2.0, teps())
+    assert_v2(vec2_ceil(vec2(1.2, -1.7)), 2.0, -1.0, teps())
+    assert_true(vec2_approx_eq(vec2(1.0, 2.0), vec2(1.0000001, 2.0), 1.0e-6))
+    assert_false(vec2_approx_eq(vec2(1.0, 2.0), vec2(1.01, 2.0), 1.0e-6))
+}
+
+// ================= Vec3 =================
+fn test_vec3_construct_and_arith() {
+    assert_v3(vec3(1.0, 2.0, 3.0), 1.0, 2.0, 3.0, teps())
+    assert_v3(vec3_splat(4.0), 4.0, 4.0, 4.0, teps())
+    assert_v3(vec3_zero(), 0.0, 0.0, 0.0, teps())
+    assert_v3(vec3_one(), 1.0, 1.0, 1.0, teps())
+    assert_v3(vec3_x(), 1.0, 0.0, 0.0, teps())
+    assert_v3(vec3_y(), 0.0, 1.0, 0.0, teps())
+    assert_v3(vec3_z(), 0.0, 0.0, 1.0, teps())
+    assert_v3(vec3_neg_x(), -1.0, 0.0, 0.0, teps())
+    assert_v3(vec3_neg_y(), 0.0, -1.0, 0.0, teps())
+    assert_v3(vec3_neg_z(), 0.0, 0.0, -1.0, teps())
+    assert_v3(vec3_add(vec3(1.0, 2.0, 3.0), vec3(4.0, 5.0, 6.0)), 5.0, 7.0, 9.0, teps())
+    assert_v3(vec3_sub(vec3(1.0, 2.0, 3.0), vec3(4.0, 5.0, 6.0)), -3.0, -3.0, -3.0, teps())
+    assert_v3(vec3_mul(vec3(1.0, 2.0, 3.0), vec3(4.0, 5.0, 6.0)), 4.0, 10.0, 18.0, teps())
+    assert_v3(vec3_div(vec3(4.0, 10.0, 18.0), vec3(4.0, 5.0, 6.0)), 1.0, 2.0, 3.0, teps())
+    assert_v3(vec3_scale(vec3(1.0, 2.0, 3.0), 3.0), 3.0, 6.0, 9.0, teps())
+    assert_v3(vec3_neg(vec3(1.0, -2.0, 3.0)), -1.0, 2.0, -3.0, teps())
+}
+fn test_vec3_dot_cross_handedness() {
+    assert_feq(vec3_dot(vec3(1.0, 2.0, 3.0), vec3(4.0, -5.0, 6.0)), 12.0, teps())
+    // the right-handed identities, all three of them
+    assert_v3(vec3_cross(vec3_x(), vec3_y()), 0.0, 0.0, 1.0, teps())
+    assert_v3(vec3_cross(vec3_y(), vec3_z()), 1.0, 0.0, 0.0, teps())
+    assert_v3(vec3_cross(vec3_z(), vec3_x()), 0.0, 1.0, 0.0, teps())
+    assert_v3(vec3_cross(vec3_y(), vec3_x()), 0.0, 0.0, -1.0, teps())
+    // a hand-computed general cross: (1,2,3) x (4,5,6) = (-3, 6, -3)
+    assert_v3(vec3_cross(vec3(1.0, 2.0, 3.0), vec3(4.0, 5.0, 6.0)), -3.0, 6.0, -3.0, teps())
+    // the cross is perpendicular to both, always
+    let c = vec3_cross(vec3(1.0, 2.0, 3.0), vec3(4.0, 5.0, 6.0))
+    assert_feq(vec3_dot(c, vec3(1.0, 2.0, 3.0)), 0.0, teps())
+    assert_feq(vec3_dot(c, vec3(4.0, 5.0, 6.0)), 0.0, teps())
+}
+fn test_vec3_length_and_normalize() {
+    assert_feq(vec3_length(vec3(3.0, 4.0, 0.0)), 5.0, teps())
+    assert_feq(vec3_length(vec3(1.0, 2.0, 2.0)), 3.0, teps())        // the 1-2-2-3 pythagorean quadruple
+    assert_feq(vec3_length_sq(vec3(1.0, 2.0, 2.0)), 9.0, teps())
+    assert_feq(vec3_distance(vec3(1.0, 1.0, 1.0), vec3(2.0, 3.0, 3.0)), 3.0, teps())
+    assert_feq(vec3_distance_sq(vec3(1.0, 1.0, 1.0), vec3(2.0, 3.0, 3.0)), 9.0, teps())
+    assert_v3(vec3_normalize(vec3(0.0, 3.0, 4.0)), 0.0, 0.6, 0.8, teps())
+    assert_feq(vec3_length(vec3_normalize(vec3(1.0, 2.0, 3.0))), 1.0, teps())
+    assert_v3(vec3_normalize_or_zero(vec3_zero()), 0.0, 0.0, 0.0, teps())
+    assert_v3(vec3_normalize_or_zero(vec3(0.0, 0.0, 7.0)), 0.0, 0.0, 1.0, teps())
+}
+fn test_vec3_componentwise() {
+    assert_v3(vec3_lerp(vec3(0.0, 0.0, 0.0), vec3(4.0, 8.0, 12.0), 0.25), 1.0, 2.0, 3.0, teps())
+    assert_v3(vec3_lerp(vec3(1.0, 2.0, 3.0), vec3(9.0, 9.0, 9.0), 0.0), 1.0, 2.0, 3.0, teps())
+    assert_v3(vec3_lerp(vec3(1.0, 2.0, 3.0), vec3(9.0, 8.0, 7.0), 1.0), 9.0, 8.0, 7.0, teps())
+    assert_v3(vec3_min(vec3(1.0, 9.0, 5.0), vec3(4.0, 2.0, 5.0)), 1.0, 2.0, 5.0, teps())
+    assert_v3(vec3_max(vec3(1.0, 9.0, 5.0), vec3(4.0, 2.0, 5.0)), 4.0, 9.0, 5.0, teps())
+    assert_v3(vec3_abs(vec3(-1.0, 2.0, -3.0)), 1.0, 2.0, 3.0, teps())
+    assert_v3(vec3_floor(vec3(1.7, -1.2, 3.0)), 1.0, -2.0, 3.0, teps())
+    assert_v3(vec3_ceil(vec3(1.2, -1.7, 3.0)), 2.0, -1.0, 3.0, teps())
+    assert_feq(vec3_max_element(vec3(1.0, 9.0, 5.0)), 9.0, teps())
+    assert_feq(vec3_min_element(vec3(1.0, 9.0, -5.0)), -5.0, teps())
+}
+fn test_vec3_reflect_project_angle() {
+    // a ball dropped at 45 degrees onto a floor whose normal is +Y comes back up at 45 degrees
+    assert_v3(vec3_reflect(vec3(1.0, -1.0, 0.0), vec3_y()), 1.0, 1.0, 0.0, teps())
+    assert_v3(vec3_reflect(vec3(0.0, -1.0, 0.0), vec3_y()), 0.0, 1.0, 0.0, teps())
+    // projection keeps only the component along b, and b's length must not matter
+    assert_v3(vec3_project_onto(vec3(2.0, 3.0, 4.0), vec3(5.0, 0.0, 0.0)), 2.0, 0.0, 0.0, teps())
+    assert_v3(vec3_project_onto(vec3(2.0, 3.0, 4.0), vec3(1.0, 0.0, 0.0)), 2.0, 0.0, 0.0, teps())
+    assert_v3(vec3_project_onto(vec3(2.0, 3.0, 4.0), vec3_zero()), 0.0, 0.0, 0.0, teps())
+    assert_v3(vec3_reject_from(vec3(2.0, 3.0, 4.0), vec3(9.0, 0.0, 0.0)), 0.0, 3.0, 4.0, teps())
+    assert_feq(vec3_angle_between(vec3_x(), vec3_y()), m::pi() * 0.5, eps())
+    assert_feq(vec3_angle_between(vec3_x(), vec3_x()), 0.0, eps())
+    assert_feq(vec3_angle_between(vec3_x(), vec3_neg_x()), m::pi(), eps())
+    assert_feq(vec3_angle_between(vec3(1.0, 1.0, 0.0), vec3_x()), m::pi() * 0.25, eps())
+    // an orthonormal companion really is perpendicular and really is unit
+    let o = vec3_any_orthonormal(vec3_normalize(vec3(1.0, 2.0, 3.0)))
+    assert_feq(vec3_dot(o, vec3_normalize(vec3(1.0, 2.0, 3.0))), 0.0, eps())
+    assert_feq(vec3_length(o), 1.0, eps())
+}
+
+// ================= Vec4 and conversions =================
+fn test_vec4() {
+    assert_v4(vec4(1.0, 2.0, 3.0, 4.0), 1.0, 2.0, 3.0, 4.0, teps())
+    assert_v4(vec4_splat(2.0), 2.0, 2.0, 2.0, 2.0, teps())
+    assert_v4(vec4_zero(), 0.0, 0.0, 0.0, 0.0, teps())
+    assert_v4(vec4_one(), 1.0, 1.0, 1.0, 1.0, teps())
+    assert_v4(vec4_add(vec4(1.0, 2.0, 3.0, 4.0), vec4(1.0, 1.0, 1.0, 1.0)), 2.0, 3.0, 4.0, 5.0, teps())
+    assert_v4(vec4_sub(vec4(1.0, 2.0, 3.0, 4.0), vec4(1.0, 1.0, 1.0, 1.0)), 0.0, 1.0, 2.0, 3.0, teps())
+    assert_v4(vec4_mul(vec4(1.0, 2.0, 3.0, 4.0), vec4(2.0, 2.0, 2.0, 2.0)), 2.0, 4.0, 6.0, 8.0, teps())
+    assert_v4(vec4_div(vec4(2.0, 4.0, 6.0, 8.0), vec4(2.0, 2.0, 2.0, 2.0)), 1.0, 2.0, 3.0, 4.0, teps())
+    assert_v4(vec4_scale(vec4(1.0, 2.0, 3.0, 4.0), 0.5), 0.5, 1.0, 1.5, 2.0, teps())
+    assert_v4(vec4_neg(vec4(1.0, -2.0, 3.0, -4.0)), -1.0, 2.0, -3.0, 4.0, teps())
+    assert_feq(vec4_dot(vec4(1.0, 2.0, 3.0, 4.0), vec4(1.0, 1.0, 1.0, 1.0)), 10.0, teps())
+    assert_feq(vec4_length(vec4(1.0, 1.0, 1.0, 1.0)), 2.0, teps())   // sqrt(4)
+    assert_feq(vec4_length_sq(vec4(1.0, 1.0, 1.0, 1.0)), 4.0, teps())
+    assert_feq(vec4_distance(vec4_zero(), vec4(1.0, 1.0, 1.0, 1.0)), 2.0, teps())
+    assert_feq(vec4_distance_sq(vec4_zero(), vec4(1.0, 1.0, 1.0, 1.0)), 4.0, teps())
+    assert_v4(vec4_normalize(vec4(0.0, 0.0, 0.0, 5.0)), 0.0, 0.0, 0.0, 1.0, teps())
+    assert_v4(vec4_normalize_or_zero(vec4_zero()), 0.0, 0.0, 0.0, 0.0, teps())
+    assert_v4(vec4_lerp(vec4_zero(), vec4(4.0, 4.0, 4.0, 4.0), 0.5), 2.0, 2.0, 2.0, 2.0, teps())
+    assert_v4(vec4_min(vec4(1.0, 9.0, 1.0, 9.0), vec4(9.0, 1.0, 9.0, 1.0)), 1.0, 1.0, 1.0, 1.0, teps())
+    assert_v4(vec4_max(vec4(1.0, 9.0, 1.0, 9.0), vec4(9.0, 1.0, 9.0, 1.0)), 9.0, 9.0, 9.0, 9.0, teps())
+    assert_v4(vec4_abs(vec4(-1.0, 2.0, -3.0, 4.0)), 1.0, 2.0, 3.0, 4.0, teps())
+    assert_v4(vec4_floor(vec4(1.7, -1.2, 0.0, 2.0)), 1.0, -2.0, 0.0, 2.0, teps())
+    assert_v4(vec4_ceil(vec4(1.2, -1.7, 0.0, 2.0)), 2.0, -1.0, 0.0, 2.0, teps())
+    assert_true(vec4_approx_eq(vec4_one(), vec4(1.0, 1.0, 1.0, 1.0), teps()))
+    assert_false(vec4_approx_eq(vec4_one(), vec4(1.0, 1.0, 1.0, 1.5), teps()))
+}
+fn test_conversions() {
+    assert_v4(vec3_extend(vec3(1.0, 2.0, 3.0), 1.0), 1.0, 2.0, 3.0, 1.0, teps())
+    assert_v4(vec3_extend(vec3(1.0, 2.0, 3.0), 0.0), 1.0, 2.0, 3.0, 0.0, teps())
+    assert_v3(vec4_truncate(vec4(1.0, 2.0, 3.0, 9.0)), 1.0, 2.0, 3.0, teps())
+    assert_v3(vec4_project3(vec4(2.0, 4.0, 6.0, 2.0)), 1.0, 2.0, 3.0, teps())
+    assert_v3(vec2_extend(vec2(1.0, 2.0), 3.0), 1.0, 2.0, 3.0, teps())
+    assert_v2(vec3_truncate(vec3(1.0, 2.0, 3.0)), 1.0, 2.0, teps())
+}
+
+// ================= Mat3 =================
+// the running example: A has rows (2,0,0) (0,0,-1) (0,1,0); a scale of 2 on x composed with a
+// quarter turn about x. det(A) = 2, and its inverse has rows (0.5,0,0) (0,0,1) (0,-1,0).
+fn ex_mat3() -> Mat3 { return mat3_from_cols(vec3(2.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0), vec3(0.0, -1.0, 0.0)) }
+fn ex_mat3_inverse() -> Mat3 { return mat3_from_cols(vec3(0.5, 0.0, 0.0), vec3(0.0, 0.0, -1.0), vec3(0.0, 1.0, 0.0)) }
+
+fn test_mat3_basics() {
+    let i = mat3_identity()
+    assert_v3(i.x_axis, 1.0, 0.0, 0.0, teps())
+    assert_v3(i.y_axis, 0.0, 1.0, 0.0, teps())
+    assert_v3(i.z_axis, 0.0, 0.0, 1.0, teps())
+    assert_m3_eq(mat3_mul(i, ex_mat3()), ex_mat3(), teps())
+    assert_m3_eq(mat3_mul(ex_mat3(), i), ex_mat3(), teps())
+    assert_v3(mat3_mul_vec3(mat3_identity(), vec3(1.0, 2.0, 3.0)), 1.0, 2.0, 3.0, teps())
+    // A applied to (1,2,3): rows dot the vector -> (2, -3, 2)
+    assert_v3(mat3_mul_vec3(ex_mat3(), vec3(1.0, 2.0, 3.0)), 2.0, -3.0, 2.0, teps())
+    assert_m3_eq(mat3_from_scale(vec3(2.0, 3.0, 4.0)), mat3_from_cols(vec3(2.0, 0.0, 0.0), vec3(0.0, 3.0, 0.0), vec3(0.0, 0.0, 4.0)), teps())
+    // transpose swaps rows and columns and is its own inverse
+    assert_m3_eq(mat3_transpose(mat3_transpose(ex_mat3())), ex_mat3(), teps())
+    assert_feq(mat3_transpose(ex_mat3()).y_axis.z, ex_mat3().z_axis.y, teps())
+    assert_m3_eq(mat3_scale(mat3_identity(), 3.0), mat3_from_scale(vec3_splat(3.0)), teps())
+    assert_m3_eq(mat3_add(mat3_identity(), mat3_identity()), mat3_from_scale(vec3_splat(2.0)), teps())
+    assert_false(mat3_approx_eq(mat3_identity(), ex_mat3(), 1.0e-6))
+}
+fn test_mat3_determinant() {
+    assert_feq(mat3_determinant(mat3_identity()), 1.0, teps())
+    assert_feq(mat3_determinant(mat3_from_scale(vec3(2.0, 3.0, 4.0))), 24.0, teps())
+    assert_feq(mat3_determinant(ex_mat3()), 2.0, teps())
+    // a rotation preserves volume, whatever the axis
+    assert_feq(mat3_determinant(mat3_from_axis_angle(vec3(1.0, 2.0, 3.0), 0.7)), 1.0, eps())
+    assert_feq(mat3_determinant(mat3_zero()), 0.0, teps())
+}
+fn test_mat3_inverse() {
+    // the hand-computed one, element for element
+    assert_m3_eq(mat3_inverse(ex_mat3()), ex_mat3_inverse(), teps())
+    // and the round trip, for several matrices that are not each other's special cases
+    assert_m3_eq(mat3_mul(ex_mat3(), mat3_inverse(ex_mat3())), mat3_identity(), teps())
+    let r = mat3_from_axis_angle(vec3(1.0, -2.0, 0.5), 1.3)
+    assert_m3_eq(mat3_mul(r, mat3_inverse(r)), mat3_identity(), eps())
+    let s = mat3_mul(r, mat3_from_scale(vec3(2.0, 0.25, 7.0)))
+    assert_m3_eq(mat3_mul(s, mat3_inverse(s)), mat3_identity(), eps())
+    assert_m3_eq(mat3_mul(mat3_inverse(s), s), mat3_identity(), eps())
+    let g = mat3_from_cols(vec3(1.0, 2.0, 3.0), vec3(0.0, 1.0, 4.0), vec3(5.0, 6.0, 0.0))
+    assert_m3_eq(mat3_mul(g, mat3_inverse(g)), mat3_identity(), eps())
+    // a rotation's inverse is its transpose
+    assert_m3_eq(mat3_inverse(r), mat3_transpose(r), eps())
+    // singular input yields the zero matrix rather than infinities
+    assert_m3_eq(mat3_inverse(mat3_zero()), mat3_zero(), teps())
+}
+fn test_mat3_rotations() {
+    let q = m::pi() * 0.5
+    // right-handed quarter turns: each axis sends the next one round the cycle
+    assert_v3(mat3_mul_vec3(mat3_from_rotation_x(q), vec3_y()), 0.0, 0.0, 1.0, eps())
+    assert_v3(mat3_mul_vec3(mat3_from_rotation_y(q), vec3_z()), 1.0, 0.0, 0.0, eps())
+    assert_v3(mat3_mul_vec3(mat3_from_rotation_z(q), vec3_x()), 0.0, 1.0, 0.0, eps())
+    assert_v3(mat3_mul_vec3(mat3_from_rotation_y(q), vec3_x()), 0.0, 0.0, -1.0, eps())
+    // the axis itself is fixed
+    assert_v3(mat3_mul_vec3(mat3_from_rotation_y(0.9), vec3_y()), 0.0, 1.0, 0.0, eps())
+    // axis-angle about a cardinal axis is the same matrix as the cardinal constructor
+    assert_m3_eq(mat3_from_axis_angle(vec3_z(), 0.6), mat3_from_rotation_z(0.6), eps())
+    assert_m3_eq(mat3_from_axis_angle(vec3_x(), 0.6), mat3_from_rotation_x(0.6), eps())
+    assert_m3_eq(mat3_from_axis_angle(vec3_y(), 0.6), mat3_from_rotation_y(0.6), eps())
+    // and a non-unit axis is normalized for you
+    assert_m3_eq(mat3_from_axis_angle(vec3(0.0, 5.0, 0.0), 0.6), mat3_from_rotation_y(0.6), eps())
+    // rotating about an axis by t then by -t is the identity
+    let a = mat3_from_axis_angle(vec3(1.0, 1.0, 1.0), 0.4)
+    assert_m3_eq(mat3_mul(a, mat3_from_axis_angle(vec3(1.0, 1.0, 1.0), -0.4)), mat3_identity(), eps())
+}
+fn test_mat3_normal_matrix() {
+    // a pure rotation is its own normal matrix (inverse-transpose of orthonormal is itself)
+    let r = mat4_from_axis_angle(vec3(0.3, 1.0, -0.2), 0.8)
+    assert_m3_eq(mat3_normal_matrix(r), mat3_from_mat4(r), eps())
+    // under a non-uniform scale the normal matrix is the reciprocal scale; that is its whole point
+    let s = mat4_from_scale(vec3(1.0, 2.0, 4.0))
+    assert_m3_eq(mat3_normal_matrix(s), mat3_from_scale(vec3(1.0, 0.5, 0.25)), teps())
+    // translation never reaches the normal matrix
+    assert_m3_eq(mat3_normal_matrix(mat4_from_translation(vec3(9.0, 9.0, 9.0))), mat3_identity(), teps())
+    // a stretched plane's normal stays perpendicular to its stretched tangents
+    let mm = mat4_mul(mat4_from_axis_angle(vec3_z(), 0.5), mat4_from_scale(vec3(1.0, 3.0, 1.0)))
+    let nm = mat3_normal_matrix(mm)
+    let t1 = mat4_transform_vector3(mm, vec3(1.0, 1.0, 0.0))
+    let t2 = mat4_transform_vector3(mm, vec3(1.0, -1.0, 0.0))
+    let n = mat3_mul_vec3(nm, vec3_cross(vec3(1.0, 1.0, 0.0), vec3(1.0, -1.0, 0.0)))
+    assert_feq(vec3_dot(n, t1), 0.0, eps())
+    assert_feq(vec3_dot(n, t2), 0.0, eps())
+}
+fn test_mat3_cols_array() {
+    let o = mat3_to_cols_array(ex_mat3())
+    assert_feq(o[0], 2.0, teps())
+    assert_feq(o[1], 0.0, teps())
+    assert_feq(o[2], 0.0, teps())
+    assert_feq(o[3], 0.0, teps())
+    assert_feq(o[4], 0.0, teps())
+    assert_feq(o[5], 1.0, teps())
+    assert_feq(o[6], 0.0, teps())
+    assert_feq(o[7], -1.0, teps())
+    assert_feq(o[8], 0.0, teps())
+}
+
+// ================= Mat4 =================
+// the running example: the Mat3 above lifted to 4x4 with a translation of (1,2,3).
+// M = T(1,2,3) * A, so M's inverse is A^-1 * T(-1,-2,-3), whose translation is
+// -A^-1*(1,2,3) = -(0.5, 3, -2) = (-0.5, -3, 2). Every number below was worked out by hand.
+fn ex_mat4() -> Mat4 { return mat4_from_cols(vec4(2.0, 0.0, 0.0, 0.0), vec4(0.0, 0.0, 1.0, 0.0), vec4(0.0, -1.0, 0.0, 0.0), vec4(1.0, 2.0, 3.0, 1.0)) }
+fn ex_mat4_inverse() -> Mat4 { return mat4_from_cols(vec4(0.5, 0.0, 0.0, 0.0), vec4(0.0, 0.0, -1.0, 0.0), vec4(0.0, 1.0, 0.0, 0.0), vec4(-0.5, -3.0, 2.0, 1.0)) }
+
+fn test_mat4_basics() {
+    let i = mat4_identity()
+    assert_v4(i.x_axis, 1.0, 0.0, 0.0, 0.0, teps())
+    assert_v4(i.w_axis, 0.0, 0.0, 0.0, 1.0, teps())
+    assert_m4_eq(mat4_mul(i, ex_mat4()), ex_mat4(), teps())
+    assert_m4_eq(mat4_mul(ex_mat4(), i), ex_mat4(), teps())
+    assert_m4_eq(mat4_zero(), mat4_from_cols(vec4_zero(), vec4_zero(), vec4_zero(), vec4_zero()), teps())
+    assert_m4_eq(mat4_transpose(mat4_transpose(ex_mat4())), ex_mat4(), teps())
+    // the transpose puts the translation into the bottom row
+    assert_v4(mat4_transpose(ex_mat4()).x_axis, 2.0, 0.0, 0.0, 1.0, teps())
+    assert_m4_eq(mat4_from_mat3(ex_mat3()), mat4_from_cols(vec4(2.0, 0.0, 0.0, 0.0), vec4(0.0, 0.0, 1.0, 0.0), vec4(0.0, -1.0, 0.0, 0.0), vec4(0.0, 0.0, 0.0, 1.0)), teps())
+    assert_m3_eq(mat3_from_mat4(ex_mat4()), ex_mat3(), teps())
+    assert_m4_eq(mat4_scale_elems(mat4_identity(), 2.0), mat4_from_cols(vec4(2.0, 0.0, 0.0, 0.0), vec4(0.0, 2.0, 0.0, 0.0), vec4(0.0, 0.0, 2.0, 0.0), vec4(0.0, 0.0, 0.0, 2.0)), teps())
+    assert_m4_eq(mat4_add(mat4_zero(), ex_mat4()), ex_mat4(), teps())
+}
+fn test_mat4_transform_point_vs_vector() {
+    let t = mat4_from_translation(vec3(10.0, 20.0, 30.0))
+    // a point is moved; a direction is not
+    assert_v3(mat4_transform_point3(t, vec3(1.0, 2.0, 3.0)), 11.0, 22.0, 33.0, teps())
+    assert_v3(mat4_transform_vector3(t, vec3(1.0, 2.0, 3.0)), 1.0, 2.0, 3.0, teps())
+    assert_v4(mat4_transform_vec4(t, vec4(1.0, 2.0, 3.0, 1.0)), 11.0, 22.0, 33.0, 1.0, teps())
+    assert_v4(mat4_transform_vec4(t, vec4(1.0, 2.0, 3.0, 0.0)), 1.0, 2.0, 3.0, 0.0, teps())
+    // A then the translation, worked out by hand: A*(1,2,3) = (2,-3,2), plus (1,2,3) = (3,-1,5)
+    assert_v3(mat4_transform_point3(ex_mat4(), vec3(1.0, 2.0, 3.0)), 3.0, -1.0, 5.0, teps())
+    assert_v3(mat4_transform_vector3(ex_mat4(), vec3(1.0, 2.0, 3.0)), 2.0, -3.0, 2.0, teps())
+    assert_v3(mat4_transform_point3(mat4_from_scale(vec3(2.0, 3.0, 4.0)), vec3(1.0, 1.0, 1.0)), 2.0, 3.0, 4.0, teps())
+    // multiplication order: mul(a, b) applies b first
+    let sc = mat4_from_scale(vec3_splat(2.0))
+    let tr = mat4_from_translation(vec3(1.0, 0.0, 0.0))
+    assert_v3(mat4_transform_point3(mat4_mul(tr, sc), vec3(1.0, 0.0, 0.0)), 3.0, 0.0, 0.0, teps())
+    assert_v3(mat4_transform_point3(mat4_mul(sc, tr), vec3(1.0, 0.0, 0.0)), 4.0, 0.0, 0.0, teps())
+}
+fn test_mat4_determinant() {
+    assert_feq(mat4_determinant(mat4_identity()), 1.0, teps())
+    assert_feq(mat4_determinant(ex_mat4()), 2.0, teps())              // = det of the upper-left 3x3
+    assert_feq(mat4_determinant(mat4_from_scale(vec3(2.0, 3.0, 4.0))), 24.0, teps())
+    assert_feq(mat4_determinant(mat4_from_translation(vec3(9.0, 8.0, 7.0))), 1.0, teps())
+    assert_feq(mat4_determinant(mat4_from_axis_angle(vec3(1.0, 2.0, 3.0), 0.9)), 1.0, eps())
+    assert_feq(mat4_determinant(mat4_zero()), 0.0, teps())
+}
+fn test_mat4_inverse_hand_computed() {
+    assert_m4_eq(mat4_inverse(ex_mat4()), ex_mat4_inverse(), teps())
+    // a translation's inverse is the opposite translation, exactly
+    assert_m4_eq(mat4_inverse(mat4_from_translation(vec3(1.0, -2.0, 3.0))), mat4_from_translation(vec3(-1.0, 2.0, -3.0)), teps())
+    // a scale's inverse is the reciprocal scale
+    assert_m4_eq(mat4_inverse(mat4_from_scale(vec3(2.0, 4.0, 8.0))), mat4_from_scale(vec3(0.5, 0.25, 0.125)), teps())
+    // singular input yields the zero matrix rather than infinities
+    assert_m4_eq(mat4_inverse(mat4_from_scale(vec3(1.0, 1.0, 0.0))), mat4_zero(), teps())
+}
+fn test_mat4_inverse_roundtrip() {
+    // several non-trivial matrices, each M * inverse(M) and inverse(M) * M against the identity
+    let a = ex_mat4()
+    assert_m4_eq(mat4_mul(a, mat4_inverse(a)), mat4_identity(), teps())
+    assert_m4_eq(mat4_mul(mat4_inverse(a), a), mat4_identity(), teps())
+    let b = mat4_mul(mat4_from_translation(vec3(1.0, 2.0, 3.0)), mat4_mul(mat4_from_axis_angle(vec3(0.3, -1.0, 2.0), 1.1), mat4_from_scale(vec3(2.0, 0.5, 3.0))))
+    assert_m4_eq(mat4_mul(b, mat4_inverse(b)), mat4_identity(), eps())
+    assert_m4_eq(mat4_mul(mat4_inverse(b), b), mat4_identity(), eps())
+    let c = perspective_rh(m::pi() / 3.0, 16.0 / 9.0, 0.1, 250.0)
+    assert_m4_eq(mat4_mul(c, mat4_inverse(c)), mat4_identity(), eps())
+    let d = look_at_rh(vec3(3.0, 4.0, 5.0), vec3(1.0, 0.0, -2.0), vec3_y())
+    assert_m4_eq(mat4_mul(d, mat4_inverse(d)), mat4_identity(), eps())
+    let e = orthographic_rh(-4.0, 4.0, -3.0, 3.0, 0.5, 60.0)
+    assert_m4_eq(mat4_mul(e, mat4_inverse(e)), mat4_identity(), eps())
+    // a fully general matrix, no structure at all
+    let g = mat4_from_cols(vec4(1.0, 2.0, 3.0, 4.0), vec4(0.0, 1.0, 4.0, 2.0), vec4(5.0, 6.0, 0.0, 1.0), vec4(2.0, 0.0, 1.0, 3.0))
+    assert_m4_eq(mat4_mul(g, mat4_inverse(g)), mat4_identity(), 1.0e-12)
+    assert_m4_eq(mat4_mul(mat4_inverse(g), g), mat4_identity(), 1.0e-12)
+}
+fn test_mat4_cols_array() {
+    // column-major: the translation lands at 12, 13, 14, where a wgpu uniform expects it
+    let o = mat4_to_cols_array(ex_mat4())
+    assert_feq(o[0], 2.0, teps())
+    assert_feq(o[5], 0.0, teps())
+    assert_feq(o[6], 1.0, teps())
+    assert_feq(o[9], -1.0, teps())
+    assert_feq(o[12], 1.0, teps())
+    assert_feq(o[13], 2.0, teps())
+    assert_feq(o[14], 3.0, teps())
+    assert_feq(o[15], 1.0, teps())
+    let rt = mat4_to_cols_array(ex_mat4())
+    assert_m4_eq(mat4_from_cols_array(rt), ex_mat4(), teps())
+}
+
+// ================= Quat =================
+fn test_quat_construct() {
+    assert_q(quat_identity(), 0.0, 0.0, 0.0, 1.0, teps())
+    // 90 degrees about Y: the vector part is sin(45) on y, the scalar cos(45)
+    let h = sqrt(2.0) * 0.5
+    assert_q(quat_from_axis_angle(vec3_y(), m::pi() * 0.5), 0.0, h, 0.0, h, eps())
+    assert_q(quat_from_rotation_y(m::pi() * 0.5), 0.0, h, 0.0, h, eps())
+    assert_q(quat_from_rotation_x(m::pi() * 0.5), h, 0.0, 0.0, h, eps())
+    assert_q(quat_from_rotation_z(m::pi() * 0.5), 0.0, 0.0, h, h, eps())
+    // 180 degrees about X: pure vector part
+    assert_q(quat_from_rotation_x(m::pi()), 1.0, 0.0, 0.0, 0.0, eps())
+    // every constructor produces a unit quaternion, and a non-unit axis is normalized for you
+    assert_feq(quat_length(quat_from_axis_angle(vec3(1.0, 2.0, 3.0), 0.7)), 1.0, eps())
+    assert_feq(quat_length(quat_from_axis_angle(vec3(0.0, 9.0, 0.0), 0.7)), 1.0, eps())
+    assert_q(quat_from_axis_angle(vec3(0.0, 9.0, 0.0), 0.7), quat_from_rotation_y(0.7).x, quat_from_rotation_y(0.7).y, quat_from_rotation_y(0.7).z, quat_from_rotation_y(0.7).w, eps())
+    assert_feq(quat_length_sq(quat_identity()), 1.0, teps())
+}
+fn test_quat_handedness() {
+    // The handedness statement: right-handed, so a +90 degree turn about +Y takes +X to -Z.
+    // (Curl the right hand's fingers from +Z to +X with the thumb along +Y.)
+    let qy = quat_from_axis_angle(vec3_y(), m::pi() * 0.5)
+    assert_v3(quat_rotate_vec3(qy, vec3_x()), 0.0, 0.0, -1.0, eps())
+    assert_v3(quat_rotate_vec3(qy, vec3_z()), 1.0, 0.0, 0.0, eps())
+    assert_v3(quat_rotate_vec3(qy, vec3_y()), 0.0, 1.0, 0.0, eps())      // the axis is fixed
+    // and the other two axes follow the same right-handed cycle
+    let qx = quat_from_axis_angle(vec3_x(), m::pi() * 0.5)
+    assert_v3(quat_rotate_vec3(qx, vec3_y()), 0.0, 0.0, 1.0, eps())
+    let qz = quat_from_axis_angle(vec3_z(), m::pi() * 0.5)
+    assert_v3(quat_rotate_vec3(qz, vec3_x()), 0.0, 1.0, 0.0, eps())
+    // a rotation preserves length
+    assert_feq(vec3_length(quat_rotate_vec3(quat_from_axis_angle(vec3(1.0, 2.0, 3.0), 1.2), vec3(3.0, -1.0, 2.0))), vec3_length(vec3(3.0, -1.0, 2.0)), eps())
+}
+fn test_quat_matrix_agreement() {
+    // quat -> mat3 must be the same rotation the quaternion applies directly, on arbitrary vectors
+    let q = quat_normalize(quat(0.2, -0.5, 0.3, 0.78))
+    let r = mat3_from_quat(q)
+    assert_v3(mat3_mul_vec3(r, vec3_x()), quat_rotate_vec3(q, vec3_x()).x, quat_rotate_vec3(q, vec3_x()).y, quat_rotate_vec3(q, vec3_x()).z, eps())
+    let v = vec3(1.0, -2.0, 3.5)
+    let a = mat3_mul_vec3(r, v)
+    let b = quat_rotate_vec3(q, v)
+    assert_v3(a, b.x, b.y, b.z, eps())
+    // and it must equal the direct axis constructors
+    assert_m3_eq(mat3_from_quat(quat_from_rotation_y(0.6)), mat3_from_rotation_y(0.6), eps())
+    assert_m3_eq(mat3_from_quat(quat_from_rotation_x(0.6)), mat3_from_rotation_x(0.6), eps())
+    assert_m3_eq(mat3_from_quat(quat_from_rotation_z(0.6)), mat3_from_rotation_z(0.6), eps())
+    assert_m3_eq(mat3_from_quat(quat_identity()), mat3_identity(), teps())
+    assert_m4_eq(mat4_from_quat(quat_from_rotation_z(0.6)), mat4_from_rotation_z(0.6), eps())
+    // the matrix of a rotation is orthonormal with determinant +1
+    assert_m3_eq(mat3_mul(r, mat3_transpose(r)), mat3_identity(), eps())
+    assert_feq(mat3_determinant(r), 1.0, eps())
+    // mat3 -> quat comes back to the same rotation (up to the sign the double cover allows)
+    let back = quat_from_mat3(r)
+    assert_feq(m::fabs(quat_dot(back, q)), 1.0, eps())
+    // including the branches Shepperd's method picks for near-180-degree turns
+    let q180 = quat_from_axis_angle(vec3_normalize(vec3(1.0, 1.0, 0.0)), m::pi())
+    assert_feq(m::fabs(quat_dot(quat_from_mat3(mat3_from_quat(q180)), q180)), 1.0, eps())
+    let q180z = quat_from_axis_angle(vec3_z(), m::pi())
+    assert_feq(m::fabs(quat_dot(quat_from_mat3(mat3_from_quat(q180z)), q180z)), 1.0, eps())
+    let q180y = quat_from_axis_angle(vec3_y(), m::pi())
+    assert_feq(m::fabs(quat_dot(quat_from_mat3(mat3_from_quat(q180y)), q180y)), 1.0, eps())
+    assert_feq(m::fabs(quat_dot(quat_from_mat4(mat4_from_quat(q)), q)), 1.0, eps())
+}
+fn test_quat_algebra() {
+    let a = quat_from_axis_angle(vec3_y(), 0.4)
+    let b = quat_from_axis_angle(vec3_x(), 0.9)
+    // mul(a, b) applies b first: the same order mat4_mul uses
+    let v = vec3(1.0, 2.0, 3.0)
+    let viaq = quat_rotate_vec3(quat_mul(a, b), v)
+    let step = quat_rotate_vec3(a, quat_rotate_vec3(b, v))
+    assert_v3(viaq, step.x, step.y, step.z, eps())
+    // two quarter turns about the same axis is a half turn
+    let qy = quat_from_rotation_y(m::pi() * 0.5)
+    assert_v3(quat_rotate_vec3(quat_mul(qy, qy), vec3_x()), -1.0, 0.0, 0.0, eps())
+    // conjugate and inverse undo the rotation
+    assert_q(quat_mul(a, quat_conjugate(a)), 0.0, 0.0, 0.0, 1.0, eps())
+    assert_q(quat_mul(a, quat_inverse(a)), 0.0, 0.0, 0.0, 1.0, eps())
+    assert_v3(quat_rotate_vec3(quat_conjugate(qy), vec3_x()), 0.0, 0.0, 1.0, eps())
+    // inverse of a non-unit quaternion still inverts
+    assert_q(quat_mul(quat(1.0, 2.0, 3.0, 4.0), quat_inverse(quat(1.0, 2.0, 3.0, 4.0))), 0.0, 0.0, 0.0, 1.0, eps())
+    assert_feq(quat_dot(quat_identity(), quat_identity()), 1.0, teps())
+    assert_q(quat_add(quat(1.0, 2.0, 3.0, 4.0), quat(1.0, 1.0, 1.0, 1.0)), 2.0, 3.0, 4.0, 5.0, teps())
+    assert_q(quat_sub(quat(1.0, 2.0, 3.0, 4.0), quat(1.0, 1.0, 1.0, 1.0)), 0.0, 1.0, 2.0, 3.0, teps())
+    assert_q(quat_scale(quat(1.0, 2.0, 3.0, 4.0), 2.0), 2.0, 4.0, 6.0, 8.0, teps())
+    assert_q(quat_neg(quat(1.0, 2.0, 3.0, 4.0)), -1.0, -2.0, -3.0, -4.0, teps())
+    assert_q(quat_normalize(quat(0.0, 0.0, 0.0, 5.0)), 0.0, 0.0, 0.0, 1.0, teps())
+    assert_q(quat_normalize(quat(0.0, 0.0, 0.0, 0.0)), 0.0, 0.0, 0.0, 1.0, teps())
+    // the angle between two rotations, and the fact that -q is the same rotation as q
+    assert_feq(quat_angle_between(quat_identity(), quat_from_rotation_y(0.8)), 0.8, eps())
+    assert_feq(quat_angle_between(quat_identity(), quat_neg(quat_identity())), 0.0, eps())
+    assert_true(quat_approx_eq(quat_identity(), quat(0.0, 0.0, 0.0, 1.0), teps()))
+    assert_false(quat_approx_eq(quat_identity(), quat_neg(quat_identity()), 1.0e-6))
+}
+fn test_quat_axis_angle_roundtrip() {
+    let aa = quat_to_axis_angle(quat_from_axis_angle(vec3_y(), 1.1))
+    assert_v3(vec4_truncate(aa), 0.0, 1.0, 0.0, eps())
+    assert_feq(aa.w, 1.1, eps())
+    // the negated quaternion is the same rotation, so it must decompose to the same axis and angle
+    let neg = quat_to_axis_angle(quat_neg(quat_from_axis_angle(vec3_y(), 1.1)))
+    assert_v3(vec4_truncate(neg), 0.0, 1.0, 0.0, eps())
+    assert_feq(neg.w, 1.1, eps())
+    let ax = vec3_normalize(vec3(1.0, -2.0, 0.5))
+    let r2 = quat_to_axis_angle(quat_from_axis_angle(ax, 2.4))
+    assert_v3(vec4_truncate(r2), ax.x, ax.y, ax.z, eps())
+    assert_feq(r2.w, 2.4, eps())
+    // the identity has no axis to report; +X and zero is the documented answer
+    assert_v4(quat_to_axis_angle(quat_identity()), 1.0, 0.0, 0.0, 0.0, eps())
+    // a tiny angle is exactly where 2*acos(w) would have lost its digits
+    let tiny = quat_to_axis_angle(quat_from_axis_angle(vec3_z(), 1.0e-7))
+    assert_feq(tiny.w, 1.0e-7, 1.0e-15)
+}
+fn test_quat_euler() {
+    // the stated order is intrinsic Y-X-Z: yaw applied last, roll first
+    let e = quat_from_euler(0.3, 0.7, 0.2)
+    let byhand = quat_mul(quat_mul(quat_from_rotation_y(0.7), quat_from_rotation_x(0.3)), quat_from_rotation_z(0.2))
+    assert_q(e, byhand.x, byhand.y, byhand.z, byhand.w, eps())
+    // a single-axis euler is that axis's rotation
+    assert_q(quat_from_euler(0.0, 0.5, 0.0), quat_from_rotation_y(0.5).x, quat_from_rotation_y(0.5).y, quat_from_rotation_y(0.5).z, quat_from_rotation_y(0.5).w, eps())
+    // and to_euler inverts it
+    assert_v3(quat_to_euler(quat_from_euler(0.3, 0.7, 0.2)), 0.3, 0.7, 0.2, eps())
+    assert_v3(quat_to_euler(quat_from_euler(-0.9, 2.0, 0.45)), -0.9, 2.0, 0.45, eps())
+    assert_v3(quat_to_euler(quat_identity()), 0.0, 0.0, 0.0, eps())
+    // at the pole, pitch is +90 and roll is folded into yaw, as documented
+    let pole = quat_to_euler(quat_from_euler(m::pi() * 0.5, 0.4, 0.0))
+    assert_feq(pole.x, m::pi() * 0.5, 1.0e-6)
+    assert_feq(pole.z, 0.0, teps())
+}
+fn test_quat_slerp_and_nlerp() {
+    let a = quat_from_rotation_y(0.0)
+    let b = quat_from_rotation_y(m::pi() * 0.5)
+    // endpoints are exact: the weights are sin(x)/sin(x) and sin(0)
+    assert_q(quat_slerp(a, b, 0.0), a.x, a.y, a.z, a.w, 0.0)
+    assert_q(quat_slerp(a, b, 1.0), b.x, b.y, b.z, b.w, 0.0)
+    // and the midpoint of a 90-degree turn is the 45-degree turn, at constant angular speed
+    let mid = quat_from_rotation_y(m::pi() * 0.25)
+    assert_q(quat_slerp(a, b, 0.5), mid.x, mid.y, mid.z, mid.w, eps())
+    assert_q(quat_slerp(a, b, 0.25), quat_from_rotation_y(m::pi() * 0.125).x, quat_from_rotation_y(m::pi() * 0.125).y, quat_from_rotation_y(m::pi() * 0.125).z, quat_from_rotation_y(m::pi() * 0.125).w, eps())
+    // the result stays a unit quaternion all the way along
+    assert_feq(quat_length(quat_slerp(quat_from_axis_angle(vec3(1.0, 0.0, 0.0), 0.2), quat_from_axis_angle(vec3(0.0, 1.0, 1.0), 2.1), 0.37)), 1.0, eps())
+    // slerp takes the short way: past 180 degrees apart it interpolates toward -b
+    let far = quat_from_rotation_y(m::pi() * 1.8)
+    assert_true(quat_dot(quat_slerp(a, far, 0.5), a) > 0.0)
+    // nlerp: same endpoints, unit result, but a different midpoint (that is the whole difference)
+    assert_q(quat_nlerp(a, b, 0.0), a.x, a.y, a.z, a.w, eps())
+    assert_q(quat_nlerp(a, b, 1.0), b.x, b.y, b.z, b.w, eps())
+    assert_feq(quat_length(quat_nlerp(a, b, 0.3)), 1.0, eps())
+    // near-parallel rotations take the nlerp branch and must still hit their endpoints
+    let n1 = quat_from_rotation_y(0.5)
+    let n2 = quat_from_rotation_y(0.5000001)
+    assert_q(quat_slerp(n1, n2, 0.0), n1.x, n1.y, n1.z, n1.w, eps())
+    assert_q(quat_slerp(n1, n2, 1.0), n2.x, n2.y, n2.z, n2.w, eps())
+}
+fn test_quat_rotation_arc() {
+    let q = quat_from_rotation_arc(vec3_x(), vec3_y())
+    assert_v3(quat_rotate_vec3(q, vec3_x()), 0.0, 1.0, 0.0, eps())
+    let q2 = quat_from_rotation_arc(vec3(1.0, 2.0, 3.0), vec3(0.0, -1.0, 1.0))
+    assert_v3(quat_rotate_vec3(q2, vec3_normalize(vec3(1.0, 2.0, 3.0))), vec3_normalize(vec3(0.0, -1.0, 1.0)).x, vec3_normalize(vec3(0.0, -1.0, 1.0)).y, vec3_normalize(vec3(0.0, -1.0, 1.0)).z, eps())
+    // the antiparallel case has no unique axis and must still land on the target
+    let q3 = quat_from_rotation_arc(vec3_x(), vec3_neg_x())
+    assert_v3(quat_rotate_vec3(q3, vec3_x()), -1.0, 0.0, 0.0, eps())
+    assert_v3(quat_rotate_vec3(quat_from_rotation_arc(vec3_z(), vec3_neg_z()), vec3_z()), 0.0, 0.0, -1.0, eps())
+    // and the identical case is the identity
+    assert_q(quat_from_rotation_arc(vec3_y(), vec3_y()), 0.0, 0.0, 0.0, 1.0, eps())
+}
+
+// ================= projections =================
+fn test_perspective_rh_entries() {
+    // the documented wgpu-convention formula, with fov_y = 90 degrees so cot(fov/2) is exactly 1
+    let n = 0.1
+    let f = 100.0
+    let p = perspective_rh(m::pi() * 0.5, 16.0 / 9.0, n, f)
+    let r = f / (n - f)                                              // -1.001001001001001
+    assert_feq(p.x_axis.x, 9.0 / 16.0, eps())                        // cot(fov/2) / aspect
+    assert_feq(p.y_axis.y, 1.0, eps())                               // cot(fov/2)
+    assert_feq(p.z_axis.z, r, teps())
+    assert_feq(p.z_axis.w, -1.0, teps())                             // the perspective divide's -z
+    assert_feq(p.w_axis.z, r * n, teps())
+    assert_feq(p.w_axis.w, 0.0, teps())
+    // everything else is zero
+    assert_feq(p.x_axis.y, 0.0, teps())
+    assert_feq(p.x_axis.z, 0.0, teps())
+    assert_feq(p.x_axis.w, 0.0, teps())
+    assert_feq(p.y_axis.x, 0.0, teps())
+    assert_feq(p.z_axis.x, 0.0, teps())
+    assert_feq(p.w_axis.x, 0.0, teps())
+}
+fn test_perspective_rh_depth_range() {
+    let n = 0.1
+    let f = 100.0
+    let p = perspective_rh(m::pi() * 0.5, 16.0 / 9.0, n, f)
+    // The convention check: near maps to 0 and far to 1, not to -1 and 1
+    assert_feq(mat4_project_point3(p, vec3(0.0, 0.0, 0.0 - n)).z, 0.0, eps())
+    assert_feq(mat4_project_point3(p, vec3(0.0, 0.0, 0.0 - f)).z, 1.0, eps())
+    // depth is monotone and non-linear in between: the halfway point in z is already past 0.99
+    let midz = mat4_project_point3(p, vec3(0.0, 0.0, -50.0)).z
+    assert_true(midz > 0.998)
+    assert_true(midz < 1.0)
+    // the view frustum's edges land on the NDC cube's: at 90 degrees vertical fov and distance d,
+    // the half-height is d and the half-width is d*aspect
+    let d = 2.0
+    let e = mat4_project_point3(p, vec3(d * 16.0 / 9.0, d, 0.0 - d))
+    assert_feq(e.x, 1.0, eps())
+    assert_feq(e.y, 1.0, eps())
+    assert_feq(mat4_project_point3(p, vec3(0.0 - d * 16.0 / 9.0, 0.0 - d, 0.0 - d)).x, -1.0, eps())
+    // a point on the axis is at the centre of the screen
+    assert_v3(mat4_project_point3(p, vec3(0.0, 0.0, -5.0)), 0.0, 0.0, mat4_project_point3(p, vec3(0.0, 0.0, -5.0)).z, eps())
+}
+fn test_perspective_infinite_rh() {
+    let n = 0.5
+    let p = perspective_infinite_rh(m::pi() * 0.5, 1.0, n)
+    assert_feq(p.y_axis.y, 1.0, eps())
+    assert_feq(p.x_axis.x, 1.0, eps())
+    assert_feq(p.z_axis.z, -1.0, teps())
+    assert_feq(p.z_axis.w, -1.0, teps())
+    assert_feq(p.w_axis.z, 0.0 - n, teps())
+    // near still maps to 0, and depth approaches 1 instead of reaching it
+    assert_feq(mat4_project_point3(p, vec3(0.0, 0.0, 0.0 - n)).z, 0.0, eps())
+    assert_feq(mat4_project_point3(p, vec3(0.0, 0.0, -1.0e9)).z, 1.0, 1.0e-8)
+    assert_true(mat4_project_point3(p, vec3(0.0, 0.0, -1.0e9)).z < 1.0)
+    // reversed-Z is the same range read backwards: near is 1, infinity is 0
+    let rz = perspective_infinite_reverse_rh(m::pi() * 0.5, 1.0, n)
+    assert_feq(mat4_project_point3(rz, vec3(0.0, 0.0, 0.0 - n)).z, 1.0, eps())
+    assert_feq(mat4_project_point3(rz, vec3(0.0, 0.0, -1.0e9)).z, 0.0, 1.0e-8)
+}
+fn test_orthographic_rh() {
+    let o = orthographic_rh(-2.0, 2.0, -1.0, 1.0, 0.1, 100.0)
+    assert_feq(o.x_axis.x, 0.5, teps())                              // 2 / (right - left)
+    assert_feq(o.y_axis.y, 1.0, teps())                              // 2 / (top - bottom)
+    assert_feq(o.z_axis.z, 1.0 / (0.1 - 100.0), teps())
+    assert_feq(o.w_axis.x, 0.0, teps())                              // the box is centred on x
+    assert_feq(o.w_axis.z, 0.1 / (0.1 - 100.0), teps())
+    assert_feq(o.w_axis.w, 1.0, teps())
+    // the corners of the view box map to the corners of the NDC cube, with depth 0..1
+    assert_v3(mat4_project_point3(o, vec3(2.0, 1.0, -0.1)), 1.0, 1.0, 0.0, eps())
+    assert_v3(mat4_project_point3(o, vec3(-2.0, -1.0, -100.0)), -1.0, -1.0, 1.0, eps())
+    assert_v3(mat4_project_point3(o, vec3(0.0, 0.0, -50.05)), 0.0, 0.0, 0.5, eps())
+    // an off-centre box gets the offset the formula says
+    let off = orthographic_rh(0.0, 4.0, 0.0, 2.0, 1.0, 3.0)
+    assert_feq(off.w_axis.x, -1.0, teps())
+    assert_feq(off.w_axis.y, -1.0, teps())
+    assert_v3(mat4_project_point3(off, vec3(0.0, 0.0, -1.0)), -1.0, -1.0, 0.0, eps())
+    assert_v3(mat4_project_point3(off, vec3(4.0, 2.0, -3.0)), 1.0, 1.0, 1.0, eps())
+}
+fn test_look_at_rh() {
+    let eye = vec3(3.0, 4.0, 5.0)
+    let target = vec3(0.0, 0.0, 0.0)
+    let v = look_at_rh(eye, target, vec3_y())
+    // the camera basis is orthonormal: R * R^T is the identity and det R is +1
+    let r = mat3_from_mat4(v)
+    assert_m3_eq(mat3_mul(r, mat3_transpose(r)), mat3_identity(), eps())
+    assert_feq(mat3_determinant(r), 1.0, eps())
+    assert_feq(vec3_length(r.x_axis), 1.0, eps())
+    // the eye is the origin of view space
+    assert_v3(mat4_transform_point3(v, eye), 0.0, 0.0, 0.0, eps())
+    // and the target is straight down -Z, at its true distance
+    let tv = mat4_transform_point3(v, target)
+    assert_feq(tv.x, 0.0, eps())
+    assert_feq(tv.y, 0.0, eps())
+    assert_feq(tv.z, 0.0 - vec3_distance(eye, target), eps())
+    assert_true(tv.z < 0.0)
+    // the world up hint stays up in view space, and world right stays on the right
+    assert_true(mat4_transform_vector3(v, vec3_y()).y > 0.0)
+    let side = vec3_normalize(vec3_cross(vec3_sub(target, eye), vec3_y()))
+    assert_v3(mat4_transform_vector3(v, side), 1.0, 0.0, 0.0, eps())
+    // a camera at the origin looking down -Z with +Y up is the identity
+    assert_m4_eq(look_at_rh(vec3_zero(), vec3_neg_z(), vec3_y()), mat4_identity(), eps())
+    // look_to_rh with the same direction gives the same matrix
+    assert_m4_eq(look_to_rh(eye, vec3_sub(target, eye), vec3_y()), v, teps())
+    // the up hint is only a hint: scaling it, or leaning it along the view direction, changes nothing
+    let lean = vec3_add(vec3_scale(vec3_y(), 3.0), vec3_scale(vec3_sub(target, eye), 2.0))
+    assert_m4_eq(look_at_rh(eye, target, lean), look_at_rh(eye, target, vec3_y()), 1.0e-9)
+}
+
+// ================= Transform =================
+fn test_transform_basics() {
+    let t = transform_identity()
+    assert_v3(t.translation, 0.0, 0.0, 0.0, teps())
+    assert_v3(t.scale, 1.0, 1.0, 1.0, teps())
+    assert_q(t.rotation, 0.0, 0.0, 0.0, 1.0, teps())
+    assert_m4_eq(transform_to_mat4(t), mat4_identity(), teps())
+    assert_m4_eq(transform_to_mat4(transform_from_translation(vec3(1.0, 2.0, 3.0))), mat4_from_translation(vec3(1.0, 2.0, 3.0)), teps())
+    assert_m4_eq(transform_to_mat4(transform_from_scale(vec3(2.0, 3.0, 4.0))), mat4_from_scale(vec3(2.0, 3.0, 4.0)), teps())
+    assert_m4_eq(transform_to_mat4(transform_from_rotation(quat_from_rotation_z(0.7))), mat4_from_rotation_z(0.7), eps())
+    // the local axes of an unrotated transform are the world axes; -Z is forward
+    assert_v3(transform_right(t), 1.0, 0.0, 0.0, teps())
+    assert_v3(transform_up(t), 0.0, 1.0, 0.0, teps())
+    assert_v3(transform_forward(t), 0.0, 0.0, -1.0, teps())
+    // yawed 90 degrees about +Y, forward swings from -Z round to -X
+    let yaw = transform_from_rotation(quat_from_rotation_y(m::pi() * 0.5))
+    assert_v3(transform_forward(yaw), -1.0, 0.0, 0.0, eps())
+    assert_v3(transform_right(yaw), 0.0, 0.0, -1.0, eps())
+}
+fn test_transform_to_mat4_order() {
+    // scale first, then rotate, then translate: check against the point that composition gives
+    let tr = transform_new(vec3(10.0, 0.0, 0.0), quat_from_rotation_z(m::pi() * 0.5), vec3(2.0, 3.0, 1.0))
+    // (1,0,0) scaled by 2 is (2,0,0); turned 90 degrees about +Z is (0,2,0); plus (10,0,0)
+    assert_v3(transform_point3(tr, vec3(1.0, 0.0, 0.0)), 10.0, 2.0, 0.0, eps())
+    assert_v3(mat4_transform_point3(transform_to_mat4(tr), vec3(1.0, 0.0, 0.0)), 10.0, 2.0, 0.0, eps())
+    // a direction gets the scale and the rotation but never the translation
+    assert_v3(transform_vector3(tr, vec3(1.0, 0.0, 0.0)), 0.0, 2.0, 0.0, eps())
+    assert_v3(mat4_transform_vector3(transform_to_mat4(tr), vec3(1.0, 0.0, 0.0)), 0.0, 2.0, 0.0, eps())
+    // the matrix built in one step equals the three composed
+    let byparts = mat4_mul(mat4_from_translation(vec3(10.0, 0.0, 0.0)), mat4_mul(mat4_from_rotation_z(m::pi() * 0.5), mat4_from_scale(vec3(2.0, 3.0, 1.0))))
+    assert_m4_eq(transform_to_mat4(tr), byparts, eps())
+}
+fn test_transform_decompose() {
+    let tr = transform_new(vec3(1.0, -2.0, 3.0), quat_from_axis_angle(vec3(0.4, 1.0, -0.2), 1.05), vec3(2.0, 0.5, 3.0))
+    let back = transform_from_mat4(transform_to_mat4(tr))
+    assert_v3(back.translation, 1.0, -2.0, 3.0, eps())
+    assert_v3(back.scale, 2.0, 0.5, 3.0, eps())
+    assert_feq(m::fabs(quat_dot(back.rotation, tr.rotation)), 1.0, eps())
+    // whichever sign the quaternion came back with, the matrix must be identical
+    assert_m4_eq(transform_to_mat4(back), transform_to_mat4(tr), eps())
+    // a mirrored matrix has no rotation that produces it, so the sign lands on the x scale
+    let mirrored = transform_from_mat4(mat4_from_scale(vec3(-1.0, 2.0, 3.0)))
+    assert_feq(mirrored.scale.x, -1.0, eps())
+    assert_feq(mirrored.scale.y, 2.0, eps())
+    assert_feq(mirrored.scale.z, 3.0, eps())
+    assert_m4_eq(transform_to_mat4(mirrored), mat4_from_scale(vec3(-1.0, 2.0, 3.0)), eps())
+    // the trivial decompositions
+    assert_true(transform_approx_eq(transform_from_mat4(mat4_identity()), transform_identity(), eps()))
+    assert_v3(transform_from_mat4(mat4_from_translation(vec3(5.0, 6.0, 7.0))).translation, 5.0, 6.0, 7.0, teps())
+}
+fn test_transform_compose_and_inverse() {
+    let a = transform_new(vec3(1.0, 2.0, 3.0), quat_from_rotation_y(0.6), vec3_splat(2.0))
+    let b = transform_new(vec3(-1.0, 0.5, 2.0), quat_from_rotation_x(0.9), vec3_splat(0.5))
+    // composing transforms agrees with composing their matrices (both scales are uniform)
+    assert_m4_eq(transform_to_mat4(transform_mul(a, b)), mat4_mul(transform_to_mat4(a), transform_to_mat4(b)), eps())
+    // and applies b first, like every other mul here
+    let p = vec3(3.0, -1.0, 0.5)
+    let viacompose = transform_point3(transform_mul(a, b), p)
+    let stepwise = transform_point3(a, transform_point3(b, p))
+    assert_v3(viacompose, stepwise.x, stepwise.y, stepwise.z, eps())
+    // the inverse really inverts, as a transform and as a matrix
+    assert_v3(transform_point3(transform_inverse(a), transform_point3(a, p)), p.x, p.y, p.z, eps())
+    assert_m4_eq(transform_to_mat4(transform_inverse(a)), mat4_inverse(transform_to_mat4(a)), eps())
+    assert_true(transform_approx_eq(transform_mul(a, transform_inverse(a)), transform_identity(), eps()))
+}

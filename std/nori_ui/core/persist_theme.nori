@@ -1,0 +1,514 @@
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// full Theme JSON persistence
+// (serialize_theme / deserialize_theme for Preferences -> Theme save/load).
+//
+// Hand-rolled writer + positional mini-parser; this module does not use std/json,
+// whose recursive enum would be pulled into every program that imports it. The
+// format is stable JSON keyed by our field names: colors are [r,g,b,a], Vec2 [x,y], Margin
+// [l,r,t,b], CornerRadius [nw,ne,sw,se]; Stroke/FontId are small objects; an
+// absent optional color is null. deserialize_theme parses only what
+// serialize_theme emits (same key order); any mismatch gives ok=false + the
+// default theme (there are no exceptions to surface a parse error through).
+// File IO is the host's one-liner via std/os (like the dock persist).
+// ===========================================================================
+
+fn tj_q() -> Str { return "" + chr(34) }
+/// escape a string for the JSON writer: backslash and double-quote.
+fn tj_esc(sv: Str) -> Str {
+    var out = ""
+    var i = 0
+    var n = sv.len()
+    while i < n {
+        var cc = ord(sv.at(i))
+        if cc == 92 { out = ((out + chr(92)) + chr(92)) }
+        else if cc == 34 { out = ((out + chr(92)) + chr(34)) }
+        else { out = (out + sv.slice(i, i + 1)) }
+        i = i + 1
+    }
+    return out
+}
+fn tj_key(name: Str) -> Str { return tj_q() + (name + (tj_q() + ":")) }
+fn tj_f(v: Float) -> Str { return to_str(v) }
+fn tj_bool(b: Bool) -> Str { if b { return "true" }  return "false" }
+fn tj_color(cv: Color) -> Str {
+    return "[" + (to_str(cv.r) + ("," + (to_str(cv.g) + ("," + (to_str(cv.b) + ("," + (to_str(cv.a) + "]")))))))
+}
+fn tj_opt(oc: OptColor) -> Str { if oc.present { return tj_color(oc.color) }  return "null" }
+fn tj_vec2(v: Vec2) -> Str { return "[" + (tj_f(v.x) + ("," + (tj_f(v.y) + "]"))) }
+fn tj_margin(m: Margin) -> Str {
+    return "[" + (tj_f(m.left) + ("," + (tj_f(m.right) + ("," + (tj_f(m.top) + ("," + (tj_f(m.bottom) + "]")))))))
+}
+fn tj_corner(cr: CornerRadius) -> Str {
+    return "[" + (tj_f(cr.nw) + ("," + (tj_f(cr.ne) + ("," + (tj_f(cr.sw) + ("," + (tj_f(cr.se) + "]")))))))
+}
+fn tj_stroke(sk: Stroke) -> Str {
+    return "{" + (tj_key("width") + (tj_f(sk.width) + ("," + (tj_key("color") + (tj_color(sk.color) + "}")))))
+}
+fn tj_font(fid: FontId) -> Str {
+    return "{" + (tj_key("size") + (tj_f(fid.size) + ("," + (tj_key("family") + (tj_q() + (tj_esc(fid.family) + (tj_q() + "}")))))))
+}
+fn tj_wv(wv: WidgetVisuals) -> Str {
+    var out = "{" + (tj_key("weak_bg_fill") + tj_color(wv.weak_bg_fill))
+    out = out + ("," + (tj_key("bg_fill") + tj_color(wv.bg_fill)))
+    out = out + ("," + (tj_key("bg_stroke") + tj_stroke(wv.bg_stroke)))
+    out = out + ("," + (tj_key("corner_radius") + tj_corner(wv.corner_radius)))
+    out = out + ("," + (tj_key("fg_stroke") + tj_stroke(wv.fg_stroke)))
+    out = out + ("," + (tj_key("expansion") + tj_f(wv.expansion)))
+    return out + "}"
+}
+fn tj_widgets(w: Widgets) -> Str {
+    var out = "{" + (tj_key("noninteractive") + tj_wv(w.noninteractive))
+    out = out + ("," + (tj_key("inactive") + tj_wv(w.inactive)))
+    out = out + ("," + (tj_key("hovered") + tj_wv(w.hovered)))
+    out = out + ("," + (tj_key("active") + tj_wv(w.active)))
+    out = out + ("," + (tj_key("open") + tj_wv(w.open)))
+    return out + "}"
+}
+fn tj_visuals(v: Visuals) -> Str {
+    var out = "{" + (tj_key("dark_mode") + tj_bool(v.dark_mode))
+    out = out + ("," + (tj_key("panel_fill") + tj_color(v.panel_fill)))
+    out = out + ("," + (tj_key("window_fill") + tj_color(v.window_fill)))
+    out = out + ("," + (tj_key("extreme_bg_color") + tj_color(v.extreme_bg_color)))
+    out = out + ("," + (tj_key("faint_bg_color") + tj_color(v.faint_bg_color)))
+    out = out + ("," + (tj_key("override_text_color") + tj_opt(v.override_text_color)))
+    out = out + ("," + (tj_key("hyperlink_color") + tj_opt(v.hyperlink_color)))
+    out = out + ("," + (tj_key("selection_bg") + tj_color(v.selection_bg)))
+    out = out + ("," + (tj_key("selection_stroke") + tj_stroke(v.selection_stroke)))
+    out = out + ("," + (tj_key("window_stroke") + tj_stroke(v.window_stroke)))
+    out = out + ("," + (tj_key("window_corner_radius") + tj_corner(v.window_corner_radius)))
+    out = out + ("," + (tj_key("menu_corner_radius") + tj_corner(v.menu_corner_radius)))
+    out = out + ("," + (tj_key("input_bg") + tj_color(v.input_bg)))
+    out = out + ("," + (tj_key("dock_menu_bar_fill") + tj_color(v.dock_menu_bar_fill)))
+    out = out + ("," + (tj_key("dock_menu_bar_border") + tj_color(v.dock_menu_bar_border)))
+    out = out + ("," + (tj_key("dock_tab_bar_fill") + tj_color(v.dock_tab_bar_fill)))
+    out = out + ("," + (tj_key("dock_tab_active_fill") + tj_color(v.dock_tab_active_fill)))
+    out = out + ("," + (tj_key("dock_tab_inactive_fill") + tj_color(v.dock_tab_inactive_fill)))
+    out = out + ("," + (tj_key("dock_tab_bar_border") + tj_color(v.dock_tab_bar_border)))
+    out = out + ("," + (tj_key("dock_active_tab_indicator") + tj_color(v.dock_active_tab_indicator)))
+    out = out + ("," + (tj_key("dock_content_fill") + tj_color(v.dock_content_fill)))
+    out = out + ("," + (tj_key("dock_splitter_fill") + tj_color(v.dock_splitter_fill)))
+    out = out + ("," + (tj_key("dock_splitter_hover_fill") + tj_color(v.dock_splitter_hover_fill)))
+    out = out + ("," + (tj_key("dock_splitter_center_line") + tj_color(v.dock_splitter_center_line)))
+    out = out + ("," + (tj_key("dock_menu_item_hover_fill") + tj_color(v.dock_menu_item_hover_fill)))
+    return out + "}"
+}
+fn tj_spacing(sp: Spacing) -> Str {
+    var out = "{" + (tj_key("item_spacing") + tj_vec2(sp.item_spacing))
+    out = out + ("," + (tj_key("button_padding") + tj_vec2(sp.button_padding)))
+    out = out + ("," + (tj_key("indent") + tj_f(sp.indent)))
+    out = out + ("," + (tj_key("window_margin") + tj_margin(sp.window_margin)))
+    out = out + ("," + (tj_key("menu_margin") + tj_margin(sp.menu_margin)))
+    out = out + ("," + (tj_key("interact_size") + tj_vec2(sp.interact_size)))
+    out = out + ("," + (tj_key("slider_width") + tj_f(sp.slider_width)))
+    out = out + ("," + (tj_key("text_edit_width") + tj_f(sp.text_edit_width)))
+    return out + "}"
+}
+fn tj_text_styles(ts: TextStyles) -> Str {
+    var out = "{" + (tj_key("small") + tj_font(ts.small))
+    out = out + ("," + (tj_key("body") + tj_font(ts.body)))
+    out = out + ("," + (tj_key("button") + tj_font(ts.button)))
+    out = out + ("," + (tj_key("heading") + tj_font(ts.heading)))
+    out = out + ("," + (tj_key("monospace") + tj_font(ts.monospace)))
+    out = out + ("," + (tj_key("custom") + "["))
+    var i = 0
+    while i < ts.custom_names.len() {
+        if i > 0 { out = out + "," }
+        out = out + ("{" + (tj_key("name") + (tj_q() + (tj_esc(ts.custom_names[i]) + (tj_q() + ",")))))
+        out = out + (tj_key("font") + (tj_font(ts.custom_fonts[i]) + "}"))
+        i = i + 1
+    }
+    return out + "]}"
+}
+/// serialize a Theme to a JSON string (Preferences -> Theme save).
+pub fn serialize_theme(t: Theme) -> Str {
+    var out = "{" + (tj_key("visuals") + tj_visuals(t.visuals))
+    out = out + ("," + (tj_key("widgets") + tj_widgets(t.widgets)))
+    out = out + ("," + (tj_key("spacing") + tj_spacing(t.spacing)))
+    out = out + ("," + (tj_key("text_styles") + tj_text_styles(t.text_styles)))
+    out = out + ("," + (tj_key("animation_time") + tj_f(t.animation_time)))
+    return out + "}"
+}
+
+// ---- the positional mini-parser (parses exactly what serialize_theme emits) ----
+fn tp_peek(src: Str, pos: Vec<Int>) -> Int {
+    if pos[0] < src.len() { return ord(src.at(pos[0])) }
+    return 0 - 1
+}
+fn tp_adv(inout pos: Vec<Int>) { pos[0] = pos[0] + 1 }
+fn tp_ws(src: Str, inout pos: Vec<Int>) {
+    var go = true
+    while go {
+        var cc = tp_peek(src, pos)
+        if cc == 32 || cc == 9 || cc == 10 || cc == 13 { tp_adv(pos) } else { go = false }
+    }
+}
+fn tp_eat(src: Str, inout pos: Vec<Int>, cc: Int, inout okv: Vec<Int>) {
+    tp_ws(src, pos)
+    if tp_peek(src, pos) == cc { tp_adv(pos)  return }
+    okv[0] = 0
+}
+fn tp_str(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> Str {
+    tp_eat(src, pos, 34, okv)
+    var out = ""
+    while true {
+        var cc = tp_peek(src, pos)
+        if cc < 0 { okv[0] = 0  return out }
+        if cc == 34 { tp_adv(pos)  return out }
+        if cc == 92 {
+            tp_adv(pos)
+            var ec = tp_peek(src, pos)
+            if ec < 0 { okv[0] = 0  return out }
+            out = (out + chr(ec))
+            tp_adv(pos)
+        } else { out = (out + src.slice(pos[0], pos[0] + 1))  tp_adv(pos) }
+    }
+    return out
+}
+/// read (and discard) a `"key":`. The format is positional; keys are documentation.
+fn tp_key(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) {
+    var _ignored = tp_str(src, pos, okv)
+    tp_eat(src, pos, 58, okv)
+}
+fn tp_float(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> Float {
+    tp_ws(src, pos)
+    var neg = false
+    if tp_peek(src, pos) == 45 { neg = true  tp_adv(pos) }
+    var v = 0.0
+    var any = 0
+    while tp_peek(src, pos) >= 48 && tp_peek(src, pos) <= 57 {
+        v = v * 10.0 + to_float(tp_peek(src, pos) - 48)
+        tp_adv(pos)
+        any = 1
+    }
+    if tp_peek(src, pos) == 46 {
+        tp_adv(pos)
+        var fscale = 0.1
+        while tp_peek(src, pos) >= 48 && tp_peek(src, pos) <= 57 {
+            v = v + to_float(tp_peek(src, pos) - 48) * fscale
+            fscale = fscale * 0.1
+            tp_adv(pos)
+            any = 1
+        }
+    }
+    if any == 0 { okv[0] = 0  return 0.0 }
+    // scientific notation, in case to_str(Float) ever emits it
+    if tp_peek(src, pos) == 101 || tp_peek(src, pos) == 69 {
+        tp_adv(pos)
+        var eneg = false
+        if tp_peek(src, pos) == 45 { eneg = true  tp_adv(pos) }
+        else if tp_peek(src, pos) == 43 { tp_adv(pos) }
+        var ev = 0
+        while tp_peek(src, pos) >= 48 && tp_peek(src, pos) <= 57 { ev = ev * 10 + (tp_peek(src, pos) - 48)  tp_adv(pos) }
+        var k = 0
+        while k < ev { if eneg { v = v / 10.0 } else { v = v * 10.0 }  k = k + 1 }
+    }
+    if neg { return 0.0 - v }
+    return v
+}
+fn tp_int(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> Int { return to_int(tp_float(src, pos, okv)) }
+fn tp_bool(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> Bool {
+    tp_ws(src, pos)
+    if tp_peek(src, pos) == 116 { var k = 0  while k < 4 { tp_adv(pos)  k = k + 1 }  return true }
+    if tp_peek(src, pos) == 102 { var k = 0  while k < 5 { tp_adv(pos)  k = k + 1 }  return false }
+    okv[0] = 0
+    return false
+}
+fn tp_color(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> Color {
+    tp_eat(src, pos, 91, okv)
+    var rr = tp_int(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    var gg = tp_int(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    var bb = tp_int(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    var aa = tp_int(src, pos, okv)
+    tp_eat(src, pos, 93, okv)
+    return color_rgba(rr, gg, bb, aa)
+}
+fn tp_opt(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> OptColor {
+    tp_ws(src, pos)
+    if tp_peek(src, pos) == 110 { var k = 0  while k < 4 { tp_adv(pos)  k = k + 1 }  return no_color() }
+    return some_color(tp_color(src, pos, okv))
+}
+fn tp_vec2(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> Vec2 {
+    tp_eat(src, pos, 91, okv)
+    var x = tp_float(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    var y = tp_float(src, pos, okv)
+    tp_eat(src, pos, 93, okv)
+    return vec2(x, y)
+}
+fn tp_margin(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> Margin {
+    tp_eat(src, pos, 91, okv)
+    var l = tp_float(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    var rt = tp_float(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    var tt = tp_float(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    var bt = tp_float(src, pos, okv)
+    tp_eat(src, pos, 93, okv)
+    return Margin { left: l, right: rt, top: tt, bottom: bt }
+}
+fn tp_corner(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> CornerRadius {
+    tp_eat(src, pos, 91, okv)
+    var nw = tp_float(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    var ne = tp_float(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    var sw = tp_float(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    var se = tp_float(src, pos, okv)
+    tp_eat(src, pos, 93, okv)
+    return CornerRadius { nw: nw, ne: ne, sw: sw, se: se }
+}
+fn tp_stroke(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> Stroke {
+    tp_eat(src, pos, 123, okv)
+    tp_key(src, pos, okv)
+    var wd = tp_float(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var cv = tp_color(src, pos, okv)
+    tp_eat(src, pos, 125, okv)
+    return stroke(wd, cv)
+}
+fn tp_font(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> FontId {
+    tp_eat(src, pos, 123, okv)
+    tp_key(src, pos, okv)
+    var sz = tp_float(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var fam = tp_str(src, pos, okv)
+    tp_eat(src, pos, 125, okv)
+    return FontId { size: sz, family: fam }
+}
+fn tp_wv(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> WidgetVisuals {
+    tp_eat(src, pos, 123, okv)
+    tp_key(src, pos, okv)
+    var weak = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var fill = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var bgs = tp_stroke(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var crn = tp_corner(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var fgs = tp_stroke(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var exp = tp_float(src, pos, okv)
+    tp_eat(src, pos, 125, okv)
+    return WidgetVisuals { weak_bg_fill: weak, bg_fill: fill, bg_stroke: bgs, corner_radius: crn, fg_stroke: fgs, expansion: exp }
+}
+fn tp_widgets(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> Widgets {
+    tp_eat(src, pos, 123, okv)
+    tp_key(src, pos, okv)
+    var ni = tp_wv(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var ina = tp_wv(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var hov = tp_wv(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var act = tp_wv(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var opn = tp_wv(src, pos, okv)
+    tp_eat(src, pos, 125, okv)
+    return Widgets { noninteractive: ni, inactive: ina, hovered: hov, active: act, open: opn }
+}
+fn tp_visuals(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> Visuals {
+    tp_eat(src, pos, 123, okv)
+    tp_key(src, pos, okv)
+    var dark = tp_bool(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var panel = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var window = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var extreme = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var faint = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var otc = tp_opt(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var hyper = tp_opt(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var selbg = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var selstk = tp_stroke(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var winstk = tp_stroke(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var wincr = tp_corner(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var menucr = tp_corner(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var inputbg = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var dmbf = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var dmbb = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var dtbf = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var dtaf = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var dtif = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var dtbb = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var dati = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var dcf = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var dsf = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var dshf = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var dscl = tp_color(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var dmih = tp_color(src, pos, okv)
+    tp_eat(src, pos, 125, okv)
+    return Visuals {
+        dark_mode: dark, panel_fill: panel, window_fill: window, extreme_bg_color: extreme,
+        faint_bg_color: faint, override_text_color: otc, hyperlink_color: hyper,
+        selection_bg: selbg, selection_stroke: selstk, window_stroke: winstk,
+        window_corner_radius: wincr, menu_corner_radius: menucr, input_bg: inputbg,
+        dock_menu_bar_fill: dmbf, dock_menu_bar_border: dmbb, dock_tab_bar_fill: dtbf,
+        dock_tab_active_fill: dtaf, dock_tab_inactive_fill: dtif, dock_tab_bar_border: dtbb,
+        dock_active_tab_indicator: dati, dock_content_fill: dcf, dock_splitter_fill: dsf,
+        dock_splitter_hover_fill: dshf, dock_splitter_center_line: dscl, dock_menu_item_hover_fill: dmih
+    }
+}
+fn tp_spacing(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> Spacing {
+    tp_eat(src, pos, 123, okv)
+    tp_key(src, pos, okv)
+    var isp = tp_vec2(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var bp = tp_vec2(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var ind = tp_float(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var wm = tp_margin(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var mm = tp_margin(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var isz = tp_vec2(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var slw = tp_float(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var tew = tp_float(src, pos, okv)
+    tp_eat(src, pos, 125, okv)
+    return Spacing {
+        item_spacing: isp, button_padding: bp, indent: ind, window_margin: wm,
+        menu_margin: mm, interact_size: isz, slider_width: slw, text_edit_width: tew
+    }
+}
+fn tp_text_styles(src: Str, inout pos: Vec<Int>, inout okv: Vec<Int>) -> TextStyles {
+    tp_eat(src, pos, 123, okv)
+    tp_key(src, pos, okv)
+    var small = tp_font(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var body = tp_font(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var button = tp_font(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var heading = tp_font(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var mono = tp_font(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var names: Vec<Str> = vec()
+    var fonts: Vec<FontId> = vec()
+    tp_eat(src, pos, 91, okv)
+    tp_ws(src, pos)
+    while tp_peek(src, pos) == 123 && okv[0] == 1 {
+        tp_adv(pos)                                   // {
+        tp_key(src, pos, okv)
+        var nm = tp_str(src, pos, okv)
+        tp_eat(src, pos, 44, okv)
+        tp_key(src, pos, okv)
+        var fnt = tp_font(src, pos, okv)
+        tp_eat(src, pos, 125, okv)
+        names.push(nm)
+        fonts.push(fnt)
+        tp_ws(src, pos)
+        if tp_peek(src, pos) == 44 { tp_adv(pos)  tp_ws(src, pos) }
+    }
+    tp_eat(src, pos, 93, okv)
+    tp_eat(src, pos, 125, okv)
+    return TextStyles { small: small, body: body, button: button, heading: heading, monospace: mono, custom_names: names, custom_fonts: fonts }
+}
+
+/// the deserialize outcome: ok=false (with the default theme) on malformed input.
+pub struct ThemeLoad { ok: Bool, theme: Theme }
+/// deserialize a Theme from serialize_theme's JSON.
+pub fn deserialize_theme(src: Str) -> ThemeLoad {
+    var pos: Vec<Int> = vec()
+    pos.push(0)
+    var okv: Vec<Int> = vec()
+    okv.push(1)
+    tp_eat(src, pos, 123, okv)
+    tp_key(src, pos, okv)
+    var vis = tp_visuals(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var wid = tp_widgets(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var spc = tp_spacing(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var txs = tp_text_styles(src, pos, okv)
+    tp_eat(src, pos, 44, okv)
+    tp_key(src, pos, okv)
+    var anim = tp_float(src, pos, okv)
+    tp_eat(src, pos, 125, okv)
+    if okv[0] == 0 { return ThemeLoad { ok: false, theme: theme_default() } }
+    return ThemeLoad { ok: true, theme: Theme { visuals: vis, widgets: wid, spacing: spc, text_styles: txs, animation_time: anim } }
+}

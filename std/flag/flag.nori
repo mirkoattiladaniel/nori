@@ -1,0 +1,187 @@
+//! std/flag: a getopt-style command-line flag parser. Define flags (string/int/bool) with defaults,
+//! then `parse` a Vec<Str> of arguments. Everything is stored in Str-keyed Maps inside the struct;
+//! values are kept stringified and converted on the way out by the typed getters.
+//!
+//!   import "std/flag" as flag
+//!   var f = flag::new()
+//!   f.add_str("name", "world")
+//!   f.add_int("count", 1)
+//!   f.add_bool("verbose")
+//!   f.parse(flag::argv())              // or pass your own Vec<Str>
+//!   f.get_str("name")                  // parsed value, else default, else ""
+//!   f.get_int("count")                 // parse_int of the stored string
+//!   f.get_bool("verbose")              // true iff stored value is "1"
+//!   f.positionals()                    // Vec<Str> of the non-flag args, in order
+//!
+//! Supported forms: `--name value`, `--name=value`, bare `--name` (a bool → "1"), short `-n`
+//! (treated like `--n`), and `--` which ends option parsing (the rest become positionals).
+//! Unknown `--x` is lenient: recorded as a string so `get_str` can still read it.
+
+import "std/result" as result
+import "std/strutil" as su
+
+/// kinds[name] = 0 (string) | 1 (int) | 2 (bool); defs/vals hold stringified defaults/parsed values;
+/// pos holds the positional (non-flag) arguments in order.
+pub struct Flags {
+    kinds: Map<Str, Int>,
+    defs: Map<Str, Str>,
+    vals: Map<Str, Str>,
+    pos: Vec<Str>
+}
+
+/// a fresh parser with no flags defined and no positionals.
+pub fn new() -> Flags {
+    var k: Map<Str, Int> = map()
+    var d: Map<Str, Str> = map()
+    var v: Map<Str, Str> = map()
+    var p: Vec<Str> = vec()
+    return Flags { kinds: k, defs: d, vals: v, pos: p }
+}
+
+/// build a Vec<Str> from the live process argv (`argc()`/`arg(i)`), for `f.parse(argv())`.
+pub fn argv() -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var n = argc()
+    var i = 0
+    while i < n {
+        out.push(arg(i))
+        i = i + 1
+    }
+    return out
+}
+
+/// strip leading dashes from a flag token: `--name` and `-n` both yield `name`.
+pub fn strip_dashes(tok: Str) -> Str {
+    var i = 0
+    var n = tok.len()
+    while i < n && tok.at(i) == '-' {
+        i = i + 1
+    }
+    return tok.slice(i, n)
+}
+
+impl Flags {
+    /// declare a string flag `name` with default `dflt`. Returns 0.
+    fn add_str(inout self, name: Str, sink dflt: Str) -> Int {
+        self.kinds.put(name, 0)
+        self.defs.put(name, dflt)
+        return 0
+    }
+    /// declare an int flag `name` with default `dflt` (stored stringified). Returns 0.
+    fn add_int(inout self, name: Str, dflt: Int) -> Int {
+        var s = "" + dflt
+        self.kinds.put(name, 1)
+        self.defs.put(name, s)
+        return 0
+    }
+    /// declare a bool flag `name`; default is false ("0"). Returns 0.
+    fn add_bool(inout self, name: Str) -> Int {
+        self.kinds.put(name, 2)
+        self.defs.put(name, "0")
+        return 0
+    }
+
+    /// parse `args`: option forms `--name value`, `--name=value`, bare `--name` (bool), short `-n`,
+    /// and `--` which ends option parsing (the rest are positional). Returns 0.
+    fn parse(inout self, args: Vec<Str>) -> Int {
+        var n = args.len()
+        var i = 0
+        var only_pos = false
+        while i < n {
+            var tok = args[i]
+            if only_pos {
+                self.pos.push(copy tok)
+                i = i + 1
+            } else {
+                var is_flag = false
+                if tok.len() >= 1 && tok.at(0) == '-' {
+                    is_flag = true
+                }
+                var is_dd = su::starts_with(tok, "--")
+                if is_dd && tok.len() == 2 {
+                    only_pos = true
+                    i = i + 1
+                } else {
+                    if !is_flag {
+                        self.pos.push(copy tok)
+                        i = i + 1
+                    } else {
+                        var bare = strip_dashes(tok)
+                        var eq = su::index_of(bare, "=")
+                        if eq >= 0 {
+                            var key = bare.slice(0, eq)
+                            var val = bare.slice(eq + 1, bare.len())
+                            self.vals.put(key, val)
+                            i = i + 1
+                        } else {
+                            var k2 = bare
+                            var is_bool = false
+                            if self.kinds.has(k2) {
+                                var kind = self.kinds.get(k2)
+                                if kind == 2 {
+                                    is_bool = true
+                                }
+                            }
+                            if is_bool {
+                                self.vals.put(k2, "1")
+                                i = i + 1
+                            } else {
+                                if i + 1 < n {
+                                    var nx = args[i + 1]
+                                    self.vals.put(k2, copy nx)
+                                    i = i + 2
+                                } else {
+                                    self.vals.put(k2, "")
+                                    i = i + 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return 0
+    }
+
+    /// the parsed string for `name`, else its default, else "".
+    fn get_str(self, name: Str) -> Str {
+        if self.vals.has(name) {
+            return copy self.vals.get(name)
+        }
+        if self.defs.has(name) {
+            return copy self.defs.get(name)
+        }
+        return ""
+    }
+    /// the parsed value of `name` as an Int. Traps when the value is not a number; see `get_int_or`
+    /// and `try_get_int`, which do not.
+    fn get_int(self, name: Str) -> Int {
+        var s = self.get_str(name)
+        return parse_int(s)
+    }
+    /// the value of `name` as an Int, or `dflt` when it is absent or not a number.
+    ///
+    /// A command line is typed by a person, and `--count abc` is a typo rather than a reason to abort:
+    /// `get_int` reaches parse_int, which traps. Use this when the program should carry on, or
+    /// `try_get_int` when it should say what was wrong.
+    fn get_int_or(self, name: Str, dflt: Int) -> Int {
+        var s = self.get_str(name)
+        return parse_int_or(s, dflt)
+    }
+    /// the value of `name` as an Int, or Err naming what was wrong with it. Does not trap.
+    fn try_get_int(self, name: Str) -> Result<Int> {
+        var s = self.get_str(name)
+        if s == "" { return Result::Err(("no value for --" + name)) }
+        if !result::is_int(s) { return Result::Err(("--" + name + " is not a number: " + s)) }
+        return Result::Ok(parse_int(s))
+    }
+    /// true iff the stored value for `name` is "1".
+    fn get_bool(self, name: Str) -> Bool {
+        var s = self.get_str(name)
+        return(s == "1")
+    }
+    /// the positional (non-flag) arguments, in order.
+    fn positionals(self) -> view Vec<Str> {
+        return self.pos
+    }
+}

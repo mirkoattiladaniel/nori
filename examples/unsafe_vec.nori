@@ -1,0 +1,47 @@
+// A growable array (Vec) written in Nori itself,
+// using the unsafe subset: `extern fn` (C FFI) + raw memory (peek/poke at an i64 address), each raw
+// access fenced in an `unsafe { }` block. It shows that Nori's runtime data structures can
+// live in the language, with only libc (malloc/realloc/free) as the external floor. The handle is a
+// malloc'd header: [len, cap, dataptr].
+//
+// Build:  noric --build examples/unsafe_vec.nori /tmp/uv && /tmp/uv
+extern fn malloc(Int) -> Int
+extern fn realloc(Int, Int) -> Int
+extern fn free(Int)
+
+fn mv_new() -> Int {
+    let h = malloc(24)
+    unsafe { poke(h, 0)  poke(h + 8, 0)  poke(h + 16, 0) }   // len=0, cap=0, data=null
+    return h
+}
+fn mv_len(h: Int) -> Int { unsafe { return peek(h) } }
+fn mv_push(h: Int, x: Int) {
+    unsafe {
+        let len = peek(h)
+        let cap = peek(h + 8)
+        if len == cap {                               // grow (double, min 8)
+            var ncap = cap * 2
+            if ncap == 0 { ncap = 8 }
+            poke(h + 16, realloc(peek(h + 16), ncap * 8))
+            poke(h + 8, ncap)
+        }
+        poke(peek(h + 16) + len * 8, x)               // data[len] = x
+        poke(h, len + 1)
+    }
+}
+fn mv_get(h: Int, i: Int) -> Int { unsafe { return peek(peek(h + 16) + i * 8) } }
+fn mv_free(h: Int) { unsafe { free(peek(h + 16)) }  free(h) }
+
+fn main() -> Int {
+    let v = mv_new()
+    var i = 0
+    while i < 1000 { mv_push(v, i * i)  i = i + 1 }
+    printl(mv_len(v))        // 1000
+    printl(mv_get(v, 999))   // 998001
+    var sum = 0
+    i = 0
+    while i < mv_len(v) { sum = sum + mv_get(v, i)  i = i + 1 }
+    printl(sum)              // sum of i^2 for 0..999 = 332833500
+    mv_free(v)
+    return 0
+}

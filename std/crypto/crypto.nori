@@ -1,0 +1,1308 @@
+//! std/crypto: hashes, MAC, authenticated encryption, password hashing and secure randomness:
+//! SHA-256, SHA-384, SHA-512, SHA-1, BLAKE2b, BLAKE3, HMAC over any of the SHA-2 hashes, CRC-32,
+//! AES-128/256-GCM, Argon2id and PBKDF2 password hashes, the kernel CSPRNG, and signed tokens.
+//!   import "std/crypto" as crypto
+//!   crypto::sha256("abc")            // -> "ba7816bf...20015ad"  (lowercase hex)
+//!   crypto::sha256_raw(data)         // 32 raw bytes (for HMAC / binary protocols)
+//!   crypto::hmac_sha256(key, msg)    // RFC 2104, lowercase hex
+//!   crypto::sha512(data) / crypto::sha384(data)      // and _raw for the bytes
+//!   crypto::hmac_sha512(key, msg) / crypto::hmac_sha384(key, msg)
+//!   crypto::sha1("abc") / crypto::crc32_hex(data)
+//!   crypto::md5(data)                // RFC 1321, hex: only where a format names it (thumbnail paths)
+//!   crypto::rand_bytes(32) / crypto::rand_hex(32)   // the kernel CSPRNG, never std/rand
+//!   crypto::ct_eq(given, expected)                  // compare secrets without a timing leak
+//!   crypto::password_hash(pw) / password_verify(h, pw)   // Argon2id, PHC format
+//!   crypto::argon2id_raw(...) / crypto::blake2b(data, 32)
+//!   crypto::blake3(data)                            // BLAKE3-256, lowercase hex
+//!   crypto::blake3_raw(data) / crypto::blake3_file(path)
+//!   crypto::blake3_keyed(key32, data)               // BLAKE3 as a MAC
+//!   crypto::blake3_xof(data, n) / crypto::blake3_derive_key(context, material, n)
+//!   var h = crypto::b3_new()  h.update(part)  h.hex()   // incremental, for large inputs
+//!   crypto::aes256_gcm_seal(key32, nonce12, aad, plain)   // -> ciphertext ‖ 16-byte tag
+//!   crypto::aes256_gcm_open(key32, nonce12, aad, sealed)  // -> plaintext, or "" if it does not verify
+//!   crypto::aes128_gcm_seal(key16, nonce12, aad, plain) / aes128_gcm_open(...)
+//!   crypto::token_new(key, payload, 3600)           // a signed, expiring token
+//!   crypto::token_read(key, token)                  // -> ok / bad_signature / expired
+//! 32-bit words are held in i64 and masked to 32 bits after each op (FIPS 180-4); the SHA-512
+//! family uses the full 64 bits, where no masking is needed. SHA-1 is for git-style/legacy
+//! hashing, not new security uses.
+//!
+//! Anything comparing a secret must use `ct_eq` and not `==`.
+import "std/os" as os
+import "std/time" as time
+import "std/encoding" as enc
+
+extern fn malloc(Int) -> Int
+extern fn free(Int)
+extern fn access(Int, Int) -> I32 // POSIX: int access(const char* path, int mode); F_OK = 0
+
+fn m32(x: Int) -> Int {
+    return(x & 0xffffffff)
+}
+fn rotr(x: Int, n: Int) -> Int {
+    return m32(((x >> n) | (x << 32 - n)))
+}
+fn ch(e: Int, f: Int, g: Int) -> Int {
+    return((e & f) ^ ((~ e) & g))
+}
+fn maj(a: Int, b: Int, c: Int) -> Int {
+    return(((a & b) ^ (a & c)) ^ (b & c))
+}
+fn bsig0(a: Int) -> Int {
+    return((rotr(a, 2) ^ rotr(a, 13)) ^ rotr(a, 22))
+}
+fn bsig1(e: Int) -> Int {
+    return((rotr(e, 6) ^ rotr(e, 11)) ^ rotr(e, 25))
+}
+fn ssig0(x: Int) -> Int {
+    return((rotr(x, 7) ^ rotr(x, 18)) ^ (x >> 3))
+}
+fn ssig1(x: Int) -> Int {
+    return((rotr(x, 17) ^ rotr(x, 19)) ^ (x >> 10))
+}
+
+// the 64 round constants (first 32 bits of the cube roots of the first 64 primes).
+// `frozen`: written never, read everywhere, which is what lets sha256 be called
+// from inside a task. A plain global would make every hashing function unusable in
+// concurrent code ("runs in a task but touches a global"); hashing a segment on
+// a worker task is something a P2P node does.
+frozen global K: [Int] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+]
+
+// byte j of the padded message: data ++ 0x80 ++ zeros ++ 64-bit big-endian bit length
+fn pad_byte(data: Str, n: Int, ln: Int, j: Int) -> Int {
+    if j < n {
+        return ord(data.at(j))
+    }
+    if j == n {
+        return 0x80
+    }
+    if j >= ln - 8 {
+        let b = ln - 1 - j
+        return((n * 8 >> 8 * b) & 0xff)
+    }
+    return 0
+}
+fn hex8(x: Int) -> Str {
+    let digs = "0123456789abcdef"
+    var out = ""
+    var i = 7
+    while i >= 0 {
+        out = out + digs.at(((x >> i * 4) & 0xf))
+        i = i - 1
+    }
+    return out
+}
+
+// the eight SHA-256 state words for `data` (the shared core of the hex + raw + HMAC entry points).
+fn sha256_words(data: Str) -> Vec<Int> {
+    let n = data.len()
+    let ln = ((n + 8) / 64 + 1) * 64 // padded length: smallest multiple of 64 >= n + 9
+    var h0 = 0x6a09e667 var h1 = 0xbb67ae85 var h2 = 0x3c6ef372 var h3 = 0xa54ff53a
+    var h4 = 0x510e527f var h5 = 0x9b05688c var h6 = 0x1f83d9ab var h7 = 0x5be0cd19
+    // The message schedule holds the same 64 slots for every block, so it is allocated once and
+    // overwritten. A fresh Vec per block costs one allocation and 64 pushes for each 64 bytes of input,
+    // which over a large file is most of the work rather than the compression itself.
+    var w: Vec<Int> = vec()
+    var wi = 0
+    while wi < 64 { w.push(0)  wi = wi + 1 }
+    var blk = 0
+    while blk < ln / 64 {
+        let base = blk * 64
+        var t = 0
+        // A block that lies wholly inside the data needs no padding decision: pad_byte answers four
+        // questions about every byte, and only the final one or two blocks can be the padded ones.
+        if base + 64 <= n {
+            while t < 16 {
+                let p = base + t * 4
+                let wv = (((ord(data.at(p)) << 24) | (ord(data.at(p + 1)) << 16)) | ((ord(data.at(p + 2)) << 8) | ord(data.at(p + 3))))
+                w[t] = m32(wv)
+                t = t + 1
+            }
+        } else {
+            while t < 16 {
+                let p = base + t * 4
+                let wv = (((pad_byte(data, n, ln, p) << 24) | (pad_byte(data, n, ln, p + 1) << 16)) | ((pad_byte(data, n, ln, p + 2) << 8) | pad_byte(data, n, ln, p + 3)))
+                w[t] = m32(wv)
+                t = t + 1
+            }
+        }
+        while t < 64 {
+            w[t] = m32(ssig1(w[t - 2]) + w[t - 7] + ssig0(w[t - 15]) + w[t - 16])
+            t = t + 1
+        }
+        var a = h0 var b = h1 var c = h2 var d = h3 var e = h4 var f = h5 var g = h6 var hh = h7
+        var i = 0
+        while i < 64 {
+            let t1 = m32(hh + bsig1(e) + ch(e, f, g) + K[i] + w[i])
+            let t2 = m32(bsig0(a) + maj(a, b, c))
+            hh = g g = f f = e e = m32(d + t1) d = c c = b b = a a = m32(t1 + t2)
+            i = i + 1
+        }
+        h0 = m32(h0 + a) h1 = m32(h1 + b) h2 = m32(h2 + c) h3 = m32(h3 + d)
+        h4 = m32(h4 + e) h5 = m32(h5 + f) h6 = m32(h6 + g) h7 = m32(h7 + hh)
+        blk = blk + 1
+    }
+    var out: Vec<Int> = vec()
+    out.push(h0) out.push(h1) out.push(h2) out.push(h3)
+    out.push(h4) out.push(h5) out.push(h6) out.push(h7)
+    return out
+}
+/// the big-endian bytes of `x`'s low 32 bits, appended to `out`.
+fn be32_bytes(x: Int, out: Str) -> Str {
+    var s = out
+    s = (s + chr(((x >> 24) & 255)))
+    s = (s + chr(((x >> 16) & 255)))
+    s = (s + chr(((x >> 8) & 255)))
+    s = (s + chr((x & 255)))
+    return s
+}
+
+/// SHA-256 of an arbitrary byte string, as lowercase hex (64 chars).
+pub fn sha256(data: Str) -> Str {
+    let h = sha256_words(data)
+    return hex8(h[0]) + hex8(h[1]) + hex8(h[2]) + hex8(h[3]) + hex8(h[4]) + hex8(h[5]) + hex8(h[6]) + hex8(h[7])
+}
+/// SHA-256 as 32 raw bytes (a byte Str), the form HMAC and binary protocols need.
+pub fn sha256_raw(data: Str) -> Str {
+    let h = sha256_words(data)
+    var out = ""
+    var i = 0
+    while i < 8 {
+        out = be32_bytes(h[i], out)
+        i = i + 1
+    }
+    return out
+}
+/// HMAC-SHA256(key, msg) -> lowercase hex (RFC 2104). Keys longer than the 64-byte block are hashed first.
+pub fn hmac_sha256(key: Str, msg: Str) -> Str {
+    return hex_of(hmac_sha256_raw(key, msg))
+}
+
+/// HMAC-SHA256(key, msg) -> the 32 raw bytes. What PBKDF2 and any binary protocol
+/// want; `hmac_sha256` is this, hex-encoded.
+pub fn hmac_sha256_raw(key: Str, msg: Str) -> Str {
+    var k = key
+    if k.len() > 64 {
+        k = sha256_raw(k)
+    }
+    var ipad = ""
+    var opad = ""
+    var i = 0
+    while i < 64 {
+        var kb = 0
+        if i < k.len() {
+            kb = ord(k.at(i))
+        }
+        ipad = (ipad + chr((kb ^ 0x36)))
+        opad = (opad + chr((kb ^ 0x5c)))
+        i = i + 1
+    }
+    return sha256_raw(opad + sha256_raw(ipad + msg))
+}
+
+/// the CRC-32 lookup table (polynomial 0xEDB88320).
+fn crc32_tab() -> Vec<Int> {
+    var tab: Vec<Int> = vec()
+    var n = 0
+    while n < 256 {
+        var c = n
+        var k = 0
+        while k < 8 {
+            if(c & 1) == 1 {
+                c = (0xedb88320 ^ (c >> 1))
+            } else {
+                c = (c >> 1)
+            }
+            k = k + 1
+        }
+        tab.push(m32(c))
+        n = n + 1
+    }
+    return tab
+}
+/// CRC-32 (IEEE 802.3) of a byte string, as a 32-bit integer.
+pub fn crc32(data: Str) -> Int {
+    let tab = crc32_tab()
+    var crc = 0xffffffff
+    var i = 0
+    while i < data.len() {
+        let idx = ((crc ^ ord(data.at(i))) & 0xff)
+        crc = ((crc >> 8) ^ tab[idx])
+        i = i + 1
+    }
+    return m32((crc ^ 0xffffffff))
+}
+/// CRC-32 as 8 lowercase hex digits.
+pub fn crc32_hex(data: Str) -> Str {
+    return hex8(crc32(data))
+}
+
+// ---- SHA-1 (160-bit; for git-style hashing / legacy protocols, not for new security uses) ----
+fn rotl32(x: Int, n: Int) -> Int {
+    return m32(((m32(x) << n) | (m32(x) >> 32 - n)))
+}
+/// SHA-1 of a byte string, as lowercase hex (40 chars).
+pub fn sha1(data: Str) -> Str {
+    let n = data.len()
+    let ln = ((n + 8) / 64 + 1) * 64
+    var h0 = 0x67452301 var h1 = 0xefcdab89 var h2 = 0x98badcfe var h3 = 0x10325476 var h4 = 0xc3d2e1f0
+    var blk = 0
+    while blk < ln / 64 {
+        var w: Vec<Int> = vec()
+        var t = 0
+        while t < 16 {
+            let p = blk * 64 + t * 4
+            w.push(m32((((pad_byte(data, n, ln, p) << 24) | (pad_byte(data, n, ln, p + 1) << 16)) | ((pad_byte(data, n, ln, p + 2) << 8) | pad_byte(data, n, ln, p + 3)))))
+            t = t + 1
+        }
+        while t < 80 {
+            w.push(rotl32(((w[t - 3] ^ w[t - 8]) ^ (w[t - 14] ^ w[t - 16])), 1))
+            t = t + 1
+        }
+        var a = h0 var b = h1 var c = h2 var d = h3 var e = h4
+        var i = 0
+        while i < 80 {
+            var f = 0
+            var kk = 0
+            if i < 20 {
+                f = ((b & c) | ((~ b) & d))
+                kk = 0x5a827999
+            }
+            else {
+                if i < 40 {
+                    f = ((b ^ c) ^ d)
+                    kk = 0x6ed9eba1
+                }
+                else {
+                    if i < 60 {
+                        f = (((b & c) | (b & d)) | (c & d))
+                        kk = 0x8f1bbcdc
+                    }
+                    else {
+                        f = ((b ^ c) ^ d)
+                        kk = 0xca62c1d6
+                    }
+            } }
+            let tmp = m32(rotl32(a, 5) + f + e + kk + w[i])
+            e = d d = c c = rotl32(b, 30) b = a a = tmp
+            i = i + 1
+        }
+        h0 = m32(h0 + a) h1 = m32(h1 + b) h2 = m32(h2 + c) h3 = m32(h3 + d) h4 = m32(h4 + e)
+        blk = blk + 1
+    }
+    return hex8(h0) + hex8(h1) + hex8(h2) + hex8(h3) + hex8(h4)
+}
+
+fn c_cstr(s: Str) -> Int {
+    let n = s.len()
+    var c = 0 unsafe { c = malloc(n + 1) }
+    var i = 0 while i < n { unsafe { poke8(c + i, ord(s.at(i))) } i = i + 1 }
+    unsafe {
+        poke8(c + n, 0)
+    }
+    return c
+}
+// ---- randomness + constant-time compare ----------------------------------------
+//
+// std/rand is xoshiro seeded from the clock: the right generator for choosing a peer or
+// jittering a retry, and a catastrophic one for anything an attacker would like to predict
+// (session ids, tokens, salts, nonces). Use the functions below for those.
+
+/// `n` bytes from the kernel's CSPRNG, or "" if they could not be read.
+///
+/// "" is a hard failure and must be treated as one: a caller that shrugs and carries
+/// on with a shorter or empty token has produced something guessable. There is no
+/// fallback to std/rand here: a weak token that looks like a strong one is
+/// worse than no token.
+///
+/// Reads /dev/urandom rather than calling getrandom(2), which keeps std/crypto free of
+/// FFI and portable to any POSIX system. getrandom would avoid needing a file
+/// descriptor (and works in a chroot with no /dev); worth adding behind `cfg linux` if
+/// that ever matters.
+///
+/// Windows has no /dev/urandom; there the bytes come from advapi32's system CSPRNG instead.
+/// A caller that treats an empty answer as bytes would be building a key out of nothing.
+pub fn rand_bytes(n: Int) -> Str {
+    if n <= 0 { return "" }
+    cfg(windows) { return win_rand_bytes(n) }
+    let raw = os::read_file_head("/dev/urandom", n)
+    if raw.len() != n { return "" }          // short read = something is wrong; say so
+    return raw
+}
+
+cfg(windows) {
+// RtlGenRandom, which every Windows program ends up at one way or another (CryptGenRandom and
+// BCryptGenRandom are wrappers over the same generator). It is exported from advapi32 under its
+// ordinal name, SystemFunction036, and declared here rather than loaded through std/dl: an import
+// is not conditional, so importing std/dl for the Windows path would put its externs in front of every
+// program on every platform. A `cfg(windows)` extern exists only where it
+// is real. Link advapi32 (`clink = advapi32`) in a program that needs randomness on Windows.
+extern fn SystemFunction036(Int, Int) -> Int
+fn win_rand_bytes(n: Int) -> Str {
+    var buf = 0
+    unsafe { buf = malloc(n) }
+    if buf == 0 { return "" }
+    var ok = 0
+    unsafe { ok = SystemFunction036(buf, n) }
+    var out = ""
+    if ok != 0 {
+        unsafe {
+            var i = 0
+            while i < n { out = out + chr(peek8(buf + i))  i = i + 1 }
+        }
+    }
+    unsafe { free(buf) }
+    return out
+}
+}
+
+/// `n` random bytes, hex-encoded (so the result is 2n characters).
+///
+/// The unit is bytes, not characters, because that is the unit security is measured
+/// in: `rand_hex(32)` is a 256-bit token. "" on failure, as `rand_bytes`.
+pub fn rand_hex(n: Int) -> Str {
+    let raw = rand_bytes(n)
+    if raw.len() == 0 { return "" }
+    return hex_of(raw)
+}
+
+fn hex_of(s: Str) -> Str {
+    let d = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        let b = ord(s.at(i))
+        out = out + d.slice((b >> 4) & 15, ((b >> 4) & 15) + 1)
+        out = out + d.slice(b & 15, (b & 15) + 1)
+        i = i + 1
+    }
+    return out
+}
+
+/// Compare two strings in time that does not depend on where they differ.
+///
+/// `a == b` stops at the first differing byte, so how long it takes reveals how much
+/// of a secret a guess got right, enough to recover a token or a MAC one byte at a
+/// time over enough attempts. Use this for anything an attacker supplies and the
+/// server compares against a secret: session ids, password-reset tokens, HMACs,
+/// webhook signatures.
+///
+/// The length difference is folded into the result rather than short-circuiting, and
+/// the loop always runs the length of `a`.
+pub fn ct_eq(a: Str, b: Str) -> Bool {
+    var diff = a.len() ^ b.len()
+    var i = 0
+    while i < a.len() {
+        var bb = 0
+        if i < b.len() { bb = ord(b.at(i)) }
+        diff = diff | (ord(a.at(i)) ^ bb)
+        i = i + 1
+    }
+    return diff == 0
+}
+
+// ---- signed tokens ---------------------------------------------------------------
+//
+// A string you can hand to a browser and get back knowing it was not edited: password
+// reset links, unsubscribe links, email-change confirmations, signed cookies. The
+// server keeps one secret and no database row per token.
+//
+//     let t = crypto::token_new(key, user, 3600)      // good for an hour
+//     let r = crypto::token_read(key, t)
+//     if r.ok { grant(r.payload) } else { refuse(r.why) }
+//
+// The payload is not secret. It is base64url, which is encoding, not encryption;
+// anyone holding the token can read it. Signing proves the server wrote it and that
+// nobody changed it; it hides nothing. Never put a password, a key, or anything you
+// would not print in a log inside one.
+//
+// Format: v1.<expiry>.<b64url payload>.<hmac hex>, with the MAC taken over everything
+// before it. Signing the expiry too is the point: a MAC over the payload alone lets
+// anyone move the deadline.
+
+/// what a token turned out to be. `why` is "" when ok, else "bad_format",
+/// "bad_signature" or "expired".
+pub struct TokenCheck { ok: Bool, why: Str, payload: Str = "", expires: Int = 0 }
+
+/// The seconds-since-epoch a token minted now with `ttl` would expire at; 0 for a
+/// token that never expires.
+fn token_deadline(ttl: Int) -> Int {
+    if ttl <= 0 { return 0 }
+    return time::unix_secs() + ttl
+}
+
+/// Mint a token carrying `payload`, valid for `ttl` seconds.
+///
+/// `ttl <= 0` means it never expires, which is occasionally what you want (a signed cookie
+/// whose lifetime the cookie itself controls), and a liability otherwise: a token
+/// that leaks is then valid forever, and the only way to revoke it is to change the
+/// key, which invalidates every other token too.
+///
+/// `key` is the one secret this rests on. Generate it with `rand_bytes(32)`, keep it
+/// out of the repository, and give each purpose its own: a key shared between the
+/// reset-password tokens and the newsletter unsubscribe tokens lets one be used as
+/// the other.
+pub fn token_new(key: Str, payload: Str, ttl: Int) -> Str {
+    let body = "v1." + (to_str(token_deadline(ttl)) + ("." + enc::b64url_encode(payload)))
+    return body + ("." + hmac_sha256(key, body))
+}
+
+/// Verify and open a token.
+///
+/// The signature is checked before the expiry, and with `ct_eq`, so neither the
+/// answer nor the time taken tells an attacker how close a forgery came.
+pub fn token_read(key: Str, token: Str) -> TokenCheck {
+    let parts = token_split(token)
+    if parts.len() != 4 { return TokenCheck { ok: false, why: "bad_format" } }
+    if !(parts[0] == "v1") { return TokenCheck { ok: false, why: "bad_format" } }
+    let body = parts[0] + ("." + (parts[1] + ("." + parts[2])))
+    if !ct_eq(hmac_sha256(key, body), parts[3]) {
+        return TokenCheck { ok: false, why: "bad_signature" }
+    }
+    // Only now is anything in the token worth reading; everything above this line
+    // came from whoever sent it.
+    var exp = 0
+    var i = 0
+    var ok = parts[1].len() > 0
+    while i < parts[1].len() {
+        let b = ord(parts[1].at(i))
+        if b < 48 || b > 57 { ok = false } else { exp = exp * 10 + (b - 48) }
+        i = i + 1
+    }
+    if !ok { return TokenCheck { ok: false, why: "bad_format" } }
+    if exp > 0 { if time::unix_secs() >= exp { return TokenCheck { ok: false, why: "expired", expires: exp } } }
+    return TokenCheck { ok: true, why: "", payload: enc::b64url_decode(parts[2]), expires: exp }
+}
+
+/// split on '.'; the payload is base64url, which cannot contain one
+fn token_split(s: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var start = 0
+    var i = 0
+    while i <= s.len() {
+        if i == s.len() || ord(s.at(i)) == 46 {
+            out.push(s.slice(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- PBKDF2-HMAC-SHA256 (RFC 8018) ---------------------------------------------
+//
+// A password hash. Not a general-purpose hash: sha256("hunter2") is computed in
+// microseconds and a GPU tries billions per second, so a leaked table of them is a
+// leaked table of passwords. PBKDF2 makes each guess cost `iterations` HMACs, which
+// is the only thing standing between a stolen database and everyone's password.
+//
+// Argon2id (below) is better: it is memory-hard, which blunts GPUs in a way iteration count
+// cannot. PBKDF2 stays for verifying older records and for callers that need a hash built only on
+// the SHA-256 in this file; it is fully specified with published test vectors.
+
+/// 4-byte big-endian, the block index PBKDF2 appends to the salt
+fn be32(n: Int) -> Str {
+    var out = ""                          // chr() is a Byte; only Str + Byte concatenates
+    out = out + chr((n >> 24) & 255)
+    out = out + chr((n >> 16) & 255)
+    out = out + chr((n >> 8) & 255)
+    out = out + chr(n & 255)
+    return out
+}
+
+fn xor_bytes(a: Str, b: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < a.len() {
+        var bb = 0
+        if i < b.len() { bb = ord(b.at(i)) }
+        out = out + chr(ord(a.at(i)) ^ bb)
+        i = i + 1
+    }
+    return out
+}
+
+/// PBKDF2-HMAC-SHA256: derive `dklen` raw bytes from `password` and `salt`.
+///
+/// `iterations` is the cost, and it is the whole point: see `password_iterations`
+/// for what to pass. "" if any argument is nonsense, which callers must treat as a
+/// failure rather than deriving from nothing.
+pub fn pbkdf2_sha256(password: Str, salt: Str, iterations: Int, dklen: Int) -> Str {
+    if iterations < 1 { return "" }
+    if dklen < 1 { return "" }
+    var out = ""
+    var block = 1
+    while out.len() < dklen {
+        // U1 = PRF(P, S || INT_32_BE(i)); Ui = PRF(P, U(i-1)); T = U1 ^ U2 ^ ... ^ Uc
+        var u = hmac_sha256_raw(password, salt + be32(block))
+        var t = copy u
+        var j = 1
+        while j < iterations {
+            u = hmac_sha256_raw(password, u)
+            t = xor_bytes(t, u)
+            j = j + 1
+        }
+        out = out + t
+        block = block + 1
+    }
+    if out.len() > dklen { out = out.slice(0, dklen) }
+    return out
+}
+
+// ---- password hashing on top of it ---------------------------------------------
+
+/// Iterations for a new password hash, and the number you should think hardest about.
+///
+/// A login pays the cost once, and registration once more. OWASP recommends 600,000 for
+/// PBKDF2-HMAC-SHA256; this default is lower, chosen to fit a quarter-second login budget. If
+/// you need better, the answer is not a bigger number but a memory-hard KDF.
+/// Argon2id blunts GPUs in a way no iteration count can.
+///
+/// Raise it with `password_hash_with`; `password_needs_rehash` will then upgrade
+/// existing hashes on their next successful login.
+pub fn password_iterations() -> Int { return 50000 }
+
+/// bytes of derived key stored (256 bits, matching the PRF's output)
+fn password_dklen() -> Int { return 32 }
+
+/// Hash a password for storage. Returns a self-describing string:
+///
+///     $pbkdf2-sha256$i=210000$<b64url salt>$<b64url dk>
+///
+/// The salt is 16 random bytes, generated here: the same password hashed twice gives
+/// different strings, so two users sharing one are not visibly alike and precomputed
+/// tables are useless. The parameters travel with the hash, so raising the cost later
+/// leaves every existing hash verifiable. "" if the CSPRNG failed, which must be
+/// treated as a failure: a hash with a predictable salt is a weaker thing wearing the
+/// same shape.
+pub fn pbkdf2_hash(password: Str) -> Str {
+    if password.len() == 0 { return "" }
+    let salt = rand_bytes(16)
+    if salt.len() != 16 { return "" }
+    return pbkdf2_hash_with(password, salt, password_iterations())
+}
+
+/// `pbkdf2_hash` with an explicit salt and cost, for test vectors, and for
+/// re-hashing at a chosen cost.
+pub fn pbkdf2_hash_with(password: Str, salt: Str, iterations: Int) -> Str {
+    let dk = pbkdf2_sha256(password, salt, iterations, password_dklen())
+    if dk.len() == 0 { return "" }
+    return "$pbkdf2-sha256$i=" + (to_str(iterations) + ("$" + (enc::b64url_encode(salt) + ("$" + enc::b64url_encode(dk)))))
+}
+
+/// Check a password against a stored hash. Constant-time in the comparison, and false
+/// for anything it cannot parse; a malformed record must never verify.
+pub fn pbkdf2_verify(stored: Str, password: Str) -> Bool {
+    if stored.len() == 0 || password.len() == 0 { return false }
+    let f = pw_fields(stored)
+    if f.len() != 5 { return false }
+    if !(f[1] == "pbkdf2-sha256") { return false }
+    if !starts_with_str2(f[2], "i=") { return false }
+    var iters = 0
+    var ok = f[2].len() > 2
+    var i = 2
+    while i < f[2].len() {
+        let b = ord(f[2].at(i))
+        if b < 48 || b > 57 { ok = false } else { iters = iters * 10 + (b - 48) }
+        i = i + 1
+    }
+    if !ok || iters < 1 { return false }
+    let salt = enc::b64url_decode(f[3])
+    let want = enc::b64url_decode(f[4])
+    if salt.len() == 0 || want.len() == 0 { return false }
+    return ct_eq(pbkdf2_sha256(password, salt, iters, want.len()), want)
+}
+
+/// Was this hash written at a lower cost than we use now? If so, re-hash it on the
+/// next successful login, the one moment the password is in hand, and the user
+/// never knows the cost went up.
+fn pbkdf2_needs_rehash(stored: Str) -> Bool {
+    if stored.len() == 0 { return true }
+    let f = pw_fields(stored)
+    if f.len() != 5 { return true }
+    if !(f[1] == "pbkdf2-sha256") { return true }
+    var iters = 0
+    var i = 2
+    while i < f[2].len() {
+        let b = ord(f[2].at(i))
+        if b >= 48 && b <= 57 { iters = iters * 10 + (b - 48) }
+        i = i + 1
+    }
+    return iters < password_iterations()
+}
+
+/// split a `$`-delimited record; the leading `$` makes field 0 empty
+fn pw_fields(s: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var start = 0
+    var i = 0
+    while i <= s.len() {
+        if i == s.len() || ord(s.at(i)) == 36 { out.push(s.slice(start, i))  start = i + 1 }
+        i = i + 1
+    }
+    return out
+}
+
+fn starts_with_str2(s: Str, p: Str) -> Bool {
+    if s.len() < p.len() { return false }
+    return s.slice(0, p.len()) == p
+}
+
+// ---- BLAKE2b (RFC 7693) ----------------------------------------------------------
+//
+// Argon2 is built entirely on this, and it is a fine hash in its own right: faster
+// than SHA-2 in software, and with a variable output length from 1 to 64 bytes.
+//
+// Everything is 64-bit little-endian. Nori's `>>` is logical on an Int, so a rotation
+// is a shift pair with no masking; the usual source of subtle bugs in a hand-written
+// BLAKE2 simply is not there.
+
+fn rotr64(x: Int, n: Int) -> Int { return (x >> n) | (x << (64 - n)) }
+
+/// the SHA-512 initialisation vector, which BLAKE2b reuses
+fn b2_iv() -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    v.push(0x6a09e667f3bcc908)  v.push(0xbb67ae8584caa73b)
+    v.push(0x3c6ef372fe94f82b)  v.push(0xa54ff53a5f1d36f1)
+    v.push(0x510e527fade682d1)  v.push(0x9b05688c2b3e6c1f)
+    v.push(0x1f83d9abfb41bd6b)  v.push(0x5be0cd19137e2179)
+    return v
+}
+
+/// the ten message permutations, flattened to 160 entries.
+///
+/// Built by appending row by row rather than one nested expression: a transcription
+/// slip in this table is invisible in the output and caught by nothing except the
+/// test vectors, so it is written to be read.
+fn b2_sigma() -> Vec<Int> {
+    var t = "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    t = t + ",14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3"
+    t = t + ",11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4"
+    t = t + ",7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8"
+    t = t + ",9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13"
+    t = t + ",2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9"
+    t = t + ",12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11"
+    t = t + ",13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10"
+    t = t + ",6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5"
+    t = t + ",10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0"
+    var s: Vec<Int> = vec()
+    var cur = 0
+    var have = false
+    var i = 0
+    while i < t.len() {
+        let c = ord(t.at(i))
+        if c == 44 { s.push(cur)  cur = 0  have = false }
+        else { cur = cur * 10 + (c - 48)  have = true }
+        i = i + 1
+    }
+    if have { s.push(cur) }
+    return s
+}
+
+fn b2_g(inout v: Vec<Int>, a: Int, b: Int, c: Int, d: Int, x: Int, y: Int) {
+    v[a] = wrapping_add(wrapping_add(v[a], v[b]), x)
+    v[d] = rotr64(v[d] ^ v[a], 32)
+    v[c] = wrapping_add(v[c], v[d])
+    v[b] = rotr64(v[b] ^ v[c], 24)
+    v[a] = wrapping_add(wrapping_add(v[a], v[b]), y)
+    v[d] = rotr64(v[d] ^ v[a], 16)
+    v[c] = wrapping_add(v[c], v[d])
+    v[b] = rotr64(v[b] ^ v[c], 63)
+}
+
+/// one 128-byte block into the state. `t` is the byte count hashed so far
+/// (the high half of the 128-bit counter is always 0 for any input we can hold).
+fn b2_compress(inout h: Vec<Int>, m: Vec<Int>, sigma: Vec<Int>, t: Int, last: Bool) {
+    var v: Vec<Int> = vec()
+    let iv = b2_iv()
+    var i = 0
+    while i < 8 { v.push(h[i])  i = i + 1 }
+    i = 0
+    while i < 8 { v.push(iv[i])  i = i + 1 }
+    v[12] = v[12] ^ t
+    if last { v[14] = ~v[14] }
+    var r = 0
+    while r < 12 {
+        let o = (r % 10) * 16
+        b2_g(v, 0, 4,  8, 12, m[sigma[o]],      m[sigma[o + 1]])
+        b2_g(v, 1, 5,  9, 13, m[sigma[o + 2]],  m[sigma[o + 3]])
+        b2_g(v, 2, 6, 10, 14, m[sigma[o + 4]],  m[sigma[o + 5]])
+        b2_g(v, 3, 7, 11, 15, m[sigma[o + 6]],  m[sigma[o + 7]])
+        b2_g(v, 0, 5, 10, 15, m[sigma[o + 8]],  m[sigma[o + 9]])
+        b2_g(v, 1, 6, 11, 12, m[sigma[o + 10]], m[sigma[o + 11]])
+        b2_g(v, 2, 7,  8, 13, m[sigma[o + 12]], m[sigma[o + 13]])
+        b2_g(v, 3, 4,  9, 14, m[sigma[o + 14]], m[sigma[o + 15]])
+        r = r + 1
+    }
+    i = 0
+    while i < 8 { h[i] = h[i] ^ (v[i] ^ v[i + 8])  i = i + 1 }
+}
+
+/// little-endian 64-bit word at byte offset `o`, zero-padded past the end
+fn le64_at(s: Str, o: Int) -> Int {
+    var w = 0
+    var k = 7
+    while k >= 0 {
+        var b = 0
+        if o + k < s.len() { b = ord(s.at(o + k)) }
+        w = (w << 8) | b
+        k = k - 1
+    }
+    return w
+}
+
+fn le64_bytes(x: Int) -> Str {
+    var out = ""
+    var i = 0
+    while i < 8 { out = out + chr((x >> (i * 8)) & 255)  i = i + 1 }
+    return out
+}
+
+/// BLAKE2b of `data` with an `outlen`-byte digest (1..64), returned as raw bytes.
+pub fn blake2b(data: Str, outlen: Int) -> Str {
+    if outlen < 1 || outlen > 64 { return "" }
+    var h = b2_iv()
+    let sigma = b2_sigma()
+    h[0] = h[0] ^ (0x01010000 ^ outlen)          // no key, fanout 1, depth 1
+    let n = data.len()
+    var off = 0
+    // every block but the last is a full 128 bytes and not final
+    while n - off > 128 {
+        var m: Vec<Int> = vec()
+        var i = 0
+        while i < 16 { m.push(le64_at(data, off + i * 8))  i = i + 1 }
+        off = off + 128
+        b2_compress(h, m, sigma, off, false)
+    }
+    var m2: Vec<Int> = vec()
+    var j = 0
+    while j < 16 { m2.push(le64_at(data, off + j * 8))  j = j + 1 }
+    b2_compress(h, m2, sigma, n, true)
+    var out = ""
+    var k = 0
+    while k < 8 { out = out + le64_bytes(h[k])  k = k + 1 }
+    return out.slice(0, outlen)
+}
+
+/// BLAKE2b as lowercase hex
+pub fn blake2b_hex(data: Str, outlen: Int) -> Str { return hex_of(blake2b(data, outlen)) }
+
+// ---- Argon2id (RFC 9106) ---------------------------------------------------------
+//
+// The password hash PBKDF2 above is not. PBKDF2 makes each guess cost time, and an
+// attacker answers with more cores; Argon2id makes each guess cost memory, and a GPU
+// with thousands of cores does not have thousands of times the RAM. That is the whole
+// idea, and it is why this is worth 500 lines of hand-written code.
+//
+// Built on the BLAKE2b above. Checked against the RFC 9106 test vector, which
+// exercises multiple lanes, a secret and associated data. A wrong implementation
+// still produces plausible-looking bytes, so nothing here is trustworthy without it.
+
+fn le32_bytes(x: Int) -> Str {
+    var out = ""
+    var i = 0
+    while i < 4 { out = out + chr((x >> (i * 8)) & 255)  i = i + 1 }
+    return out
+}
+
+/// H': the variable-length hash of RFC 9106 3.3. Up to 64 bytes it is BLAKE2b of
+/// LE32(len) || A; beyond that it is a chain of 64-byte hashes contributing 32 bytes
+/// each, which is why a 1024-byte block costs 32 BLAKE2b calls to seed.
+fn argon2_hprime(outlen: Int, a: Str) -> Str {
+    if outlen <= 64 { return blake2b(le32_bytes(outlen) + a, outlen) }
+    var out = ""
+    var v = blake2b(le32_bytes(outlen) + a, 64)
+    out = out + v.slice(0, 32)
+    var produced = 32
+    while outlen - produced > 64 {
+        v = blake2b(v, 64)
+        out = out + v.slice(0, 32)
+        produced = produced + 32
+    }
+    out = out + blake2b(v, outlen - produced)
+    return out
+}
+
+/// Argon2's round function, lanewise. Unlike BLAKE2b's, the addition carries an extra
+/// 2*lo32(a)*lo32(b) term, which is what makes the data dependency expensive to
+/// shortcut. Dropping it produces a hash that looks fine and is not Argon2.
+///
+/// `U64x2` (see the vector types in the language reference) is not an arbitrary width
+/// here. Argon2's block layout is what makes SIMD work at all: the sixteen words of a
+/// round live in eight pairs, and a pair is adjacent in memory both when the round runs
+/// over a row of the block and when it runs down a column. Two lanes therefore load and
+/// store with no gathering in either pass, which is why the reference
+/// implementation is written in SSE2, and why a four-lane version would have to shuffle
+/// its way through the column pass and give the gain back.
+///
+/// Measured at m=16384 KiB, t=2, p=1 on an idle machine: 11ms here, against 11-13ms for the
+/// reference C binary at the same parameters.
+/// Nothing about that is portable to read off the source, so if you change this code, measure it:
+/// the compiler emits vpmuludq for the masked multiply, vprolq for the rotates and
+/// vpalignr for the diagonalize, and losing any of those costs more than it looks.
+fn argon2_fbm(a: U64x2, b: U64x2) -> U64x2 {
+    let m = u64x2_splat(0xffffffff)
+    let lo = (a & m) * (b & m)
+    return a + b + lo + lo                     // a + b + 2*lo32(a)*lo32(b), wrapping
+}
+fn argon2_g2(inout a: U64x2, inout b: U64x2, inout c: U64x2, inout d: U64x2) {
+    a = argon2_fbm(a, b)
+    d = vrotr(d ^ a, 32)
+    c = argon2_fbm(c, d)
+    b = vrotr(b ^ c, 24)
+    a = argon2_fbm(a, b)
+    d = vrotr(d ^ a, 16)
+    c = argon2_fbm(c, d)
+    b = vrotr(b ^ c, 63)
+}
+
+/// P: the BLAKE2 round over 16 words of the block at `z`, addressed in place.
+///
+/// Argon2 applies P to the rows of a 128-word block and then to its columns. Logical
+/// word `j` lives at `base + (j/2)*stride + (j%2)`: consecutive for a row (stride 2),
+/// 16 apart for a column (stride 16). Either way the pair (2k, 2k+1) is adjacent, so
+/// each of the eight loads below is one 16-byte move.
+///
+/// The eight G applications come in two shapes. The first four take their four words
+/// straight down the columns of the 4x4 word matrix, so they are two lanewise G's on
+/// the pairs as loaded. The second four take them along the diagonals, which is the
+/// same computation over a rotated view of B, C and D, hence the shuffles between the
+/// two halves, and their inverses before the block is written back.
+fn argon2_p_strided(z: Int, base: Int, stride: Int) {
+    let p0 = z + base * 8
+    let s = stride * 8
+    // declared with their type up front: the loads are the only part that needs `unsafe`, and the
+    // zero splats are dead stores the backend removes
+    var a0: U64x2 = u64x2_splat(0)
+    var a1: U64x2 = u64x2_splat(0)
+    var b0: U64x2 = u64x2_splat(0)
+    var b1: U64x2 = u64x2_splat(0)
+    var c0: U64x2 = u64x2_splat(0)
+    var c1: U64x2 = u64x2_splat(0)
+    var d0: U64x2 = u64x2_splat(0)
+    var d1: U64x2 = u64x2_splat(0)
+    unsafe {
+        a0 = u64x2_load(p0)                    // v0  v1
+        a1 = u64x2_load(p0 + s)                // v2  v3
+        b0 = u64x2_load(p0 + s * 2)            // v4  v5
+        b1 = u64x2_load(p0 + s * 3)            // v6  v7
+        c0 = u64x2_load(p0 + s * 4)            // v8  v9
+        c1 = u64x2_load(p0 + s * 5)            // v10 v11
+        d0 = u64x2_load(p0 + s * 6)            // v12 v13
+        d1 = u64x2_load(p0 + s * 7)            // v14 v15
+    }
+    argon2_g2(a0, b0, c0, d0)                  // G(v0,v4,v8,v12) and G(v1,v5,v9,v13)
+    argon2_g2(a1, b1, c1, d1)                  // G(v2,v6,v10,v14) and G(v3,v7,v11,v15)
+
+    // diagonalize: B rotates one word, C two, D three
+    var e0 = vshuffle(b0, b1, 1, 2)            // v5  v6
+    var e1 = vshuffle(b0, b1, 3, 0)            // v7  v4
+    var f0 = c1                                // v10 v11
+    var f1 = c0                                // v8  v9
+    var g0 = vshuffle(d0, d1, 3, 0)            // v15 v12
+    var g1 = vshuffle(d0, d1, 1, 2)            // v13 v14
+    argon2_g2(a0, e0, f0, g0)                  // G(v0,v5,v10,v15) and G(v1,v6,v11,v12)
+    argon2_g2(a1, e1, f1, g1)                  // G(v2,v7,v8,v13)  and G(v3,v4,v9,v14)
+
+    // and back to word order
+    b0 = vshuffle(e0, e1, 3, 0)
+    b1 = vshuffle(e0, e1, 1, 2)
+    c0 = f1
+    c1 = f0
+    d0 = vshuffle(g0, g1, 1, 2)
+    d1 = vshuffle(g0, g1, 3, 0)
+    unsafe {
+        vstore(p0, a0)
+        vstore(p0 + s, a1)
+        vstore(p0 + s * 2, b0)
+        vstore(p0 + s * 3, b1)
+        vstore(p0 + s * 4, c0)
+        vstore(p0 + s * 5, c1)
+        vstore(p0 + s * 6, d0)
+        vstore(p0 + s * 7, d1)
+    }
+}
+
+/// G(X, Y) -> the 128-word block at `dst`. All four are byte addresses into one
+/// malloc'd arena; `r` and `z` are 128-word scratch owned by the caller.
+fn argon2_g(xo: Int, yo: Int, dst: Int, with_xor: Bool, r: Int, z: Int) {
+    unsafe {
+        var i = 0
+        while i < 128 {
+            let v = peek(xo + i * 8) ^ peek(yo + i * 8)
+            poke(r + i * 8, v)
+            poke(z + i * 8, v)
+            i = i + 1
+        }
+    }
+    var row = 0
+    while row < 8 { argon2_p_strided(z, row * 16, 2)  row = row + 1 }
+    var col = 0
+    while col < 8 { argon2_p_strided(z, col * 2, 16)  col = col + 1 }
+    unsafe {
+        var i2 = 0
+        while i2 < 128 {
+            var out = peek(z + i2 * 8) ^ peek(r + i2 * 8)
+            if with_xor { out = out ^ peek(dst + i2 * 8) }
+            poke(dst + i2 * 8, out)
+            i2 = i2 + 1
+        }
+    }
+}
+
+/// bytes -> the 128-word block at byte address `off`
+fn block_from_bytes(off: Int, b: Str) {
+    var i = 0
+    while i < 128 { unsafe { poke(off + i * 8, le64_at(b, i * 8)) }  i = i + 1 }
+}
+
+/// Argon2id, returning `taglen` raw bytes. `m_kib` is memory in KiB, `t` passes,
+/// `p` lanes. `secret` and `ad` may be "".
+pub fn argon2id_raw(password: Str, salt: Str, secret: Str, ad: Str,
+                    m_kib: Int, t: Int, p: Int, taglen: Int) -> Str {
+    if p < 1 || t < 1 || taglen < 4 { return "" }
+    if m_kib < 8 * p { return "" }                    // RFC: m >= 8p
+    // m' = 4*p*floor(m/(4p)): the memory actually used, rounded to whole segments
+    let mp = 4 * p * (m_kib / (4 * p))
+    let q = mp / p                                    // blocks per lane
+    let sl = q / 4                                    // segment length
+
+    // H0 = BLAKE2b-512 over every parameter and input, so changing any of them
+    // changes everything downstream
+    var pre = ""
+    pre = pre + le32_bytes(p)
+    pre = pre + le32_bytes(taglen)
+    pre = pre + le32_bytes(m_kib)
+    pre = pre + le32_bytes(t)
+    pre = pre + le32_bytes(0x13)                      // version 1.3
+    pre = pre + le32_bytes(2)                         // type: 2 = Argon2id
+    pre = pre + le32_bytes(password.len())  pre = pre + password
+    pre = pre + le32_bytes(salt.len())      pre = pre + salt
+    pre = pre + le32_bytes(secret.len())    pre = pre + secret
+    pre = pre + le32_bytes(ad.len())        pre = pre + ad
+    let h0 = blake2b(pre, 64)
+
+    // One malloc for the whole arena: mp blocks of 1024 bytes. (A Vec<Int> would need
+    // 8.4 million pushes to build it, and a bounds check on every access afterwards.)
+    var mem = 0
+    unsafe { mem = malloc(mp * 1024) }
+    if mem == 0 { return "" }
+    var zi = 0
+    while zi < mp * 128 { unsafe { poke(mem + zi * 8, 0) }  zi = zi + 1 }
+
+    // the first two blocks of every lane come straight from H0
+    var lane = 0
+    while lane < p {
+        block_from_bytes(mem + (lane * q + 0) * 1024,
+                         argon2_hprime(1024, h0 + (le32_bytes(0) + le32_bytes(lane))))
+        block_from_bytes(mem + (lane * q + 1) * 1024,
+                         argon2_hprime(1024, h0 + (le32_bytes(1) + le32_bytes(lane))))
+        lane = lane + 1
+    }
+
+    // scratch used to generate Argon2i-style addresses
+    // scratch, all raw: the zero block, the address block, the input block, G's two
+    // working blocks, and the pair buffer
+    var scratch = 0
+    unsafe { scratch = malloc(6 * 1024) }
+    if scratch == 0 { unsafe { free(mem) }  return "" }
+    var si = 0
+    while si < 6 * 128 { unsafe { poke(scratch + si * 8, 0) }  si = si + 1 }
+    let zero = scratch
+    let addr = scratch + 1024
+    let inb = scratch + 2048
+    let scr_r = scratch + 3072
+    let scr_z = scratch + 4096
+    let pair_tmp = scratch + 5120
+
+    var pass = 0
+    while pass < t {
+        var slice = 0
+        while slice < 4 {
+            // Argon2id: data-independent addressing for the first half of the first
+            // pass (which is what resists a side-channel attacker who can watch memory
+            // access), data-dependent after (which is what resists time-memory
+            // tradeoffs). The hybrid is the point of the "id".
+            let indep = (pass == 0) && (slice < 2)
+            var l2 = 0
+            while l2 < p {
+                var ctr = 0
+                var first = 0
+                if pass == 0 && slice == 0 { first = 2 }   // blocks 0 and 1 exist already
+                var idx = first
+                while idx < sl {
+                    let j = slice * sl + idx                // position within the lane
+                    let cur = mem + (l2 * q + j) * 1024
+                    var prevj = j - 1
+                    if j == 0 { prevj = q - 1 }
+                    let prev = mem + (l2 * q + prevj) * 1024
+
+                    var j1 = 0
+                    var j2 = 0
+                    if indep {
+                        // A fresh address block every 128 positions, and one at the
+                        // start of the segment, which is not the same thing when the
+                        // segment starts at 2 rather than 0. Miss it and the whole
+                        // first segment indexes off an all-zero address block. The RFC
+                        // vector cannot catch this: its segments are 2 blocks long, so
+                        // the first-segment loop never runs at all.
+                        if idx == first || idx % 128 == 0 {
+                            ctr = ctr + 1
+                            unsafe {
+                                poke(inb + 0, pass)   poke(inb + 8, l2)   poke(inb + 16, slice)
+                                poke(inb + 24, mp)    poke(inb + 32, t)   poke(inb + 40, 2)
+                                poke(inb + 48, ctr)
+                                var zk = 7
+                                while zk < 128 { poke(inb + zk * 8, 0)  zk = zk + 1 }
+                            }
+                            // addr = G(zero, G(zero, inb)), both without the XOR
+                            argon2_g(zero, inb, pair_tmp, false, scr_r, scr_z)
+                            argon2_g(zero, pair_tmp, addr, false, scr_r, scr_z)
+                        }
+                        var w = 0
+                        unsafe { w = peek(addr + (idx % 128) * 8) }
+                        j1 = w & 0xffffffff
+                        j2 = (w >> 32) & 0xffffffff
+                    } else {
+                        var pw = 0
+                        unsafe { pw = peek(prev) }
+                        j1 = pw & 0xffffffff
+                        j2 = (pw >> 32) & 0xffffffff
+                    }
+
+                    // which lane, and how much of it, may be referenced
+                    var rl = j2 % p
+                    if pass == 0 && slice == 0 { rl = l2 }
+                    var w2 = 0
+                    var start = 0
+                    if pass == 0 {
+                        if slice == 0 { w2 = idx - 1 }
+                        else if rl == l2 { w2 = slice * sl + idx - 1 }
+                        else { w2 = slice * sl  if idx == 0 { w2 = w2 - 1 } }
+                    } else {
+                        if rl == l2 { w2 = q - sl + idx - 1 }
+                        else { w2 = q - sl  if idx == 0 { w2 = w2 - 1 } }
+                        start = ((slice + 1) % 4) * sl
+                    }
+                    if w2 < 1 { w2 = 1 }
+                    // the RFC's mapping: square, take the high half, and count back
+                    // from the end so recent blocks are likelier
+                    let x = (wrapping_mul(j1, j1) >> 32) & 0xffffffff
+                    let y = (wrapping_mul(w2, x) >> 32) & 0xffffffff
+                    let zz = w2 - 1 - y
+                    let refidx = (start + zz) % q
+                    let refoff = mem + (rl * q + refidx) * 1024
+
+                    argon2_g(prev, refoff, cur, pass > 0, scr_r, scr_z)
+                    idx = idx + 1
+                }
+                l2 = l2 + 1
+            }
+            slice = slice + 1
+        }
+        pass = pass + 1
+    }
+
+    // the answer is H' of the XOR of every lane's last block
+    var final_block: Vec<Int> = vec()
+    var fi = 0
+    while fi < 128 { final_block.push(0)  fi = fi + 1 }
+    var lz = 0
+    while lz < p {
+        let off = mem + (lz * q + (q - 1)) * 1024
+        fi = 0
+        while fi < 128 {
+            var wv = 0
+            unsafe { wv = peek(off + fi * 8) }
+            final_block[fi] = final_block[fi] ^ wv
+            fi = fi + 1
+        }
+        lz = lz + 1
+    }
+    var fb = ""
+    fi = 0
+    while fi < 128 { fb = fb + le64_bytes(final_block[fi])  fi = fi + 1 }
+    unsafe { free(mem)  free(scratch) }
+    return argon2_hprime(taglen, fb)
+}
+
+// ---- Argon2id password hashing ---------------------------------------------------
+
+/// Default cost for a new password hash: OWASP's Argon2id recommendation.
+pub fn argon2id_memory() -> Int { return 19456 }     // KiB
+/// Default pass count for a new password hash (OWASP's Argon2id recommendation).
+pub fn argon2id_time() -> Int { return 2 }
+/// Default lane (parallelism) count for a new password hash.
+pub fn argon2id_lanes() -> Int { return 1 }
+
+/// standard-alphabet base64 with the padding removed, which is what a PHC string uses
+fn phc_b64(s: Str) -> Str {
+    let e = enc::b64_encode(s)
+    var out = ""
+    var i = 0
+    while i < e.len() { if ord(e.at(i)) != 61 { out = out + e.at(i) }  i = i + 1 }
+    return out
+}
+
+/// Hash a password with Argon2id, in the PHC string format everyone else uses:
+///
+///     $argon2id$v=19$m=19456,t=2,p=1$<b64 salt>$<b64 tag>
+///
+/// Which means these verify under libsodium, and libsodium's verify here. 16 random
+/// bytes of salt, generated fresh, "" if the CSPRNG failed, and that must be treated
+/// as a failure rather than stored.
+pub fn argon2id_hash(password: Str) -> Str {
+    let salt = rand_bytes(16)
+    if salt.len() != 16 { return "" }
+    return argon2id_hash_with(password, salt, argon2id_memory(), argon2id_time(), argon2id_lanes())
+}
+
+/// `argon2id_hash` at a cost you choose, with a fresh random salt.
+///
+/// The default is OWASP's recommendation and suits most sites. Raise `m` if your
+/// login budget allows it: memory is the axis an attacker cannot buy their way out
+/// of, so it is worth more than extra passes. Remember that every concurrent login
+/// holds `m` KiB for the duration, which is a denial-of-service lever as well as a
+/// security control.
+pub fn argon2id_hash_at(password: Str, m: Int, t: Int, p: Int) -> Str {
+    let salt = rand_bytes(16)
+    if salt.len() != 16 { return "" }
+    return argon2id_hash_with(password, salt, m, t, p)
+}
+
+/// `argon2id_hash` with the salt supplied rather than generated, for reproducing a known
+/// vector or re-hashing under a recorded salt. Everything else (the PHC framing, the 32-byte
+/// tag) matches `argon2id_hash`.
+///
+/// Passing a salt is how a hash stops being unique per password, so use `argon2id_hash` or
+/// `argon2id_hash_at` for anything you store. An empty password returns "".
+pub fn argon2id_hash_with(password: Str, salt: Str, m: Int, t: Int, p: Int) -> Str {
+    if password.len() == 0 { return "" }
+    let tag = argon2id_raw(password, salt, "", "", m, t, p, 32)
+    if tag.len() != 32 { return "" }
+    var out = "$argon2id$v=19$m="
+    out = out + (to_str(m) + (",t=" + (to_str(t) + (",p=" + to_str(p)))))
+    out = out + ("$" + (phc_b64(salt) + ("$" + phc_b64(tag))))
+    return out
+}
+
+/// Verify a password against a PHC-format Argon2id hash. Constant-time, and false for
+/// anything it cannot parse; a record it does not understand must never verify.
+pub fn argon2id_verify(stored: Str, password: Str) -> Bool {
+    if password.len() == 0 { return false }
+    let f = pw_fields(stored)
+    if f.len() != 6 { return false }
+    if !(f[1] == "argon2id") { return false }
+    if !(f[2] == "v=19") { return false }
+    var m = 0
+    var t = 0
+    var p = 0
+    if !phc_params(f[3], m, t, p) { return false }
+    let salt = enc::b64_decode(f[4])
+    let want = enc::b64_decode(f[5])
+    if salt.len() == 0 || want.len() < 4 { return false }
+    return ct_eq(argon2id_raw(password, salt, "", "", m, t, p, want.len()), want)
+}
+
+/// parse "m=19456,t=2,p=1"; false if it is not exactly that
+fn phc_params(s: Str, inout m: Int, inout t: Int, inout p: Int) -> Bool {
+    var seen = 0
+    var key = 0
+    var val = 0
+    var have = false
+    var i = 0
+    while i <= s.len() {
+        if i == s.len() || ord(s.at(i)) == 44 {
+            if !have { return false }
+            if key == 109 { m = val  seen = seen | 1 }
+            else if key == 116 { t = val  seen = seen | 2 }
+            else if key == 112 { p = val  seen = seen | 4 }
+            else { return false }
+            key = 0  val = 0  have = false
+        } else {
+            let c = ord(s.at(i))
+            if c == 61 { }                                   // '='
+            else if c >= 48 && c <= 57 { val = val * 10 + (c - 48)  have = true }
+            else if key == 0 { key = c }
+            else { return false }
+        }
+        i = i + 1
+    }
+    if seen != 7 { return false }
+    return m >= 8 && t >= 1 && p >= 1
+}
+
+/// Was this hash written with something weaker than we use now (a different
+/// algorithm, or lower parameters)? If so, re-hash on the next successful login.
+pub fn argon2id_needs_rehash(stored: Str) -> Bool {
+    let f = pw_fields(stored)
+    if f.len() != 6 { return true }
+    if !(f[1] == "argon2id") { return true }
+    var m = 0
+    var t = 0
+    var p = 0
+    if !phc_params(f[3], m, t, p) { return true }
+    return m < argon2id_memory() || t < argon2id_time()
+}
+
+// ---- the password API to reach for ------------------------------------------------
+//
+// One pair of functions, so a caller does not have to hold an opinion about which KDF
+// is current. `password_hash` writes the best one available; `password_verify` reads
+// anything this library has ever written, so an existing table keeps working when the
+// default changes and `password_needs_rehash` upgrades each record as its owner logs
+// in. Storing the algorithm and its parameters in the hash is what makes that work.
+
+/// Hash a password for storage: Argon2id, in PHC format. "" on failure, which must
+/// be treated as a failure rather than stored.
+pub fn password_hash(password: Str) -> Str { return argon2id_hash(password) }
+
+/// Verify against a stored hash of any scheme this library writes: Argon2id today,
+/// PBKDF2-HMAC-SHA256 from before it existed. False for anything unrecognised.
+pub fn password_verify(stored: Str, password: Str) -> Bool {
+    if stored.len() == 0 || password.len() == 0 { return false }
+    let f = pw_fields(stored)
+    if f.len() < 2 { return false }
+    if f[1] == "argon2id" { return argon2id_verify(stored, password) }
+    if f[1] == "pbkdf2-sha256" { return pbkdf2_verify(stored, password) }
+    return false
+}
+
+/// Should this hash be rewritten? True for a weaker algorithm or lower parameters,
+/// so do it on the next successful login, the one moment the password is in hand.
+pub fn password_needs_rehash(stored: Str) -> Bool {
+    let f = pw_fields(stored)
+    if f.len() < 2 { return true }
+    if f[1] == "argon2id" { return argon2id_needs_rehash(stored) }
+    return true                       // PBKDF2, or unrecognised: upgrade it
+}
+
+/// SHA-256 of file `path`, lowercase hex (64 chars), or "" if the file can't be read.
+pub fn sha256_file(path: Str) -> Str {
+    let p = c_cstr(path)
+    var ok = 0 unsafe { ok = to_int(access(p, 0)) } // F_OK: 0 if the file exists
+    unsafe {
+        free(p)
+    }
+    if ok != 0 {
+        return ""
+    }
+    return sha256(read_file(path))
+}

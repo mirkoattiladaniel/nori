@@ -1,0 +1,30 @@
+//! std/geometry: rays, boxes, planes, spheres, frusta, and the intersections a renderer actually
+//! calls: picking (ray/triangle), physics broad-phase (AABB/AABB), and frustum culling. This file is
+//! the module's entry and overview; the shapes live in `shapes.nori`, the ray queries in
+//! `intersect.nori`, and the view frustum in `frustum.nori`.
+//!
+//! Geometry is built on the primitives, so this module imports `std/math` (Vec3, Mat4, …) rather
+//! than containing them. Everything below therefore spells a vector `m::Vec3`.
+//!
+//! Nori has no tuple return, so a query that produces more than a Bool returns a small result
+//! struct (`RayHit`, `AabbHit`, `TriHit`), declared here because all three sub-files produce them.
+//! Every one carries its `hit` flag, and the other fields are only meaningful when `hit` is true;
+//! they are left at zero otherwise so a caller that forgets to check gets an obvious value rather
+//! than a stale one.
+//!
+//! A `t` is always a distance along the ray in units of `dir`'s length, so a unit `dir` makes `t` a
+//! world distance. All of these treat a ray as a half-line: an intersection behind the origin is a miss.
+//!
+//! There is no `Point3`/`Direction3` distinction: a position and a
+//! displacement are both `m::Vec3`, as in `glam`. That is what lets `ray.origin` and
+//! `ray.dir` share a type and `vec3_sub` of two points give a direction, and it is also what lets a
+//! caller pass a point where a direction was meant with no complaint from the checker. Introducing
+//! the distinction would be a redesign of the whole math layer, not a change to this module.
+
+/// a hit with a single parameter along the ray.
+pub struct RayHit { hit: Bool, t: Float }
+/// a slab hit: `t_min` is where the ray enters the box and `t_max` where it leaves. For a ray that
+/// starts inside, `t_min` is 0 and `t_max` is the exit.
+pub struct AabbHit { hit: Bool, t_min: Float, t_max: Float }
+/// a triangle hit with its barycentric coordinates: the point is `(1-u-v)*v0 + u*v1 + v*v2`.
+pub struct TriHit { hit: Bool, t: Float, u: Float, v: Float }

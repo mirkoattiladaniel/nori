@@ -1,0 +1,203 @@
+// roll: the Nori project/build tool, written in Nori. Turns a folder of .nori files into a project
+// with a manifest, a layout, and verbs that map onto noric.
+//
+//   roll init [NAME] [--lib]                 scaffold a project (here, or in NAME/) with default profiles
+//   roll build [--release | --profile P]     compile using a build profile (default: dev)
+//   roll run   [--release | --profile P] [-- ARGS]   build, then run, forwarding ARGS
+//   roll check                               type-check only
+//   roll clean                               remove build/  (native os::remove_tree, no `rm`)
+//   roll db [IMAGE]                          report what the project's persisted images hold and whether
+//                                            this build loads, migrates, or refuses them
+//   roll xray                                write build/xray/<name>.xray: an annotated report of what
+//                                            the compiler does to your code (heap-value lifelines + safety)
+//
+// Build profiles live in the manifest as [profile.NAME] sections (dev + release are written at init;
+// override them or add your own). Each profile sets optimisation options that become noric build flags.
+// roll is laid out as directory modules: this file is the entry (argv -> verb), and each concern
+// (the toolchain store, dependencies, the build verbs, each tool) is a module of its own under
+// src/, reached through its alias. `use x::*` keeps the call sites short; only what another module
+// uses is `pub`.
+
+import "bench" as bench
+import "caps" as caps
+import "cmds" as cmds
+import "deps" as deps
+import "ext" as ext
+import "last" as last
+import "law" as law
+import "toolchain" as toolchain
+import "tools" as tools
+import "ui" as ui
+
+use bench::*
+use caps::*
+use cmds::*
+use deps::*
+use ext::*
+use last::*
+use law::*
+use toolchain::*
+use tools::*
+use ui::*
+
+fn main() -> Int {
+    if argc() == 0 {
+        usage()
+        return 0
+    }
+    let cmd = arg(0)
+    // `--help` or `-h` before any `--` (what follows `--` is the program's): the usage of the command, when
+    // it is one, never the command itself (`roll build --help` prints help, it does not build)
+    var hk = 0
+    while hk < argc() && !(arg(hk) == "--") {
+        if (arg(hk) == "--help") || (arg(hk) == "-h") {
+            if (cmd == "--help") || (cmd == "-h") { usage() } else { usage_for(cmd) }
+            return 0
+        }
+        hk = hk + 1
+    }
+    if(cmd == "toolchain") {
+        return toolchain_cmd()
+    }
+    // manage the store (never routed)
+    if(cmd == "update") {
+        return cmd_update()
+    }
+    // roll update nori|deps|tools|all
+    if(cmd == "install") {
+        return cmd_install()
+    }
+    // install a nori version + select it
+    if(cmd == "use") {
+        return cmd_use()
+    }
+    // switch the active nori version
+    if needs_toolchain(cmd) {
+        let r = route_to_toolchain(cmd)
+        if r != 0 - 999 {
+            return r
+        }
+    }
+    // launcher
+    if(cmd == "--version") {
+        printl(("roll " + roll_version()))
+        return 0
+    }
+    if(cmd == "version") {
+        printl(("roll " + roll_version()))
+        return 0
+    }
+    if(cmd == "init") {
+        init()
+        return 0
+    }
+    if(cmd == "build") {
+        return build()
+    }
+    if(cmd == "check") {
+        return check()
+    }
+    if(cmd == "fmt") {
+        return fmt_cmd()
+    }
+    // canonical-format every .nori under src/ + tests/
+    if(cmd == "lsp") {
+        return lsp_cmd()
+    }
+    // run the Nori language server (JSON-RPC over stdio)
+    if(cmd == "lsp-flags") {
+        return lsp_flags_cmd()
+    }
+    // (internal) emit a project's import flags for the server
+    if(cmd == "run") {
+        return run()
+    }
+    if(cmd == "clean") {
+        clean()
+        return 0
+    }
+    if(cmd == "vendor") {
+        return vendor()
+    }
+    if(cmd == "add") {
+        return cmd_add()
+    }
+    // add a dependency to nori.manifest [deps] + resolve
+    if(cmd == "remove") {
+        return cmd_remove()
+    }
+    // drop a dependency from nori.manifest [deps]
+    if(cmd == "rm") {
+        return cmd_remove()
+    }
+    // alias for remove
+    if(cmd == "list") {
+        return deps_list()
+    }
+    // list cached dependencies (--sort used|downloaded|name)
+    if(cmd == "prune") {
+        return prune()
+    }
+    // remove dependencies unused for 90+ days
+    if(cmd == "xray") {
+        return xray()
+    }
+    if(cmd == "db") {
+        return db_cmd()
+    }
+    // what the project's persisted images hold, and whether this build loads them
+    if(cmd == "todo") {
+        return todo_cmd("TODO")
+    }
+    // list `// TODO` markers in the project
+    if(cmd == "fixme") {
+        return todo_cmd("FIXME")
+    }
+    // list `// FIXME` markers in the project
+    if(cmd == "unsafe") {
+        return unsafe_cmd()
+    }
+    // audit unsafe/extern/cstruct escapes across the whole tree
+    if(cmd == "last") {
+        return last_cmd()
+    }
+    // the previous `roll run`, as a filterable table
+    if(cmd == "caps") {
+        return caps_cmd()
+    }
+    // classify the tree's capabilities (net/fs/exec/env/time/rawmem/ffi)
+    if(cmd == "test") {
+        return test_cmd()
+    }
+    // run native `.nori` tests (tests/*.nori, fn test_*)
+    if(cmd == "law") {
+        return law_cmd()
+    }
+    // fuzz `law` properties (+ `roll law prove <name>` scaffolds a Lean obligation)
+    if(cmd == "shadow") {
+        return shadow_cmd()
+    }
+    // build with `--shadow`, run, and tally `shadows` divergences per target
+    if(cmd == "bench") {
+        return bench_cmd()
+    }
+    // time the app; `--try-schedules` searches parallel/vectorize schedules for `named` loops
+    if(cmd == "verify") {
+        return verify_cmd()
+    }
+    // show the proof-carrying evidence embedded in the built binary
+    if(cmd == "doc") {
+        return doc_cmd()
+    }
+    // extract /// and //! doc comments -> Markdown
+    if(cmd == "help") {
+        usage()
+        return 0
+    }
+    // an extension lives in a toolchain (its tools/ and roll-X binaries), so it runs in the active one's roll
+    let r = route_to_toolchain(cmd)
+    if r != 0 - 999 {
+        return r
+    }
+    return dispatch_external(cmd) // `roll X` -> `roll-X` (PATH/$NORI_HOME) or tools/X.nori
+}

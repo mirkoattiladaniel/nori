@@ -1,0 +1,8 @@
+// knori.nori: the same kernel as kmain.nori, with its boot trampoline in Nori too.
+//
+//   noric --build knori.nori kernel --native --freestanding --lds kernel.lds --flatbin
+//
+// No --asm, and no .S file in the directory's build at all: boot.nori carries the multiboot header,
+// the long-mode trampoline, the GDT and the stack as `@section` assembly blocks.
+import "boot.nori"
+import "kmain.nori"

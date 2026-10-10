@@ -1,0 +1,350 @@
+// std/video/mkv.nori: Matroska and WebM, read by offset. Written from the Matroska specification (RFC 9559,
+// "Matroska Media Container Format Specification", and its EBML base, RFC 8794):
+//
+//   EBML (RFC 8794 §4-5): an element is an ID (a variable-length integer, 1-4 bytes, its length marker kept as part
+//   of the ID) and a data size (a variable-length integer, 1-8 bytes, the marker removed; all ones: unknown size),
+//   then the data;
+//   the EBML header (0x1A45DFA3) with its DocType ("webm" or "matroska");
+//   Segment (0x18538067), whose children are: SeekHead, Info (0x1549A966: TimestampScale 0x2AD7B1, nanoseconds a tick,
+//   1000000 when absent), Tracks (0x1654AE6B: TrackEntry 0xAE: TrackNumber 0xD7, TrackType 0x83 (1 video),
+//   CodecID 0x86 ("V_VP9", "V_VP8", "V_AV1", "V_MPEG4/ISO/AVC", "V_MPEGH/ISO/HEVC" …), DefaultDuration 0x23E383,
+//   Video 0xE0: PixelWidth 0xB0, PixelHeight 0xBA), Cues (0x1C53BB6B: CuePoint 0xBB: CueTime 0xB3,
+//   CueTrackPositions 0xB7: CueTrack 0xF7, CueClusterPosition 0xF1, relative to the Segment's data),
+//   Cluster (0x1F43B675: Timestamp 0xE7, SimpleBlock 0xA3, BlockGroup 0xA0: Block 0xA1);
+//   a block (RFC 9559 §10): the track number (a variable-length integer), a 16-bit signed timestamp relative to the
+//   cluster's, flags (lacing 0x06: none, Xiph 0x02, fixed 0x04, EBML 0x06), then the frame(s).
+//
+// The reader keeps only where it is: the cluster it is in, the next element in it; a cluster of unknown size (a live
+// stream) ends where an element that cannot be its child begins. Seeking to the start goes to the first cluster the
+// Cues name for the track (the first cluster found when there are no Cues).
+
+/// the length of the EBML variable-length integer starting at s[i] (1..8; 0 when the byte is 0: not one)
+fn ebml_len(s: Str, i: Int) -> Int {
+    let b0 = sb(s, i)
+    if b0 == 0 { return 0 }
+    var len = 1
+    var mask = 128
+    while (b0 & mask) == 0 { mask = mask >> 1  len = len + 1 }
+    return len
+}
+/// its value: with the length marker kept (an ID), or without it (a size; -1 for all ones: unknown)
+fn ebml_val(s: Str, i: Int, len: Int, keep: Bool) -> Int {
+    let mask = 256 >> len
+    var v = sb(s, i)
+    if !keep { v = v & (mask - 1) }
+    var ones = v == mask - 1
+    var k = 1
+    while k < len {
+        let bk = sb(s, i + k)
+        if bk != 255 { ones = false }
+        v = v * 256 + bk
+        k = k + 1
+    }
+    if !keep && ones { return 0 - 1 }
+    return v
+}
+
+/// the element at `off`: its ID, the offset of its data and its size (-1: unknown); false past the end
+struct Elem { id: Int, data: Int, size: Int }
+fn mkv_elem(v: Video, off: Int, inout e: Elem) -> Bool {
+    let h = vread(v, off, 12)
+    if h.len() < 2 { return false }
+    let il = ebml_len(h, 0)
+    if il == 0 || il > 4 { return false }
+    let sl = ebml_len(h, il)
+    if sl == 0 || sl > 8 { return false }
+    e.id = ebml_val(h, 0, il, true)
+    e.size = ebml_val(h, il, sl, false)
+    e.data = off + il + sl
+    return true
+}
+/// an unsigned integer element's value
+fn mkv_uint(v: Video, e: Elem) -> Int { if e.size <= 0 || e.size > 8 { return 0 }  return sbe(vread(v, e.data, e.size), 0, e.size) }
+
+fn mkv_open(inout v: Video) {
+    var e = Elem { id: 0, data: 0, size: 0 }
+    if !mkv_elem(v, 0, e) || e.id != 440786851 { v.err = "not an EBML file"  return }
+    // the header's DocType
+    var doc = ""
+    var p = e.data
+    var c = Elem { id: 0, data: 0, size: 0 }
+    while p < e.data + e.size && mkv_elem(v, p, c) {
+        if c.id == 17026 { doc = vread(v, c.data, c.size) }
+        if c.size < 0 { p = e.data + e.size } else { p = c.data + c.size }
+    }
+    if !(doc == "webm") && !(doc == "matroska") { v.err = "an EBML file that is not Matroska (" + doc + ")"  return }
+    // the Segment
+    var off = e.data + e.size
+    var s = Elem { id: 0, data: 0, size: 0 }
+    var found = false
+    while !found && off < v.size && mkv_elem(v, off, s) {
+        if s.id == 408125543 { found = true } else { if s.size < 0 { off = v.size } else { off = s.data + s.size } }
+    }
+    if !found { v.err = "Matroska without a Segment"  return }
+    v.seg0 = s.data
+    v.seg_end = v.size
+    if s.size >= 0 && s.data + s.size < v.size { v.seg_end = s.data + s.size }
+    // its children up to the first Cluster: Info, Tracks, Cues (and a Cues after the clusters, through SeekHead)
+    var q = v.seg0
+    var cues = 0 - 1
+    var ch = Elem { id: 0, data: 0, size: 0 }
+    var going = true
+    while going && q < v.seg_end && mkv_elem(v, q, ch) {
+        if ch.id == 357149030 { mkv_info(v, ch) }
+        else if ch.id == 374648427 { mkv_tracks(v, ch) }
+        else if ch.id == 475249515 { cues = ch.data - 0  mkv_cues(v, ch) }
+        else if ch.id == 290298740 { mkv_seekhead(v, ch, cues) }
+        else if ch.id == 524531317 { v.first_cluster = q  going = false }
+        if going { if ch.size < 0 { going = false } else { q = ch.data + ch.size } }
+    }
+    if v.track < 0 { v.err = "Matroska without a video track"  return }
+    if v.first_cluster == 0 { v.err = "Matroska without clusters"  return }
+    mkv_rewind(v)
+}
+
+fn mkv_info(inout v: Video, e: Elem) {
+    var p = e.data
+    var c = Elem { id: 0, data: 0, size: 0 }
+    while p < e.data + e.size && mkv_elem(v, p, c) {
+        if c.id == 2807729 { v.tscale = mkv_uint(v, c) }
+        if c.size < 0 { p = e.data + e.size } else { p = c.data + c.size }
+    }
+    if v.tscale <= 0 { v.tscale = 1000000 }
+}
+
+fn mkv_tracks(inout v: Video, e: Elem) {
+    var p = e.data
+    var t = Elem { id: 0, data: 0, size: 0 }
+    while p < e.data + e.size && mkv_elem(v, p, t) {
+        if t.id == 174 && v.track < 0 {
+            var num = 0
+            var kind = 0
+            var codec = ""
+            var w = 0
+            var h = 0
+            var dur = 0
+            var q = t.data
+            var c = Elem { id: 0, data: 0, size: 0 }
+            while q < t.data + t.size && mkv_elem(v, q, c) {
+                if c.id == 215 { num = mkv_uint(v, c) }
+                else if c.id == 131 { kind = mkv_uint(v, c) }
+                else if c.id == 134 { codec = vread(v, c.data, c.size) }
+                else if c.id == 2352003 { dur = mkv_uint(v, c) }
+                else if c.id == 224 {
+                    var r = c.data
+                    var g = Elem { id: 0, data: 0, size: 0 }
+                    while r < c.data + c.size && mkv_elem(v, r, g) {
+                        if g.id == 176 { w = mkv_uint(v, g) }
+                        if g.id == 186 { h = mkv_uint(v, g) }
+                        if g.size < 0 { r = c.data + c.size } else { r = g.data + g.size }
+                    }
+                }
+                if c.size < 0 { q = t.data + t.size } else { q = c.data + c.size }
+            }
+            if kind == 1 {
+                v.track = num
+                v.w = w
+                v.h = h
+                v.default_dur = dur
+                // CodecID (RFC 9559 §25 and the codec mappings)
+                if codec == "V_VP9" { v.codec = "vp9" }
+                else if codec == "V_VP8" { v.codec = "vp8" }
+                else if codec == "V_AV1" { v.codec = "av1" }
+                else if codec == "V_MPEG4/ISO/AVC" { v.codec = "h264" }
+                else if codec == "V_MPEGH/ISO/HEVC" { v.codec = "hevc" }
+                else if codec.len() >= 7 && codec.slice(0, 7) == "V_MPEG4" { v.codec = "mpeg4" }
+                else { v.codec = copy codec }
+            }
+        }
+        if t.size < 0 { p = e.data + e.size } else { p = t.data + t.size }
+    }
+}
+
+/// a SeekHead pointing at Cues placed after the clusters: those Cues read too
+fn mkv_seekhead(inout v: Video, e: Elem, cues_seen: Int) {
+    if cues_seen >= 0 { return }
+    var p = e.data
+    var s = Elem { id: 0, data: 0, size: 0 }
+    while p < e.data + e.size && mkv_elem(v, p, s) {
+        if s.id == 19899 {
+            var id = 0
+            var pos = 0 - 1
+            var q = s.data
+            var c = Elem { id: 0, data: 0, size: 0 }
+            while q < s.data + s.size && mkv_elem(v, q, c) {
+                if c.id == 21419 { let b = vread(v, c.data, c.size)  id = sbe(b, 0, b.len()) }
+                if c.id == 21420 { pos = mkv_uint(v, c) }
+                q = c.data + c.size
+            }
+            if id == 475249515 && pos >= 0 {
+                var cu = Elem { id: 0, data: 0, size: 0 }
+                if mkv_elem(v, v.seg0 + pos, cu) && cu.id == 475249515 { mkv_cues(v, cu) }
+            }
+        }
+        if s.size < 0 { p = e.data + e.size } else { p = s.data + s.size }
+    }
+}
+
+/// the Cues: the cluster of the earliest cue point of the video track is where the file starts
+fn mkv_cues(inout v: Video, e: Elem) {
+    var best_t = 0 - 1
+    var best_pos = 0 - 1
+    var p = e.data
+    var cp = Elem { id: 0, data: 0, size: 0 }
+    while p < e.data + e.size && mkv_elem(v, p, cp) {
+        if cp.id == 187 {
+            var t = 0
+            var q = cp.data
+            var c = Elem { id: 0, data: 0, size: 0 }
+            while q < cp.data + cp.size && mkv_elem(v, q, c) {
+                if c.id == 179 { t = mkv_uint(v, c) }
+                if c.id == 183 {
+                    var trk = 0
+                    var pos = 0 - 1
+                    var r = c.data
+                    var g = Elem { id: 0, data: 0, size: 0 }
+                    while r < c.data + c.size && mkv_elem(v, r, g) {
+                        if g.id == 247 { trk = mkv_uint(v, g) }
+                        if g.id == 241 { pos = mkv_uint(v, g) }
+                        r = g.data + g.size
+                    }
+                    if (v.track < 0 || trk == v.track) && pos >= 0 && (best_t < 0 || t < best_t) { best_t = t  best_pos = pos }
+                }
+                q = c.data + c.size
+            }
+        }
+        if cp.size < 0 { p = e.data + e.size } else { p = cp.data + cp.size }
+    }
+    if best_pos >= 0 {
+        var cl = Elem { id: 0, data: 0, size: 0 }
+        if mkv_elem(v, v.seg0 + best_pos, cl) && cl.id == 524531317 { v.first_cluster = v.seg0 + best_pos }
+    }
+}
+
+fn mkv_rewind(inout v: Video) {
+    v.cl_pos = 0
+    v.cl_end = v.first_cluster
+    v.pos = v.first_cluster
+    v.lace_i = 0
+    var none: Vec<Int> = vec()
+    v.lace_off = copy none
+    v.lace_len = copy none
+}
+
+/// is `id` a top-level element (one that ends a cluster of unknown size)?
+fn mkv_top(id: Int) -> Bool {
+    return id == 524531317 || id == 475249515 || id == 357149030 || id == 374648427 || id == 290298740 || id == 307544935 || id == 272869232 || id == 423732329
+}
+
+/// the next frame of the video track into the packet buffer
+fn mkv_next(inout v: Video) -> Bool {
+    // a laced block's frames first
+    if v.lace_i < v.lace_off.len() {
+        let ok = pkt_read(v, v.lace_off[v.lace_i], v.lace_len[v.lace_i])
+        v.pkt_ms = v.lace_time
+        v.lace_i = v.lace_i + 1
+        return ok
+    }
+    var guard = 0
+    var e = Elem { id: 0, data: 0, size: 0 }
+    while guard < 100000 {
+        guard = guard + 1
+        if v.pos >= v.seg_end { return false }
+        if !mkv_elem(v, v.pos, e) { return false }
+        if v.pos >= v.cl_end || mkv_top(e.id) {
+            // between clusters: to the next Cluster
+            if e.id == 524531317 {
+                v.cl_pos = v.pos
+                v.cl_time = 0
+                if e.size < 0 { v.cl_end = v.seg_end } else { v.cl_end = e.data + e.size }
+                v.pos = e.data
+            } else {
+                if e.size < 0 { return false }
+                v.pos = e.data + e.size
+                v.cl_end = v.pos
+            }
+        } else {
+            if e.size < 0 { return false }
+            let next = e.data + e.size
+            if e.id == 231 { v.cl_time = mkv_uint(v, e) }
+            else if e.id == 163 { if mkv_block(v, e.data, e.size) { v.pos = next  return mkv_next(v) } }
+            else if e.id == 160 {
+                var q = e.data
+                var c = Elem { id: 0, data: 0, size: 0 }
+                var got = false
+                while q < next && mkv_elem(v, q, c) && c.size >= 0 {
+                    if c.id == 161 { if mkv_block(v, c.data, c.size) { got = true } }
+                    q = c.data + c.size
+                }
+                if got { v.pos = next  return mkv_next(v) }
+            }
+            v.pos = next
+        }
+    }
+    return false
+}
+
+/// a (Simple)Block at `off` of `n` bytes: when it is the video track's, its frame(s) queued (lacing undone)
+fn mkv_block(inout v: Video, off: Int, n: Int) -> Bool {
+    let h = vread(v, off, 16)
+    let tl = ebml_len(h, 0)
+    if tl == 0 || tl > 8 || ebml_val(h, 0, tl, false) != v.track { return false }
+    var rel = sbe(h, tl, 2)
+    if rel >= 32768 { rel = rel - 65536 }
+    let flags = sb(h, tl + 2)
+    let time = ((v.cl_time + rel) * v.tscale) / 1000000
+    var offs: Vec<Int> = vec()
+    var lens: Vec<Int> = vec()
+    let lacing = (flags >> 1) & 3
+    var p = off + tl + 3
+    let end = off + n
+    if lacing == 0 { offs.push(p)  lens.push(end - p) }
+    else {
+        let lh = vread(v, p, 4096)
+        let count = sb(lh, 0) + 1
+        var i = 1
+        var sizes: Vec<Int> = vec()
+        if lacing == 1 {
+            // Xiph: each size but the last as a run of 255s and a final byte
+            var k = 0
+            while k < count - 1 {
+                var sz = 0
+                var b = 255
+                while b == 255 { b = sb(lh, i)  i = i + 1  sz = sz + b }
+                sizes.push(sz)
+                k = k + 1
+            }
+        } else if lacing == 3 {
+            // EBML: the first size, then signed differences
+            let fl = ebml_len(lh, i)
+            var sz = ebml_val(lh, i, fl, false)
+            i = i + fl
+            sizes.push(sz)
+            var k = 1
+            while k < count - 1 {
+                let l = ebml_len(lh, i)
+                let raw = ebml_val(lh, i, l, false)
+                let bias = (1 << (7 * l - 1)) - 1
+                sz = sz + raw - bias
+                sizes.push(sz)
+                i = i + l
+                k = k + 1
+            }
+        }
+        p = p + i
+        var total = 0
+        foreach s in sizes { total = total + s }
+        if lacing == 2 {
+            let each = (end - p) / count
+            var k = 0
+            while k < count { sizes.push(each)  k = k + 1 }
+        } else { sizes.push(end - p - total) }
+        foreach s in sizes { offs.push(p)  lens.push(s)  p = p + s }
+    }
+    let nl = lens.len()
+    v.lace_off = offs
+    v.lace_len = lens
+    v.lace_i = 0
+    v.lace_time = time
+    return nl > 0
+}

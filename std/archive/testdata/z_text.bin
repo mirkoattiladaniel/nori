@@ -1,0 +1,193 @@
+//! std/archive — a Brotli decoder (RFC 7932), for WOFF2 web fonts (which Brotli-compress the
+//! SFNT table data). Built up in layers: bit reader + prefix codes (here, unit-tested), then meta-block
+//! decode (literals/commands/distances + context modeling), then the static dictionary. WOFF2's table
+//! directory + glyf/loca transform reversal live in std/font.
+//!
+//! Brotli reads bits LSB-first; its prefix codes are canonical Huffman read low-bit-first, so a code's
+//! bits are the reverse of the DEFLATE-style canonical code. We build a flat lookup table indexed by the
+//! next `maxlen` bits (with the reversed code filled across all high-bit combinations) — the standard
+//! constant-time Brotli symbol decode.
+
+// ── bit reader (LSB-first, accumulating buffer) ──────────────────────────────────────────────────────
+struct BR {
+    d: Str,
+    n: Int,
+    pos: Int,
+    buf: Int,
+    cnt: Int
+}
+fn br_new(data: Str) -> BR {
+    return BR { d: data, n: data.len(), pos: 0, buf: 0, cnt: 0 }
+}
+fn br_ensure(inout b: BR, k: Int) {
+    while b.cnt < k {
+        var byte = 0
+        if b.pos < b.n {
+            byte = ord(b.d.at(b.pos))
+            b.pos = b.pos + 1
+        }
+        b.buf = (b.buf | (byte << b.cnt))
+        b.cnt = b.cnt + 8
+    }
+}
+/// read `k` bits LSB-first (k <= 24).
+fn br_take(inout b: BR, k: Int) -> Int {
+    if k == 0 {
+        return 0
+    }
+    br_ensure(b, k)
+    let v = (b.buf & (1 << k) - 1)
+    b.buf = (b.buf >> k)
+    b.cnt = b.cnt - k
+    return v
+}
+fn br_bit(inout b: BR) -> Int {
+    return br_take(b, 1)
+}
+
+// ── prefix (canonical Huffman) codes, decoded low-bit-first ──────────────────────────────────────────
+struct Prefix {
+    sym: Vec<Int>,
+    len: Vec<Int>,
+    maxlen: Int
+}
+fn rev_bits(x: Int, n: Int) -> Int {
+    var r = 0
+    var i = 0
+    while i < n {
+        r = ((r << 1) | ((x >> i) & 1))
+        i = i + 1
+    }
+    return r
+}
+// build a decode table from per-symbol code lengths (0 = symbol absent). Canonical code assignment,
+// filled at the bit-reversed code so decode reads the code low-bit-first.
+fn prefix_build(lengths: Vec<Int>, n: Int) -> Prefix {
+    var maxlen = 0
+    var i = 0
+    while i < n {
+        if lengths[i] > maxlen {
+            maxlen = lengths[i]
+        }
+        i = i + 1
+    }
+    if maxlen == 0 {
+        var s: Vec<Int> = vec()
+        s.push(0)
+        var l: Vec<Int> = vec()
+        l.push(0)
+        return Prefix { sym: s, len: l, maxlen: 0 }
+    }
+    let size = (1 << maxlen)
+    var sym: Vec<Int> = vec() var lentab: Vec<Int> = vec()
+    i = 0 while i < size { sym.push(0) lentab.push(0) i = i + 1 }
+    var blcount: Vec<Int> = vec() i = 0 while i <= maxlen { blcount.push(0) i = i + 1 }
+    i = 0 while i < n { if lengths[i] > 0 { blcount[lengths[i]] = blcount[lengths[i]] + 1 } i = i + 1 }
+    var nextcode: Vec<Int> = vec() i = 0 while i <= maxlen { nextcode.push(0) i = i + 1 }
+    var code = 0 var bl = 1
+    while bl <= maxlen {
+        code = (code + blcount[bl - 1] << 1)
+        nextcode[bl] = code
+        bl = bl + 1
+    }
+    i = 0
+    while i < n {
+        let ln = lengths[i]
+        if ln > 0 {
+            let c = nextcode[ln]
+            nextcode[ln] = c + 1
+            let rev = rev_bits(c, ln)
+            let step = (1 << ln)
+            var j = rev
+            while j < size {
+                sym[j] = i
+                lentab[j] = ln
+                j = j + step
+            }
+        }
+        i = i + 1
+    }
+    return Prefix { sym: sym, len: lentab, maxlen: maxlen }
+}
+/// decode one symbol (constant time: peek maxlen bits, look up, consume the code's length).
+fn prefix_decode(inout b: BR, p: Prefix) -> Int {
+    if p.maxlen == 0 {
+        return p.sym[0]
+    }
+    br_ensure(b, p.maxlen)
+    let idx = (b.buf & (1 << p.maxlen) - 1)
+    let ln = p.len[idx]
+    b.buf = (b.buf >> ln)
+    b.cnt = b.cnt - ln
+    return p.sym[idx]
+}
+
+// ── RFC 7932 constant tables (length/block prefix codes: base + extra bits) ──────────────────────────
+fn tbl(a: Int, b: Int, c: Int, dd: Int, e: Int, f: Int, g: Int, h: Int) -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    v.push(a)
+    v.push(b)
+    v.push(c)
+    v.push(dd)
+    v.push(e)
+    v.push(f)
+    v.push(g)
+    v.push(h)
+    return v
+}
+fn vext(inout dst: Vec<Int>, src: Vec<Int>) {
+    var i = 0
+    while i < src.len() {
+        dst.push(src[i])
+        i = i + 1
+    }
+}
+fn ins_base() -> Vec<Int> {
+    var v = tbl(0, 1, 2, 3, 4, 5, 6, 8)
+    vext(v, tbl(10, 14, 18, 26, 34, 50, 66, 98))
+    vext(v, tbl(130, 194, 322, 578, 1090, 2114, 6210, 22594))
+    return v
+}
+fn ins_extra() -> Vec<Int> {
+    var v = tbl(0, 0, 0, 0, 0, 0, 1, 1)
+    vext(v, tbl(2, 2, 3, 3, 4, 4, 5, 5))
+    vext(v, tbl(6, 7, 8, 9, 10, 12, 14, 24))
+    return v
+}
+fn cpy_base() -> Vec<Int> {
+    var v = tbl(2, 3, 4, 5, 6, 7, 8, 9)
+    vext(v, tbl(10, 12, 14, 18, 22, 30, 38, 54))
+    vext(v, tbl(70, 102, 134, 198, 326, 582, 1094, 2118))
+    return v
+}
+fn cpy_extra() -> Vec<Int> {
+    var v = tbl(0, 0, 0, 0, 0, 0, 0, 0)
+    vext(v, tbl(1, 1, 2, 2, 3, 3, 4, 4))
+    vext(v, tbl(5, 5, 6, 7, 8, 9, 10, 24))
+    return v
+}
+fn blk_base() -> Vec<Int> {
+    var v = tbl(1, 5, 9, 13, 17, 25, 33, 41)
+    vext(v, tbl(49, 65, 81, 97, 113, 145, 177, 209))
+    vext(v, tbl(241, 305, 369, 497, 753, 1265, 2289, 4337))
+    vext(v, tbl(8433, 16625, 0, 0, 0, 0, 0, 0))
+    var r: Vec<Int> = vec()
+    var i = 0
+    while i < 26 {
+        r.push(v[i])
+        i = i + 1
+    }
+    return r
+}
+fn blk_extra() -> Vec<Int> {
+    var v = tbl(2, 2, 2, 2, 3, 3, 3, 3)
+    vext(v, tbl(4, 4, 4, 4, 5, 5, 5, 5))
+    vext(v, tbl(6, 6, 7, 8, 9, 10, 11, 12))
+    vext(v, tbl(13, 24, 0, 0, 0, 0, 0, 0))
+    var r: Vec<Int> = vec()
+    var i = 0
+    while i < 26 {
+        r.push(v[i])
+        i = i + 1
+    }
+    

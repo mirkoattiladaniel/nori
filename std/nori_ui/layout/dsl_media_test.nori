@@ -1,0 +1,465 @@
+// Native .nori tests for layout/dsl_media.nori, run with
+//   noric --test std/nori_ui/layout/dsl_media_test.nori compiler/runtime.nori --import-root .
+// A root file of std/nori_ui/layout, so it shares the module scope and can call the parser
+// directly.
+import "std/nori_ui" as ui
+import "std/os" as os
+
+// ---- helpers (must not be named test_*) ----
+
+/// parse `src` as a whole document and return its root node; asserts the parse succeeded.
+fn dmt_root(src: Str) -> ui::layout::UiNode {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    return sink r.doc.tree
+}
+/// parse `src`, assert it failed, and assert the message contains `needle`.
+fn dmt_err(src: Str, needle: Str) {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_false(r.ok)
+    assert_true(ui::layout::nui_contains(r.err, needle))
+}
+/// lay `src`'s root out in a `w` x `h` viewport at the origin.
+fn dmt_lay(src: Str, w: Float, h: Float) -> ui::layout::ComputedOverlay {
+    var root = dmt_root(src)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(w, h))
+    return ui::layout::layout_overlay(root, vp)
+}
+fn dmt_q() -> Str { return ("" + chr(34)) }
+/// how many primitives of kind `k` the overlay carries.
+fn dmt_count(ov: ui::layout::ComputedOverlay, k: Int) -> Int {
+    var n = 0
+    var i = 0
+    while i < ov.prims.len() { if ov.prims[i].kind == k { n = n + 1 }  i = i + 1 }
+    return n
+}
+/// the first primitive of kind `k`.
+fn dmt_prim(ov: ui::layout::ComputedOverlay, k: Int) -> ui::layout::PaintPrimitive {
+    var i = 0
+    var found = -1
+    while i < ov.prims.len() {
+        if ov.prims[i].kind == k { if found < 0 { found = i } }
+        i = i + 1
+    }
+    assert_true(found >= 0)
+    if found < 0 { return ui::layout::pp_dup(ov.prims[0]) }
+    return ui::layout::pp_dup(ov.prims[found])
+}
+
+// A PNG that ships with the repo: 4x2, corners red / green / blue / white. Used both as the byte
+// source for the temp files the resolver tests need and as a real cwd-relative resolve target.
+fn dmt_seed_png() -> Str { return "std/image/testdata/corners_rgb.png" }
+
+/// the scratch directory the resolver tests build their fixture tree in, under the system's temp
+/// directory. Created on demand.
+fn dmt_tmp() -> Str {
+    let base = os::temp_dir() + "/nori_dsl_media_fixture"
+    let _m = os::make_dir_p(base)
+    return base
+}
+/// write the fixture PNG's real bytes to `path` (creating parent dirs).
+fn dmt_put_png(dir: Str, name: Str) -> Str {
+    let _m = os::make_dir_p(dir)
+    let dst = dir + ("/" + name)
+    write_file(dst, read_file(dmt_seed_png()))
+    return dst
+}
+/// build the fixture tree once and return its root:
+///   <tmp>/root/assets/hero.png   <tmp>/root/thumbs/icon.png   <tmp>/root/plain.txt
+///   <tmp>/save/thumbs/icon.png   (a different copy, to prove save_dir wins)
+fn dmt_fixture() -> Str {
+    let tmp = dmt_tmp()
+    let _a = dmt_put_png(tmp + "/root/assets", "hero.png")
+    let _b = dmt_put_png(tmp + "/root/thumbs", "icon.png")
+    let _c = dmt_put_png(tmp + "/save/thumbs", "icon.png")
+    let _d = dmt_put_png(tmp + "/root", "upper.PNG")
+    write_file(tmp + "/root/plain.txt", "not an image")
+    let _e = os::make_dir_p(tmp + "/root/adir.png")     // a directory named *.png: is_file() must reject it
+    return tmp
+}
+
+// =========================================================================
+// 1. the parser
+// =========================================================================
+
+fn test_dm_image_minimal() {
+    var n = dmt_root("image { path: " + dmt_q() + "a.png" + dmt_q() + " }")
+    assert_eq(n.kind, ui::layout::nk_image())
+    assert_streq(n.src, "a.png")
+    // fill_w defaults false here, unlike text_input / text_area where it is true
+    assert_false(n.fill_w)
+    assert_false(n.fill_h)
+    assert_eq(n.w.unit, 0)
+    assert_feq(n.w.value, 0.0, 0.001)
+    assert_eq(n.h.unit, 0)
+    assert_feq(n.h.value, 0.0, 0.001)
+    assert_eq(n.classes.len(), 0)
+    assert_false(n.has_align_self)
+    assert_streq(ui::layout::ui_kind_tag(n.kind), "image")
+}
+
+fn test_dm_image_every_attr() {
+    var src = "image { path: " + dmt_q() + "assets/hero.png" + dmt_q()
+    src = src + " fill_w: true fill_h: true w: 120 h: 80 classes: [a, b] align_self: center }"
+    var n = dmt_root(src)
+    assert_streq(n.src, "assets/hero.png")
+    assert_true(n.fill_w)
+    assert_true(n.fill_h)
+    assert_feq(n.w.value, 120.0, 0.001)
+    assert_feq(n.h.value, 80.0, 0.001)
+    assert_eq(n.classes.len(), 2)
+    assert_streq(n.classes[0], "a")
+    assert_streq(n.classes[1], "b")
+    assert_true(n.has_align_self)
+    assert_eq(n.align_self, ui::layout::cross_center())
+    // `fill` is an alias for fill_w (and only for fill_w); `class` replaces `classes`
+    var n2 = dmt_root("image { path: " + dmt_q() + "x.png" + dmt_q() + " fill: true classes: [a, b] class: solo }")
+    assert_true(n2.fill_w)
+    assert_false(n2.fill_h)
+    assert_eq(n2.classes.len(), 1)
+    assert_streq(n2.classes[0], "solo")
+    // value_bool coerces a number; align_self takes all four words
+    var n3 = dmt_root("image { path: " + dmt_q() + "x.png" + dmt_q() + " fill_h: 1 align_self: stretch }")
+    assert_true(n3.fill_h)
+    assert_eq(n3.align_self, ui::layout::cross_stretch())
+    var n4 = dmt_root("image { path: " + dmt_q() + "x.png" + dmt_q() + " align_self: end }")
+    assert_eq(n4.align_self, ui::layout::cross_end())
+    var n5 = dmt_root("image { path: " + dmt_q() + "x.png" + dmt_q() + " align_self: start }")
+    assert_eq(n5.align_self, ui::layout::cross_start())
+}
+
+fn test_dm_image_length_units() {
+    // `w` / `h` are full UiLengths: a bare number, or one with a %, vw, vh or ui suffix
+    var n = dmt_root("image { path: " + dmt_q() + "x.png" + dmt_q() + " w: 50% h: 2vh }")
+    assert_eq(n.w.unit, 1)
+    assert_feq(n.w.value, 50.0, 0.001)
+    assert_eq(n.h.unit, 3)
+    var n2 = dmt_root("image { path: " + dmt_q() + "x.png" + dmt_q() + " w: 3vw h: 4ui }")
+    assert_eq(n2.w.unit, 2)
+    assert_eq(n2.h.unit, 4)
+    var n3 = dmt_root("image { path: " + dmt_q() + "x.png" + dmt_q() + " w: -8 }")
+    assert_feq(n3.w.value, -8.0, 0.001)
+}
+
+fn test_dm_image_w_fill_quirk() {
+    // The quirk: a bare ident `fill` under `w:` sets fill_w and leaves the
+    // length alone; it is not a length value at all. Same for `h:` -> fill_h.
+    var n = dmt_root("image { path: " + dmt_q() + "x.png" + dmt_q() + " w: fill }")
+    assert_true(n.fill_w)
+    assert_false(n.fill_h)
+    assert_feq(n.w.value, 0.0, 0.001)                  // untouched: still the Px(0.0) default
+    assert_eq(n.w.unit, 0)
+    var n2 = dmt_root("image { path: " + dmt_q() + "x.png" + dmt_q() + " h: fill }")
+    assert_true(n2.fill_h)
+    assert_false(n2.fill_w)
+    assert_feq(n2.h.value, 0.0, 0.001)
+    var n3 = dmt_root("image { path: " + dmt_q() + "x.png" + dmt_q() + " w: fill h: fill }")
+    assert_true(n3.fill_w)
+    assert_true(n3.fill_h)
+    // a quoted "fill" is a String, not an Ident, so it misses the special case and hits
+    // value_length's hint instead
+    dmt_err("image { path: " + dmt_q() + "x.png" + dmt_q() + " w: " + dmt_q() + "fill" + dmt_q() + " }", "use fill_w / fill_h instead of `fill`")
+}
+
+fn test_dm_image_requires_path() {
+    // no trailing colon on this one, unlike "text_input requires id:"
+    dmt_err("image { }", "image requires path")
+    dmt_err("image { w: 40 h: 40 }", "image requires path")
+    // and it really is colon-free
+    var r = ui::layout::dsl_parse_document("image { }")
+    assert_false(r.ok)
+    assert_streq(r.emsg, "image requires path")
+}
+
+fn test_dm_image_path_must_be_quoted() {
+    // quoted string only. Ident, Number, Bool and Array are all rejected, and there
+    // is no `src` alias.
+    dmt_err("image { path: hero.png }", "path must be a quoted string")
+    dmt_err("image { path: 3 }", "path must be a quoted string")
+    dmt_err("image { path: true }", "path must be a quoted string")
+    dmt_err("image { path: [a] }", "path must be a quoted string")
+    dmt_err("image { src: " + dmt_q() + "a.png" + dmt_q() + " }", "unknown image field " + dmt_q() + "src" + dmt_q())
+}
+
+fn test_dm_image_errors() {
+    var q = dmt_q()
+    var p = "image { path: " + q + "x.png" + q + " "
+    dmt_err(p + "foo: 1 }", "unknown image field " + q + "foo" + q)
+    // image accepts no bind_visible / bind_disabled and no flex_weight / flex_shrink, even though
+    // a serializer may write them, but the parser rejects them.
+    dmt_err(p + "bind_visible: v }", "unknown image field " + q + "bind_visible" + q)
+    dmt_err(p + "bind_disabled: d }", "unknown image field " + q + "bind_disabled" + q)
+    dmt_err(p + "flex_weight: 1 }", "unknown image field " + q + "flex_weight" + q)
+    dmt_err(p + "flex_shrink: 1 }", "unknown image field " + q + "flex_shrink" + q)
+    dmt_err(p + "id: i }", "unknown image field " + q + "id" + q)
+    dmt_err(p + "padding: 4 }", "unknown image field " + q + "padding" + q)
+    // Style A `:` enforcement, and image takes no children, so `name {` is the same error
+    dmt_err("image { path " + q + "x.png" + q + " }", "expected `:` in image node")
+    dmt_err("image { kid { } }", "expected `:` in image node")
+    dmt_err("image { path", "expected `:` in image node")
+    // value-type errors
+    dmt_err(p + "fill_w: sure }", "fill_w must be true or false")
+    dmt_err(p + "fill_h: sure }", "fill_h must be true or false")
+    dmt_err(p + "classes: nope }", "classes must be [...]")
+    dmt_err(p + "classes: [1] }", "class names must be strings or identifiers")
+    dmt_err(p + "class: [a] }", "class must be string or ident")
+    dmt_err(p + "align_self: sideways }", "unknown cross_align " + q + "sideways" + q)
+    dmt_err(p + "align_self: 3 }", "cross_align must be stretch, center, or end")
+    // value_length is strict about lengths: a garbage ident is `invalid w`,
+    // not a silent 0.0 the way the shared dsl.nori length reader treats it.
+    dmt_err(p + "w: bogus }", "invalid w: " + q + "bogus" + q)
+    dmt_err(p + "h: bogus }", "invalid h: " + q + "bogus" + q)
+    dmt_err(p + "w: " + q + "12px" + q + " }", "invalid w: " + q + "12px" + q)
+    dmt_err(p + "w: " + q + "%" + q + " }", "invalid w: " + q + "%" + q)
+    dmt_err(p + "w: [1] }", "w must be a number or length")
+    dmt_err(p + "h: true }", "h must be a number or length")
+    // ...but the real length forms still go through, quoted or bare
+    var ok = dmt_root(p + "w: " + q + "50%" + q + " h: " + q + "ui" + q + " }")
+    assert_eq(ok.w.unit, 1)
+    assert_feq(ok.w.value, 50.0, 0.001)
+    assert_eq(ok.h.unit, 4)
+    assert_feq(ok.h.value, 1.0, 0.001)
+    var ok2 = dmt_root(p + "w: " + q + "-1.5e2" + q + " }")
+    assert_feq(ok2.w.value, -150.0, 0.01)
+}
+
+// =========================================================================
+// 2. the resolver
+// =========================================================================
+
+fn test_dm_resolve_direct_filesystem() {
+    let tmp = dmt_fixture()
+    ui::layout::ui_media_set_resolve_roots(tmp + "/root", "")
+    // step 5: project_root/rel exists on disk
+    var r = ui::layout::resolve_image_png_path("assets/hero.png")
+    assert_true(r.ok)
+    assert_streq(r.value, tmp + "/root/assets/hero.png")
+    // a path that simply is not there resolves to nothing
+    assert_false(ui::layout::resolve_image_png_path("assets/missing.png").ok)
+    // ...and a directory named *.png is not a file (an is-file test, not exists())
+    assert_false(ui::layout::resolve_image_png_path("adir.png/x.png").ok)
+}
+
+// the extra roots (a desktop's data directories): tried after the project root, in order; the project root wins
+fn test_dm_resolve_extra_roots() {
+    let tmp = dmt_fixture()
+    ui::layout::ui_media_set_resolve_roots(tmp + "/nowhere", "")
+    var roots: Vec<Str> = vec()
+    roots.push(tmp + "/none")
+    roots.push(tmp + "/root")
+    ui::layout::ui_media_set_extra_roots(roots)
+    var r = ui::layout::resolve_image_png_path("assets/hero.png")
+    assert_true(r.ok)
+    assert_streq(r.value, tmp + "/root/assets/hero.png")
+    assert_false(ui::layout::resolve_image_png_path("../root/assets/hero.png").ok)
+    ui::layout::ui_media_set_resolve_roots(tmp + "/root", "")
+    var r2 = ui::layout::resolve_image_png_path("assets/hero.png")
+    assert_streq(r2.value, tmp + "/root/assets/hero.png")
+    var none: Vec<Str> = vec()
+    ui::layout::ui_media_set_extra_roots(none)
+    ui::layout::ui_media_set_resolve_roots(tmp + "/nowhere", "")
+    assert_false(ui::layout::resolve_image_png_path("assets/hero.png").ok)
+}
+
+fn test_dm_resolve_dot_slash_strip() {
+    let tmp = dmt_fixture()
+    ui::layout::ui_media_set_resolve_roots(tmp + "/root", "")
+    // step 4: every leading "./" is stripped, not just one
+    var r = ui::layout::resolve_image_png_path("./assets/hero.png")
+    assert_true(r.ok)
+    assert_streq(r.value, tmp + "/root/assets/hero.png")
+    var r2 = ui::layout::resolve_image_png_path("././assets/hero.png")
+    assert_true(r2.ok)
+    assert_streq(r2.value, tmp + "/root/assets/hero.png")
+}
+
+fn test_dm_resolve_thumb_lookup() {
+    let tmp = dmt_fixture()
+    // step 2 fires only for a path with no '/': project_root/thumbs/<name>
+    ui::layout::ui_media_set_resolve_roots(tmp + "/root", "")
+    var r = ui::layout::resolve_image_png_path("icon.png")
+    assert_true(r.ok)
+    assert_streq(r.value, tmp + "/root/thumbs/icon.png")
+    // save_dir/thumbs is probed first when a save dir is configured
+    ui::layout::ui_media_set_resolve_roots(tmp + "/root", tmp + "/save")
+    var r2 = ui::layout::resolve_image_png_path("icon.png")
+    assert_true(r2.ok)
+    assert_streq(r2.value, tmp + "/save/thumbs/icon.png")
+    // a path with a '/' never reaches the thumb probe
+    ui::layout::ui_media_set_resolve_roots(tmp + "/root", "")
+    assert_false(ui::layout::resolve_image_png_path("sub/icon.png").ok)
+    ui::layout::ui_media_set_resolve_roots("", "")
+}
+
+fn test_dm_resolve_traversal_rejected() {
+    let tmp = dmt_fixture()
+    ui::layout::ui_media_set_resolve_roots(tmp + "/root", "")
+    // step 1: sanitize_overlay_image_path: five rejections plus a trim.
+    assert_false(ui::layout::resolve_image_png_path("").ok)                       // empty
+    assert_false(ui::layout::resolve_image_png_path("   ").ok)                    // whitespace only
+    assert_false(ui::layout::resolve_image_png_path("../hero.png").ok)            // parent escape
+    assert_false(ui::layout::resolve_image_png_path("assets/../hero.png").ok)     // ".." anywhere
+    assert_false(ui::layout::resolve_image_png_path("/etc/hero.png").ok)          // absolute
+    assert_false(ui::layout::resolve_image_png_path("a" + chr(92) + "b.png").ok)  // backslash
+    assert_false(ui::layout::resolve_image_png_path("C:/hero.png").ok)            // drive letter
+    // a real file behind a traversal is still refused; the check is on the string, not the disk
+    assert_false(ui::layout::resolve_image_png_path("assets/../assets/hero.png").ok)
+    // leading/trailing whitespace is trimmed, not rejected
+    var r = ui::layout::resolve_image_png_path("  assets/hero.png  ")
+    assert_true(r.ok)
+    assert_streq(r.value, tmp + "/root/assets/hero.png")
+    ui::layout::ui_media_set_resolve_roots("", "")
+}
+
+fn test_dm_resolve_png_only() {
+    let tmp = dmt_fixture()
+    ui::layout::ui_media_set_resolve_roots(tmp + "/root", "")
+    // step 3: the extension check. plain.txt exists on disk and is still refused.
+    assert_true(os::path_exists(tmp + "/root/plain.txt"))
+    assert_false(ui::layout::resolve_image_png_path("plain.txt").ok)
+    assert_false(ui::layout::resolve_image_png_path("hero.jpg").ok)
+    assert_false(ui::layout::resolve_image_png_path("hero.pngx").ok)
+    // the check is ASCII-case-insensitive
+    var r = ui::layout::resolve_image_png_path("upper.PNG")
+    assert_true(r.ok)
+    assert_streq(r.value, tmp + "/root/upper.PNG")
+    ui::layout::ui_media_set_resolve_roots("", "")
+}
+
+fn test_dm_resolve_empty_root_is_cwd() {
+    // An empty project_root means "the working
+    // directory" rather than an absent root (which would skip the probe entirely). Without it an
+    // unconfigured host could never draw any image at all.
+    ui::layout::ui_media_set_resolve_roots("", "")
+    var r = ui::layout::resolve_image_png_path(dmt_seed_png())
+    assert_true(r.ok)
+    assert_streq(r.value, dmt_seed_png())
+    assert_streq(ui::layout::ui_media_project_root(), "")
+    assert_streq(ui::layout::ui_media_save_dir(), "")
+}
+
+// =========================================================================
+// 3. measure + layout
+// =========================================================================
+
+fn test_dm_measure() {
+    var ctx = ui::layout::LayoutLengthContext { viewport_w: 800.0, viewport_h: 600.0, ui_scale: 1.0, parent_inner_w: 800.0, parent_inner_h: 600.0 }
+    // pure explicit size, the nk_rect / nk_surface model; an image has no intrinsic size at
+    // layout time (the pixels are not decoded until the blit)
+    var n = dmt_root("image { path: " + dmt_q() + "x.png" + dmt_q() + " w: 120 h: 80 }")
+    var m = ui::layout::ui_measure(n, ctx)
+    assert_feq(m.x, 120.0, 0.01)
+    assert_feq(m.y, 80.0, 0.01)
+    var n2 = dmt_root("image { path: " + dmt_q() + "x.png" + dmt_q() + " }")
+    var m2 = ui::layout::ui_measure(n2, ctx)
+    assert_feq(m2.x, 0.0, 0.01)
+    assert_feq(m2.y, 0.0, 0.01)
+    var n3 = dmt_root("image { path: " + dmt_q() + "x.png" + dmt_q() + " w: 50% h: 25% }")
+    var m3 = ui::layout::ui_measure(n3, ctx)
+    assert_feq(m3.x, 400.0, 0.01)
+    assert_feq(m3.y, 150.0, 0.01)
+}
+
+fn test_dm_image_layout_emits_kind3() {
+    ui::layout::ui_media_set_resolve_roots("", "")
+    var src = "image { path: " + dmt_q() + dmt_seed_png() + dmt_q() + " }"
+    var ov = dmt_lay(src, 200.0, 100.0)
+    assert_eq(dmt_count(ov, 3), 1)                     // exactly one image primitive
+    var im = dmt_prim(ov, 3)
+    assert_streq(im.text, dmt_seed_png())              // the resolved path rides in `text`
+    assert_feq(im.rect.min.x, 0.0, 0.01)
+    assert_feq(im.rect.min.y, 0.0, 0.01)
+    assert_feq(im.rect.width(), 200.0, 0.01)
+    assert_feq(im.rect.height(), 100.0, 0.01)
+    assert_eq(ov.hits.len(), 0)                        // image is not interactive
+    assert_eq(ov.surfaces.len(), 0)
+}
+
+fn test_dm_image_layout_inside_a_row() {
+    ui::layout::ui_media_set_resolve_roots("", "")
+    var src = "row { padding: 0 gap: 0 cross_align: start image { path: " + dmt_q() + dmt_seed_png() + dmt_q() + " w: 40 h: 30 } }"
+    var ov = dmt_lay(src, 200.0, 100.0)
+    assert_eq(dmt_count(ov, 3), 1)
+    var im = dmt_prim(ov, 3)
+    assert_feq(im.rect.width(), 40.0, 0.01)
+    assert_feq(im.rect.height(), 30.0, 0.01)
+    assert_feq(im.rect.min.x, 0.0, 0.01)
+}
+
+fn test_dm_unresolved_path_draws_nothing() {
+    ui::layout::ui_media_set_resolve_roots("", "")
+    // On a failed resolve the layout returns early:
+    // no placeholder, no border, no diagnostic.
+    var ov = dmt_lay("image { path: " + dmt_q() + "no/such/file.png" + dmt_q() + " }", 200.0, 100.0)
+    assert_eq(dmt_count(ov, 3), 0)
+    assert_eq(ov.prims.len(), 0)
+    // ...and so does a path the sanitizer refuses
+    var ov2 = dmt_lay("image { path: " + dmt_q() + "../secret.png" + dmt_q() + " }", 200.0, 100.0)
+    assert_eq(dmt_count(ov2, 3), 0)
+    // a non-PNG that really is on disk is just as silent
+    var ov3 = dmt_lay("image { path: " + dmt_q() + "std/image/testdata/quad.gif" + dmt_q() + " }", 200.0, 100.0)
+    assert_eq(dmt_count(ov3, 3), 0)
+}
+
+// =========================================================================
+// 4. the letterbox fit rule + the decode cache (shared by both painters)
+// =========================================================================
+
+fn test_dm_letterbox_contain() {
+    // A 4x2 source in a 40x40 panel: scale = min(10, 20) = 10, so the
+    // blit is 40x20, full width, centred vertically with a 10px letterbox strip top and bottom.
+    var panel = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(40.0, 40.0))
+    var fit = ui::layout::ui_media_letterbox(panel, 4, 2)
+    assert_feq(fit.min.x, 0.0, 0.01)
+    assert_feq(fit.min.y, 10.0, 0.01)
+    assert_feq(fit.width(), 40.0, 0.01)
+    assert_feq(fit.height(), 20.0, 0.01)
+    // the other axis: a 2x4 source in the same panel pillarboxes instead
+    var fit2 = ui::layout::ui_media_letterbox(panel, 2, 4)
+    assert_feq(fit2.min.x, 10.0, 0.01)
+    assert_feq(fit2.min.y, 0.0, 0.01)
+    assert_feq(fit2.width(), 20.0, 0.01)
+    // an exact match neither scales nor offsets
+    var fit3 = ui::layout::ui_media_letterbox(panel, 40, 40)
+    assert_feq(fit3.min.x, 0.0, 0.01)
+    assert_feq(fit3.width(), 40.0, 0.01)
+    // the panel origin is respected, not assumed to be 0,0
+    var off = ui::core::rect_min_max(ui::core::vec2(100.0, 200.0), ui::core::vec2(140.0, 240.0))
+    var fit4 = ui::layout::ui_media_letterbox(off, 4, 2)
+    assert_feq(fit4.min.x, 100.0, 0.01)
+    assert_feq(fit4.min.y, 210.0, 0.01)
+    // .max(1.0) floors: a huge source in a tiny panel still gets a 1px blit, not a 0px one
+    var tiny = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(4.0, 4.0))
+    var fit5 = ui::layout::ui_media_letterbox(tiny, 1000, 1)
+    assert_true(fit5.height() >= 1.0)
+}
+
+fn test_dm_decode_cache() {
+    ui::layout::ui_media_cache_clear()
+    assert_eq(ui::layout::ui_media_cache_len(), 0)
+    var im = ui::layout::ui_media_image_load(dmt_seed_png())
+    assert_true(im.ok)
+    assert_eq(im.w, 4)
+    assert_eq(im.h, 2)
+    assert_true(im.px != 0)
+    assert_eq(ui::layout::ui_media_cache_len(), 1)
+    // a second load of the same unchanged file is served from the cache: same pixel buffer
+    var im2 = ui::layout::ui_media_image_load(dmt_seed_png())
+    assert_true(im2.ok)
+    assert_eq(im2.px, im.px)
+    assert_eq(ui::layout::ui_media_cache_len(), 1)
+    // a second distinct image adds an entry
+    var im3 = ui::layout::ui_media_image_load("std/image/testdata/corners_rgba.png")
+    assert_true(im3.ok)
+    assert_eq(ui::layout::ui_media_cache_len(), 2)
+    // read_file aborts on a missing path, so the loader stats first: a missing or
+    // non-file path must come back as a clean failure rather than killing the process.
+    assert_false(ui::layout::ui_media_image_load("std/image/testdata/nope.png").ok)
+    assert_false(ui::layout::ui_media_image_load("std/image/testdata").ok)
+    assert_false(ui::layout::ui_media_image_load("").ok)
+    // a file that is not a PNG decodes to nothing and is not cached
+    assert_false(ui::layout::ui_media_image_load("std/image/testdata/quad.gif").ok)
+    assert_eq(ui::layout::ui_media_cache_len(), 2)
+    ui::layout::ui_media_cache_clear()
+    assert_eq(ui::layout::ui_media_cache_len(), 0)
+}

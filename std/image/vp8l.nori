@@ -1,0 +1,641 @@
+// std/image: WebP lossless (VP8L), written from RFC 9649 §3 ("Specification for WebP Lossless Bitstream"):
+//
+//   §3.4    the header: signature 0x2f, 14-bit width-1 and height-1, the alpha hint, a 3-bit version (0);
+//   §3.5    the transforms, each at most once, undone last read first: predictor (§3.5.1, 14 modes over
+//           blocks, the border rules: the first pixel black, the top row L, the left column T, the right
+//           column's TR the row's first pixel), colour (§3.5.2, three signed 3.5 fixed-point multipliers per
+//           block), subtract green (§3.5.3), colour indexing (§3.5.4, a palette, 2/4/8 pixels bundled per
+//           pixel when it has at most 16 colours, the image narrowed by width_bits);
+//   §3.6    the image data: prefix-coded literals (green, red, blue, alpha), LZ77 copies (length and distance
+//           prefix codes with extra bits, Table 4; distance codes 1..120 the neighbourhood map, Figure 20) and
+//           the colour cache (index (0x1e35a7bd * argb) >> (32 - bits), every pixel put in it);
+//   §3.7    the prefix codes: simple (1 or 2 symbols) or normal (code length code lengths in
+//           kCodeLengthCodeOrder, max_symbol, the repeat codes 16, 17, 18), canonical, a complete tree; five
+//           per group (green+length+cache, red, blue, alpha, distance), groups chosen per block by the entropy
+//           image's red and green (§3.7.2.2).
+//
+// The pixels are 32-bit ARGB words in a buffer of their own while the image is decoded and transformed; the
+// caller gets that buffer (vl_decode) and turns it into RGBA. Prefix codes are tables of 32-bit entries, an
+// 8-bit first level and second-level tables for longer codes, each entry (code length << 16) | symbol, a
+// first-level entry for a longer code (16 + its table's bits) << 16 | the table's offset. A code with one
+// symbol takes no bits.
+//
+// Truncated data reads as zero bits past the end, and the decoder stops with an error as soon as it has
+// read more bits than there are; a code that is not a complete tree, a size that is not the frame's, a distance
+// before the image's start, a cache index past the cache: each is an error, never a read outside a buffer.
+
+struct LBits { p: Int, end: Int, pos: Int, acc: Int, nb: Int, phantom: Int }
+
+fn lb_new(p: Int, n: Int) -> LBits { return LBits { p: p, end: p + n, pos: p, acc: 0, nb: 0, phantom: 0 } }
+fn lb_fill(inout b: LBits) {
+    while b.nb <= 48 {
+        if b.pos < b.end { unsafe { b.acc = b.acc | (peek8(b.pos) << b.nb) }  b.pos = b.pos + 1 }
+        else { b.phantom = b.phantom + 1 }
+        b.nb = b.nb + 8
+    }
+}
+fn lb_bits(inout b: LBits, n: Int) -> Int {
+    if n == 0 { return 0 }
+    if b.nb < n { lb_fill(b) }
+    let v = b.acc & ((1 << n) - 1)
+    b.acc = b.acc >> n
+    b.nb = b.nb - n
+    return v
+}
+/// more bits read than the data holds
+fn lb_over(b: LBits) -> Bool { return b.phantom * 8 > b.nb }
+
+// ---- prefix codes ------------------------------------------------------------------------------------------------
+
+/// a canonical prefix code from `n` code lengths at `lens` (one Int each, peek/poke): its table (malloc'd), or 0
+/// when the lengths are not a complete tree. A code with a single used symbol decodes it in zero bits.
+fn vl_build(lens: Int, n: Int) -> Int {
+    var count = 0
+    var single = 0
+    var i = 0
+    var maxl = 0
+    unsafe {
+        while i < n {
+            let l = peek(lens + i * 8)
+            if l > 0 { count = count + 1  single = i  if l > maxl { maxl = l } }
+            i = i + 1
+        }
+    }
+    if count == 0 { return 0 }
+    if count == 1 {
+        var t = 0
+        unsafe { t = malloc(256 * 4)  i = 0  while i < 256 { poke32(t + i * 4, single)  i = i + 1 } }
+        return t
+    }
+    // the Kraft sum: a complete tree, no more and no fewer leaves
+    var bl: Vec<Int> = vec()
+    i = 0
+    while i <= 15 { bl.push(0)  i = i + 1 }
+    unsafe { i = 0  while i < n { let l = peek(lens + i * 8)  if l > 15 { return 0 }  bl[l] = bl[l] + 1  i = i + 1 } }
+    var left = 1
+    var l2 = 1
+    while l2 <= 15 { left = left * 2 - bl[l2]  if left < 0 { return 0 }  l2 = l2 + 1 }
+    if left != 0 { return 0 }
+    // the first code of each length (canonical, RFC 1951 §3.2.2's way)
+    var next: Vec<Int> = vec()
+    var code = 0
+    bl[0] = 0
+    l2 = 0
+    while l2 <= 15 { next.push(0)  l2 = l2 + 1 }
+    l2 = 1
+    while l2 <= 15 { code = (code + bl[l2 - 1]) << 1  next[l2] = code  l2 = l2 + 1 }
+    // the second-level tables' sizes: for each first 8 bits (reversed), the longest code starting with them
+    var subl: Vec<Int> = vec()
+    i = 0
+    while i < 256 { subl.push(0)  i = i + 1 }
+    var codes: Vec<Int> = vec()
+    unsafe {
+        i = 0
+        while i < n {
+            let l = peek(lens + i * 8)
+            var r = 0
+            if l > 0 {
+                let c = next[l]
+                next[l] = c + 1
+                r = vl_rev(c, l)
+                if l > 8 { let root = r & 255  if l - 8 > subl[root] { subl[root] = l - 8 } }
+            }
+            codes.push(r)
+            i = i + 1
+        }
+    }
+    var size = 256
+    var offs: Vec<Int> = vec()
+    i = 0
+    while i < 256 { offs.push(size)  if subl[i] > 0 { size = size + (1 << subl[i]) }  i = i + 1 }
+    var t = 0
+    unsafe { t = malloc(size * 4) }
+    if t == 0 { return 0 }
+    unsafe {
+        i = 0
+        while i < 256 { if subl[i] > 0 { poke32(t + i * 4, ((16 + subl[i]) << 16) | offs[i]) }  i = i + 1 }
+        i = 0
+        while i < n {
+            let l = peek(lens + i * 8)
+            if l > 0 {
+                let r = codes[i]
+                if l <= 8 {
+                    var k = r
+                    while k < 256 { poke32(t + k * 4, (l << 16) | i)  k = k + (1 << l) }
+                } else {
+                    let root = r & 255
+                    let sb = subl[root]
+                    let base = t + offs[root] * 4
+                    var k = r >> 8
+                    while k < (1 << sb) { poke32(base + k * 4, ((l - 8) << 16) | i)  k = k + (1 << (l - 8)) }
+                }
+            }
+            i = i + 1
+        }
+    }
+    return t
+}
+
+fn vl_rev(c: Int, l: Int) -> Int {
+    var r = 0
+    var i = 0
+    while i < l { r = (r << 1) | ((c >> i) & 1)  i = i + 1 }
+    return r
+}
+
+/// one symbol through the table `t`
+fn vl_sym(inout b: LBits, t: Int) -> Int {
+    if b.nb < 15 { lb_fill(b) }
+    var e = 0
+    unsafe { e = peek32(t + (b.acc & 255) * 4) }
+    var l = e >> 16
+    if l > 15 {
+        let sb = l - 16
+        b.acc = b.acc >> 8
+        b.nb = b.nb - 8
+        unsafe { e = peek32(t + ((e & 65535) + (b.acc & ((1 << sb) - 1))) * 4) }
+        l = e >> 16
+    }
+    b.acc = b.acc >> l
+    b.nb = b.nb - l
+    return e & 65535
+}
+
+/// read one prefix code of an alphabet of `size` symbols (§3.7.2.1): its table, or 0 (error)
+fn vl_read_code(inout b: LBits, size: Int, lens: Int) -> Int {
+    var i = 0
+    unsafe { while i < size { poke(lens + i * 8, 0)  i = i + 1 } }
+    if lb_bits(b, 1) == 1 {
+        // simple: one or two symbols
+        let ns = lb_bits(b, 1) + 1
+        let first8 = lb_bits(b, 1)
+        let s0 = lb_bits(b, 1 + 7 * first8)
+        if s0 >= size { return 0 }
+        unsafe { poke(lens + s0 * 8, 1) }
+        if ns == 2 {
+            let s1 = lb_bits(b, 8)
+            if s1 >= size { return 0 }
+            unsafe { poke(lens + s1 * 8, 1) }
+            // two of the same symbol: one leaf, taking no bits
+        }
+        return vl_build(lens, size)
+    }
+    // normal: the code length code first
+    let order = [17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    var cl = 0
+    unsafe { cl = malloc(19 * 8)  i = 0  while i < 19 { poke(cl + i * 8, 0)  i = i + 1 } }
+    let ncl = 4 + lb_bits(b, 4)
+    i = 0
+    unsafe { while i < ncl { poke(cl + order[i] * 8, lb_bits(b, 3))  i = i + 1 } }
+    let clt = vl_build(cl, 19)
+    unsafe { free(cl) }
+    if clt == 0 { return 0 }
+    var maxsym = size
+    if lb_bits(b, 1) == 1 {
+        let lnb = 2 + 2 * lb_bits(b, 3)
+        maxsym = 2 + lb_bits(b, lnb)
+        if maxsym > size { unsafe { free(clt) }  return 0 }
+    }
+    var prev = 8
+    var sym = 0
+    var good = true
+    while sym < size && maxsym > 0 && good {
+        maxsym = maxsym - 1
+        let c = vl_sym(b, clt)
+        if c < 16 {
+            unsafe { poke(lens + sym * 8, c) }
+            sym = sym + 1
+            if c != 0 { prev = c }
+        } else {
+            var rep = 0
+            var val = 0
+            if c == 16 { rep = 3 + lb_bits(b, 2)  val = prev }
+            else if c == 17 { rep = 3 + lb_bits(b, 3) }
+            else { rep = 11 + lb_bits(b, 7) }
+            if sym + rep > size { good = false }
+            else { unsafe { while rep > 0 { poke(lens + sym * 8, val)  sym = sym + 1  rep = rep - 1 } } }
+        }
+        if lb_over(b) { good = false }
+    }
+    unsafe { free(clt) }
+    if !good { return 0 }
+    return vl_build(lens, size)
+}
+
+// ---- the image stream --------------------------------------------------------------------------------------------
+
+/// the decoder's state for one VP8L stream
+struct VL {
+    err: Str,
+    lens: Int,              // scratch for code lengths (the largest alphabet)
+    tabs: Vec<Int>,         // every code table made, freed at the end
+    dmap: Vec<Int>          // vl_dmap
+}
+
+fn vl_err(inout v: VL, s: Str) -> Int { if v.err.len() == 0 { v.err = "VP8L: " + s }  return 0 }
+
+fn vl_lz(inout b: LBits, prefix: Int) -> Int {
+    if prefix < 4 { return prefix + 1 }
+    let eb = (prefix - 2) >> 1
+    let off = (2 + (prefix & 1)) << eb
+    return off + lb_bits(b, eb) + 1
+}
+
+/// decode an entropy-coded image of xs x ys ARGB words (§3.6, §3.7). `level0`: the main image (it may have a
+/// meta prefix image). Returns its buffer (malloc'd, xs*ys*4), or 0 with v.err said.
+fn vl_image(inout v: VL, inout b: LBits, xs: Int, ys: Int, level0: Bool) -> Int {
+    var cbits = 0
+    if lb_bits(b, 1) == 1 {
+        cbits = lb_bits(b, 4)
+        if cbits < 1 || cbits > 11 { return vl_err(v, "colour cache bits " + to_str(cbits)) }
+    }
+    var csize = 0
+    if cbits > 0 { csize = 1 << cbits }
+    // the entropy image: which group each block uses
+    var pbits = 0
+    var ent = 0
+    var pw = 0
+    var ngroups = 1
+    if level0 && lb_bits(b, 1) == 1 {
+        pbits = lb_bits(b, 3) + 2
+        pw = (xs + (1 << pbits) - 1) >> pbits
+        let ph = (ys + (1 << pbits) - 1) >> pbits
+        ent = vl_image(v, b, pw, ph, false)
+        if ent == 0 { return 0 }
+        var i = 0
+        unsafe {
+            while i < pw * ph {
+                let g = (peek32(ent + i * 4) >> 8) & 65535
+                poke32(ent + i * 4, g)
+                if g + 1 > ngroups { ngroups = g + 1 }
+                i = i + 1
+            }
+        }
+    }
+    if ngroups > 65536 || lb_over(b) { if ent != 0 { unsafe { free(ent) } }  return vl_err(v, "the prefix groups") }
+    // the groups' codes, five each
+    var groups = 0
+    unsafe { groups = malloc(ngroups * 5 * 8) }
+    var g = 0
+    var good = true
+    while g < ngroups && good {
+        var k = 0
+        while k < 5 && good {
+            var size = 256
+            if k == 0 { size = 256 + 24 + csize }
+            if k == 4 { size = 40 }
+            let t = vl_read_code(b, size, v.lens)
+            if t == 0 { good = false }
+            else { v.tabs.push(t)  unsafe { poke(groups + (g * 5 + k) * 8, t) } }
+            k = k + 1
+        }
+        g = g + 1
+    }
+    if !good || lb_over(b) { unsafe { free(groups)  if ent != 0 { free(ent) } }  return vl_err(v, "a prefix code is not a complete tree, or the data ends") }
+    // the pixels
+    let total = xs * ys
+    var px = 0
+    unsafe { px = malloc(total * 4 + 4) }
+    var cache = 0
+    if csize > 0 { unsafe { cache = calloc(csize, 4) } }
+    let cshift = 32 - cbits
+    var i = 0
+    var x = 0
+    var y = 0
+    var gi = 0
+    unsafe { gi = groups }
+    let pmask = (1 << pbits) - 1
+    var last_cached = 0              // pixels before this index are in the cache
+    while i < total && good {
+        if ent != 0 && (x & pmask) == 0 {
+            unsafe { gi = groups + peek32(ent + ((y >> pbits) * pw + (x >> pbits)) * 4) * 40 }
+        }
+        var tg = 0
+        unsafe { tg = peek(gi) }
+        let s = vl_sym(b, tg)
+        if s < 256 {
+            var tr = 0  var tb = 0  var ta = 0
+            unsafe { tr = peek(gi + 8)  tb = peek(gi + 16)  ta = peek(gi + 24) }
+            let r = vl_sym(b, tr)
+            let bl = vl_sym(b, tb)
+            let a = vl_sym(b, ta)
+            unsafe { poke32(px + i * 4, (a << 24) | (r << 16) | (s << 8) | bl) }
+            i = i + 1
+            x = x + 1
+            if x == xs { x = 0  y = y + 1  if lb_over(b) { good = false } }
+        } else if s < 280 {
+            let len = vl_lz(b, s - 256)
+            var td = 0
+            unsafe { td = peek(gi + 32) }
+            let dc = vl_lz(b, vl_sym(b, td))
+            var dist = 0
+            if dc > 120 { dist = dc - 120 }
+            else {
+                let m = v.dmap[dc - 1]
+                dist = (m >> 8) - 8 + (m & 255) * xs
+                if dist < 1 { dist = 1 }
+            }
+            if dist > i || i + len > total { good = false  vl_err(v, "a copy from before the image or past its end") }
+            else {
+                var k = 0
+                unsafe { while k < len { poke32(px + (i + k) * 4, peek32(px + (i + k - dist) * 4))  k = k + 1 } }
+                i = i + len
+                x = x + len
+                while x >= xs { x = x - xs  y = y + 1 }
+                if ent != 0 { unsafe { gi = groups + peek32(ent + ((y >> pbits) * pw + (x >> pbits)) * 4) * 40 } }
+                if lb_over(b) { good = false }
+            }
+        } else {
+            let ci = s - 280
+            if ci >= csize { good = false  vl_err(v, "a colour cache index past the cache") }
+            else {
+                // the cache holds every pixel before this one
+                unsafe {
+                    while last_cached < i { let c = peek32(px + last_cached * 4)  poke32(cache + (((c * 506832829) & 4294967295) >> cshift) * 4, c)  last_cached = last_cached + 1 }
+                    poke32(px + i * 4, peek32(cache + ci * 4))
+                }
+                i = i + 1
+                x = x + 1
+                if x == xs { x = 0  y = y + 1  if lb_over(b) { good = false } }
+            }
+        }
+    }
+    if good && lb_over(b) { good = false }
+    unsafe {
+        free(groups)
+        if ent != 0 { free(ent) }
+        if cache != 0 { free(cache) }
+    }
+    if !good { unsafe { free(px) }  return vl_err(v, "the image data is damaged or ends early") }
+    return px
+}
+
+/// the neighbourhood map (§3.6.2.2.1, Figure 20): code k (0..119) as (xi + 8) << 8 | yi
+fn vl_dmap() -> Vec<Int> {
+    let m: Vec<Int> = [2049, 2304, 2305, 1793, 2050, 2560, 2306, 1794, 2561, 1537, 2562, 1538, 2051, 2816, 2307, 1795, 2817, 1281, 2563, 1539, 2818, 1282, 2052, 3072,
+             2308, 1796, 3073, 1025, 2819, 1283, 2564, 1540, 3074, 1026, 2053, 2820, 1284, 3075, 1027, 3328, 2309, 1797, 3329, 769, 2565, 1541, 3330, 770,
+             3076, 1028, 2821, 1285, 3331, 771, 2054, 3584, 2310, 1798, 3585, 513, 2566, 1542, 3586, 514, 3077, 1029, 3332, 772, 2822, 1286, 3587, 515,
+             2055, 3840, 2311, 1799, 3333, 773, 3841, 257, 3078, 1030, 3588, 516, 2567, 1543, 3842, 258, 2823, 1287, 3843, 259, 3334, 774, 3589, 517,
+             4096, 3079, 1031, 3844, 260, 4097, 4098, 3590, 518, 4099, 3335, 775, 3845, 261, 4100, 3591, 519, 3846, 262, 4101, 3847, 263, 4102, 4103]
+    return copy m
+}
+
+// ---- the stream: header, transforms, image, transforms undone ----------------------------------------------------
+
+/// a decoded VP8L image: w*h ARGB words at px (malloc'd), or px 0 and err said
+struct VLOut { px: Int, w: Int, h: Int, err: Str }
+
+/// decode the VP8L stream of `n` bytes at `p`. `header`: it starts with the signature and size (a VP8L chunk);
+/// otherwise (an ALPH chunk's lossless data) it is the image stream alone, of the size given.
+fn vl_decode(p: Int, n: Int, w0: Int, h0: Int, header: Bool) -> VLOut {
+    var b = lb_new(p, n)
+    var w = w0
+    var h = h0
+    if header {
+        if n < 5 { return VLOut { px: 0, w: 0, h: 0, err: "VP8L: truncated header" } }
+        if lb_bits(b, 8) != 47 { return VLOut { px: 0, w: 0, h: 0, err: "VP8L: no signature" } }
+        w = lb_bits(b, 14) + 1
+        h = lb_bits(b, 14) + 1
+        let _alpha = lb_bits(b, 1)
+        if lb_bits(b, 3) != 0 { return VLOut { px: 0, w: 0, h: 0, err: "VP8L: version is not 0" } }
+        if (w0 > 0 && w != w0) || (h0 > 0 && h != h0) { return VLOut { px: 0, w: 0, h: 0, err: "VP8L: the image is not the frame's size" } }
+    }
+    if w <= 0 || h <= 0 || w * h > ANIM_MAX_PX() { return VLOut { px: 0, w: 0, h: 0, err: "VP8L: size " + to_str(w) + "x" + to_str(h) } }
+    var tv: Vec<Int> = vec()
+    var v = VL { err: "", lens: 0, tabs: tv, dmap: vl_dmap() }
+    unsafe { v.lens = malloc((256 + 24 + 2048) * 8) }
+    // the transforms, in the order read: type, bits, data (a sub-image, or the colour table), its width
+    var ttype: Vec<Int> = vec()
+    var tbits: Vec<Int> = vec()
+    var tdata: Vec<Int> = vec()
+    var tsize: Vec<Int> = vec()
+    var xs = w
+    var seen = 0
+    var good = true
+    while good && lb_bits(b, 1) == 1 {
+        let t = lb_bits(b, 2)
+        if (seen & (1 << t)) != 0 { good = false  vl_err(v, "transform " + to_str(t) + " twice") }
+        else {
+            seen = seen | (1 << t)
+            var bits = 0
+            var data = 0
+            var size = 0
+            if t == 0 || t == 1 {
+                bits = lb_bits(b, 3) + 2
+                let bw = (xs + (1 << bits) - 1) >> bits
+                let bh = (h + (1 << bits) - 1) >> bits
+                data = vl_image(v, b, bw, bh, false)
+                if data == 0 { good = false }
+            } else if t == 3 {
+                size = lb_bits(b, 8) + 1
+                data = vl_image(v, b, size, 1, false)
+                if data == 0 { good = false }
+                else {
+                    // the table is coded as differences: each entry adds the one before it, per channel
+                    var i = 1
+                    unsafe {
+                        while i < size {
+                            let a = peek32(data + i * 4)
+                            let pr = peek32(data + (i - 1) * 4)
+                            poke32(data + i * 4, vl_addpx(a, pr))
+                            i = i + 1
+                        }
+                    }
+                    if size <= 2 { bits = 3 } else if size <= 4 { bits = 2 } else if size <= 16 { bits = 1 }
+                }
+            }
+            ttype.push(t)  tbits.push(bits)  tdata.push(data)  tsize.push(size)
+            if t == 3 { xs = (xs + (1 << bits) - 1) >> bits }
+        }
+    }
+    var px = 0
+    if good { px = vl_image(v, b, xs, h, true)  if px == 0 { good = false } }
+    // the transforms undone, the last read first
+    var k = ttype.len() - 1
+    while good && k >= 0 {
+        let t = ttype[k]
+        if t == 0 { vl_predict(px, xs, h, tbits[k], tdata[k]) }
+        else if t == 1 { vl_colour(px, xs, h, tbits[k], tdata[k]) }
+        else if t == 2 {
+            var i = 0
+            unsafe {
+                while i < xs * h {
+                    let c = peek32(px + i * 4)
+                    let g = (c >> 8) & 255
+                    poke32(px + i * 4, (c & 4278255360) | ((((c >> 16) + g) & 255) << 16) | ((c + g) & 255))
+                    i = i + 1
+                }
+            }
+        } else {
+            // the width before this transform narrowed it
+            var wide = w
+            var j = 0
+            while j < k { if ttype[j] == 3 { wide = (wide + (1 << tbits[j]) - 1) >> tbits[j] }  j = j + 1 }
+            let np = vl_index(px, xs, wide, h, tbits[k], tdata[k], tsize[k])
+            unsafe { free(px) }
+            px = np
+            xs = wide
+        }
+        k = k - 1
+    }
+    var i = 0
+    unsafe {
+        while i < tdata.len() { if tdata[i] != 0 { free(tdata[i]) }  i = i + 1 }
+        i = 0
+        while i < v.tabs.len() { free(v.tabs[i])  i = i + 1 }
+        free(v.lens)
+    }
+    if !good { if px != 0 { unsafe { free(px) } }  return VLOut { px: 0, w: 0, h: 0, err: copy v.err } }
+    return VLOut { px: px, w: w, h: h, err: "" }
+}
+
+/// two ARGB words added per channel (mod 256)
+fn vl_addpx(a: Int, b: Int) -> Int {
+    return ((((a >> 24) + (b >> 24)) & 255) << 24) | (((((a >> 16) & 255) + ((b >> 16) & 255)) & 255) << 16) |
+           (((((a >> 8) & 255) + ((b >> 8) & 255)) & 255) << 8) | (((a & 255) + (b & 255)) & 255)
+}
+fn vl_avg2(a: Int, b: Int) -> Int {
+    // per channel (a + b) / 2: the halves of each byte added, the carry of the two low bits
+    return (((a ^ b) & 4278124286) >> 1) + (a & b)
+}
+fn vl_clamp(v: Int) -> Int { if v < 0 { return 0 }  if v > 255 { return 255 }  return v }
+fn vl_select(l: Int, t: Int, tl: Int) -> Int {
+    var pl = 0
+    var pt = 0
+    var s = 0
+    while s < 32 {
+        let cl = (l >> s) & 255
+        let ct = (t >> s) & 255
+        let ctl = (tl >> s) & 255
+        let pr = cl + ct - ctl
+        var dl = pr - cl  if dl < 0 { dl = 0 - dl }
+        var dt = pr - ct  if dt < 0 { dt = 0 - dt }
+        pl = pl + dl
+        pt = pt + dt
+        s = s + 8
+    }
+    if pl < pt { return l }
+    return t
+}
+fn vl_full(l: Int, t: Int, tl: Int) -> Int {
+    var r = 0
+    var s = 0
+    while s < 32 { r = r | (vl_clamp(((l >> s) & 255) + ((t >> s) & 255) - ((tl >> s) & 255)) << s)  s = s + 8 }
+    return r
+}
+fn vl_half(a: Int, b: Int) -> Int {
+    var r = 0
+    var s = 0
+    while s < 32 {
+        let ca = (a >> s) & 255
+        let cb = (b >> s) & 255
+        r = r | (vl_clamp(ca + (ca - cb) / 2) << s)
+        s = s + 8
+    }
+    return r
+}
+
+/// the predictor transform undone (§3.5.1), in place, in scan order
+fn vl_predict(px: Int, w: Int, h: Int, bits: Int, modes: Int) {
+    let bw = (w + (1 << bits) - 1) >> bits
+    unsafe {
+        // the first pixel: black; the top row: L
+        poke32(px, vl_addpx(peek32(px), 4278190080))
+        var x = 1
+        while x < w { poke32(px + x * 4, vl_addpx(peek32(px + x * 4), peek32(px + (x - 1) * 4)))  x = x + 1 }
+        var y = 1
+        while y < h {
+            let row = px + y * w * 4
+            let up = row - w * 4
+            // the left column: T
+            poke32(row, vl_addpx(peek32(row), peek32(up)))
+            x = 1
+            while x < w {
+                let mode = (peek32(modes + ((y >> bits) * bw + (x >> bits)) * 4) >> 8) & 15
+                // the block's run of pixels with this mode
+                var xe = ((x >> bits) + 1) << bits
+                if xe > w { xe = w }
+                while x < xe {
+                    let o = x * 4
+                    var pr = 0
+                    if mode == 0 { pr = 4278190080 }
+                    else if mode == 1 { pr = peek32(row + o - 4) }
+                    else if mode == 2 { pr = peek32(up + o) }
+                    else if mode == 3 { pr = peek32(up + o + 4) }
+                    else if mode == 4 { pr = peek32(up + o - 4) }
+                    else if mode == 5 { pr = vl_avg2(vl_avg2(peek32(row + o - 4), peek32(up + o + 4)), peek32(up + o)) }
+                    else if mode == 6 { pr = vl_avg2(peek32(row + o - 4), peek32(up + o - 4)) }
+                    else if mode == 7 { pr = vl_avg2(peek32(row + o - 4), peek32(up + o)) }
+                    else if mode == 8 { pr = vl_avg2(peek32(up + o - 4), peek32(up + o)) }
+                    else if mode == 9 { pr = vl_avg2(peek32(up + o), peek32(up + o + 4)) }
+                    else if mode == 10 { pr = vl_avg2(vl_avg2(peek32(row + o - 4), peek32(up + o - 4)), vl_avg2(peek32(up + o), peek32(up + o + 4))) }
+                    else if mode == 11 { pr = vl_select(peek32(row + o - 4), peek32(up + o), peek32(up + o - 4)) }
+                    else if mode == 12 { pr = vl_full(peek32(row + o - 4), peek32(up + o), peek32(up + o - 4)) }
+                    else { pr = vl_half(vl_avg2(peek32(row + o - 4), peek32(up + o)), peek32(up + o - 4)) }
+                    poke32(row + o, vl_addpx(peek32(row + o), pr))
+                    x = x + 1
+                }
+            }
+            y = y + 1
+        }
+    }
+}
+
+fn vl_s8(v: Int) -> Int { if v >= 128 { return v - 256 }  return v }
+
+/// the colour transform undone (§3.5.2)
+fn vl_colour(px: Int, w: Int, h: Int, bits: Int, el: Int) {
+    let bw = (w + (1 << bits) - 1) >> bits
+    var y = 0
+    unsafe {
+        while y < h {
+            var x = 0
+            while x < w {
+                let e = peek32(el + ((y >> bits) * bw + (x >> bits)) * 4)
+                let g2r = vl_s8(e & 255)
+                let g2b = vl_s8((e >> 8) & 255)
+                let r2b = vl_s8((e >> 16) & 255)
+                var xe = ((x >> bits) + 1) << bits
+                if xe > w { xe = w }
+                while x < xe {
+                    let p = px + (y * w + x) * 4
+                    let c = peek32(p)
+                    let g = vl_s8((c >> 8) & 255)
+                    var r = (c >> 16) & 255
+                    var b = c & 255
+                    r = (r + ((g2r * g) >> 5)) & 255
+                    b = (b + ((g2b * g) >> 5)) & 255
+                    b = (b + ((r2b * vl_s8(r)) >> 5)) & 255
+                    poke32(p, (c & 4278255360) | (r << 16) | b)
+                    x = x + 1
+                }
+            }
+            y = y + 1
+        }
+    }
+}
+
+/// the colour indexing transform undone (§3.5.4): a new buffer `wide` pixels wide
+fn vl_index(px: Int, xs: Int, wide: Int, h: Int, bits: Int, table: Int, size: Int) -> Int {
+    var out = 0
+    unsafe { out = malloc(wide * h * 4 + 4) }
+    let per = 1 << bits
+    let ib = 8 >> bits
+    let imask = (1 << ib) - 1
+    var y = 0
+    unsafe {
+        while y < h {
+            var x = 0
+            while x < wide {
+                let packed = (peek32(px + (y * xs + (x >> bits)) * 4) >> 8) & 255
+                let idx = (packed >> ((x & (per - 1)) * ib)) & imask
+                var c = 0
+                if idx < size { c = peek32(table + idx * 4) }
+                poke32(out + (y * wide + x) * 4, c)
+                x = x + 1
+            }
+            y = y + 1
+        }
+    }
+    return out
+}

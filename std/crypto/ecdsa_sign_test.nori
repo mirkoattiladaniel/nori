@@ -1,0 +1,91 @@
+// .nori tests for ECDSA signing, run with
+//   noric --test std/crypto/ecdsa_sign_test.nori compiler/runtime.nori --import-root .
+//
+// The answers are RFC 6979's own published vectors. They fix the signature byte for byte, so
+// they pin the deterministic nonce derivation as well as the curve arithmetic. A randomised
+// signer can only be checked by verifying what it produced, and that check passes just as
+// happily when the nonce is derived wrongly, including when it is derived identically for two
+// different messages, which hands over the private key.
+//
+// The project's test suite also cross-checks fresh keys and messages against OpenSSL.
+import "std/crypto" as crypto
+
+fn hexv(c: Byte) -> Int {
+    let o = ord(c)
+    if o >= 97 { return (o - 87) }
+    if o >= 65 { return (o - 55) }
+    return (o - 48)
+}
+fn unhex(h: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < h.len() { out = (out + chr(((hexv(h.at(i)) << 4) | hexv(h.at(i + 1)))))  i = i + 2 }
+    return out
+}
+fn tohex(s: Str) -> Str {
+    let d = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < s.len() { let b = ord(s.at(i))  out = ((out + d.at((b >> 4))) + d.at((b & 15)))  i = i + 1 }
+    return out
+}
+
+fn rfc6979_key() -> Str {
+    return unhex("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721")
+}
+
+fn test_public_key_from_private() {
+    // RFC 6979 A.2.5
+    assert_streq(tohex(crypto::ecdsa_public(crypto::ec_p256(), rfc6979_key())),
+        "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299")
+}
+
+fn test_rfc6979_signatures() {
+    let c = crypto::ec_p256()
+    let d = rfc6979_key()
+    // "sample" with SHA-256
+    assert_streq(tohex(crypto::ecdsa_sign(c, d, crypto::sha256_raw("sample"))),
+        "efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8")
+    // "test" with SHA-256
+    assert_streq(tohex(crypto::ecdsa_sign(c, d, crypto::sha256_raw("test"))),
+        "f1abb023518351cd71d881567b1ea663ed3efcf6c5132b354f28d3b0b7d38367019f4113742a2b14bd25926b49c649155f267e60d3814b4c0cc84250e46f0083")
+}
+
+fn test_deterministic() {
+    // the same message signs identically every time. Not a nicety: it is the property that makes
+    // a repeated nonce impossible, and a repeated nonce is how a private key is recovered from
+    // two signatures.
+    let c = crypto::ec_p256()
+    let d = rfc6979_key()
+    let a = crypto::ecdsa_sign(c, d, crypto::sha256_raw("sample"))
+    let b = crypto::ecdsa_sign(c, d, crypto::sha256_raw("sample"))
+    assert_streq(tohex(a), tohex(b))
+    // and two different messages must not share a nonce, which would show as an equal r
+    let e = crypto::ecdsa_sign(c, d, crypto::sha256_raw("test"))
+    assert_true(tohex(a.slice(0, 32)) != tohex(e.slice(0, 32)))
+}
+
+fn test_sign_then_verify() {
+    let c = crypto::ec_p256()
+    let d = rfc6979_key()
+    let pub = crypto::ecdsa_public(c, d)
+    let dg = crypto::sha256_raw("a signed statement")
+    let sig = crypto::ecdsa_sign(c, d, dg)
+    assert_true(crypto::ecdsa_verify(c, pub, dg, sig.slice(0, 32), sig.slice(32, 64)))
+    // a different message, the same signature: refused
+    assert_true(!crypto::ecdsa_verify(c, pub, crypto::sha256_raw("another statement"), sig.slice(0, 32), sig.slice(32, 64)))
+    // one bit of the signature flipped: refused
+    var bad = sig.slice(0, 63) + chr((ord(sig.at(63)) ^ 1))
+    assert_true(!crypto::ecdsa_verify(c, pub, dg, bad.slice(0, 32), bad.slice(32, 64)))
+}
+
+fn test_refuses_bad_private_keys() {
+    let c = crypto::ec_p256()
+    // zero is not a scalar
+    assert_true(!crypto::ecdsa_valid_private(c, unhex("0000000000000000000000000000000000000000000000000000000000000000")))
+    assert_streq(crypto::ecdsa_sign(c, unhex("0000000000000000000000000000000000000000000000000000000000000000"), crypto::sha256_raw("x")), "")
+    // n itself, and anything above it, is not a scalar either
+    assert_true(!crypto::ecdsa_valid_private(c, unhex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")))
+    assert_true(!crypto::ecdsa_valid_private(c, unhex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")))
+    assert_true(crypto::ecdsa_valid_private(c, rfc6979_key()))
+}

@@ -1,0 +1,765 @@
+// Constant expression evaluation over the token cursor s.xt/s.xp, shared by `#if` (s.ev_pp: every
+// value is 64-bit, identifiers read as 0) and the parser (enum values, array lengths, bitfield
+// widths, `#define` constants: C's int/long typing, casts, sizeof, enumerators).
+//
+// A value is an Int plus its type in s.ev_sz (4 or 8 bytes) and s.ev_uns, or a Float in s.ev_fv
+// when s.ev_isf. Anything that is not a constant sets s.ev_fail. Inside an operand that is not
+// evaluated (the dead side of `&&`, `||`, `?:`), s.ev_skip is non-zero and division by zero is not
+// an error.
+
+fn cev_min() -> Int { return 9223372036854775807 + 1 }
+
+fn cev_id(s: St) -> Int { return ctk_id(s.xt[s.xp]) }
+fn cev_kind(s: St) -> Int { return ctk_kind(s.xt[s.xp]) }
+fn cev_is_punct(s: St, id: Int) -> Bool {
+    let t = s.xt[s.xp]
+    return ctk_kind(t) == TK_PUNCT && ctk_id(t) == id
+}
+
+fn cev_fail(inout s: St) { s.ev_fail = true }
+
+// `v` wrapped to a value of `sz` bytes with the given signedness
+fn cev_norm(v: Int, sz: Int, uns: Bool) -> Int {
+    if sz >= 8 { return v }
+    var bits = sz * 8
+    let m = (1 << bits) - 1
+    var w = v & m
+    if !uns && w >= (1 << (bits - 1)) { w = w - (1 << bits) }
+    return w
+}
+
+// unsigned 64-bit comparison a < b
+fn cev_ult(a: Int, b: Int) -> Bool { return (a ^ cev_min()) < (b ^ cev_min()) }
+
+fn cev_udiv(a: Int, b: Int) -> Int {
+    if b < 0 { if cev_ult(a, b) { return 0 }  return 1 }
+    if a >= 0 { return a / b }
+    var q = (((a >> 1) & 9223372036854775807) / b) << 1
+    let r = a - q * b
+    if !cev_ult(r, b) { q = q + 1 }
+    return q
+}
+
+fn cev_set(inout s: St, v: Int, sz: Int, uns: Bool) -> Int {
+    s.ev_sz = sz
+    s.ev_uns = uns
+    s.ev_isf = false
+    return v
+}
+
+fn cev_setf(inout s: St, f: Float) -> Int {
+    s.ev_isf = true
+    s.ev_fv = f
+    s.ev_sz = 8
+    s.ev_uns = false
+    return 0
+}
+
+fn cev_int_type(s: St) -> Int { if s.ev_pp { return 8 }  return 4 }
+
+// Evaluate a whole token list on its own (every token located at `loc`), in preprocessor mode when
+// `pp`. The parser's cursor is put back afterwards. s.ev_fail is set when the tokens are not one
+// constant expression.
+fn cev_eval_tokens(inout s: St, toks: Vec<Int>, loc: Int, pp: Bool) -> Int {
+    var xt: Vec<Int> = vec()
+    var xl: Vec<Int> = vec()
+    foreach t in toks { xt.push(t)  xl.push(loc) }
+    var e = 0
+    while e < 2 { xt.push(ctk_make(0, TK_EOF, 0))  xl.push(loc)  e = e + 1 }
+    let saved_t = sink s.xt
+    let saved_l = sink s.xl
+    let saved_p = s.xp
+    let saved_pp = s.ev_pp
+    s.xt = sink xt
+    s.xl = sink xl
+    s.xp = 0
+    s.ev_pp = pp
+    s.ev_fail = false
+    s.ev_skip = 0
+    s.perr = false
+    let v = cev_comma(s)
+    if s.perr || ctk_kind(s.xt[s.xp]) != TK_EOF { s.ev_fail = true }
+    s.perr = false
+    s.ev_pp = saved_pp
+    s.xt = sink saved_t
+    s.xl = sink saved_l
+    s.xp = saved_p
+    return v
+}
+
+// ── expressions ──────────────────────────────────────────────────────────────────────────────────
+
+// expression with the comma operator
+fn cev_comma(inout s: St) -> Int {
+    var v = cev_cond(s)
+    while cev_is_punct(s, P_COMMA) {
+        s.xp = s.xp + 1
+        v = cev_cond(s)
+    }
+    return v
+}
+
+// conditional-expression
+fn cev_cond(inout s: St) -> Int {
+    let c = cev_binary(s, 1)
+    if !cev_is_punct(s, P_QUESTION) { return c }
+    var truth = c != 0
+    if s.ev_isf { truth = s.ev_fv != 0.0 }
+    s.xp = s.xp + 1
+    if !truth { s.ev_skip = s.ev_skip + 1 }
+    let a = cev_comma(s)
+    if !truth { s.ev_skip = s.ev_skip - 1 }
+    let asz = s.ev_sz
+    let au = s.ev_uns
+    let af = s.ev_isf
+    let afv = s.ev_fv
+    if !cev_is_punct(s, P_COLON) { cev_fail(s)  return 0 }
+    s.xp = s.xp + 1
+    if truth { s.ev_skip = s.ev_skip + 1 }
+    let b = cev_cond(s)
+    if truth { s.ev_skip = s.ev_skip - 1 }
+    let bsz = s.ev_sz
+    let bu = s.ev_uns
+    let bf = s.ev_isf
+    let bfv = s.ev_fv
+    if af || bf {
+        var fa = afv
+        if !af { fa = to_float(a) }
+        var fb = bfv
+        if !bf { fb = to_float(b) }
+        if truth { return cev_setf(s, fa) }
+        return cev_setf(s, fb)
+    }
+    var sz = asz
+    if bsz > sz { sz = bsz }
+    var uns = au || bu
+    if asz != bsz { if asz > bsz { uns = au } else { uns = bu } }
+    if truth { return cev_set(s, cev_norm(a, sz, uns), sz, uns) }
+    return cev_set(s, cev_norm(b, sz, uns), sz, uns)
+}
+
+fn cev_prec(t: Int) -> Int {
+    if ctk_kind(t) != TK_PUNCT { return 0 }
+    let id = ctk_id(t)
+    if id == P_OROR { return 1 }
+    if id == P_ANDAND { return 2 }
+    if id == P_PIPE { return 3 }
+    if id == P_CARET { return 4 }
+    if id == P_AMP { return 5 }
+    if id == P_EQ || id == P_NE { return 6 }
+    if id == P_LT || id == P_GT || id == P_LE || id == P_GE { return 7 }
+    if id == P_SHL || id == P_SHR { return 8 }
+    if id == P_PLUS || id == P_MINUS { return 9 }
+    if id == P_STAR || id == P_SLASH || id == P_PERCENT { return 10 }
+    return 0
+}
+
+// binary operators of precedence `minp` and above
+fn cev_binary(inout s: St, minp: Int) -> Int {
+    var l = cev_unary(s)
+    var lsz = s.ev_sz
+    var lu = s.ev_uns
+    var lf = s.ev_isf
+    var lfv = s.ev_fv
+    while true {
+        let t = s.xt[s.xp]
+        let p = cev_prec(t)
+        if p == 0 || p < minp { break }
+        let op = ctk_id(t)
+        s.xp = s.xp + 1
+        var ltruth = l != 0
+        if lf { ltruth = lfv != 0.0 }
+        let skip_r = (op == P_ANDAND && !ltruth) || (op == P_OROR && ltruth)
+        if skip_r { s.ev_skip = s.ev_skip + 1 }
+        let r = cev_binary(s, p + 1)
+        if skip_r { s.ev_skip = s.ev_skip - 1 }
+        let rsz = s.ev_sz
+        let ru = s.ev_uns
+        let rf = s.ev_isf
+        let rfv = s.ev_fv
+        let isz = cev_int_type(s)
+        if op == P_ANDAND || op == P_OROR {
+            var rtruth = r != 0
+            if rf { rtruth = rfv != 0.0 }
+            var res = 0
+            if op == P_ANDAND && ltruth && rtruth { res = 1 }
+            if op == P_OROR && (ltruth || rtruth) { res = 1 }
+            l = res  lsz = isz  lu = false  lf = false
+            continue
+        }
+        if lf || rf {
+            var fa = lfv
+            if !lf { if lu && l < 0 { fa = to_float((l >> 1) & 9223372036854775807) * 2.0 } else { fa = to_float(l) } }
+            var fb = rfv
+            if !rf { if ru && r < 0 { fb = to_float((r >> 1) & 9223372036854775807) * 2.0 } else { fb = to_float(r) } }
+            var cmp = 0 - 1
+            if op == P_PLUS { lfv = fa + fb }
+            else if op == P_MINUS { lfv = fa - fb }
+            else if op == P_STAR { lfv = fa * fb }
+            else if op == P_SLASH { if fb == 0.0 { if s.ev_skip == 0 { cev_fail(s) }  lfv = 0.0 } else { lfv = fa / fb } }
+            else if op == P_LT { if fa < fb { cmp = 1 } else { cmp = 0 } }
+            else if op == P_GT { if fa > fb { cmp = 1 } else { cmp = 0 } }
+            else if op == P_LE { if fa <= fb { cmp = 1 } else { cmp = 0 } }
+            else if op == P_GE { if fa >= fb { cmp = 1 } else { cmp = 0 } }
+            else if op == P_EQ { if fa == fb { cmp = 1 } else { cmp = 0 } }
+            else if op == P_NE { if fa != fb { cmp = 1 } else { cmp = 0 } }
+            else { cev_fail(s) }
+            if cmp >= 0 { l = cmp  lsz = isz  lu = false  lf = false } else { lf = true  lsz = 8  lu = false }
+            continue
+        }
+        if op == P_SHL || op == P_SHR {
+            var v = 0
+            if r >= 0 && r < lsz * 8 {
+                if op == P_SHL { v = cev_norm(l << r, lsz, lu) }
+                else if lu && lsz == 8 && r > 0 { v = (l >> r) & ((1 << (64 - r)) - 1) }
+                else { v = l >> r }
+            }
+            l = v
+            continue
+        }
+        var sz = lsz
+        if rsz > sz { sz = rsz }
+        var uns = lu || ru
+        if lsz != rsz { if lsz > rsz { uns = lu } else { uns = ru } }
+        let a = cev_norm(l, sz, uns)
+        let b = cev_norm(r, sz, uns)
+        var res2 = 0
+        var cmp2 = false
+        if op == P_PLUS { res2 = a + b }
+        else if op == P_MINUS { res2 = a - b }
+        else if op == P_STAR { res2 = a * b }
+        else if op == P_AMP { res2 = a & b }
+        else if op == P_PIPE { res2 = a | b }
+        else if op == P_CARET { res2 = a ^ b }
+        else if op == P_SLASH || op == P_PERCENT {
+            if b == 0 {
+                if s.ev_skip == 0 { cev_fail(s) }
+                res2 = 0
+            } else if uns && sz == 8 {
+                let q = cev_udiv(a, b)
+                if op == P_SLASH { res2 = q } else { res2 = a - q * b }
+            } else if a == cev_min() && b == 0 - 1 {
+                if op == P_SLASH { res2 = a } else { res2 = 0 }
+            } else {
+                if op == P_SLASH { res2 = a / b } else { res2 = a % b }
+            }
+        } else {
+            cmp2 = true
+            var lt = a < b
+            if uns && sz == 8 { lt = cev_ult(a, b) }
+            var gt = b < a
+            if uns && sz == 8 { gt = cev_ult(b, a) }
+            var rb = false
+            if op == P_LT { rb = lt }
+            if op == P_GT { rb = gt }
+            if op == P_LE { rb = !gt }
+            if op == P_GE { rb = !lt }
+            if op == P_EQ { rb = a == b }
+            if op == P_NE { rb = a != b }
+            if rb { res2 = 1 }
+        }
+        if cmp2 { l = res2  lsz = isz  lu = false }
+        else { l = cev_norm(res2, sz, uns)  lsz = sz  lu = uns }
+    }
+    s.ev_sz = lsz
+    s.ev_uns = lu
+    s.ev_isf = lf
+    s.ev_fv = lfv
+    return l
+}
+
+// unary operators, casts, sizeof, and primaries
+fn cev_unary(inout s: St) -> Int {
+    let t = s.xt[s.xp]
+    let k = ctk_kind(t)
+    let id = ctk_id(t)
+    if k == TK_PUNCT {
+        if id == P_MINUS || id == P_PLUS || id == P_NOT || id == P_TILDE {
+            s.xp = s.xp + 1
+            let v = cev_unary(s)
+            if id == P_PLUS { return v }
+            if id == P_NOT {
+                var z = v == 0
+                if s.ev_isf { z = s.ev_fv == 0.0 }
+                var r = 0
+                if z { r = 1 }
+                return cev_set(s, r, cev_int_type(s), false)
+            }
+            if s.ev_isf {
+                if id == P_MINUS { return cev_setf(s, 0.0 - s.ev_fv) }
+                cev_fail(s)
+                return 0
+            }
+            if id == P_MINUS { return cev_norm(0 - v, s.ev_sz, s.ev_uns) }
+            return cev_norm(v ^ (0 - 1), s.ev_sz, s.ev_uns)
+        }
+        if id == P_LPAREN {
+            if !s.ev_pp && cps_is_type_start(s, s.xp + 1) {
+                s.xp = s.xp + 1
+                let ty = cps_type_name(s)
+                if s.perr || !cev_is_punct(s, P_RPAREN) { s.perr = false  cev_fail(s)  return 0 }
+                s.xp = s.xp + 1
+                if cev_is_punct(s, P_LBRACE) { cev_fail(s)  return 0 }
+                let v2 = cev_unary(s)
+                return cev_cast(s, v2, ty)
+            }
+            s.xp = s.xp + 1
+            let v3 = cev_comma(s)
+            if !cev_is_punct(s, P_RPAREN) { cev_fail(s)  return v3 }
+            s.xp = s.xp + 1
+            return cev_postfix(s, v3)
+        }
+        cev_fail(s)
+        return 0
+    }
+    if k == TK_IDENT && !s.ev_pp {
+        if id == KW_sizeof { return cev_sizeof(s) }
+        if id == KW_UAlignof || id == KW_UUalignof__ || id == KW_alignof || id == KW_UUalignof {
+            s.xp = s.xp + 1
+            if cev_is_punct(s, P_LPAREN) && cps_is_type_start(s, s.xp + 1) {
+                s.xp = s.xp + 1
+                let ty2 = cps_type_name(s)
+                if s.perr || !cev_is_punct(s, P_RPAREN) { s.perr = false  cev_fail(s)  return 0 }
+                s.xp = s.xp + 1
+                return cev_set(s, alignof(s.unit, ty2), 8, true)
+            }
+            cev_fail(s)
+            return 0
+        }
+        if id == KW_UUbuiltin_offsetof { return cev_offsetof(s) }
+        if id == KW_UUextension__ { s.xp = s.xp + 1  return cev_unary(s) }
+    }
+    return cev_postfix(s, cev_primary(s))
+}
+
+// anything after a primary that would make it a non-constant: a call, a subscript, a member
+fn cev_postfix(inout s: St, v: Int) -> Int {
+    let t = s.xt[s.xp]
+    if ctk_kind(t) == TK_PUNCT {
+        let id = ctk_id(t)
+        if id == P_LPAREN || id == P_LBRACK || id == P_DOT || id == P_ARROW { cev_fail(s) }
+    }
+    return v
+}
+
+fn cev_primary(inout s: St) -> Int {
+    let t = s.xt[s.xp]
+    let k = ctk_kind(t)
+    let id = ctk_id(t)
+    if k == TK_NUM {
+        s.xp = s.xp + 1
+        return cev_number(s, s.names[id])
+    }
+    if k == TK_CHAR {
+        s.xp = s.xp + 1
+        return cev_char(s, s.names[id])
+    }
+    if k == TK_IDENT {
+        s.xp = s.xp + 1
+        if s.ev_pp {
+            // an unknown operator such as clang's `__building_module(M)` reads as 0, arguments and all
+            if cev_is_punct(s, P_LPAREN) {
+                var depth = 0
+                var go = true
+                while go && ctk_kind(s.xt[s.xp]) != TK_EOF {
+                    if cev_is_punct(s, P_LPAREN) { depth = depth + 1 }
+                    if cev_is_punct(s, P_RPAREN) { depth = depth - 1  if depth == 0 { go = false } }
+                    s.xp = s.xp + 1
+                }
+            }
+            return cev_set(s, 0, 8, false)
+        }
+        if s.econst.has(id) {
+            let v = s.econst[id] else 0
+            if v >= 0 - 2147483648 && v <= 2147483647 { return cev_set(s, v, 4, false) }
+            if v >= 0 && v <= 4294967295 { return cev_set(s, v, 4, true) }
+            return cev_set(s, v, 8, false)
+        }
+        cev_fail(s)
+        return 0
+    }
+    if k == TK_STR {
+        while ctk_kind(s.xt[s.xp]) == TK_STR { s.xp = s.xp + 1 }
+    } else if k != TK_EOF {
+        s.xp = s.xp + 1
+    }
+    cev_fail(s)
+    return 0
+}
+
+// convert a value to type `ty`
+fn cev_cast(inout s: St, v: Int, ty: Int) -> Int {
+    let rt = resolve(s.unit, ty)
+    let k = s.unit.types[rt].kind
+    if k == K_VOID { return cev_set(s, 0, 4, false) }
+    if k >= K_FLOAT && k <= K_FLOAT16 {
+        if s.ev_isf { return 0 }
+        if s.ev_uns && v < 0 { return cev_setf(s, to_float((v >> 1) & 9223372036854775807) * 2.0) }
+        return cev_setf(s, to_float(v))
+    }
+    var iv = v
+    if s.ev_isf { iv = to_int(s.ev_fv) }
+    if k == K_POINTER { return cev_set(s, iv, 8, true) }
+    if (k >= K_BOOL && k <= K_UINT128) || k == K_ENUM {
+        if k == K_BOOL {
+            var b = 0
+            if s.ev_isf { if s.ev_fv != 0.0 { b = 1 } } else if v != 0 { b = 1 }
+            return cev_set(s, b, 4, false)
+        }
+        let size = sizeof(s.unit, rt)
+        let uns = is_unsigned(s.unit, rt)
+        if size < 4 { return cev_set(s, cev_norm(iv, size, uns), 4, false) }
+        if size == 4 { return cev_set(s, cev_norm(iv, 4, uns), 4, uns) }
+        return cev_set(s, iv, 8, uns)
+    }
+    cev_fail(s)
+    return 0
+}
+
+fn cev_sizeof(inout s: St) -> Int {
+    s.xp = s.xp + 1
+    if cev_is_punct(s, P_LPAREN) && cps_is_type_start(s, s.xp + 1) {
+        s.xp = s.xp + 1
+        let ty = cps_type_name(s)
+        if s.perr || !cev_is_punct(s, P_RPAREN) { s.perr = false  cev_fail(s)  return 0 }
+        s.xp = s.xp + 1
+        return cev_set(s, sizeof(s.unit, ty), 8, true)
+    }
+    // sizeof of an expression: a string literal, a declared object, or a value of a known type
+    var paren = 0
+    while cev_is_punct(s, P_LPAREN) { paren = paren + 1  s.xp = s.xp + 1 }
+    var size = 0
+    let t = s.xt[s.xp]
+    if ctk_kind(t) == TK_STR {
+        let sp = s.names[ctk_id(t)]
+        size = cev_string_size(s, sp)
+        s.xp = s.xp + 1
+    } else if ctk_kind(t) == TK_IDENT && s.var_of.has(ctk_id(t)) {
+        let vi = s.var_of[ctk_id(t)] else 0
+        size = sizeof(s.unit, s.unit.variables[vi].ty)
+        s.xp = s.xp + 1
+    } else {
+        s.ev_skip = s.ev_skip + 1
+        cev_unary(s)
+        s.ev_skip = s.ev_skip - 1
+        size = s.ev_sz
+    }
+    while paren > 0 {
+        if !cev_is_punct(s, P_RPAREN) { cev_fail(s)  return 0 }
+        s.xp = s.xp + 1
+        paren = paren - 1
+    }
+    return cev_set(s, size, 8, true)
+}
+
+// __builtin_offsetof(type, member-designator)
+fn cev_offsetof(inout s: St) -> Int {
+    s.xp = s.xp + 1
+    if !cev_is_punct(s, P_LPAREN) { cev_fail(s)  return 0 }
+    s.xp = s.xp + 1
+    var ty = cps_type_name(s)
+    if s.perr || !cev_is_punct(s, P_COMMA) { s.perr = false  cev_fail(s)  return 0 }
+    s.xp = s.xp + 1
+    var off = 0
+    var go = true
+    while go {
+        let t = s.xt[s.xp]
+        if ctk_kind(t) == TK_IDENT {
+            let rt = resolve(s.unit, ty)
+            if s.unit.types[rt].kind != K_RECORD { cev_fail(s)  return 0 }
+            let r = s.unit.types[rt].ref
+            let fx = find_field(s.unit, r, s.names[ctk_id(t)])
+            if fx < 0 { cev_fail(s)  return 0 }
+            off = off + s.unit.records[r].fields[fx].offset / 8
+            ty = s.unit.records[r].fields[fx].ty
+            s.xp = s.xp + 1
+        } else if cev_is_punct(s, P_DOT) {
+            s.xp = s.xp + 1
+        } else if cev_is_punct(s, P_LBRACK) {
+            s.xp = s.xp + 1
+            let idx = cev_comma(s)
+            if !cev_is_punct(s, P_RBRACK) { cev_fail(s)  return 0 }
+            s.xp = s.xp + 1
+            let at = resolve(s.unit, ty)
+            if s.unit.types[at].kind != K_ARRAY { cev_fail(s)  return 0 }
+            ty = s.unit.types[at].base
+            off = off + idx * sizeof(s.unit, ty)
+        } else {
+            go = false
+        }
+    }
+    if !cev_is_punct(s, P_RPAREN) { cev_fail(s)  return 0 }
+    s.xp = s.xp + 1
+    return cev_set(s, off, 8, true)
+}
+
+// ── literals ─────────────────────────────────────────────────────────────────────────────────────
+
+fn cev_digit_val(c: Int) -> Int {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    return 99
+}
+
+// the value of an integer spelling, ignoring suffixes (used where only a small count is wanted)
+fn cev_parse_int_text(sp: Str) -> Int {
+    var i = 0
+    var base = 10
+    let n = sp.len()
+    if n > 2 && ord(sp.at(0)) == 48 && (ord(sp.at(1)) == 120 || ord(sp.at(1)) == 88) { base = 16  i = 2 }
+    else if n > 1 && ord(sp.at(0)) == 48 { base = 8  i = 1 }
+    var v = 0
+    while i < n {
+        let d = cev_digit_val(ord(sp.at(i)))
+        if d >= base { return v }
+        v = v * base + d
+        i = i + 1
+    }
+    return v
+}
+
+fn cev_number(inout s: St, sp: Str) -> Int {
+    let n = sp.len()
+    var hex = n > 2 && ord(sp.at(0)) == 48 && (ord(sp.at(1)) == 120 || ord(sp.at(1)) == 88)
+    let bin = n > 2 && ord(sp.at(0)) == 48 && (ord(sp.at(1)) == 98 || ord(sp.at(1)) == 66)
+    var isfloat = false
+    var i = 0
+    while i < n {
+        let c = ord(sp.at(i))
+        if c == 46 { isfloat = true }
+        if !hex && (c == 101 || c == 69) { isfloat = true }
+        if hex && (c == 112 || c == 80) { isfloat = true }
+        i = i + 1
+    }
+    if isfloat { return cev_setf(s, cev_float_text(sp)) }
+    // suffix
+    var e = n
+    var nu = 0
+    var nl = 0
+    var go = true
+    while go && e > 0 {
+        let c2 = ord(sp.at(e - 1))
+        if c2 == 117 || c2 == 85 { nu = nu + 1  e = e - 1 }
+        else if c2 == 108 || c2 == 76 { nl = nl + 1  e = e - 1 }
+        else if c2 == 122 || c2 == 90 { e = e - 1 }
+        else { go = false }
+    }
+    var base = 10
+    var j = 0
+    if hex { base = 16  j = 2 }
+    else if bin { base = 2  j = 2 }
+    else if n > 1 && ord(sp.at(0)) == 48 { base = 8  j = 1 }
+    var v = 0
+    var ovf = false
+    while j < e {
+        let c3 = ord(sp.at(j))
+        if c3 != 39 {
+            let d = cev_digit_val(c3)
+            if d >= base { cev_fail(s)  return 0 }
+            // detect passing 2^64 by watching the top bits before the multiply
+            if base == 10 { if cev_ult(1844674407370955161, v) { ovf = true } }
+            else if base == 16 { if (v >> 60) != 0 { ovf = true } }
+            else if base == 8 { if (v >> 61) != 0 { ovf = true } }
+            else if (v >> 63) != 0 { ovf = true }
+            v = v * base + d
+        }
+        j = j + 1
+    }
+    if s.ev_pp {
+        return cev_set(s, v, 8, nu > 0 || v < 0 || ovf)
+    }
+    let fits_int = v >= 0 && v <= 2147483647
+    let fits_uint = v >= 0 && v <= 4294967295
+    let fits_long = v >= 0 && !ovf
+    // with a 4-byte `long` a single `L` suffix gives a 32-bit constant when the value fits
+    let long4 = nl == 1 && s.unit.long_size == 4
+    if nu > 0 {
+        if (nl == 0 || long4) && fits_uint { return cev_set(s, v, 4, true) }
+        return cev_set(s, v, 8, true)
+    }
+    if nl > 0 {
+        if long4 && fits_int { return cev_set(s, v, 4, false) }
+        if long4 && base != 10 && fits_uint { return cev_set(s, v, 4, true) }
+        if fits_long { return cev_set(s, v, 8, false) }
+        return cev_set(s, v, 8, true)
+    }
+    if fits_int { return cev_set(s, v, 4, false) }
+    if base != 10 && fits_uint { return cev_set(s, v, 4, true) }
+    if fits_long { return cev_set(s, v, 8, false) }
+    return cev_set(s, v, 8, true)
+}
+
+// the value of a decimal or hexadecimal floating spelling
+fn cev_float_text(sp: Str) -> Float {
+    let n = sp.len()
+    var i = 0
+    let hex = n > 2 && ord(sp.at(0)) == 48 && (ord(sp.at(1)) == 120 || ord(sp.at(1)) == 88)
+    var base = 10
+    if hex { base = 16  i = 2 }
+    var mant = 0.0
+    var exp10 = 0
+    var seen_dot = false
+    var go = true
+    while go && i < n {
+        let c = ord(sp.at(i))
+        let d = cev_digit_val(c)
+        if c == 46 { seen_dot = true  i = i + 1 }
+        else if d < base && !(base == 10 && (c == 101 || c == 69)) {
+            mant = mant * to_float(base) + to_float(d)
+            if seen_dot { exp10 = exp10 - 1 }
+            i = i + 1
+        } else { go = false }
+    }
+    var ex = 0
+    if i < n {
+        let c2 = ord(sp.at(i))
+        if c2 == 101 || c2 == 69 || c2 == 112 || c2 == 80 {
+            i = i + 1
+            var neg = false
+            if i < n && ord(sp.at(i)) == 45 { neg = true  i = i + 1 }
+            else if i < n && ord(sp.at(i)) == 43 { i = i + 1 }
+            while i < n && ord(sp.at(i)) >= 48 && ord(sp.at(i)) <= 57 { ex = ex * 10 + (ord(sp.at(i)) - 48)  i = i + 1 }
+            if neg { ex = 0 - ex }
+        }
+    }
+    if hex {
+        // hex digits after the dot are sixteenths; the exponent is binary
+        var bexp = ex + exp10 * 4
+        var r = mant
+        while bexp > 0 { r = r * 2.0  bexp = bexp - 1 }
+        while bexp < 0 { r = r / 2.0  bexp = bexp + 1 }
+        return r
+    }
+    var e10 = ex + exp10
+    var r2 = mant
+    while e10 > 0 { r2 = r2 * 10.0  e10 = e10 - 1 }
+    while e10 < 0 { r2 = r2 / 10.0  e10 = e10 + 1 }
+    return r2
+}
+
+// decode one escape or character of a literal body at `i`; returns the value, advancing inout `i`
+fn cev_lit_char(sp: Str, inout i: Int) -> Int {
+    let c = ord(sp.at(i))
+    if c != 92 { i = i + 1  return c }
+    i = i + 1
+    if i >= sp.len() { return 92 }
+    let e = ord(sp.at(i))
+    i = i + 1
+    if e == 110 { return 10 }
+    if e == 116 { return 9 }
+    if e == 114 { return 13 }
+    if e == 48 || (e >= 49 && e <= 55) {
+        var v = e - 48
+        var cnt = 1
+        while cnt < 3 && i < sp.len() && ord(sp.at(i)) >= 48 && ord(sp.at(i)) <= 55 { v = v * 8 + (ord(sp.at(i)) - 48)  i = i + 1  cnt = cnt + 1 }
+        return v
+    }
+    if e == 120 {
+        var v2 = 0
+        while i < sp.len() && cev_digit_val(ord(sp.at(i))) < 16 { v2 = v2 * 16 + cev_digit_val(ord(sp.at(i)))  i = i + 1 }
+        return v2
+    }
+    if e == 117 || e == 85 {                           // \uXXXX, \UXXXXXXXX: a code point
+        var digits = 4
+        if e == 85 { digits = 8 }
+        var v3 = 0
+        while digits > 0 && i < sp.len() && cev_digit_val(ord(sp.at(i))) < 16 { v3 = v3 * 16 + cev_digit_val(ord(sp.at(i)))  i = i + 1  digits = digits - 1 }
+        return v3
+    }
+    if e == 97 { return 7 }
+    if e == 98 { return 8 }
+    if e == 102 { return 12 }
+    if e == 118 { return 11 }
+    if e == 101 || e == 69 { return 27 }
+    return e
+}
+
+fn cev_char(inout s: St, sp: Str) -> Int {
+    var i = 0
+    while i < sp.len() && ord(sp.at(i)) != 39 { i = i + 1 }
+    let prefix = i
+    i = i + 1
+    var v = 0
+    var count = 0
+    let n = sp.len() - 1
+    while i < n {
+        let c = ord(sp.at(i))
+        var ch = 0
+        if c >= 128 && prefix > 0 {
+            // a UTF-8 sequence in a wide literal is one code point
+            var len = 1
+            ch = c
+            if c >= 240 { len = 4  ch = c & 7 } else if c >= 224 { len = 3  ch = c & 15 } else if c >= 192 { len = 2  ch = c & 31 }
+            var q = 1
+            while q < len && i + q < n { ch = (ch << 6) | (ord(sp.at(i + q)) & 63)  q = q + 1 }
+            i = i + len
+        } else {
+            ch = cev_lit_char(sp, i)
+        }
+        if prefix > 0 { v = ch } else { v = (v << 8) | (ch & 255) }
+        count = count + 1
+    }
+    let sz = cev_int_type(s)
+    if prefix == 0 {
+        if count == 1 && v >= 128 { v = v - 256 }
+        return cev_set(s, cev_norm(v, 4, false), sz, false)
+    }
+    let p0 = ord(sp.at(0))
+    if p0 == 117 && prefix == 1 { return cev_set(s, v & 65535, sz, false) }
+    if p0 == 85 { return cev_set(s, v, sz, true) }
+    if p0 == 76 && s.unit.long_size == 4 { return cev_set(s, v & 65535, sz, false) }   // a 16-bit unsigned wchar_t
+    return cev_set(s, cev_norm(v, 4, false), sz, false)
+}
+
+// the size in bytes of a string literal's array: its code units and the terminating one, a unit
+// being 1 byte for "" and u8"", 2 for u"" (a code point past U+FFFF takes two), 4 for U"", and the
+// target's wchar_t for L"" (4 bytes, or 2 in UTF-16 for Windows)
+fn cev_string_size(s: St, sp: Str) -> Int {
+    var q = 0
+    while q < sp.len() && ord(sp.at(q)) != 34 { q = q + 1 }
+    let p0 = ord(sp.at(0))
+    var unit = 1
+    if q == 1 && p0 == 117 { unit = 2 }
+    if q == 1 && p0 == 85 { unit = 4 }
+    if q == 1 && p0 == 76 { unit = 4  if s.win { unit = 2 } }
+    if unit == 1 { return cev_string_bytes(sp).len() + 1 }
+    var units = 1
+    var i = q + 1
+    let n = sp.len() - 1
+    while i < n {
+        let c = ord(sp.at(i))
+        var cp = 0
+        if c == 92 { cp = cev_lit_char(sp, i) }
+        else if c >= 128 {
+            var len = 1
+            if c >= 240 { len = 4  cp = 65536 } else if c >= 224 { len = 3 } else if c >= 192 { len = 2 }
+            i = i + len
+        } else { i = i + 1 }
+        units = units + 1
+        if unit == 2 && cp >= 65536 { units = units + 1 }
+    }
+    return units * unit
+}
+
+// the bytes a string literal spelling stands for (one literal, prefix and quotes removed)
+fn cev_string_bytes(sp: Str) -> Str {
+    var i = 0
+    while i < sp.len() && ord(sp.at(i)) != 34 { i = i + 1 }
+    i = i + 1
+    let n = sp.len() - 1
+    var parts: Vec<Str> = vec()
+    var run = i
+    while i < n {
+        if ord(sp.at(i)) == 92 {
+            if run < i { parts.push(sp.slice(run, i)) }
+            let v = cev_lit_char(sp, i)
+            parts.push("" + chr(v & 255))
+            run = i
+        } else {
+            i = i + 1
+        }
+    }
+    if run < n { parts.push(sp.slice(run, n)) }
+    return cty_join(parts, "")
+}

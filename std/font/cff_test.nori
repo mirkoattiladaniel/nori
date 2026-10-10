@@ -1,0 +1,154 @@
+// Native tests for CFF outlines, .ttc collections and the rasterizer against FreeType: run with
+//   noric --test std/font/cff_test.nori compiler/runtime.nori --import-root .
+import "std/font" as font
+import "std/strutil" as su
+
+
+
+fn test_cff_loads() {
+    let fr = font::font_load(read_file("std/font/assets/NotoSansCJKjp-subset.otf"))
+    assert_true(fr.ok)
+    let f = fr.font
+    assert_true(f.cff_cs >= 0)
+    assert_eq(f.cff_cid, 1)                       // NotoSansCJK is CID-keyed
+    assert_true(f.cff_fdselect >= 0)
+    let g = font::font_glyph_index(f, 27704)      // 永
+    assert_true(g > 0)
+    let o = font::font_outline(f, g)
+    assert_true(font::outline_num_contours(o) >= 2)
+    assert_true(o.xmax > o.xmin)
+    assert_true(o.ymax > 500.0)
+    var cubic = 0
+    var ci = 0
+    while ci < o.contours.len() {
+        var si = 0
+        while si < o.contours[ci].segs.len() { if o.contours[ci].segs[si].kind == 2 { cubic = cubic + 1 }  si = si + 1 }
+        ci = ci + 1
+    }
+    assert_true(cubic > 0)
+}
+
+fn test_ttc_collection() {
+    let d = read_file("std/font/assets/NotoSansCJK-subset.ttc")
+    assert_eq(font::font_face_count(d), 2)
+    let a = font::font_load_index(d, 0)
+    let b = font::font_load_index(d, 1)
+    assert_true(a.ok)
+    assert_true(b.ok)
+    assert_true(a.font.face_off != b.font.face_off)
+    assert_true(font::font_glyph_index(a.font, 27704) > 0)
+    assert_true(font::font_glyph_index(b.font, 27704) > 0)
+    let c = font::font_load_index(d, 2)
+    assert_true(!c.ok)
+    assert_true(!font::font_load_index(read_file("std/font/assets/DejaVuSans.ttf"), 1).ok)
+    assert_eq(font::font_face_count(read_file("std/font/assets/DejaVuSans.ttf")), 1)
+}
+
+fn test_cff_malformed_never_traps() {
+    // every prefix and a corrupted copy of a CFF font load or fail cleanly, and whatever loads outlines
+    let d = read_file("std/font/assets/NotoSansCJKjp-subset.otf")
+    var cut = 64
+    while cut < d.len() {
+        let fr = font::font_load(d.slice(0, cut))
+        if fr.ok {
+            var g = 0
+            while g < 8 { let o = font::font_outline(fr.font, g)  assert_true(o.contours.len() >= 0)  g = g + 1 }
+        }
+        cut = cut + 997
+    }
+    // flip bytes through the CFF table
+    let fr0 = font::font_load(d)
+    let base = fr0.font.cff_off
+    var k = 0
+    while k < 40 {
+        var bad = d.slice(0, d.len())
+        let at = base + 4 + k * 113
+        if at < bad.len() { bad.set_at(at, byte(255 - ord(bad.at(at)))) }
+        let fr = font::font_load(bad)
+        if fr.ok {
+            var g = 0
+            while g < 70 { let gb = font::rasterize(fr.font, g, 16.0)  assert_true(gb.w >= 0)  g = g + 1 }
+        }
+        k = k + 1
+    }
+}
+
+// FreeType's unhinted coverage (oracle/ftraster.c) against ours with hinting off: the box is the same
+// within a pixel, and the summed absolute per-pixel difference, aligned on the glyph origin, is a
+// small fraction of the ink.
+fn test_raster_matches_freetype() {
+    font::set_hinting(false)
+    let lines = su::split(read_file("std/font/testdata/raster_expected.txt"), "\n")
+    var i = 0
+    var cases = 0
+    var worst = 0
+    while i < lines.len() {
+        let ln = lines[i]
+        if su::starts_with(ln, "raster ") {
+            let p = su::split(ln, " ")
+            let f = font::font_load_index(read_file(p[1]), parse_int(p[2])).font
+            let gid = parse_int(p[3])
+            let size = parse_int(p[4])
+            let fw = parse_int(p[5])
+            let fh = parse_int(p[6])
+            let fl = parse_int(p[7])
+            let ft = parse_int(p[8])
+            let fsum = parse_int(p[9])
+            let g = font::rasterize(f, gid, to_float(size))
+            // our box may be a pixel larger (control-point bbox for CFF); the origin must agree
+            var diff = 0
+            var ours = 0
+            // union in absolute pixel space: x from min(left), y from max(top)
+            var x0 = fl  if g.left < x0 { x0 = g.left }
+            var y0 = ft  if g.top > y0 { y0 = g.top }
+            var x1 = fl + fw  if g.left + g.w > x1 { x1 = g.left + g.w }
+            var y1 = ft - fh  if g.top - g.h < y1 { y1 = g.top - g.h }
+            var py = y0
+            while py > y1 {
+                var px = x0
+                let row = py
+                while px < x1 {
+                    var a = 0
+                    let fx = px - fl
+                    let fy = ft - row
+                    if fx >= 0 && fx < fw && fy >= 0 && fy < fh {
+                        let hex = lines[i + 1 + fy].slice(4 + fx * 2, 6 + fx * 2)
+                        a = hexval(hex)
+                    }
+                    let b = font::glyph_cov_at(g, px - g.left, g.top - row)
+                    ours = ours + b
+                    var dd = a - b  if dd < 0 { dd = 0 - dd }
+                    diff = diff + dd
+                    px = px + 1
+                }
+                py = py - 1
+            }
+            // per mille of the reference ink
+            var pm = 0
+            if fsum > 0 { pm = diff * 1000 / fsum }
+            if pm > worst { worst = pm }
+            if pm > 60 { printl("raster mismatch ${p[1]} gid ${gid} @${size}px: ${pm} per mille (ours ${ours} ft ${fsum}, box ${g.w}x${g.h}@${g.left},${g.top} vs ${fw}x${fh}@${fl},${ft})") }
+            assert_true(pm <= 60)
+            var sd = ours - fsum  if sd < 0 { sd = 0 - sd }
+            if sd * 1000 > fsum * 40 + 255 * 4 { printl("ink ${p[1]} gid ${gid} @${size}: ours ${ours} ft ${fsum}") }
+            assert_true(sd * 1000 <= fsum * 40 + 255 * 4)     // total ink within 4% (plus a few pixels)
+            cases = cases + 1
+            i = i + 1 + fh
+        } else { i = i + 1 }
+    }
+    printl("raster cases ${cases}, worst ${worst} per mille")
+    assert_true(cases >= 40)
+    font::set_hinting(true)
+}
+fn hexval(h: Str) -> Int {
+    var v = 0
+    var k = 0
+    while k < h.len() {
+        let c = ord(h.at(k))
+        var n = 0
+        if c >= 48 && c <= 57 { n = c - 48 } else if c >= 97 && c <= 102 { n = c - 87 } else if c >= 65 && c <= 70 { n = c - 55 }
+        v = v * 16 + n
+        k = k + 1
+    }
+    return v
+}

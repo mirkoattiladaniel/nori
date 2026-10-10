@@ -1,0 +1,16 @@
+# a small database, written for these tests
+50:image/png:*.png
+50:image/jpeg:*.jpg
+50:image/jpeg:*.jpeg
+50:text/plain:*.txt
+55:application/x-compressed-tar:*.tar.gz
+50:application/gzip:*.gz
+50:text/x-csrc:*.c
+50:text/x-c++src:*.C:cs
+50:text/x-readme:README*
+50:text/x-makefile:makefile
+50:text/x-makefile:Makefile
+50:application/msword:*.doc
+50:text/x-doc:*.doc
+40:text/x-log:*.[0-9]
+50:application/x-old:*.old

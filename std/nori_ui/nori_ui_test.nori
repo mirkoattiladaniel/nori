@@ -1,0 +1,3175 @@
+// Native .nori tests for std/nori_ui, run with
+//   noric --test std/nori_ui/nori_ui_test.nori compiler/runtime.nori --import-root .
+import "std/nori_ui" as ui
+import "std/result" as result
+import "std/json" as json
+import "std/os" as os
+
+fn test_vec2() {
+    var v = ui::core::vec2(3.0, 4.0)
+    assert_feq(v.length(), 5.0, 0.0001)
+    var u = v.normalize()
+    assert_feq(u.length(), 1.0, 0.0001)
+    assert_feq(ui::core::vec2_zero().normalize().length(), 0.0, 0.0001)
+    var s = ui::core::vec2(1.0, 2.0).add(ui::core::vec2(3.0, 4.0))
+    assert_feq(s.x, 4.0, 0.0001)
+    assert_feq(s.y, 6.0, 0.0001)
+    assert_feq(ui::core::vec2_splat(2.0).mul(3.0).x, 6.0, 0.0001)
+}
+
+fn test_rect() {
+    var r = ui::core::rect_min_size(ui::core::vec2(10.0, 20.0), ui::core::vec2(100.0, 50.0))
+    assert_feq(r.width(), 100.0, 0.0001)
+    assert_feq(r.height(), 50.0, 0.0001)
+    assert_feq(r.center().x, 60.0, 0.0001)
+    assert_feq(r.center().y, 45.0, 0.0001)
+    var ins = r.inset(5.0, 5.0, 5.0, 5.0)
+    assert_feq(ins.min.x, 15.0, 0.0001)
+    assert_feq(ins.width(), 90.0, 0.0001)
+    var ex = r.expand(5.0, 5.0, 5.0, 5.0)
+    assert_feq(ex.width(), 110.0, 0.0001)
+    assert_true(r.contains(ui::core::vec2(50.0, 40.0)))
+    assert_false(r.contains(ui::core::vec2(0.0, 0.0)))
+}
+
+fn test_rect_set_ops() {
+    var a = ui::core::rect_min_size(ui::core::vec2(0.0, 0.0), ui::core::vec2(10.0, 10.0))
+    var b = ui::core::rect_min_size(ui::core::vec2(8.0, 5.0), ui::core::vec2(10.0, 10.0))
+    var un = a.union(b)
+    assert_feq(un.max.x, 18.0, 0.0001)
+    assert_feq(un.max.y, 15.0, 0.0001)
+    assert_true(a.overlaps(b))
+    var c = ui::core::rect_min_size(ui::core::vec2(100.0, 100.0), ui::core::vec2(5.0, 5.0))
+    assert_false(a.overlaps(c))
+    var got = result::unwrap_or(a.intersect(b), ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2_zero()))
+    assert_feq(got.min.x, 8.0, 0.0001)
+    assert_feq(got.max.x, 10.0, 0.0001)
+    assert_true(!result::is_some(c.intersect(a)))
+}
+
+fn test_color() {
+    var c = ui::core::color_rgb(40, 44, 52)
+    assert_eq(c.r, 40)
+    assert_eq(c.a, 255)
+    assert_eq(ui::core::color_gray(128).g, 128)
+    assert_eq(ui::core::color_transparent().a, 0)
+    var mid = ui::core::color_white().lerp(ui::core::color_black(), 0.5)
+    assert_true(mid.r >= 127 && mid.r <= 128)
+    assert_eq(ui::core::color_white().with_alpha(10).a, 10)
+    assert_true(ui::core::color_black().eq(ui::core::color_rgb(0, 0, 0)))
+}
+
+fn test_hsv() {
+    var hsv = ui::core::rgb_to_hsv(255, 0, 0)
+    assert_feq(hsv.h, 0.0, 0.001)
+    assert_feq(hsv.s, 1.0, 0.001)
+    assert_feq(hsv.v, 1.0, 0.001)
+    var back = ui::core::hsv_to_rgb(hsv.h, hsv.s, hsv.v)
+    assert_eq(back.r, 255)
+    assert_eq(back.g, 0)
+    assert_eq(back.b, 0)
+    var g = ui::core::hsv_to_rgb(120.0, 1.0, 1.0)
+    assert_eq(g.g, 255)
+}
+
+fn test_theme_dark() {
+    var t = ui::core::theme_default_dark()
+    assert_true(t.visuals.dark_mode)
+    assert_eq(t.visuals.panel_fill.r, 26)
+    assert_eq(t.widgets.active.bg_fill.b, 250)
+    assert_feq(t.spacing.button_padding.x, 8.0, 0.001)
+    assert_true(t.visuals.override_text_color.present)
+    assert_eq(t.visuals.override_text_color.color.r, 230)
+    assert_false(t.visuals.hyperlink_color.present)
+}
+
+fn test_theme_light() {
+    var t = ui::core::theme_default_light()
+    assert_false(t.visuals.dark_mode)
+    assert_eq(t.visuals.panel_fill.r, 250)
+    assert_feq(t.spacing.button_padding.x, 14.0, 0.001)
+}
+
+fn test_text_styles() {
+    var t = ui::core::theme_default_dark()
+    var f = result::unwrap_or(t.resolve_text_style("Heading"), ui::core::font_default())
+    assert_feq(f.size, 16.0, 0.001)
+    assert_streq(f.family, "Proportional")
+    var m = result::unwrap_or(t.resolve_text_style("Monospace"), ui::core::font_default())
+    assert_streq(m.family, "Monospace")
+    assert_true(!result::is_some(t.resolve_text_style("Nope")))
+    t.text_styles.put_style("Caption", ui::core::font_proportional(9.0))
+    var cap = result::unwrap_or(t.resolve_text_style("Caption"), ui::core::font_default())
+    assert_feq(cap.size, 9.0, 0.001)
+}
+
+fn test_theme_scale() {
+    var t = ui::core::theme_default_dark()
+    var s = t.scale(2.0)
+    var f = result::unwrap_or(s.resolve_text_style("Heading"), ui::core::font_default())
+    assert_feq(f.size, 32.0, 0.001)
+    assert_feq(s.spacing.button_padding.x, 16.0, 0.001)
+    // minimum scale clamp (>= 0.25) and minimum font size (>= 8)
+    var tiny = t.scale(0.1)
+    var tf = result::unwrap_or(tiny.resolve_text_style("Heading"), ui::core::font_default())
+    assert_true(tf.size >= 8.0)
+}
+
+fn test_draw_commands() {
+    var rect = ui::core::rect_min_size(ui::core::vec2(0.0, 0.0), ui::core::vec2(100.0, 40.0))
+    assert_eq(ui::core::draw_command_tag(ui::core::dc_rect_filled(rect, ui::core::color_white(), 4.0)), 0)
+    assert_eq(ui::core::draw_command_tag(ui::core::dc_rect_stroke(rect, ui::core::stroke_default(), 0.0)), 1)
+    assert_eq(ui::core::draw_command_tag(ui::core::dc_line(ui::core::vec2_zero(), ui::core::vec2(1.0, 1.0), ui::core::stroke_default())), 3)
+    assert_eq(ui::core::draw_command_tag(ui::core::dc_circle_filled(ui::core::vec2_zero(), 3.0, ui::core::color_black())), 4)
+    assert_eq(ui::core::draw_command_tag(ui::core::dc_text(ui::core::text_cmd(ui::core::vec2_zero(), "x", ui::core::color_black(), 10.0))), 6)
+    assert_eq(ui::core::paint_layer_tag(ui::core::PaintLayer::LayerMain), 0)
+    assert_eq(ui::core::paint_layer_tag(ui::core::PaintLayer::LayerOverlay), 1)
+}
+
+fn test_stroke_dash() {
+    var rect = ui::core::rect_min_size(ui::core::vec2(0.0, 0.0), ui::core::vec2(100.0, 40.0))
+    var solid: Vec<ui::core::Rect> = vec()
+    ui::core::push_solid_rect_stroke(rect, 2.0, solid)
+    assert_eq(solid.len(), 4)
+    var dashed: Vec<ui::core::Rect> = vec()
+    ui::core::push_dashed_rect_stroke(rect, 2.0, ui::core::BorderDash { dash: 8.0, gap: 6.0, offset: 0.0 }, dashed)
+    assert_true(dashed.len() > solid.len())
+    // degenerate dash falls back to a solid (4-rect) stroke
+    var deg: Vec<ui::core::Rect> = vec()
+    ui::core::push_dashed_rect_stroke(rect, 2.0, ui::core::BorderDash { dash: 0.0, gap: 0.0, offset: 0.0 }, deg)
+    assert_eq(deg.len(), 4)
+}
+
+fn test_scroll_enums() {
+    assert_true(ui::core::overflow_scrolls(ui::core::OverflowMode::OvAuto))
+    assert_true(ui::core::overflow_scrolls(ui::core::OverflowMode::OvScroll))
+    assert_false(ui::core::overflow_scrolls(ui::core::OverflowMode::OvVisible))
+    assert_true(ui::core::overflow_clips(ui::core::OverflowMode::OvHidden))
+    assert_false(ui::core::overflow_clips(ui::core::OverflowMode::OvVisible))
+    assert_eq(ui::core::scroll_axis_tag(ui::core::ScrollAxis::AxisX), 1)
+    assert_streq(ui::core::scrollbar_key_root("tab1").region_id, "_root")
+    assert_true(ui::core::scroll_to_bottom().to_bottom)
+    assert_feq(ui::core::scroll_to(40.0).absolute, 40.0, 0.001)
+}
+
+fn test_context_interact() {
+    var sr = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(800.0, 600.0))
+    var inp = ui::core::input_state_default()
+    inp.cursor = ui::core::vec2(50.0, 25.0)
+    inp.pointer_primary_released = true
+    var c = ui::core::context_from_input(sr, inp)
+    c.begin_frame()
+    var btn = ui::core::rect_min_size(ui::core::vec2(10.0, 10.0), ui::core::vec2(100.0, 30.0))
+    var r = c.interact_rect(btn, ui::core::Sense::SClick)
+    assert_true(r.hovered)
+    assert_true(r.clicked)
+    // a button the cursor is not ovr: no hover, no click
+    var far = ui::core::rect_min_size(ui::core::vec2(400.0, 400.0), ui::core::vec2(50.0, 20.0))
+    var r2 = c.interact_rect(far, ui::core::Sense::SClick)
+    assert_false(r2.hovered)
+    assert_false(r2.clicked)
+    // disabled region suppresses hover
+    c.begin_disabled()
+    assert_true(c.is_disabled())
+    var r3 = c.interact_rect(btn, ui::core::Sense::SClick)
+    assert_false(r3.hovered)
+    c.end_disabled()
+    assert_false(c.is_disabled())
+}
+
+fn test_context_draw_buffers() {
+    var sr = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(800.0, 600.0))
+    var c = ui::core::context_new(sr)
+    c.begin_frame()
+    var rect = ui::core::rect_min_size(ui::core::vec2(10.0, 10.0), ui::core::vec2(100.0, 30.0))
+    c.rect_filled(rect, ui::core::color_white(), 4.0)
+    c.text(ui::core::vec2(12.0, 12.0), "hi", ui::core::color_black(), 13.0)
+    assert_eq(c.draw_commands(ui::core::PaintLayer::LayerMain).len(), 2)
+    c.overlay_rect_filled(rect, ui::core::color_black(), 0.0)
+    assert_eq(c.draw_commands(ui::core::PaintLayer::LayerOverlay).len(), 1)
+    c.begin_frame()
+    assert_eq(c.draw_commands(ui::core::PaintLayer::LayerMain).len(), 0)
+}
+
+fn test_context_layout_alloc() {
+    var sr = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(800.0, 600.0))
+    var c = ui::core::context_new(sr)
+    c.begin_frame()
+    var a = c.allocate_rect(ui::core::vec2(40.0, 20.0))
+    assert_feq(a.min.x, 0.0, 0.001)
+    var b = c.allocate_rect(ui::core::vec2(30.0, 20.0))
+    assert_feq(b.min.x, 40.0, 0.001)
+    var rr = c.allocate_rect_with_spacing(ui::core::vec2(50.0, 25.0), 8.0, 4.0)
+    assert_feq(c.layout_cursor.x, 40.0 + 30.0 + 50.0 + 8.0, 0.001)
+    assert_feq(c.layout_cursor.y, rr.max.y + 4.0, 0.001)
+}
+
+fn test_widget_id_hash() {
+    assert_eq(ui::core::widget_id_from_str("hello"), ui::core::widget_id_from_str("hello"))
+    assert_ne(ui::core::widget_id_from_str("a"), ui::core::widget_id_from_str("b"))
+    assert_true(ui::core::widget_id_from_str("x") > 0)
+}
+
+fn test_scroll_regions_notes() {
+    var sr = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(800.0, 600.0))
+    var c = ui::core::context_new(sr)
+    c.note_scroll_region_extent("r1", 120.0)
+    c.note_scroll_region_extent("r1", 80.0)
+    assert_feq(c.scroll_region_extent("r1"), 120.0, 0.001)
+    assert_feq(c.scroll_region_extent("missing"), 0.0, 0.001)
+    c.set_host_scroll_offset("r1", 33.0)
+    assert_feq(c.host_scroll_offset("r1"), 33.0, 0.001)
+    c.request_panel_scroll(40.0)
+    assert_true(c.has_panel_scroll_request)
+    assert_feq(c.panel_scroll_request.absolute, 40.0, 0.001)
+    var reg = ui::core::RegisteredScrollRegion { id: "a", viewport: sr, content_extent: 200.0, depth: 1, axis: ui::core::ScrollAxis::AxisY }
+    c.register_scroll_region(reg)
+    assert_true(c.panel_uses_region_scroll())
+    assert_eq(c.take_registered_scroll_regions().len(), 1)
+    assert_eq(c.take_registered_scroll_regions().len(), 0)
+}
+
+fn dk_ids(a: Str, b: Str) -> Vec<Str> { var v: Vec<Str> = vec()  v.push(copy a)  v.push(copy b)  return v }
+
+fn test_dock_build_and_present() {
+    var ds = ui::layout::dock_state_new(dk_ids("scene", "inspector"))
+    assert_true(ds.tab_is_present(0, "scene"))
+    assert_true(ds.tab_is_present(0, "inspector"))
+    assert_false(ds.tab_is_present(0, "missing"))
+    ds.set_tab_present(0, "console", true)
+    assert_true(ds.tab_is_present(0, "console"))
+    // idempotent add
+    ds.set_tab_present(0, "console", true)
+    var locs = ui::layout::tree_tab_locations(ds.surface_tree(0), "console")
+    assert_eq(locs.len(), 1)
+}
+
+fn test_dock_retain_tabs() {
+    var ds = ui::layout::dock_state_new(dk_ids("a", "b"))
+    ds.set_tab_present(0, "c", true)                 // leaf: a, b, c
+    var keep: Vec<Str> = vec()  keep.push("a")  keep.push("c")
+    ds.retain_tabs(keep)
+    assert_true(ds.tab_is_present(0, "a"))
+    assert_false(ds.tab_is_present(0, "b"))          // dropped, leaf not collapsed
+    assert_true(ds.tab_is_present(0, "c"))
+}
+
+fn test_dock_normalize() {
+    // remap old->new, drop invalid, ensure a valid-but-absent tab
+    var ds = ui::layout::dock_state_new(dk_ids("old", "keep"))
+    ds.set_tab_present(0, "junk", true)              // junk is not valid -> dropped
+    var valid: Vec<Str> = vec()  valid.push("new")  valid.push("keep")  valid.push("extra")
+    var remap: Map<Str, Str> = map()  remap.put("old", "new")
+    var ensure: Vec<Str> = vec()  ensure.push("extra")
+    var def = ui::layout::dock_state_new(dk_ids("home", "home2"))
+    ds.normalize_dock_state(valid, remap, ensure, def)
+    assert_true(ds.tab_is_present(0, "new"))         // old -> new
+    assert_false(ds.tab_is_present(0, "old"))
+    assert_true(ds.tab_is_present(0, "keep"))
+    assert_false(ds.tab_is_present(0, "junk"))       // invalid dropped
+    assert_true(ds.tab_is_present(0, "extra"))       // ensured
+
+    // rebuild-when-empty: if normalize strips everything, replace with default
+    var ds2 = ui::layout::dock_state_new(dk_ids("gone1", "gone2"))
+    var valid2: Vec<Str> = vec()  valid2.push("onlyvalid")
+    var remap2: Map<Str, Str> = map()
+    var ensure2: Vec<Str> = vec()
+    var def2 = ui::layout::dock_state_new(dk_ids("home", "home2"))
+    ds2.normalize_dock_state(valid2, remap2, ensure2, def2)
+    assert_true(ds2.tab_is_present(0, "home"))
+    assert_true(ds2.tab_is_present(0, "home2"))
+}
+
+fn test_shrink_to_avoid_overlay() {
+    var r = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(100.0, 100.0))
+    // overlay covers the bottom half (full width) -> keep the top strip 0..50
+    var ov = ui::core::rect_min_max(ui::core::vec2(0.0, 50.0), ui::core::vec2(100.0, 100.0))
+    var s = r.shrink_to_avoid_overlay(ov)
+    assert_true(s.min.y < 0.1 && s.max.y > 49.9 && s.max.y < 50.1)
+    // no overlap -> unchanged
+    var ov2 = ui::core::rect_min_max(ui::core::vec2(200.0, 200.0), ui::core::vec2(300.0, 300.0))
+    var s2 = r.shrink_to_avoid_overlay(ov2)
+    assert_true(s2.max.y > 99.9)
+    // overlay in the middle: equal above/below strips -> above wins (>= tie-break) -> 0..40
+    var ov3 = ui::core::rect_min_max(ui::core::vec2(0.0, 40.0), ui::core::vec2(100.0, 60.0))
+    var s3 = r.shrink_to_avoid_overlay(ov3)
+    assert_true(s3.min.y < 0.1 && s3.max.y > 39.9 && s3.max.y < 40.1)
+}
+
+fn test_dock_split_layout() {
+    var ds = ui::layout::dock_state_new(dk_ids("a", "b"))
+    var rootp: Vec<Int> = vec()
+    assert_true(ds.split_leaf_and_put_tab(0, rootp, ui::layout::SplitDirection::DirVertical, 0.7, false, "c"))
+    var dock = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(800.0, 600.0))
+    var splits = ds.layout_surface(0, dock, 6.0)
+    assert_eq(splits.len(), 1)
+    var rects = ui::layout::tree_leaf_rects(ds.surface_tree(0))
+    assert_eq(rects.len(), 2)
+    // first (top) child ~= 0.7*600 - 3 = 417
+    assert_true(rects[0].rect.height() > 400.0 && rects[0].rect.height() < 425.0)
+    // splitter direction is vertical
+    assert_eq(ui::layout::split_direction_tag(splits[0].direction), 1)
+}
+
+fn test_dock_ratio_and_hit() {
+    var ds = ui::layout::dock_state_new(dk_ids("a", "b"))
+    var rootp: Vec<Int> = vec()
+    ds.split_leaf_and_put_tab(0, rootp, ui::layout::SplitDirection::DirHorizontal, 0.5, false, "c")
+    var p0: Vec<Int> = vec()
+    ds.set_split_ratio(0, p0, 0.3)
+    assert_feq(ds.split_ratio(0, p0), 0.3, 0.001)
+    // clamp below 0.15
+    ds.set_split_ratio(0, p0, 0.01)
+    assert_feq(ds.split_ratio(0, p0), 0.15, 0.001)
+    var dock = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(800.0, 600.0))
+    ds.layout_surface(0, dock, 6.0)
+    // right side (second child) around x=700
+    var fp = ds.find_leaf_path_containing_point(0, ui::core::vec2(700.0, 300.0))
+    assert_true(fp.ok)
+    assert_eq(fp.path.len(), 1)
+    assert_eq(fp.path[0], 1)
+}
+
+fn test_dock_resize_from_cursor() {
+    var parent = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(800.0, 600.0))
+    // basic: the divider follows the cursor (ratio = (cursor.x - sw/2) / width), clamped
+    var ds = ui::layout::dock_state_new(dk_ids("a", "b"))
+    var rootp: Vec<Int> = vec()
+    ds.split_leaf_and_put_tab(0, rootp, ui::layout::SplitDirection::DirHorizontal, 0.5, false, "c")
+    var p0: Vec<Int> = vec()
+    ds.resize_split_from_cursor(0, p0, parent, ui::layout::SplitDirection::DirHorizontal, ui::core::vec2(600.0, 300.0), 6.0)
+    assert_feq(ds.split_ratio(0, p0), (600.0 - 3.0) / 800.0, 0.01)
+    ds.resize_split_from_cursor(0, p0, parent, ui::layout::SplitDirection::DirHorizontal, ui::core::vec2(790.0, 300.0), 6.0)
+    assert_feq(ds.split_ratio(0, p0), 0.85, 0.001)   // clamp
+
+    // nested ((a|b)|c): resizing the outer divider re-derives the inner same-direction split's ratio
+    // to preserve the inner-first pane's outer width (so it doesn't just stay 0.5).
+    var ds2 = ui::layout::dock_state_new(dk_ids("a", "b"))
+    var rp: Vec<Int> = vec()
+    ds2.split_leaf_and_put_tab(0, rp, ui::layout::SplitDirection::DirHorizontal, 0.5, false, "c")
+    var firstp: Vec<Int> = vec()  firstp.push(0)
+    ds2.split_leaf_and_put_tab(0, firstp, ui::layout::SplitDirection::DirHorizontal, 0.5, false, "d")
+    var op: Vec<Int> = vec()
+    ds2.resize_split_from_cursor(0, op, parent, ui::layout::SplitDirection::DirHorizontal, ui::core::vec2(600.0, 300.0), 6.0)
+    var inner = ds2.split_ratio(0, firstp)
+    assert_true(inner < 0.49)   // adjusted down from 0.5 to keep the inner-first pane's width
+}
+
+fn test_dock_collapse_and_remove() {
+    var ds = ui::layout::dock_state_new(dk_ids("a", "b"))
+    var rootp: Vec<Int> = vec()
+    ds.split_leaf_and_put_tab(0, rootp, ui::layout::SplitDirection::DirVertical, 0.6, false, "c")
+    var lp1: Vec<Int> = vec()  lp1.push(1)
+    ds.collapse_leaf(0, lp1)
+    assert_true(ds.is_leaf_collapsed(0, lp1))
+    ds.expand_leaf(0, lp1)
+    assert_false(ds.is_leaf_collapsed(0, lp1))
+    // removing "c" empties leaf [1] and collapses the tree back to one leaf
+    ds.set_tab_present(0, "c", false)
+    assert_false(ds.tab_is_present(0, "c"))
+    var rects = ui::layout::tree_leaf_rects(ds.surface_tree(0))
+    var dock = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(800.0, 600.0))
+    ds.layout_surface(0, dock, 6.0)
+    assert_eq((ui::layout::tree_leaf_rects(ds.surface_tree(0))).len(), 1)
+}
+
+fn test_dock_tab_ops() {
+    var ds = ui::layout::dock_state_new(dk_ids("a", "b"))
+    var rootp: Vec<Int> = vec()
+    assert_true(ds.insert_tab_into_leaf(0, rootp, 1, "x"))
+    // tabs now a, x, b ; active = inserted index 1
+    var locs = ui::layout::tree_tab_locations(ds.surface_tree(0), "x")
+    assert_eq(locs[0].index, 1)
+    assert_true(ds.remove_tab_from_leaf(0, rootp, 0))  // remove "a"
+    var lx = ui::layout::tree_tab_locations(ds.surface_tree(0), "x")
+    assert_eq(lx[0].index, 0)  // shifted left
+    ds.set_leaf_active(0, rootp, 5)  // clamps
+    // focus
+    var fp: Vec<Int> = vec()
+    ds.set_focus(0, false, fp)
+    assert_true(ds.has_focus_surface)
+    ds.clear_focus()
+    assert_false(ds.has_focus_surface)
+}
+
+fn test_split_rect_geometry() {
+    var r = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(100.0, 50.0))
+    var sr = ui::layout::split_rect(r, ui::layout::SplitDirection::DirHorizontal, 0.5, 4.0)
+    // first width = 100*0.5 - 2 = 48 ; splitter 4 ; second = 100-48-4 = 48
+    assert_feq(sr.first.width(), 48.0, 0.001)
+    assert_feq(sr.splitter.width(), 4.0, 0.001)
+    assert_feq(sr.second.width(), 48.0, 0.001)
+    assert_feq(sr.first.height(), 50.0, 0.001)
+}
+
+/// letter_spacing / word_spacing land in measurement, by the rule the text line-width measure uses:
+/// `(glyphs - 1) * letter_spacing + (words - 1) * word_spacing`, both clamped at 0. This is the half
+/// that decides how wide a box is reserved; the other half (the glyphs actually moving) is asserted
+/// in paint_cpu/ui_cpu_test.nori.
+fn test_text_measure_letter_and_word_spacing() {
+    var base = ui::layout::text_measure_style(12.0)
+    // three glyphs = two gaps, not three: there is no trailing space after the last glyph
+    var ls2 = ui::layout::text_measure_style_sp(12.0, 2.0, 0.0)
+    assert_feq(ui::layout::text_measure_width("abc", ls2), ui::layout::text_measure_width("abc", base) + 4.0, 0.001)
+    // one glyph has no gap at all, and an empty string is still 0
+    assert_feq(ui::layout::text_measure_width("a", ls2), ui::layout::text_measure_width("a", base), 0.001)
+    assert_feq(ui::layout::text_measure_width("", ls2), 0.0, 0.001)
+    // word spacing counts word gaps (split_whitespace().count() - 1), so it is not "once per space":
+    // two words is one gap however many spaces separate them, and outer whitespace is no gap.
+    var ws5 = ui::layout::text_measure_style_sp(12.0, 0.0, 5.0)
+    assert_feq(ui::layout::text_measure_width("ab cd", ws5), ui::layout::text_measure_width("ab cd", base) + 5.0, 0.001)
+    assert_feq(ui::layout::text_measure_width("ab  cd", ws5), ui::layout::text_measure_width("ab  cd", base) + 5.0, 0.001)
+    assert_feq(ui::layout::text_measure_width(" ab ", ws5), ui::layout::text_measure_width(" ab ", base), 0.001)
+    // both at once, and a negative value is a no-op (resolved with v.max(0.0)), not a squeeze
+    var both = ui::layout::text_measure_style_sp(12.0, 1.0, 3.0)
+    assert_feq(ui::layout::text_measure_width("ab cd", both), ui::layout::text_measure_width("ab cd", base) + 7.0, 0.001)
+    var neg = ui::layout::text_measure_style_sp(12.0, 0.0 - 4.0, 0.0 - 4.0)
+    assert_feq(ui::layout::text_measure_width("ab cd", neg), ui::layout::text_measure_width("ab cd", base), 0.001)
+    // the caret table carries the same offsets, so a caret lands where the glyph was drawn
+    var cx = ui::layout::text_measure_cumulative_x("abc", ls2)
+    assert_feq(cx[0], 0.0, 0.001)
+    assert_feq(cx[1] - ui::layout::fallback_advance_to_caret("abc", 1, 12.0), 2.0, 0.001)
+    assert_feq(cx[3] - ui::layout::fallback_advance_to_caret("abc", 3, 12.0), 4.0, 0.001)
+    // and it reaches the node-level box: a `text` node measures wider with spacing than without
+    var plain = ui::layout::dsl_parse_document("column { gap: 0 padding: 0 text { text: abc size_px: 12 } }")
+    assert_true(plain.ok)
+    var spaced = ui::layout::dsl_parse_document("column { gap: 0 padding: 0 text { text: abc size_px: 12 letter_spacing: 2 } }")
+    assert_true(spaced.ok)
+    var tp = ui::layout::ui_text_layout(plain.doc.tree.children[0], 1000.0)
+    var ts = ui::layout::ui_text_layout(spaced.doc.tree.children[0], 1000.0)
+    assert_feq(ts.width, tp.width + 4.0, 0.001)
+}
+
+fn test_text_measure() {
+    var st = ui::layout::text_measure_style(12.0)
+    // digit width = 12*0.52 = 6.24 ; "123" => 18.72
+    assert_feq(ui::layout::text_measure_width("123", st), 18.72, 0.001)
+    assert_feq(ui::layout::text_measure_width("", st), 0.0, 0.001)
+    var cx = ui::layout::text_measure_cumulative_x("ab", st)
+    assert_eq(cx.len(), 3)
+    assert_feq(cx[0], 0.0, 0.001)
+    assert_feq(ui::layout::text_measure_width_to_caret("abcd", 2, st), ui::layout::fallback_advance_to_caret("abcd", 2, 12.0), 0.001)
+    assert_feq(ui::layout::text_measure_width_from_cumulative(cx, 99), cx[2], 0.001)
+    var lm = ui::layout::text_measure_line(st, "x")
+    assert_feq(lm.line_height, 17.0, 0.001)
+    // anchor center inside a 200x24 box for a 1-char-ish sample
+    var bounds = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(200.0, 24.0))
+    var pos = ui::layout::text_measure_draw_pos(bounds, "Name", st, 0.0, 0.5)
+    assert_feq(pos.x, 0.0, 0.001)
+    assert_feq(pos.y, (24.0 - 17.0) * 0.5, 0.001)
+}
+
+fn test_dock_presets() {
+    var valid: Vec<Str> = vec()
+    valid.push("a")  valid.push("b")  valid.push("c")
+    var leftc: Vec<Str> = vec()  leftc.push("a")  leftc.push("zzz")
+    var rightc: Vec<Str> = vec()  rightc.push("b")
+    var ds = ui::layout::build_horizontal_split(valid, leftc, rightc, 0.4)
+    // "zzz" not valid -> dropped; both sides present -> a horizontal split
+    var rects_pre = ui::layout::tree_leaf_rects(ds.surface_tree(0))
+    var dock = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(800.0, 600.0))
+    ds.layout_surface(0, dock, 6.0)
+    assert_eq((ui::layout::tree_leaf_rects(ds.surface_tree(0))).len(), 2)
+    assert_true(ds.tab_is_present(0, "a"))
+    assert_true(ds.tab_is_present(0, "b"))
+    assert_false(ds.tab_is_present(0, "zzz"))
+    var ids = ui::layout::collect_dock_tab_ids_from_state(ds)
+    assert_eq(ids.len(), 2)
+    // normalize strips unknown tabs
+    var ds2 = ui::layout::dock_state_new(dk_ids("a", "ghost"))
+    var valid2: Vec<Str> = vec()  valid2.push("a")
+    ui::layout::normalize_dock_strip_unknown(ds2, valid2)
+    assert_true(ds2.tab_is_present(0, "a"))
+    assert_false(ds2.tab_is_present(0, "ghost"))
+}
+
+fn du_menu() -> Vec<Str> { var m: Vec<Str> = vec()  m.push("File")  m.push("Edit")  return m }
+
+fn test_dock_ui_layout() {
+    var ids: Vec<Str> = vec()  ids.push("TabA")
+    var ds = ui::layout::dock_state_new(ids)
+    var ex: Vec<Str> = vec()
+    var res = ui::layout::layout_dock_ui(ds, 0, 800, 600, ui::core::theme_default_dark(), -1, false, 0, du_menu(), ex)
+    assert_true(res.rects.len() > 0)
+    assert_true(res.labels.len() > 0)
+    assert_eq(res.menu_rects.len(), 2)
+    assert_eq(res.tab_rects.len(), 1)
+    assert_eq(res.splitter_infos.len(), 0)
+    assert_eq(res.leaf_collapse_rects.len(), 1)
+    assert_eq(res.leaf_close_rects.len(), 1)
+}
+
+fn test_dock_ui_hit_test() {
+    var ids: Vec<Str> = vec()  ids.push("TabA")
+    var ds = ui::layout::dock_state_new(ids)
+    var ex: Vec<Str> = vec()
+    var res = ui::layout::layout_dock_ui(ds, 0, 800, 600, ui::core::theme_default_dark(), -1, false, 0, du_menu(), ex)
+    var mhit = ui::layout::dock_hit_test(ui::core::vec2(20.0, 14.0), res.menu_rects, res.splitter_infos, res.tab_rects, res.tab_close_rects, res.leaf_collapse_rects, res.leaf_close_rects)
+    assert_eq(mhit.kind, 0)
+    assert_eq(mhit.index, 0)
+    var tr = res.tab_rects[0].rect
+    var thit = ui::layout::dock_hit_test(ui::core::vec2(tr.min.x + 4.0, tr.min.y + 4.0), res.menu_rects, res.splitter_infos, res.tab_rects, res.tab_close_rects, res.leaf_collapse_rects, res.leaf_close_rects)
+    assert_eq(thit.kind, 3)
+    var none = ui::layout::dock_hit_test(ui::core::vec2(790.0, 590.0), res.menu_rects, res.splitter_infos, res.tab_rects, res.tab_close_rects, res.leaf_collapse_rects, res.leaf_close_rects)
+    assert_eq(none.kind, -1)
+}
+
+fn test_dock_ui_drop_target() {
+    var ids: Vec<Str> = vec()  ids.push("TabA")
+    var ds = ui::layout::dock_state_new(ids)
+    ds.layout_surface(0, ui::core::rect_min_size(ui::core::vec2(0.0, 28.0), ui::core::vec2(800.0, 572.0)), 6.0)
+    var lr = ui::layout::tree_leaf_rects(ds.surface_tree(0))
+    var c = lr[0].rect
+    var center = ui::core::vec2(c.min.x + c.width() * 0.5, c.min.y + 30.0 + (c.height() - 30.0) * 0.5)
+    var dr = ui::layout::resolve_drop_target(center, ds.surface_tree(0))
+    assert_true(dr.ok)
+    assert_eq(dr.target.kind, 0)
+    // The outer left edge docks against the whole surface (kind 2), not against the leaf that
+    // happens to be there. With one leaf the two produce the same picture, so the difference only
+    // shows once there is a second row to be spanned.
+    var leftpt = ui::core::vec2(c.min.x + 5.0, c.min.y + 30.0 + (c.height() - 30.0) * 0.5)
+    var dl = ui::layout::resolve_drop_target(leftpt, ds.surface_tree(0))
+    assert_true(dl.ok)
+    assert_eq(dl.target.kind, 2)
+    assert_true(dl.target.new_pane_is_first)
+
+    // ...and an edge inside the dock still splits the leaf it belongs to. Split the surface in two
+    // columns: the right leaf's left edge is nowhere near the dock's border, so it is a leaf drop.
+    ds.split_leaf_and_put_tab(0, lr[0].path, ui::layout::SplitDirection::DirHorizontal, 0.5, false, "TabB")
+    ds.layout_surface(0, ui::core::rect_min_size(ui::core::vec2(0.0, 28.0), ui::core::vec2(800.0, 572.0)), 6.0)
+    var lr2 = ui::layout::tree_leaf_rects(ds.surface_tree(0))
+    var right = lr2[1].rect
+    var innerpt = ui::core::vec2(right.min.x + 5.0, right.min.y + 30.0 + (right.height() - 30.0) * 0.5)
+    var di = ui::layout::resolve_drop_target(innerpt, ds.surface_tree(0))
+    assert_true(di.ok)
+    assert_eq(di.target.kind, 1)
+    assert_true(di.target.new_pane_is_first)
+}
+
+fn test_context_menu() {
+    var m = ui::layout::menu_new("ctx")
+    ui::layout::menu_add(m, ui::layout::menu_item("Open", "open"))
+    ui::layout::menu_add(m, ui::layout::menu_separator())
+    ui::layout::menu_add(m, ui::layout::menu_item("Copy path", "copy"))
+    var theme = ui::core::theme_default_dark()
+
+    var cm = ui::layout::context_menu_none()
+    assert_true(!ui::layout::context_menu_is_open(cm))
+
+    // A right-click on something with no actions does nothing. An empty menu must not flash an
+    // empty box, which is what opening unconditionally would do.
+    var empty = ui::layout::menu_new("none")
+    ui::layout::context_menu_open(cm, ui::core::vec2(10.0, 10.0), empty)
+    assert_true(!ui::layout::context_menu_is_open(cm))
+
+    ui::layout::context_menu_open(cm, ui::core::vec2(100.0, 100.0), m)
+    assert_true(ui::layout::context_menu_is_open(cm))
+
+    // it opens at the pointer
+    var r = ui::layout::context_menu_rect(cm, 800.0, 600.0)
+    assert_true(r.min.x == 100.0)
+    assert_true(r.min.y == 100.0)
+
+    // ...and is pulled back inside the view rather than hanging off the edge
+    ui::layout::context_menu_open(cm, ui::core::vec2(790.0, 590.0), m)
+    var r2 = ui::layout::context_menu_rect(cm, 800.0, 600.0)
+    assert_true(r2.max.x <= 800.0)
+    assert_true(r2.max.y <= 600.0)
+
+    // a click on a row yields that row's action and closes
+    ui::layout::context_menu_open(cm, ui::core::vec2(100.0, 100.0), m)
+    var ov = ui::layout::context_menu_overlay(cm, theme, 800.0, 600.0, false, ui::core::vec2_zero())
+    var panel = ui::layout::context_menu_rect(cm, 800.0, 600.0)
+    var row0 = ui::layout::menu_row_rect(cm.menu, panel, 0)
+    var hit = ui::layout::context_menu_click(cm, ov, ui::core::vec2(row0.min.x + 5.0, row0.min.y + 5.0))
+    assert_true(hit.consumed)
+    assert_streq(hit.action, "open")
+    assert_true(!ui::layout::context_menu_is_open(cm))
+
+    // A click outside is consumed too. Its job is to dismiss the menu; letting it also reach what
+    // is underneath would make a menu select something on the way out.
+    ui::layout::context_menu_open(cm, ui::core::vec2(100.0, 100.0), m)
+    var ov2 = ui::layout::context_menu_overlay(cm, theme, 800.0, 600.0, false, ui::core::vec2_zero())
+    var out = ui::layout::context_menu_click(cm, ov2, ui::core::vec2(5.0, 5.0))
+    assert_true(out.consumed)
+    assert_streq(out.action, "")
+    assert_true(!ui::layout::context_menu_is_open(cm))
+
+    // a separator is not clickable: the row between two items yields nothing
+    ui::layout::context_menu_open(cm, ui::core::vec2(100.0, 100.0), m)
+    var ov3 = ui::layout::context_menu_overlay(cm, theme, 800.0, 600.0, false, ui::core::vec2_zero())
+    var sep = ui::layout::menu_row_rect(cm.menu, ui::layout::context_menu_rect(cm, 800.0, 600.0), 1)
+    var s3 = ui::layout::context_menu_click(cm, ov3, ui::core::vec2(sep.min.x + 5.0, sep.min.y + 2.0))
+    assert_streq(s3.action, "")
+
+    // closed: no click is consumed, so the host's ordinary handling is untouched
+    var q = ui::layout::context_menu_click(cm, ov3, ui::core::vec2(100.0, 100.0))
+    assert_true(!q.consumed)
+}
+
+fn test_context_submenu() {
+    var profiles = ui::layout::menu_new("profiles")
+    ui::layout::menu_add(profiles, ui::layout::menu_item("dev", "build/dev"))
+    ui::layout::menu_add(profiles, ui::layout::menu_item("release", "build/release"))
+    var m = ui::layout::menu_new("ctx")
+    ui::layout::menu_add(m, ui::layout::menu_item("Open", "open"))
+    ui::layout::menu_add(m, ui::layout::menu_submenu("Build", profiles))
+    ui::layout::menu_add(m, ui::layout::menu_submenu("Empty", ui::layout::menu_empty()))
+    var theme = ui::core::theme_default_dark()
+
+    var cm = ui::layout::context_menu_none()
+    ui::layout::context_menu_open(cm, ui::core::vec2(100.0, 100.0), m)
+
+    // An empty submenu is disabled. An arrow onto a dead end is misleading, and a menu built from
+    // whatever a host found (profiles in a manifest, say) will produce empty ones regularly.
+    assert_true(ui::layout::menu_item_has_sub(m, 2))
+    assert_streq(ui::layout::menu_item_action(m, 2), "")
+
+    // nothing is expanded until the pointer says so
+    assert_eq(ui::layout::context_menu_panels(cm, 800.0, 600.0).len(), 1)
+
+    var panels = ui::layout::context_menu_panels(cm, 800.0, 600.0)
+    var rowBuild = ui::layout::menu_row_rect(m, panels[0], 1)
+
+    // hovering the submenu row opens it beside the parent, aligned with the row
+    ui::layout::context_menu_hover(cm, ui::core::vec2(rowBuild.min.x + 5.0, rowBuild.min.y + 5.0), 800.0, 600.0)
+    var p2 = ui::layout::context_menu_panels(cm, 800.0, 600.0)
+    assert_eq(p2.len(), 2)
+    assert_true(p2[1].min.x >= p2[0].max.x - 4.0)
+    assert_true(p2[1].min.y <= rowBuild.min.y)
+
+    // hovering a plain row on the parent collapses it again
+    var rowOpen = ui::layout::menu_row_rect(m, panels[0], 0)
+    ui::layout::context_menu_hover(cm, ui::core::vec2(rowOpen.min.x + 5.0, rowOpen.min.y + 5.0), 800.0, 600.0)
+    assert_eq(ui::layout::context_menu_panels(cm, 800.0, 600.0).len(), 1)
+
+    // ...but the gap between a row and its submenu does not. That space is what you cross to reach
+    // the child, and a menu that collapsed there could not be used with a real mouse.
+    ui::layout::context_menu_hover(cm, ui::core::vec2(rowBuild.min.x + 5.0, rowBuild.min.y + 5.0), 800.0, 600.0)
+    assert_eq(ui::layout::context_menu_panels(cm, 800.0, 600.0).len(), 2)
+    ui::layout::context_menu_hover(cm, ui::core::vec2(5.0, 5.0), 800.0, 600.0)
+    assert_eq(ui::layout::context_menu_panels(cm, 800.0, 600.0).len(), 2)
+
+    // a click on a child row yields the child's action
+    var p3 = ui::layout::context_menu_panels(cm, 800.0, 600.0)
+    var sub = ui::layout::context_menu_at_depth(cm, 1)
+    var childRow = ui::layout::menu_row_rect(sub, p3[1], 1)
+    var ov = ui::layout::context_menu_overlay(cm, theme, 800.0, 600.0, false, ui::core::vec2_zero())
+    var hit = ui::layout::context_menu_click(cm, ov, ui::core::vec2(childRow.min.x + 5.0, childRow.min.y + 5.0))
+    assert_true(hit.consumed)
+    assert_streq(hit.action, "build/release")
+    assert_true(!ui::layout::context_menu_is_open(cm))
+
+    // A click on the parent row does not dismiss. It is not a choice; it is what hovering does.
+    ui::layout::context_menu_open(cm, ui::core::vec2(100.0, 100.0), m)
+    ui::layout::context_menu_hover(cm, ui::core::vec2(rowBuild.min.x + 5.0, rowBuild.min.y + 5.0), 800.0, 600.0)
+    var ov2 = ui::layout::context_menu_overlay(cm, theme, 800.0, 600.0, false, ui::core::vec2_zero())
+    var stay = ui::layout::context_menu_click(cm, ov2, ui::core::vec2(rowBuild.min.x + 5.0, rowBuild.min.y + 5.0))
+    assert_true(stay.consumed)
+    assert_streq(stay.action, "")
+    assert_true(ui::layout::context_menu_is_open(cm))
+
+    // a submenu that would run off the right edge opens to the left of its parent instead
+    ui::layout::context_menu_open(cm, ui::core::vec2(640.0, 100.0), m)
+    var pe = ui::layout::context_menu_panels(cm, 800.0, 600.0)
+    var rowE = ui::layout::menu_row_rect(m, pe[0], 1)
+    ui::layout::context_menu_hover(cm, ui::core::vec2(rowE.min.x + 5.0, rowE.min.y + 5.0), 800.0, 600.0)
+    var pf = ui::layout::context_menu_panels(cm, 800.0, 600.0)
+    assert_eq(pf.len(), 2)
+    assert_true(pf[1].max.x <= 800.0)
+    assert_true(pf[1].min.x < pf[0].min.x)
+}
+
+fn test_window_manager_focus_drag() {
+    var wm = ui::layout::window_manager_new()
+    wm.upsert(ui::layout::window_state_new(1, "A", ui::core::rect_min_size(ui::core::vec2(10.0, 10.0), ui::core::vec2(200.0, 180.0))))
+    wm.upsert(ui::layout::window_state_new(2, "B", ui::core::rect_min_size(ui::core::vec2(40.0, 40.0), ui::core::vec2(200.0, 180.0))))
+    var inp = ui::core::input_state_default()
+    inp.cursor = ui::core::vec2(50.0, 50.0)
+    inp.pointer_primary_pressed = true
+    inp.pointer_primary_down = true
+    var screen = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(1280.0, 720.0))
+    var out = wm.begin_frame(inp, screen)
+    assert_true(out.has_focused)
+    assert_eq(out.focused_window, 2)
+    var d = ui::core::input_state_default()
+    d.cursor = ui::core::vec2(150.0, 150.0)
+    d.pointer_primary_down = true
+    var out2 = wm.begin_frame(d, screen)
+    assert_true(out2.has_moved)
+    assert_eq(out2.moved_window, 2)
+    var wB = wm.window(2)
+    assert_true(wB.rect.min.x > 40.0)
+}
+
+fn test_window_close_and_layout() {
+    var wm = ui::layout::window_manager_new()
+    wm.upsert(ui::layout::window_state_new(3, "Inventory", ui::core::rect_min_size(ui::core::vec2(20.0, 20.0), ui::core::vec2(320.0, 260.0))))
+    var lay = ui::layout::layout_windows(wm, ui::core::theme_default_dark())
+    assert_true(lay.rects.len() > 0)
+    assert_true(lay.labels.len() > 0)
+    assert_eq(lay.windows.len(), 1)
+    // click the close button -> window hidden
+    var w = wm.window(3)
+    var cb = ui::layout::wm_close_button_rect(w)
+    var screen = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(1280.0, 720.0))
+    var press = ui::core::input_state_default()
+    press.cursor = ui::core::vec2(cb.min.x + 2.0, cb.min.y + 2.0)
+    press.pointer_primary_pressed = true
+    press.pointer_primary_down = true
+    wm.begin_frame(press, screen)
+    var rel = ui::core::input_state_default()
+    rel.cursor = ui::core::vec2(cb.min.x + 2.0, cb.min.y + 2.0)
+    rel.pointer_primary_released = true
+    var out = wm.begin_frame(rel, screen)
+    assert_true(out.has_closed)
+    assert_eq(out.closed_window, 3)
+    assert_false(wm.window(3).visible)
+}
+
+fn test_visible_fragments() {
+    var base = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(100.0, 100.0))
+    var cover: Vec<ui::core::Rect> = vec()
+    cover.push(ui::core::rect_min_size(ui::core::vec2(-10.0, -10.0), ui::core::vec2(200.0, 200.0)))
+    assert_eq((ui::layout::visible_fragments(base, cover)).len(), 0)
+    var none: Vec<ui::core::Rect> = vec()
+    assert_eq((ui::layout::visible_fragments(base, none)).len(), 1)
+    // a corner cut leaves L-shaped fragments (>=2)
+    var corner: Vec<ui::core::Rect> = vec()
+    corner.push(ui::core::rect_min_size(ui::core::vec2(50.0, 50.0), ui::core::vec2(100.0, 100.0)))
+    assert_true((ui::layout::visible_fragments(base, corner)).len() >= 2)
+}
+
+fn pj_ids() -> Vec<Str> { var v: Vec<Str> = vec()  v.push("a")  v.push("b")  return v }
+
+fn test_persist_roundtrip() {
+    var ds = ui::layout::dock_state_new(pj_ids())
+    var rootp: Vec<Int> = vec()
+    ds.split_leaf_and_put_tab(0, rootp, ui::layout::SplitDirection::DirVertical, 0.7, false, "c")
+    var lp1: Vec<Int> = vec()  lp1.push(1)
+    ds.collapse_leaf(0, lp1)
+    var js = ui::layout::serialize_dock_state(ds)
+    var ds2 = ui::layout::deserialize_dock_state(js)
+    assert_true(ds2.tab_is_present(0, "a"))
+    assert_true(ds2.tab_is_present(0, "b"))
+    assert_true(ds2.tab_is_present(0, "c"))
+    var dock = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(800.0, 600.0))
+    ds2.layout_surface(0, dock, 6.0)
+    assert_eq((ui::layout::tree_leaf_rects(ds2.surface_tree(0))).len(), 2)
+    var p0: Vec<Int> = vec()
+    assert_feq(ds2.split_ratio(0, p0), 0.7, 0.001)
+    // collapse flag survived the round-trip
+    assert_true(ds2.is_leaf_collapsed(0, lp1))
+}
+
+fn test_persist_single_leaf() {
+    var ds = ui::layout::dock_state_new(pj_ids())
+    var js = ui::layout::serialize_dock_state(ds)
+    var ds2 = ui::layout::deserialize_dock_state(js)
+    var dock = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(800.0, 600.0))
+    ds2.layout_surface(0, dock, 6.0)
+    assert_eq((ui::layout::tree_leaf_rects(ds2.surface_tree(0))).len(), 1)
+    assert_true(ds2.tab_is_present(0, "a"))
+}
+
+fn test_image_sanitizers() {
+    assert_true(ui::layout::sanitize_overlay_image_path("assets/hero.png").ok)
+    assert_streq(ui::layout::sanitize_overlay_image_path("  assets/hero.png  ").value, "assets/hero.png")
+    assert_false(ui::layout::sanitize_overlay_image_path("../secret.png").ok)
+    assert_false(ui::layout::sanitize_overlay_image_path("/abs/x.png").ok)
+    assert_false(ui::layout::sanitize_overlay_image_path("C:/win.png").ok)
+    assert_false(ui::layout::sanitize_overlay_image_path("").ok)
+    assert_true(ui::layout::sanitize_save_thumb_filename("icon.png").ok)
+    assert_false(ui::layout::sanitize_save_thumb_filename("dir/icon.png").ok)
+    assert_false(ui::layout::sanitize_save_thumb_filename("../x").ok)
+}
+
+fn wi_set() -> Vec<ui::layout::Widget> {
+    var ws: Vec<ui::layout::Widget> = vec()
+    ws.push(ui::layout::widget_heading("Settings"))
+    ws.push(ui::layout::widget_button(1, "Apply"))
+    ws.push(ui::layout::widget_checkbox(2, "Enabled", true))
+    ws.push(ui::layout::widget_slider(3, "Volume", 0.5, 0.0, 1.0))
+    ws.push(ui::layout::widget_text_field(4, "name...", ""))
+    ws.push(ui::layout::widget_toggle(5, "Dark", true))
+    ws.push(ui::layout::widget_separator())
+    ws.push(ui::layout::widget_progress(0.75))
+    ws.push(ui::layout::widget_dropdown(6, "Mode", wi_opts(), 1))
+    return ws
+}
+fn wi_opts() -> Vec<Str> { var o: Vec<Str> = vec()  o.push("A")  o.push("B")  return o }
+
+fn test_widget_layout() {
+    var ws = wi_set()
+    var theme = ui::core::theme_default_dark()
+    assert_true(ui::layout::content_height(ws, theme) > 0.0)
+    var content = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(300.0, 400.0))
+    var dis: Vec<Int> = vec()
+    var res = ui::layout::layout_widgets(content, ws, theme, false, 0, 0.0, dis)
+    assert_true(res.rects.len() > 0)
+    assert_true(res.labels.len() > 0)
+    assert_true(res.hits.len() > 0)
+    // exactly one button hit
+    var nb = 0
+    var i = 0
+    while i < res.hits.len() { if res.hits[i].kind == ui::layout::whk_button() { nb = nb + 1 }  i = i + 1 }
+    assert_eq(nb, 1)
+    // slider yields a thumb hit and a track hit
+    var nt = 0  var j = 0
+    while j < res.hits.len() { var kk = res.hits[j].kind  if kk == ui::layout::whk_slider_thumb() || kk == ui::layout::whk_slider_track() { nt = nt + 1 }  j = j + 1 }
+    assert_eq(nt, 2)
+}
+
+fn test_widget_phase1() {
+    var theme = ui::core::theme_default_dark()
+    var content = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(400.0, 600.0))
+    var dis: Vec<Int> = vec()
+    var ws: Vec<ui::layout::Widget> = vec()
+    ws.push(ui::layout::widget_color_swatch(1, "fill", ui::core::color_rgb(200, 40, 40)))
+    ws.push(ui::layout::widget_color_picker(2, "tint", ui::core::color_rgb(40, 200, 40)))
+    ws.push(ui::layout::widget_image_button(3, "Open", "folder"))
+    var cells: Vec<ui::layout::TileGridCell> = vec()
+    cells.push(ui::layout::tile_cell("#", ui::core::color_white(), ui::core::color_rgb(10, 10, 10)))
+    cells.push(ui::layout::tile_cell(".", ui::core::color_gray(120), ui::core::color_black()))
+    cells.push(ui::layout::tile_cell("@", ui::core::color_rgb(0, 255, 0), ui::core::color_rgb(5, 5, 5)))
+    cells.push(ui::layout::tile_cell(" ", ui::core::color_white(), ui::core::color_transparent()))
+    var grid = ui::layout::widget_tilegrid(2, 2, 12.0, 14.0, cells)
+    ws.push(copy grid)
+    var res = ui::layout::layout_widgets(content, ws, theme, false, 0, 0.0, dis)
+    // one hit per interactive widget kind
+    var swatch = 0  var picker = 0  var imgbtn = 0
+    var i = 0
+    while i < res.hits.len() {
+        var kk = res.hits[i].kind
+        if kk == ui::layout::whk_color_swatch() { swatch = swatch + 1 }
+        if kk == ui::layout::whk_color_picker_swatch() { picker = picker + 1 }
+        if kk == ui::layout::whk_image_button() { imgbtn = imgbtn + 1 }
+        i = i + 1
+    }
+    assert_eq(swatch, 1)
+    assert_eq(picker, 1)
+    assert_eq(imgbtn, 1)
+    // tilegrid row height = rows * cell_h = 2 * 14
+    assert_true(ui::layout::widget_row_height(grid, 20.0) > 27.9 && ui::layout::widget_row_height(grid, 20.0) < 28.1)
+    // the blank/space cell draws no bg rect, the 3 colored cells do -> at least 3 bg rects present + swatch/picker/imgbtn
+    assert_true(res.rects.len() >= 6)
+    // monospace tile labels carry a font family + fg color (the "#", ".", "@" cells; the space is skipped)
+    var mono = 0  var j = 0
+    while j < res.labels.len() { if res.labels[j].has_font_family { mono = mono + 1 }  j = j + 1 }
+    assert_eq(mono, 3)
+}
+
+fn test_widget_phase1_rest() {
+    var theme = ui::core::theme_default_dark()
+    var content = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(400.0, 600.0))
+    var dis: Vec<Int> = vec()
+    var ws: Vec<ui::layout::Widget> = vec()
+    ws.push(ui::layout::widget_button_styled(1, "Big", "serif", 24.0, true, false))
+    ws.push(ui::layout::widget_hyperlink(2, "docs", "https://x"))
+    ws.push(ui::layout::widget_resize_handle(3, true))
+    ws.push(ui::layout::widget_label_styled("Note", "", 0.0, false, true))
+    ws.push(ui::layout::widget_tooltip("help text"))   // takes no space
+    var res = ui::layout::layout_widgets(content, ws, theme, false, 0, 0.0, dis)
+    // one hit per interactive kind + label_styled/tooltip noninteractive
+    var styled = 0  var link = 0  var resize = 0
+    var i = 0
+    while i < res.hits.len() {
+        var kk = res.hits[i].kind
+        if kk == ui::layout::whk_button() { styled = styled + 1 }
+        if kk == ui::layout::whk_hyperlink() { link = link + 1 }
+        if kk == ui::layout::whk_resize_handle() { resize = resize + 1 }
+        i = i + 1
+    }
+    assert_eq(styled, 1)
+    assert_eq(link, 1)
+    assert_eq(resize, 1)
+    // styled button row height = max(row_h_base, font_size + 10) = 34 (font 24)
+    assert_true(ui::layout::widget_row_height(ws[0], 20.0) > 33.9 && ui::layout::widget_row_height(ws[0], 20.0) < 34.1)
+    // tooltip takes no vertical space
+    assert_true(ui::layout::widget_row_height(ws[4], 20.0) < 0.1)
+    // resize handle row height = 6
+    assert_true(ui::layout::widget_row_height(ws[2], 20.0) > 5.9 && ui::layout::widget_row_height(ws[2], 20.0) < 6.1)
+    // the styled button label carries its font overrides
+    var lab0 = res.labels[0]
+    assert_true(lab0.has_font_family && lab0.font_bold)
+    assert_true(lab0.font_size > 23.9 && lab0.font_size < 24.1)
+    // tooltip_for_hovered: hovering the resize handle (index 2) -> no tooltip; index 3 (label) -> "help text"
+    assert_streq(ui::layout::tooltip_for_hovered(ws, 3), "help text")
+    assert_streq(ui::layout::tooltip_for_hovered(ws, 0), "")
+}
+
+fn test_text_field_caret() {
+    var theme = ui::core::theme_default_dark()
+    var content = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(300.0, 200.0))
+    var dis: Vec<Int> = vec()
+    var ws: Vec<ui::layout::Widget> = vec()
+    ws.push(ui::layout::widget_text_field(7, "name...", "abcd"))
+    // unfocused: plain text, no focus-ring rects (just the input bg)
+    var plain = ui::layout::layout_widgets(content, ws, theme, false, 0, 0.0, dis)
+    assert_eq(plain.rects.len(), 1)
+    // focused with caret visible at pos 2 -> "ab|cd" + 4 focus-ring edges + bg = 5 rects
+    var foc = ui::layout::text_field_focus(0, true, 2)
+    var res = ui::layout::layout_widgets_focus(content, ws, theme, false, 0, 0.0, dis, foc)
+    assert_eq(res.rects.len(), 5)
+    assert_streq(res.labels[0].text, "ab|cd")
+    // caret blink off -> no caret in the text
+    var foc2 = ui::layout::text_field_focus(0, false, 2)
+    var res2 = ui::layout::layout_widgets_focus(content, ws, theme, false, 0, 0.0, dis, foc2)
+    assert_streq(res2.labels[0].text, "abcd")
+    // with a selection [1,3): a highlight rect is added (bg + selection + 4 ring = 6)
+    var foc3 = ui::layout::text_field_focus_sel(0, true, 3, 1, 3)
+    var res3 = ui::layout::layout_widgets_focus(content, ws, theme, false, 0, 0.0, dis, foc3)
+    assert_eq(res3.rects.len(), 6)
+}
+
+/// build a command list that outlives this function, the way every layout_* helper does.
+fn dcf_build() -> ui::layout::ColorPickerPopup {
+    var cmds: Vec<ui::core::DrawCommand> = vec()
+    var fresh = ui::core::rect_min_size(ui::core::vec2(0.0, 0.0), ui::core::vec2(8.0, 8.0))
+    cmds.push(ui::core::dc_rect_filled(fresh, ui::core::color_rgb(1, 2, 3), 0.0))
+    cmds.push(ui::core::dc_gradient_rect(fresh, ui::core::color_rgb(1, 2, 3), ui::core::color_rgb(4, 5, 6), ui::core::color_rgb(7, 8, 9), ui::core::color_rgb(1, 1, 1), 0.0))
+    return ui::layout::ColorPickerPopup { commands: cmds, square_rect: ui::core::rect_copy(fresh), hue_rect: fresh }
+}
+
+fn test_draw_command_deep_free() {
+    // The invariant: `dc_rect_filled` writes its rect into four places (rect, body_rect, the drop
+    // shadow's body_rect and the clip region's rect), and each must hold its own value rather than
+    // one handle shared by four fields. If they shared one, freeing such a command would free that
+    // rect four times and corrupt the free list.
+    //
+    // test_color_picker_popup builds 62 commands and would catch the corruption itself; two are not
+    // enough to corrupt the list detectably, so this test states the property directly: four fields
+    // meant to hold four rects must not share one.
+    var held = dcf_build()
+    assert_eq(held.commands.len(), 2)
+    // the four rects must be independent values, not four names for one
+    match held.commands[0] {
+        ui::core::DrawCommand::DcRectFilled(x) => {
+            assert_true(x.rect.width() > 7.9 && x.rect.width() < 8.1)
+            assert_true(x.body_rect.width() > 7.9 && x.body_rect.width() < 8.1)
+            assert_true(x.clip_region.rect.width() > 7.9 && x.clip_region.rect.width() < 8.1)
+        }
+        _ => { assert_true(false) }
+    }
+}
+
+fn test_color_picker_popup() {
+    var sz = ui::layout::color_picker_popup_size()
+    // width = 8*2 + 120 + 4 + 16 = 156 ; height = 8*2 + 120 = 136
+    assert_true(sz.x > 155.9 && sz.x < 156.1)
+    assert_true(sz.y > 135.9 && sz.y < 136.1)
+    var popup = ui::core::rect_min_size(ui::core::vec2(10.0, 10.0), sz)
+    var res = ui::layout::layout_color_picker_popup(popup, ui::core::color_rgb(128, 64, 200))
+    // 16 gradient cells + 4 square borders + 2 marker + 36 hue segments + 2 hue borders + 2 hue marker = 62
+    assert_true(res.commands.len() > 55)
+    // square is 120x120 at padding (18,18)
+    assert_true(res.square_rect.width() > 119.9 && res.square_rect.width() < 120.1)
+    assert_true(res.square_rect.min.x > 17.9 && res.square_rect.min.x < 18.1)
+    // hue strip sits to the right of the square, 16 wide
+    assert_true(res.hue_rect.min.x > res.square_rect.max.x)
+    assert_true(res.hue_rect.width() > 15.9 && res.hue_rect.width() < 16.1)
+}
+
+fn test_widget_hit_test() {
+    var ws = wi_set()
+    var theme = ui::core::theme_default_dark()
+    var content = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(300.0, 400.0))
+    var dis: Vec<Int> = vec()
+    var res = ui::layout::layout_widgets(content, ws, theme, false, 0, 0.0, dis)
+    var bidx = -1  var k = 0
+    while k < res.hits.len() { if res.hits[k].kind == ui::layout::whk_button() { bidx = k }  k = k + 1 }
+    var br = res.hits[bidx].rect
+    var ht = ui::layout::hit_test_widgets(ui::core::vec2(br.min.x + 2.0, br.min.y + 2.0), res.hits)
+    assert_eq(ht.kind, ui::layout::whk_button())
+    assert_eq(ht.id, 1)
+    // miss -> index -1
+    var miss = ui::layout::hit_test_widgets(ui::core::vec2(2000.0, 2000.0), res.hits)
+    assert_eq(miss.index, -1)
+}
+
+fn test_widget_disabled() {
+    var ws = wi_set()
+    var theme = ui::core::theme_default_dark()
+    var content = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(300.0, 400.0))
+    var dis: Vec<Int> = vec()  dis.push(1)  // disable the Apply button (index 1)
+    var res = ui::layout::layout_widgets(content, ws, theme, false, 0, 0.0, dis)
+    var ndis = 0  var i = 0
+    while i < res.hits.len() { if res.hits[i].kind == ui::layout::whk_disabled() { ndis = ndis + 1 }  i = i + 1 }
+    assert_true(ndis >= 1)
+}
+
+fn test_scrollbar_layout() {
+    var content = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(300.0, 400.0))
+    var sb = ui::layout::scrollbar_layout(content, 800.0, 0.0, 400.0)
+    assert_true(sb.has_thumb)
+    assert_true(sb.thumb_rect.height() >= 24.0)
+    // scrolled to bottom: thumb near track bottom
+    var sb2 = ui::layout::scrollbar_layout(content, 800.0, 400.0, 400.0)
+    assert_true(sb2.thumb_rect.min.y > sb.thumb_rect.min.y)
+    // content fits -> no thumb
+    var sb3 = ui::layout::scrollbar_layout(content, 100.0, 0.0, 400.0)
+    assert_false(sb3.has_thumb)
+}
+
+fn test_widget_row_height() {
+    var theme = ui::core::theme_default_dark()
+    var base = theme.spacing.interact_size.y
+    assert_feq(ui::layout::widget_row_height(ui::layout::widget_heading("h"), base), base + 4.0, 0.001)
+    assert_feq(ui::layout::widget_row_height(ui::layout::widget_spacer(40.0), base), 40.0, 0.001)
+    assert_feq(ui::layout::widget_row_height(ui::layout::widget_button(1, "x"), base), base, 0.001)
+    // icon row tracks its size; others fall back to base
+    assert_feq(ui::layout::widget_row_height(ui::layout::widget_icon("g", 40.0), base), 40.0, 0.001)
+}
+
+fn test_new_widgets() {
+    var theme = ui::core::theme_default_dark()
+    var content = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(320.0, 600.0))
+    var ws: Vec<ui::layout::Widget> = vec()
+    ws.push(ui::layout::widget_number(10, "Count", 5.0, 0.0, 10.0, 1.0))
+    ws.push(ui::layout::widget_drag(11, "Zoom", 1.5, 0.0, 4.0, 0.1))
+    ws.push(ui::layout::widget_badge(12, "NEW"))
+    ws.push(ui::layout::widget_selectable(13, "Pick me"))
+    ws.push(ui::layout::widget_icon("gear", 24.0))
+    ws.push(ui::layout::widget_collapsing(14, "Advanced", false))
+    var dis: Vec<Int> = vec()
+    var res = ui::layout::layout_widgets(content, ws, theme, false, 0, 0.0, dis)
+    var n_num = 0  var n_plus = 0  var n_minus = 0  var n_drag = 0
+    var n_badge = 0  var n_sel = 0  var n_coll = 0
+    var i = 0
+    while i < res.hits.len() {
+        var kk = res.hits[i].kind
+        if kk == ui::layout::whk_number() { n_num = n_num + 1 }
+        if kk == ui::layout::whk_number_plus() { n_plus = n_plus + 1 }
+        if kk == ui::layout::whk_number_minus() { n_minus = n_minus + 1 }
+        if kk == ui::layout::whk_drag() { n_drag = n_drag + 1 }
+        if kk == ui::layout::whk_badge() { n_badge = n_badge + 1 }
+        if kk == ui::layout::whk_selectable() { n_sel = n_sel + 1 }
+        if kk == ui::layout::whk_collapsing() { n_coll = n_coll + 1 }
+        i = i + 1
+    }
+    assert_eq(n_num, 1)
+    assert_eq(n_plus, 1)
+    assert_eq(n_minus, 1)
+    assert_eq(n_drag, 1)
+    assert_eq(n_badge, 1)
+    assert_eq(n_sel, 1)
+    assert_eq(n_coll, 1)
+    // the +/- stepper rects are distinct and hit-test to their own kinds
+    var plus_rect = ui::core::rect_min_max(ui::core::vec2_zero(), ui::core::vec2_zero())
+    var minus_rect = ui::core::rect_min_max(ui::core::vec2_zero(), ui::core::vec2_zero())
+    var j = 0
+    while j < res.hits.len() {
+        if res.hits[j].kind == ui::layout::whk_number_plus() { plus_rect = res.hits[j].rect }
+        if res.hits[j].kind == ui::layout::whk_number_minus() { minus_rect = res.hits[j].rect }
+        j = j + 1
+    }
+    assert_true(plus_rect.min.x > minus_rect.min.x)
+    var hp = ui::layout::hit_test_widgets(ui::core::vec2(plus_rect.min.x + 2.0, plus_rect.min.y + 2.0), res.hits)
+    assert_eq(hp.kind, ui::layout::whk_number_plus())
+}
+
+fn test_widget_fidelity() {
+    var theme = ui::core::theme_default_dark()
+    var base = theme.spacing.interact_size.y
+    // icon row height floors at 16, not at row_h_base
+    assert_feq(ui::layout::widget_row_height(ui::layout::widget_icon("g", 8.0), base), 16.0, 0.001)
+    assert_feq(ui::layout::widget_row_height(ui::layout::widget_icon("g", 40.0), base), 40.0, 0.001)
+    var content = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(320.0, 400.0))
+    var ws: Vec<ui::layout::Widget> = vec()
+    ws.push(ui::layout::widget_small_button(1, "S"))
+    ws.push(ui::layout::widget_link(2, "Hi"))
+    var dis: Vec<Int> = vec()
+    var res = ui::layout::layout_widgets(content, ws, theme, false, 0, 0.0, dis)
+    // small button has its own hit kind (distinct from a regular button)
+    var nsmall = 0  var i = 0
+    while i < res.hits.len() { if res.hits[i].kind == ui::layout::whk_small_button() { nsmall = nsmall + 1 }  i = i + 1 }
+    assert_eq(nsmall, 1)
+    // link is clickable across the full row width, not just its short label
+    var link_w = 0.0  var j = 0
+    while j < res.hits.len() { if res.hits[j].kind == ui::layout::whk_link() { link_w = res.hits[j].rect.width() }  j = j + 1 }
+    assert_true(link_w > 100.0)
+}
+
+fn test_radio_tabbar() {
+    var theme = ui::core::theme_default_dark()
+    var base = theme.spacing.interact_size.y
+    var content = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(320.0, 600.0))
+    var opts: Vec<Str> = vec()  opts.push("A")  opts.push("B")  opts.push("C")
+    var tabs: Vec<Str> = vec()  tabs.push("One")  tabs.push("Two")
+    var ws: Vec<ui::layout::Widget> = vec()
+    ws.push(ui::layout::widget_radio(10, "Pick", opts, 1))
+    ws.push(ui::layout::widget_tabbar(11, tabs, 0))
+    var dis: Vec<Int> = vec()
+    var res = ui::layout::layout_widgets(content, ws, theme, false, 0, 0.0, dis)
+    // one RadioOption hit per option (3) and one TabBarTab hit per tab (2)
+    var nr = 0  var nt = 0  var i = 0
+    while i < res.hits.len() {
+        if res.hits[i].kind == ui::layout::whk_radio_option() { nr = nr + 1 }
+        if res.hits[i].kind == ui::layout::whk_tabbar_tab() { nt = nt + 1 }
+        i = i + 1
+    }
+    assert_eq(nr, 3)
+    assert_eq(nt, 2)
+    // the 3rd radio option carries sub=2, and hit-testing it returns that sub
+    var k2 = -1  var k = 0
+    while k < res.hits.len() { if res.hits[k].kind == ui::layout::whk_radio_option() && res.hits[k].sub == 2 { k2 = k }  k = k + 1 }
+    assert_true(k2 >= 0)
+    var r2 = res.hits[k2].rect
+    var ht = ui::layout::hit_test_widgets(ui::core::vec2(r2.min.x + 2.0, r2.min.y + 2.0), res.hits)
+    assert_eq(ht.kind, ui::layout::whk_radio_option())
+    assert_eq(ht.sub, 2)
+    // radio row height = options * (base + 2)
+    assert_feq(ui::layout::widget_row_height(ui::layout::widget_radio(1, "x", opts, 0), base), 3.0 * (base + 2.0), 0.001)
+}
+
+fn test_ui_length() {
+    var ctx = ui::layout::length_context_root(400.0, 300.0)
+    var c2 = ui::layout::length_context_with_parent(ctx, 200.0, 100.0)
+    assert_feq(ui::layout::ui_length_resolve(ui::layout::ui_percent(50.0), c2, 0), 100.0, 0.01)
+    assert_feq(ui::layout::ui_length_resolve(ui::layout::ui_vh(10.0), c2, 1), 30.0, 0.01)
+    assert_feq(ui::layout::ui_length_resolve(ui::layout::ui_px(42.0), c2, 0), 42.0, 0.01)
+    var p = ui::layout::ui_length_parse("50%")
+    assert_true(p.ok)
+    assert_eq(p.len.unit, 1)
+    assert_feq(p.len.value, 50.0, 0.01)
+    assert_eq(ui::layout::ui_length_parse("300ui").len.unit, 4)
+    assert_eq(ui::layout::ui_length_parse("ui").len.unit, 4)
+    assert_feq(ui::layout::ui_length_parse("ui").len.value, 1.0, 0.01)
+    assert_eq(ui::layout::ui_length_parse("42").len.unit, 0)
+    assert_false(ui::layout::ui_length_parse("").ok)
+}
+
+fn test_flex_math() {
+    var sizes: Vec<Float> = vec()  sizes.push(50.0)  sizes.push(50.0)
+    var slots: Vec<ui::layout::FlexGrowSlot> = vec()
+    slots.push(ui::layout::FlexGrowSlot { index: 0, weight: 1.0, shrink: 1.0 })
+    slots.push(ui::layout::FlexGrowSlot { index: 1, weight: 3.0, shrink: 1.0 })
+    ui::layout::distribute_flex_grow(sizes, slots, 80.0)
+    assert_feq(sizes[0], 70.0, 0.01)
+    assert_feq(sizes[1], 110.0, 0.01)
+    // weightless: equal share
+    var sz2: Vec<Float> = vec()  sz2.push(10.0)  sz2.push(10.0)
+    var sl0: Vec<ui::layout::FlexGrowSlot> = vec()
+    sl0.push(ui::layout::FlexGrowSlot { index: 0, weight: 0.0, shrink: 1.0 })
+    sl0.push(ui::layout::FlexGrowSlot { index: 1, weight: 0.0, shrink: 1.0 })
+    ui::layout::distribute_flex_grow(sz2, sl0, 40.0)
+    assert_feq(sz2[0], 30.0, 0.01)
+    assert_feq(sz2[1], 30.0, 0.01)
+    // shrink
+    var sz3: Vec<Float> = vec()  sz3.push(100.0)  sz3.push(100.0)
+    ui::layout::apply_flex_shrink(sz3, slots, 40.0)
+    assert_true(sz3[0] < 100.0 && sz3[1] < 100.0)
+}
+
+fn ov_tree() -> ui::layout::UiNode {
+    var btns: Vec<ui::layout::UiNode> = vec()
+    btns.push(ui::layout::ui_button("OK", "ok"))
+    btns.push(ui::layout::ui_button("Cancel", "cancel"))
+    var col_kids: Vec<ui::layout::UiNode> = vec()
+    col_kids.push(ui::layout::ui_text("Title", 18.0))
+    col_kids.push(ui::layout::ui_row(8.0, 0.0, btns))
+    return ui::layout::ui_column(10.0, 12.0, col_kids)
+}
+
+fn test_overlay_layout() {
+    var root = ov_tree()
+    root.has_bg = true
+    root.bg = ui::core::rgba_pack(ui::core::color_rgb(20, 20, 24))
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(300.0, 200.0))
+    var ov = ui::layout::layout_overlay(root, vp)
+    assert_true(ov.prims.len() > 0)
+    assert_eq(ov.hits.len(), 2)
+    // both button hits land on themselves
+    var i = 0
+    while i < ov.hits.len() {
+        var h = ov.hits[i]
+        var ht = ui::layout::overlay_hit_test(ov, h.rect.center())
+        assert_streq(ht.on_click, h.on_click)
+        i = i + 1
+    }
+    // a miss
+    assert_streq(ui::layout::overlay_hit_test(ov, ui::core::vec2(5000.0, 5000.0)).on_click, "")
+}
+
+fn test_text_wrap() {
+    // size 10: each ASCII char advances 5.2; "aa bb cc" = 41.6, "aa bb" = 26.0
+    assert_streq(ui::layout::wrap_text("aa bb cc", 30.0, 10.0, true), "aa bb\ncc")
+    assert_eq(ui::layout::wrap_line_count("aa bb cc", 30.0, 10.0, true), 2)
+    // existing newlines are preserved as hard breaks
+    assert_streq(ui::layout::wrap_text("aa\nbb", 100.0, 10.0, true), "aa\nbb")
+    // max_w <= 1 returns text unchanged
+    assert_streq(ui::layout::wrap_text("aa bb cc", 1.0, 10.0, true), "aa bb cc")
+    // a single ovr-wide word: hard_break splits mid-word (5 chars = 26.0 <= 30 < 31.2)
+    assert_streq(ui::layout::wrap_text("aaaaaaaa", 30.0, 10.0, true), "aaaaa\naaa")
+    // without hard_break the long word stays whole on its own line
+    assert_streq(ui::layout::wrap_text("aaaaaaaa", 30.0, 10.0, false), "aaaaaaaa")
+}
+
+fn test_text_truncate_clamp() {
+    // size 10: char advance 5.2, "..." = 3 dots * 5.2 * 0.42 = 6.552
+    // fits within width -> unchanged
+    assert_streq(ui::layout::truncate_with_ellipsis("ab", 100.0, 10.0), "ab")
+    // overflow: budget = 30 - 6.552 = 23.448 -> 4 chars (20.8) fit, 5 (26.0) don't
+    assert_streq(ui::layout::truncate_with_ellipsis("aaaaaaaa", 30.0, 10.0), "aaaa...")
+    // line clamp: keep lines[0..max_lines-1] + lines[max_lines-1]; the kept last line is
+    // ellipsized only if it overflows (8 c's = 41.6 > 30 -> "cccc...")
+    assert_streq(ui::layout::apply_line_clamp("aa\ncccccccc\ndd", 2, 30.0, 10.0, true), "aa\ncccc...")
+    // a short kept last line is not ellipsized (no overflow)
+    assert_streq(ui::layout::apply_line_clamp("aa\nbb\ncc", 2, 100.0, 10.0, true), "aa\nbb")
+    // under the limit -> unchanged
+    assert_streq(ui::layout::apply_line_clamp("aa\nbb", 3, 100.0, 10.0, true), "aa\nbb")
+    // clamp without ellipsis keeps the kept last line whole
+    assert_streq(ui::layout::apply_line_clamp("aa\ncccccccc\ndd", 2, 30.0, 10.0, false), "aa\ncccccccc")
+}
+
+fn test_text_layout_from_style() {
+    // a style that wraps + uppercases at size 10; feed "aa bb cc" -> 2 lines, uppercased
+    var s = ui::layout::node_style_empty()
+    s.has_size_px = true        s.size_px = 10.0
+    s.has_wrap = true           s.wrap = true
+    s.has_wrap_hard_break = true s.wrap_hard_break = true
+    s.has_max_width = true      s.max_width = 30.0
+    s.has_text_transform = true s.text_transform = ui::layout::tt_uppercase()
+    var tl = ui::layout::text_layout_from_style(s, "aa bb cc", 1000.0, 14.0, 1.2)
+    assert_streq(tl.content, "AA BB\nCC")
+    assert_eq(tl.lines, 2)
+    // unset size falls back to the default (14); no wrap -> single line
+    var d = ui::layout::node_style_empty()
+    var tl2 = ui::layout::text_layout_from_style(d, "hello", 1000.0, 14.0, 1.0)
+    assert_eq(tl2.lines, 1)
+    assert_true(tl2.height > 13.9 && tl2.height < 14.1)   // 1 line * 14 * 1.0
+    // text_overflow ellipsis (no wrap) truncates
+    var e = ui::layout::node_style_empty()
+    e.has_size_px = true       e.size_px = 10.0
+    e.has_max_width = true     e.max_width = 30.0
+    e.has_text_overflow = true e.text_overflow = 1
+    var tl3 = ui::layout::text_layout_from_style(e, "aaaaaaaa", 1000.0, 14.0, 1.0)
+    assert_streq(tl3.content, "aaaa...")
+}
+
+fn test_style_apply_over() {
+    // base sets bg + size; ovr sets size + color -> size overridden, bg kept, color added
+    var base = ui::layout::node_style_empty()
+    base.has_bg = true      base.bg = ui::core::rgba_pack(ui::core::color_rgb(10, 10, 10))
+    base.has_size_px = true base.size_px = 12.0
+    var ovr = ui::layout::node_style_empty()
+    ovr.has_size_px = true ovr.size_px = 20.0
+    ovr.has_color = true   ovr.color = ui::core::rgba_pack(ui::core::color_white())
+    var m = ui::layout::node_style_apply_over(base, ovr)
+    assert_true(m.has_bg)                 // base-only field kept
+    assert_eq(ui::core::rgba_color(m.bg).r, 10)
+    assert_true(m.has_size_px)
+    assert_true(m.size_px > 19.9 && m.size_px < 20.1)   // overridden
+    assert_true(m.has_color)
+    assert_eq(ui::core::rgba_color(m.color).r, 255)
+    // apply_over does not mutate base
+    assert_true(base.size_px > 11.9 && base.size_px < 12.1)
+    assert_true(!base.has_color)
+}
+
+fn test_stylesheet_cascade() {
+    var sheet = ui::layout::stylesheet_new()
+    // tag "text": size 12, transform uppercase
+    var t = ui::layout::node_style_empty()
+    t.has_size_px = true       t.size_px = 12.0
+    t.has_text_transform = true t.text_transform = ui::layout::tt_uppercase()
+    ui::layout::sheet_merge_tag(sheet, "text", t)
+    // class "big": size 24 (overrides tag)
+    var big = ui::layout::node_style_empty()
+    big.has_size_px = true     big.size_px = 24.0
+    ui::layout::sheet_merge_class(sheet, "big", big)
+    // class "italic": italic on
+    var ital = ui::layout::node_style_empty()
+    ital.has_font_italic = true ital.font_italic = true
+    ui::layout::sheet_merge_class(sheet, "italic", ital)
+
+    var classes: Vec<Str> = vec()
+    classes.push("big")
+    classes.push("italic")
+    var r = ui::layout::resolve_node_style(sheet, "text", classes)
+    assert_true(r.size_px > 23.9 && r.size_px < 24.1)     // class overrides tag
+    assert_eq(r.text_transform, ui::layout::tt_uppercase()) // from tag, kept
+    assert_true(r.font_italic)                              // from second class
+    // a tag with no rule + no classes -> empty
+    var empty: Vec<Str> = vec()
+    var none = ui::layout::resolve_node_style(sheet, "button", empty)
+    assert_true(!none.has_size_px)
+
+    // merging a second tag rule is field-level (adds radius, keeps size)
+    var t2 = ui::layout::node_style_empty()
+    t2.has_radius = true       t2.radius = 4.0
+    ui::layout::sheet_merge_tag(sheet, "text", t2)
+    var merged = ui::layout::sheet_tag(sheet, "text")
+    assert_true(merged.has_size_px && merged.has_radius)
+    assert_true(merged.radius > 3.9 && merged.radius < 4.1)
+}
+
+fn test_text_transform() {
+    assert_streq(ui::layout::apply_text_transform("hi there", ui::layout::tt_uppercase()), "HI THERE")
+    assert_streq(ui::layout::apply_text_transform("Hi There", ui::layout::tt_lowercase()), "hi there")
+    assert_streq(ui::layout::apply_text_transform("hi there", ui::layout::tt_capitalize()), "Hi There")
+    assert_streq(ui::layout::apply_text_transform("hi there", ui::layout::tt_none()), "hi there")
+}
+
+fn test_text_render_metrics() {
+    // wrap "aa bb cc" to 30 -> 2 lines; height = 2 * (10 * 1.2) = 24; width clamped to <=30
+    var tl = ui::layout::text_render_content_and_metrics("aa bb cc", 1000.0, 30.0, 10.0, true, true, 0, false, ui::layout::tt_none(), 1.2, 0.0)
+    assert_streq(tl.content, "aa bb\ncc")
+    assert_eq(tl.lines, 2)
+    assert_true(tl.height > 23.9 && tl.height < 24.1)
+    assert_true(tl.width <= 30.0)
+    // no wrap, single line: height = 1 line
+    var tl2 = ui::layout::text_render_content_and_metrics("hello", 1000.0, 0.0, 10.0, false, false, 0, false, ui::layout::tt_none(), 1.0, 0.0)
+    assert_eq(tl2.lines, 1)
+    // transform applied before layout
+    var tl3 = ui::layout::text_render_content_and_metrics("hi", 1000.0, 0.0, 10.0, false, false, 0, false, ui::layout::tt_uppercase(), 1.0, 0.0)
+    assert_streq(tl3.content, "HI")
+}
+
+fn test_color_scale_alpha() {
+    var c = ui::core::color_rgba(10, 20, 30, 200)
+    assert_eq(c.scale_alpha(0.5).a, 100)
+    assert_eq(c.scale_alpha(0.0).a, 0)
+    // clamps above 1
+    assert_eq(c.scale_alpha(2.0).a, 200)
+    // rgb untouched
+    assert_eq(c.scale_alpha(0.5).r, 10)
+}
+
+fn test_transform_rect() {
+    var r = ui::core::rect_min_size(ui::core::vec2(0.0, 0.0), ui::core::vec2(100.0, 40.0))
+    // identity is a no-op
+    var id = ui::core::transform_rect(r, ui::core::visual_transform_identity())
+    assert_true(id.width() > 99.9 && id.width() < 100.1)
+    // 0.5 scale about center (50, 20): half-size 50x20, centered -> min (25,10)
+    var t = ui::core::transform_rect(r, ui::core::VisualTransform { scale: 0.5, translate_y: 0.0 })
+    assert_true(t.width() > 49.9 && t.width() < 50.1)
+    assert_true(t.min.x > 24.9 && t.min.x < 25.1)
+    // translate_y shifts the box down
+    var ty = ui::core::transform_rect(r, ui::core::VisualTransform { scale: 1.0, translate_y: 5.0 })
+    assert_true(ty.min.y > 4.9 && ty.min.y < 5.1)
+}
+
+fn test_number_value_text() {
+    assert_streq(ui::layout::number_value_text(3.14159, 2, ""), "3.14")
+    assert_streq(ui::layout::number_value_text(2.5, 3, "x"), "2.5x")    // trailing zeros trimmed
+    assert_streq(ui::layout::number_value_text(5.0, 2, ""), "5")        // bare "." dropped
+    assert_streq(ui::layout::number_value_text(0.0 - 1.5, 1, ""), "-1.5")
+    assert_streq(ui::layout::number_value_text(42.0, 0, "%"), "42%")    // zero decimals
+}
+
+fn test_text_decorations() {
+    var rect = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(100.0, 30.0))
+    var col = ui::core::color_white()
+    // none -> no rects
+    assert_eq((ui::layout::push_text_decorations(rect, "ab", 10.0, 1.2, ui::layout::td_none(), col, 1.0)).len(), 0)
+    // fully transparent color -> no rects (alpha 0 early-out)
+    assert_eq((ui::layout::push_text_decorations(rect, "ab", 10.0, 1.2, ui::layout::td_underline(), ui::core::color_transparent(), 1.0)).len(), 0)
+    // two lines -> one underline rect each
+    var ul = ui::layout::push_text_decorations(rect, "ab\ncd", 10.0, 1.2, ui::layout::td_underline(), col, 1.0)
+    assert_eq(ul.len(), 2)
+    // empty lines are skipped
+    var sk = ui::layout::push_text_decorations(rect, "ab\n\ncd", 10.0, 1.2, ui::layout::td_strikethrough(), col, 1.0)
+    assert_eq(sk.len(), 2)
+    // underline sits below strikethrough (0.88 vs 0.55 of size)
+    var st = ui::layout::push_text_decorations(rect, "ab", 10.0, 1.2, ui::layout::td_strikethrough(), col, 1.0)
+    assert_true(ul[0].rect.min.y > st[0].rect.min.y)
+}
+
+fn test_apply_stylesheet() {
+    // sheet: tag "text" -> size 20 + uppercase; class "hot" -> red text
+    var sheet = ui::layout::stylesheet_new()
+    var ts = ui::layout::node_style_empty()
+    ts.has_size_px = true        ts.size_px = 20.0
+    ts.has_text_transform = true ts.text_transform = ui::layout::tt_uppercase()
+    ui::layout::sheet_merge_tag(sheet, "text", ts)
+    var hot = ui::layout::node_style_empty()
+    hot.has_text_color = true    hot.text_color = ui::core::rgba_pack(ui::core::color_rgb(255, 0, 0))
+    ui::layout::sheet_merge_class(sheet, "hot", hot)
+
+    // a text node with class "hot"
+    var cls: Vec<Str> = vec()
+    cls.push("hot")
+    var txt = ui::layout::ui_tagged(ui::layout::ui_text("hi there", 14.0), "", cls)
+    var kids: Vec<ui::layout::UiNode> = vec()
+    kids.push(txt)
+    var root = ui::layout::ui_column(8.0, 8.0, kids)
+    ui::layout::apply_stylesheet(root, sheet)
+
+    // the text node picked up size (tag) + red color (class)
+    var styled = root.children[0]
+    assert_true(styled.size_px > 19.9 && styled.size_px < 20.1)
+    assert_true(styled.has_color && ui::core::rgba_color(styled.color).r == 255 && ui::core::rgba_color(styled.color).g == 0)
+
+    // and layout renders the transformed (uppercased) content
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(400.0, 200.0))
+    var ov = ui::layout::layout_overlay(root, vp)
+    var found = ""
+    var i = 0
+    while i < ov.prims.len() { if ov.prims[i].kind == 2 { found = ov.prims[i].text }  i = i + 1 }
+    assert_streq(found, "HI THERE")
+}
+
+fn test_parse_ui_class_and_style() {
+    // parse a doc that carries a class + text-layout attrs, then cascade a sheet
+    var doc = "column { padding: 10 text { text: \"hello world\" class: \"hot big\" wrap: true max_width: 40 text_transform: uppercase } }"
+    var root = ui::layout::parse_ui(doc)
+    var t = root.children[0]
+    assert_eq(t.classes.len(), 2)
+    assert_streq(t.classes[0], "hot")
+    assert_streq(t.classes[1], "big")
+    assert_true(t.wrap && t.has_max_width)
+    assert_eq(t.text_transform, ui::layout::tt_uppercase())
+    // a sheet keyed on class "big" bumps size
+    var sheet = ui::layout::stylesheet_new()
+    var big = ui::layout::node_style_empty()
+    big.has_size_px = true  big.size_px = 22.0
+    ui::layout::sheet_merge_class(sheet, "big", big)
+    ui::layout::apply_stylesheet(root, sheet)
+    assert_true(root.children[0].size_px > 21.9 && root.children[0].size_px < 22.1)
+}
+
+fn test_syntax_palette() {
+    var def = ui::core::color_gray(200)
+    // defaults-only palette: keyword uses the built-in blue
+    var pal = ui::layout::palette_defaults(def)
+    var kw = ui::layout::palette_color(pal, "keyword")
+    assert_true(kw.r == 86 && kw.g == 156 && kw.b == 214)
+    // unknown class -> palette default
+    var unk = ui::layout::palette_color(pal, "whatever")
+    assert_true(unk.r == 200)
+    // default_token_color for an unknown class is absent
+    assert_false(ui::layout::default_token_color("nope").present)
+    // stylesheet override: class "keyword" text_color wins
+    var sheet = ui::layout::stylesheet_new()
+    var ns = ui::layout::node_style_empty()
+    ns.has_text_color = true  ns.text_color = ui::core::rgba_pack(ui::core::color_rgb(1, 2, 3))
+    ui::layout::sheet_merge_class(sheet, "keyword", ns)
+    var pal2 = ui::layout::palette_new(def, sheet)
+    var kw2 = ui::layout::palette_color(pal2, "keyword")
+    assert_true(kw2.r == 1 && kw2.g == 2 && kw2.b == 3)
+}
+
+fn test_syntax_lines_and_brackets() {
+    // source_lines
+    var ls = ui::layout::source_lines("a\nbb\nccc")
+    assert_eq(ls.len(), 3)
+    assert_streq(ls[1], "bb")
+    assert_eq((ui::layout::source_lines("")).len(), 1)
+    // visible_line_range: line_h 10, scroll 25 -> first 2; view 100 -> visible 11; overscan 1
+    var vr = ui::layout::visible_line_range(100.0, 25.0, 10.0, 1000, 1)
+    assert_eq(vr.start, 1)          // first(2) - overscan(1)
+    assert_eq(vr.end, 14)           // first(2) + visible(11) + overscan(1)
+    // Scrolled past the end of a short document. Nothing stops a caller from holding an offset
+    // larger than its content (a code editor's `scroll_y` may have no upper clamp), and the
+    // range must still be one a Vec of `total_lines` can be indexed with. For a single line it
+    // must not come back as 12..13.
+    var vr2 = ui::layout::visible_line_range(100.0, 300.0, 17.0, 1, 5)
+    assert_eq(vr2.start, 0)
+    assert_eq(vr2.end, 1)
+    assert_true(vr2.end <= 1 && vr2.start < vr2.end)
+    // the same, with room for the overscan to matter: 3 lines, scrolled far past them
+    var vr3 = ui::layout::visible_line_range(100.0, 9000.0, 17.0, 3, 5)
+    assert_eq(vr3.start, 2)
+    assert_eq(vr3.end, 3)
+    // bracket matching: "(a[b]c)" caret 0 '(' -> partner at 6
+    var bm = ui::layout::bracket_partner_index("(a[b]c)", 0)
+    assert_true(bm.present && bm.index == 6)
+    // caret 3 '[' -> ']' at 4
+    var bm2 = ui::layout::bracket_partner_index("(a[b]c)", 2)
+    assert_true(bm2.present && bm2.index == 4)
+    // backward: caret 6 ')' -> '(' at 0
+    var bm3 = ui::layout::bracket_partner_index("(a[b]c)", 6)
+    assert_true(bm3.present && bm3.index == 0)
+    // not on a bracket -> no match
+    assert_false(ui::layout::bracket_partner_index("(a[b]c)", 1).present)
+    // unbalanced -> no match
+    assert_false(ui::layout::bracket_partner_index("(ab", 0).present)
+}
+
+fn test_style_text_wrap_in_layout() {
+    // a wrapping text node capped at 30px (size 10): "aa bb cc" -> 2 lines
+    var n = ui::layout::ui_text("aa bb cc", 10.0)
+    n.wrap = true
+    n.has_max_width = true
+    n.max_width_px = 30.0
+    var tl = ui::layout::ui_text_layout(n, 30.0)
+    assert_streq(tl.content, "aa bb\ncc")
+    assert_eq(tl.lines, 2)
+}
+
+fn test_scroll_column() {
+    // 5 fixed 20px-tall rects in a 50px-visible scroll column, gap 0, padding 5
+    var kids: Vec<ui::layout::UiNode> = vec()
+    var i = 0
+    while i < 5 {
+        kids.push(ui::layout::ui_rect(ui::layout::ui_px(30.0), ui::layout::ui_px(20.0), ui::core::color_white()))
+        i = i + 1
+    }
+    var sc = ui::layout::ui_scroll_column("list", 0.0, 5.0, 50.0, kids)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(100.0, 60.0))
+    var ov = ui::layout::layout_overlay(sc, vp)
+    // the region is reported: viewport = padded rect, content = 5*20 = 100
+    assert_eq(ov.scrolls.len(), 1)
+    assert_streq(ov.scrolls[0].id, "list")
+    assert_eq(ov.scrolls[0].axis, 1)
+    assert_true(ov.scrolls[0].content_extent > 99.9 && ov.scrolls[0].content_extent < 100.1)
+    // unscrolled: the 50px inner viewport shows children 0,1 fully + 2 partially -> 3 clipped rect prims
+    assert_eq(ov.prims.len(), 3)
+    // every emitted prim lies inside the inner viewport and carries the clip rect
+    var pi = 0
+    while pi < ov.prims.len() {
+        assert_true(ov.prims[pi].has_clip)
+        assert_true(ov.prims[pi].rect.min.y >= 4.9 && ov.prims[pi].rect.max.y <= 55.1)
+        pi = pi + 1
+    }
+    // scrolled by 30: child 0 is half-clipped away at the top; children up to #4 enter
+    var ids: Vec<Str> = vec()  ids.push("list")
+    var offs: Vec<Float> = vec()  offs.push(30.0)
+    var ov2 = ui::layout::layout_overlay_scrolled(sc, vp, ids, offs)
+    assert_eq(ov2.prims.len(), 3)
+    // first visible prim starts at the viewport top (clipped), i.e. child 1 whose top is 5+20-30 = -5 -> clipped to 5
+    assert_true(ov2.prims[0].rect.min.y > 4.9 && ov2.prims[0].rect.min.y < 5.1)
+}
+
+fn test_scroll_clips_hits_and_text() {
+    // a button inside view and a button scrolled out: only the visible one hits
+    var kids: Vec<ui::layout::UiNode> = vec()
+    kids.push(ui::layout::ui_button("Visible", "on_a"))
+    kids.push(ui::layout::ui_rect(ui::layout::ui_px(1.0), ui::layout::ui_px(200.0), ui::core::color_transparent()))   // filler (Spacers are skipped in scroll flow)
+    kids.push(ui::layout::ui_button("Hidden", "on_b"))
+    var sc = ui::layout::ui_scroll_column("btns", 4.0, 0.0, 80.0, kids)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(200.0, 80.0))
+    var ov = ui::layout::layout_overlay(sc, vp)
+    assert_eq(ov.hits.len(), 1)
+    assert_streq(ov.hits[0].on_click, "on_a")
+    // text prims carry the clip rect for the host scissor
+    var ti = 0
+    var sawtext = false
+    while ti < ov.prims.len() { if ov.prims[ti].kind == 2 { sawtext = true  assert_true(ov.prims[ti].has_clip) }  ti = ti + 1 }
+    assert_true(sawtext)
+}
+
+/// A row a scroll viewport cannot show is not laid out at all, since the merge would clip everything it
+/// produced anyway. What the frame shows must not depend on how much is scrolled past, so the same
+/// window of a short list and of a long one is the same overlay.
+fn test_scroll_lays_out_only_what_it_shows() {
+    var short: Vec<ui::layout::UiNode> = vec()
+    var long: Vec<ui::layout::UiNode> = vec()
+    var i = 0
+    while i < 4 { short.push(ui::layout::ui_button(("b" + to_str(i)), ("on_" + to_str(i))))  i = i + 1 }
+    i = 0
+    while i < 400 { long.push(ui::layout::ui_button(("b" + to_str(i)), ("on_" + to_str(i))))  i = i + 1 }
+    let vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(200.0, 80.0))
+    var ovs = ui::layout::layout_overlay(ui::layout::ui_scroll_column("s", 4.0, 0.0, 80.0, short), vp)
+    var ovl = ui::layout::layout_overlay(ui::layout::ui_scroll_column("s", 4.0, 0.0, 80.0, long), vp)
+    // the window shows the same rows either way, and the 396 rows below it cost nothing
+    assert_eq(ovl.prims.len(), ovs.prims.len())
+    assert_eq(ovl.hits.len(), ovs.hits.len())
+    assert_true(ovs.hits.len() > 0)
+    assert_streq(ovl.hits[0].on_click, ovs.hits[0].on_click)
+}
+
+/// ...but not everything a hidden child produces is clipped. A nested scroll region is merged uncut,
+/// because the host needs every id to clamp offsets against, and the popup layer is too: a dropdown
+/// opens past its pane's edge on purpose. That is why the skip above is a whitelist of the plain flow
+/// kinds and not a height test: a subtree holding either is laid out wherever it sits.
+/// a double quote, for building a `.ui` source in a Nori string.
+fn dq() -> Str { return chr(34) + "" }
+fn test_scroll_keeps_a_nested_region_below_the_fold() {
+    var src = "scroll_column { id: s gap: 4 min_height: 80"
+    var i = 0
+    while i < 40 { src = (src + (" button { label: " + (dq() + ("b" + (dq() + " on_click: on }")))))  i = i + 1 }
+    src = (src + (" scroll_column { id: inner min_height: 40 text { text: " + (dq() + ("deep" + (dq() + " } } }")))))
+    var pr = ui::layout::dsl_parse_document(src)
+    assert_true(pr.ok)
+    let vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(200.0, 80.0))
+    var ov = ui::layout::doc_layout(pr.doc, vp)
+    // `inner` sits about 1300px down a viewport 80 tall, and is still registered
+    assert_eq(ov.scrolls.len(), 2)
+    assert_streq(ov.scrolls[1].id, "inner")
+}
+
+fn test_scroll_row_and_parse() {
+    var kids: Vec<ui::layout::UiNode> = vec()
+    var i = 0
+    while i < 4 { kids.push(ui::layout::ui_rect(ui::layout::ui_px(50.0), ui::layout::ui_px(20.0), ui::core::color_black()))  i = i + 1 }
+    var sr = ui::layout::ui_scroll_row("strip", 0.0, 0.0, 90.0, kids)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(90.0, 30.0))
+    var ov = ui::layout::layout_overlay(sr, vp)
+    assert_eq(ov.scrolls.len(), 1)
+    assert_eq(ov.scrolls[0].axis, 0)
+    assert_true(ov.scrolls[0].content_extent > 199.9)     // 4 * 50
+    assert_eq(ov.prims.len(), 2)                            // 90px shows child 0 + part of 1
+    // the .ui parser knows the element
+    var doc = "scroll_column { id: \"sc\" text { text: \"hi\" } }"
+    var root = ui::layout::parse_ui(doc)
+    assert_eq(root.kind, ui::layout::nk_scroll_column())
+}
+
+fn test_overflow_scroll_and_hidden() {
+    // a plain column given overflow_y: scroll via a stylesheet class becomes a scroll region
+    var kids: Vec<ui::layout::UiNode> = vec()
+    var i = 0
+    while i < 6 { kids.push(ui::layout::ui_rect(ui::layout::ui_px(30.0), ui::layout::ui_px(20.0), ui::core::color_white()))  i = i + 1 }
+    var col = ui::layout::ui_column(0.0, 5.0, kids)
+    col.id = "ovf"
+    var cls: Vec<Str> = vec()  cls.push("scrolly")
+    col.classes = cls
+    var sheet = ui::layout::stylesheet_new()
+    var ns = ui::layout::node_style_empty()
+    ns.has_overflow_y = true  ns.overflow_y = ui::layout::om_scroll()
+    ui::layout::sheet_merge_class(sheet, "scrolly", ns)
+    ui::layout::apply_stylesheet(col, sheet)
+    assert_eq(col.overflow_y, 3)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(100.0, 50.0))
+    var ov = ui::layout::layout_overlay(col, vp)
+    assert_eq(ov.scrolls.len(), 1)
+    assert_streq(ov.scrolls[0].id, "ovf")
+    assert_true(ov.scrolls[0].content_extent > 119.9)      // 6 * 20
+    // overflow: hidden clips without a scroll region, and layout twice stays stable (no aliasing damage)
+    var col2 = ui::layout::ui_column(0.0, 0.0, kids)
+    col2.overflow_y = 1
+    var ov2 = ui::layout::layout_overlay(col2, vp)
+    assert_eq(ov2.scrolls.len(), 0)
+    assert_true(ov2.prims.len() < 6)                        // 50px viewport clips the 120px content
+    var ov3 = ui::layout::layout_overlay(col2, vp)
+    assert_eq(ov3.prims.len(), ov2.prims.len())              // second layout identical (overflow restored)
+    // the .ui parser understands overflow_y
+    var doc = "column { overflow_y: scroll text { text: \"x\" } }"
+    var root = ui::layout::parse_ui(doc)
+    assert_eq(root.overflow_y, 3)
+}
+
+fn test_runtime_state() {
+    // a column with two identified buttons; runtime-hide one, disable the other, add a class
+    var kids: Vec<ui::layout::UiNode> = vec()
+    var b1 = ui::layout::ui_button("A", "on_a")
+    b1.id = "btn_a"
+    var b2 = ui::layout::ui_button("B", "on_b")
+    b2.id = "btn_b"
+    kids.push(b1)
+    kids.push(b2)
+    var root = ui::layout::ui_column(4.0, 4.0, kids)
+    var st = ui::layout::runtime_state_new()
+    var ns = ui::layout::node_runtime_state_new()
+    ns.hidden = true
+    ui::layout::rs_set(st, "btn_a", ns)
+    var ns2 = ui::layout::node_runtime_state_new()
+    ns2.disabled = true
+    ns2.add_classes.push("warn")
+    ui::layout::rs_set(st, "btn_b", ns2)
+    ui::layout::apply_runtime_state(root, st)
+    assert_true(root.children[0].hidden)
+    assert_true(root.children[1].disabled)
+    assert_eq(root.children[1].classes.len(), 1)
+    assert_streq(root.children[1].classes[0], "warn")
+    // layout: the hidden button contributes nothing; the disabled one paints but does not hit
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(200.0, 100.0))
+    var ov = ui::layout::layout_overlay(root, vp)
+    assert_eq(ov.hits.len(), 0)
+    // rs_clear removes the entry; a fresh tree lays out with both interactive again
+    ui::layout::rs_clear(st, "btn_a")
+    assert_eq(st.ids.len(), 1)
+}
+
+fn test_binds() {
+    // bind_visible/bind_disabled evaluated against a var environment
+    var kids: Vec<ui::layout::UiNode> = vec()
+    var b = ui::layout::ui_button("Save", "on_save")
+    b.bind_visible = "can_save"
+    var t = ui::layout::ui_text("readonly", 12.0)
+    t.bind_visible = "show_note"
+    kids.push(b)
+    kids.push(t)
+    var root = ui::layout::ui_column(4.0, 4.0, kids)
+    var ids: Vec<Str> = vec()  ids.push("can_save")  ids.push("show_note")
+    var vals: Vec<Str> = vec()  vals.push("true")    vals.push("false")
+    ui::layout::apply_binds(root, ids, vals)
+    assert_false(root.children[0].hidden)     // can_save=true -> visible
+    assert_true(root.children[1].hidden)      // show_note=false -> hidden
+    // truthiness rules
+    assert_false(ui::layout::bind_truthy(""))
+    assert_false(ui::layout::bind_truthy("0"))
+    assert_false(ui::layout::bind_truthy("false"))
+    assert_true(ui::layout::bind_truthy("yes"))
+    // bind_disabled: the var is the enabled condition: falsy/absent disables
+    var b2 = ui::layout::ui_button("Del", "on_del")
+    b2.bind_disabled = "can_delete"
+    var k3: Vec<ui::layout::UiNode> = vec()  k3.push(b2)
+    var root3 = ui::layout::ui_column(0.0, 0.0, k3)
+    ui::layout::apply_binds(root3, ids, vals)                 // can_delete absent -> disabled
+    assert_true(root3.children[0].disabled)
+    ids.push("can_delete")  vals.push("true")
+    ui::layout::apply_binds(root3, ids, vals)                 // true -> enabled
+    assert_false(root3.children[0].disabled)
+    // parser: bind attrs round-trip
+    var doc = "button { label: \"Go\" bind_disabled: \"busy\" }"
+    var n = ui::layout::parse_ui(doc)
+    assert_streq(n.bind_disabled, "busy")
+}
+
+fn test_absolute_position() {
+    // a flow rect + an absolute badge pinned to the top-right of the padded container
+    var kids: Vec<ui::layout::UiNode> = vec()
+    kids.push(ui::layout::ui_rect(ui::layout::ui_px(50.0), ui::layout::ui_px(20.0), ui::core::color_white()))
+    var badge = ui::layout::ui_rect(ui::layout::ui_px(10.0), ui::layout::ui_px(10.0), ui::core::color_black())
+    badge.position = 1
+    badge.has_top = true    badge.top = 2.0
+    badge.has_right = true  badge.right = 3.0
+    kids.push(badge)
+    var root = ui::layout::ui_column(0.0, 5.0, kids)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(100.0, 60.0))
+    var ov = ui::layout::layout_overlay(root, vp)
+    // both rects paint; the badge sits at (100-5-3-10, 5+2) = (82, 7)
+    assert_eq(ov.prims.len(), 2)
+    var bi = 1                                      // absolutes paint after the flow
+    assert_true(ov.prims[bi].rect.min.x > 81.9 && ov.prims[bi].rect.min.x < 82.1)
+    assert_true(ov.prims[bi].rect.min.y > 6.9 && ov.prims[bi].rect.min.y < 7.1)
+    // the flow rect is where it would be without the badge (absolute leaves the flow)
+    assert_true(ov.prims[0].rect.min.y > 4.9 && ov.prims[0].rect.min.y < 5.1)
+    // and a second layout is identical (children swap restored)
+    var ov2 = ui::layout::layout_overlay(root, vp)
+    assert_eq(ov2.prims.len(), 2)
+    // bottom/left pinning
+    var b2 = ui::layout::ui_rect(ui::layout::ui_px(10.0), ui::layout::ui_px(10.0), ui::core::color_black())
+    b2.position = 1
+    b2.has_bottom = true  b2.bottom = 0.0
+    b2.has_left = true    b2.left = 1.0
+    var kids2: Vec<ui::layout::UiNode> = vec()
+    kids2.push(b2)
+    var root2 = ui::layout::ui_column(0.0, 0.0, kids2)
+    var ov3 = ui::layout::layout_overlay(root2, vp)
+    assert_true(ov3.prims[0].rect.min.y > 49.9 && ov3.prims[0].rect.min.y < 50.1)   // 60 - 0 - 10
+    assert_true(ov3.prims[0].rect.min.x > 0.9 && ov3.prims[0].rect.min.x < 1.1)
+    // parser + cascade
+    var doc = "column { rect { w: 10px h: 10px position: absolute top: 4 left: 6 } }"
+    var pr = ui::layout::parse_ui(doc)
+    assert_eq(pr.children[0].position, 1)
+    assert_true(pr.children[0].has_top && pr.children[0].top > 3.9)
+    var sheet = ui::layout::stylesheet_new()
+    var ns = ui::layout::node_style_empty()
+    ns.has_position = true  ns.position = ui::layout::pm_absolute()
+    ns.has_top = true       ns.top = 8.0
+    ui::layout::sheet_merge_class(sheet, "pin", ns)
+    var pn = ui::layout::ui_rect(ui::layout::ui_px(5.0), ui::layout::ui_px(5.0), ui::core::color_white())
+    var pcls: Vec<Str> = vec()  pcls.push("pin")
+    pn.classes = pcls
+    var pk: Vec<ui::layout::UiNode> = vec()  pk.push(pn)
+    var proot = ui::layout::ui_column(0.0, 0.0, pk)
+    ui::layout::apply_stylesheet(proot, sheet)
+    assert_eq(proot.children[0].position, 1)
+    assert_true(proot.children[0].has_top && proot.children[0].top > 7.9)
+}
+
+fn test_focus_order_and_cycle() {
+    // three buttons: c has tab_index 1 (comes first), a and b follow in tree order; d is disabled (skipped)
+    var kids: Vec<ui::layout::UiNode> = vec()
+    var a = ui::layout::ui_button("A", "on_a")  a.id = "a"
+    var b = ui::layout::ui_button("B", "on_b")  b.id = "b"
+    var c = ui::layout::ui_button("C", "on_c")  c.id = "c"  c.has_tab_index = true  c.tab_index = 1
+    var d = ui::layout::ui_button("D", "on_d")  d.id = "d"  d.disabled = true
+    kids.push(a)  kids.push(b)  kids.push(c)  kids.push(d)
+    var root = ui::layout::ui_column(4.0, 4.0, kids)
+    var fs = ui::layout::collect_overlay_focusables(root)
+    assert_eq(fs.len(), 3)
+    assert_streq(fs[0].id, "c")        // explicit tab_index first
+    assert_streq(fs[1].id, "a")        // then tree order
+    assert_streq(fs[2].id, "b")
+    // cycling: none -> first; forward wraps; reverse steps back
+    assert_streq(ui::layout::cycle_overlay_focus(fs, "", false), "c")
+    assert_streq(ui::layout::cycle_overlay_focus(fs, "c", false), "a")
+    assert_streq(ui::layout::cycle_overlay_focus(fs, "b", false), "c")     // wrap
+    assert_streq(ui::layout::cycle_overlay_focus(fs, "c", true), "b")      // reverse wrap
+    // the focused class flows through the runtime state into the tree
+    var st = ui::layout::runtime_state_new()
+    ui::layout::rs_add_focus(st, "a")
+    ui::layout::apply_runtime_state(root, st)
+    assert_eq(root.children[0].classes.len(), 1)
+    assert_streq(root.children[0].classes[0], "focused")
+    // parser: tab_index attr
+    var doc = "button { label: \"X\" tab_index: 3 }"
+    var n = ui::layout::parse_ui(doc)
+    assert_true(n.has_tab_index)
+    assert_eq(n.tab_index, 3)
+}
+
+fn test_template_render() {
+    var ids: Vec<Str> = vec()  ids.push("title")  ids.push("accent")
+    var q = "" + chr(34)
+    var vals: Vec<Str> = vec()  vals.push((("He said " + q) + ("hi" + q)))  vals.push("[60,60,80,255]")
+    var lists: Vec<ui::layout::TemplateList> = vec()
+    // {{title}} escapes the quotes; {{raw:accent}} inserts as-is
+    var t = (("text { text: " + q) + ("{{title}}" + (q + " color: {{raw:accent}} }")))
+    var r = ui::layout::render_ui_template(t, ids, vals, lists)
+    assert_true(r.ok)
+    assert_true(ui::layout::nui_contains(r.out, "color: [60,60,80,255]"))
+    var bs = "" + chr(92)
+    assert_true(ui::layout::nui_contains(r.out, bs + q))     // escaped quote in the value
+    // missing variable -> error naming it
+    var bad = ui::layout::render_ui_template("{{nope}}", ids, vals, lists)
+    assert_false(bad.ok)
+    assert_true(ui::layout::nui_contains(bad.err, "nope"))
+}
+
+fn test_template_foreach() {
+    var ids: Vec<Str> = vec()  ids.push("app")
+    var vals: Vec<Str> = vec()  vals.push("demo")
+    var rows = ui::layout::template_list_new("rows")
+    var i = 0
+    while i < 3 {
+        var it = ui::layout::template_item_new()
+        it.keys.push("label")
+        it.vals.push(("Row" + to_str(i)))
+        rows.items.push(it)
+        i = i + 1
+    }
+    var lists: Vec<ui::layout::TemplateList> = vec()
+    lists.push(rows)
+    var t = "{{app}}: {{#foreach r in rows}}[{{r.label}}]{{/foreach}} done"
+    var res = ui::layout::render_ui_template(t, ids, vals, lists)
+    assert_true(res.ok)
+    assert_streq(res.out, "demo: [Row0][Row1][Row2] done")
+    // unknown list -> error
+    var bad = ui::layout::render_ui_template("{{#foreach x in nolist}}{{/foreach}}", ids, vals, lists)
+    assert_false(bad.ok)
+}
+
+fn test_parse_cache() {
+    var cache = ui::layout::parse_cache_new(2)
+    var d1 = "column { text { text: \"a\" } }"
+    var d2 = "column { text { text: \"b\" } }"
+    var d3 = "column { text { text: \"c\" } }"
+    var t1 = copy ui::layout::parse_cache_get(cache, d1)
+    var t1b = ui::layout::parse_cache_get(cache, d1)
+    // same source -> served from the one cached entry, not parsed again; the answer is that tree
+    assert_eq(cache.sources.len(), 1)
+    assert_eq(t1b.kind, t1.kind)
+    assert_eq(t1b.children.len(), t1.children.len())
+    assert_streq(t1b.children[0].text, "a")
+    var _t2 = ui::layout::parse_cache_get(cache, d2)
+    assert_eq(cache.sources.len(), 2)
+    var _t3 = ui::layout::parse_cache_get(cache, d3)    // cap 2: evicts d1
+    assert_eq(cache.sources.len(), 2)
+    assert_streq(cache.sources[0], d2)
+    assert_streq(cache.sources[1], d3)
+    ui::layout::parse_cache_clear(cache)
+    assert_eq(cache.sources.len(), 0)
+}
+
+fn test_ui_document() {
+    var doc = ui::layout::ui_document_parse("column { padding: 4 text { id: \"msg\" text: \"old\" class: \"big\" } }")
+    // attach a sheet: class big -> size 22
+    var sheet = ui::layout::stylesheet_new()
+    var ns = ui::layout::node_style_empty()
+    ns.has_size_px = true  ns.size_px = 22.0
+    ui::layout::sheet_merge_class(sheet, "big", ns)
+    ui::layout::doc_merge_stylesheet(doc, sheet)
+    // patch the text, then layout: the paint shows the new text at the cascaded size
+    assert_true(ui::layout::doc_patch_text(doc, "msg", "new text"))
+    assert_false(ui::layout::doc_patch_text(doc, "nope", "x"))
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(300.0, 100.0))
+    var ov = ui::layout::doc_layout(doc, vp)
+    var found = ""
+    var fsz = 0.0
+    var i = 0
+    while i < ov.prims.len() { if ov.prims[i].kind == 2 { found = ov.prims[i].text  fsz = ov.prims[i].size_px }  i = i + 1 }
+    assert_streq(found, "new text")
+    assert_true(fsz > 21.9 && fsz < 22.1)
+    // laying out twice is stable (cascade idempotent for an unchanged sheet)
+    var ov2 = ui::layout::doc_layout(doc, vp)
+    assert_eq(ov2.prims.len(), ov.prims.len())
+}
+
+fn test_rich_text() {
+    // "Hello " (plain 10) + "BIG" (20, red, bold) + " end" -> one line, 3+ segments, styles carried
+    var spans: Vec<ui::layout::TextSpanRun> = vec()
+    spans.push(ui::layout::span("Hello "))
+    var big = ui::layout::span("BIG")
+    big.has_size = true   big.size_px = 20.0
+    big.has_color = true  big.color = ui::core::color_rgb(255, 0, 0)
+    big.bold = true
+    spans.push(big)
+    spans.push(ui::layout::span(" end"))
+    var node = ui::layout::ui_text_spans(spans, 10.0)
+    var kids: Vec<ui::layout::UiNode> = vec()  kids.push(node)
+    var root = ui::layout::ui_column(0.0, 0.0, kids)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(400.0, 60.0))
+    var ov = ui::layout::layout_overlay(root, vp)
+    // find the BIG segment: red, size 20, bold; and a plain one at size 10
+    var sawbig = false
+    var sawplain = false
+    var i = 0
+    while i < ov.prims.len() {
+        if ov.prims[i].kind == 2 {
+            if ov.prims[i].size_px > 19.9 { sawbig = true  assert_true(ov.prims[i].font_bold)  assert_eq(ov.prims[i].color.r, 255) }
+            if ov.prims[i].size_px < 10.1 { sawplain = true }
+        }
+        i = i + 1
+    }
+    assert_true(sawbig)
+    assert_true(sawplain)
+    // wrapping: narrow width forces multiple lines -> more segments at increasing y
+    var spans2: Vec<ui::layout::TextSpanRun> = vec()
+    spans2.push(ui::layout::span("aa bb cc dd"))
+    var n2 = ui::layout::ui_text_spans(spans2, 10.0)
+    n2.wrap = true
+    var rl = ui::layout::layout_rich_spans(n2.spans, 10.0, 1.2, true, 30.0)
+    assert_true(rl.lines.len() > 1)
+    assert_true(rl.width <= 30.0)
+    // And it breaks between words, not inside them. A boundary reached mid-word must not split the
+    // word across two lines with no hyphen: the plain-text wrapper beside it makes hard breaking
+    // opt-in (`wrap_hard_break`) and this path has no such flag. Asserted on the text rather than
+    // the line count, because the count can be right while the words are not.
+    var spans3: Vec<ui::layout::TextSpanRun> = vec()
+    spans3.push(ui::layout::span("alpha bravo charlie"))
+    var rl3 = ui::layout::layout_rich_spans(spans3, 10.0, 1.2, true, 60.0)
+    var li3 = 0
+    while li3 < rl3.lines.len() {
+        var joined = ""
+        var si3 = 0
+        while si3 < rl3.lines[li3].segments.len() { joined = (joined + rl3.lines[li3].segments[si3].text)  si3 = si3 + 1 }
+        var t3 = joined
+        while t3.len() > 0 && ord(t3.at(t3.len() - 1)) == 32 { t3 = t3.slice(0, t3.len() - 1) }
+        if t3.len() > 0 {
+            assert_true(t3 == "alpha" || t3 == "bravo" || t3 == "charlie" || t3 == "alpha bravo" || t3 == "bravo charlie" || t3 == "alpha bravo charlie")
+        }
+        li3 = li3 + 1
+    }
+    // measure: rich node intrinsic height covers its lines
+    n2.has_max_width = true  n2.max_width_px = 30.0
+    var _vpx = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(30.0, 100.0))
+    var m = ui::layout::ui_measure(n2, ui::layout::length_context_root(30.0, 100.0))
+    assert_true(m.y > 12.0 * 2.0 - 0.1)               // at least two 12px lines
+}
+
+// ---- span: per-kind fidelity (parse_text_span_node) ----
+
+/// parse `src` and return its first span (the root must be a `text` node).
+fn nuit_span_of(src: Str) -> ui::layout::TextSpanRun {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    assert_true(r.doc.tree.spans.len() > 0)
+    return copy r.doc.tree.spans[0]
+}
+/// parse `src`, assert it failed, and assert the message is exactly `msg` (no line:col prefix).
+fn nuit_span_msg(src: Str, msg: Str) {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_false(r.ok)
+    assert_streq(r.emsg, msg)
+}
+
+fn test_span_attribute_table() {
+    // everything TextSpanRun can carry, in one span
+    var sp = nuit_span_of("text { span { text: \"a\" classes: [hot, big] size_px: 20 color: #ff0000 bold: true italic: true text_transform: uppercase text_outline_color: [0, 255, 0, 255] text_outline_width_px: 3 } }")
+    assert_streq(sp.text, "a")
+    assert_eq(sp.classes.len(), 2)
+    assert_streq(sp.classes[0], "hot")
+    assert_streq(sp.classes[1], "big")
+    assert_true(sp.has_size)
+    assert_feq(sp.size_px, 20.0, 0.001)
+    assert_true(sp.has_color)
+    assert_eq(sp.color.r, 255)
+    assert_true(sp.bold)
+    assert_true(sp.italic)
+    assert_true(sp.has_outline)
+    assert_eq(sp.outline_color.g, 255)
+    assert_feq(sp.outline_width_px, 3.0, 0.001)
+    // `class:` replaces the list with one name, like every other kind
+    var sp2 = nuit_span_of("text { span { text: a class: solo } }")
+    assert_eq(sp2.classes.len(), 1)
+    assert_streq(sp2.classes[0], "solo")
+    // the three accepted outline aliases
+    assert_true(nuit_span_of("text { span { text: a outline_color: #fff } }").has_outline)
+    assert_true(nuit_span_of("text { span { text: a stroke_color: #fff } }").has_outline)
+    assert_feq(nuit_span_of("text { span { text: a outline_width: 2 } }").outline_width_px, 2.0, 0.001)
+    assert_feq(nuit_span_of("text { span { text: a stroke_width: 2 } }").outline_width_px, 2.0, 0.001)
+    // the `font_size` / `text_color` aliases
+    assert_feq(nuit_span_of("text { span { text: a font_size: 9 } }").size_px, 9.0, 0.001)
+    assert_eq(nuit_span_of("text { span { text: a text_color: #0000ff } }").color.b, 255)
+}
+
+fn test_span_error_text() {
+    // the unknown-field message double-quotes the name, and the colon message names the node, not the attribute
+    nuit_span_msg("text { span { text: \"a\" zzz: 1 } }", "unknown span field " + chr(34) + "zzz" + chr(34))
+    nuit_span_msg("text { span { text: \"a\" bogus 1 } }", "expected `:` in span node")
+    // value strictness, per attribute
+    nuit_span_msg("text { span { text: a size_px: big } }", "size_px must be a number")
+    nuit_span_msg("text { span { text: a bold: yes } }", "bold must be true or false")
+    // These stay lenient and are pinned that way: a strict form would take Bool only for
+    // `bold`/`italic` and a quoted String only for `text`, but the span applies the
+    // library-wide `n != 0` / string-or-ident leniency.
+    assert_true(nuit_span_of("text { span { text: a bold: 1 } }").bold)
+    assert_streq(nuit_span_of("text { span { text: bare } }").text, "bare")
+    nuit_span_msg("text { span { text: a text_outline_width_px: thick } }", "text_outline_width_px must be a number")
+    nuit_span_msg("text { span { text: a text_outline_color: 4 } }", "expected [r,g,b,a] or #RRGGBB/#RRGGBBAA")
+    nuit_span_msg("text { span { text: a classes: hot } }", "classes must be [...]")
+    // the two span attributes nothing here could read are rejected, not silently stored:
+    // no font-family field on PaintPrimitive, and the rich flow measures with no tracking.
+    nuit_span_msg("text { span { text: a font_family: Inter } }", "unknown span field " + chr(34) + "font_family" + chr(34))
+    nuit_span_msg("text { span { text: a letter_spacing: 2 } }", "unknown span field " + chr(34) + "letter_spacing" + chr(34))
+}
+
+fn test_span_classes_cascade_and_outline_paint() {
+    // a `class` rule reaches a span, not just a node (resolve_text_span's sheet half)
+    var src = "document { stylesheet { class hot { text_color: [255, 0, 0, 255] size_px: 20 bold: true italic: true } } column { gap: 0 text { size_px: 10 span { text: \"warn\" classes: [hot] } span { text: \" ok\" } } } }"
+    var doc = ui::layout::ui_document_parse(src)
+    assert_true(doc.has_sheet)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(400.0, 60.0))
+    var ov = ui::layout::doc_layout(doc, vp)
+    var sawhot = false
+    var sawplain = false
+    var i = 0
+    while i < ov.prims.len() {
+        if ov.prims[i].kind == 2 {
+            if ov.prims[i].size_px > 19.9 { sawhot = true  assert_eq(ov.prims[i].color.r, 255)  assert_true(ov.prims[i].font_bold)  assert_true(ov.prims[i].font_italic) }
+            if ov.prims[i].size_px < 10.1 { sawplain = true }
+        }
+        i = i + 1
+    }
+    assert_true(sawhot)
+    assert_true(sawplain)
+    // the per-span outline reaches the primitive, with styled_text's 0.5..16 clamp
+    var r2 = ui::layout::dsl_parse_document("column { gap: 0 text { text: \"\" span { text: \"x\" text_outline_color: [0, 0, 255, 255] text_outline_width_px: 40 } } }")
+    assert_true(r2.ok)
+    var ov2 = ui::layout::layout_overlay(r2.doc.tree, vp)
+    var sawout = false
+    var j = 0
+    while j < ov2.prims.len() {
+        if ov2.prims[j].kind == 2 && ov2.prims[j].outline_w > 0.0 {
+            sawout = true
+            assert_eq(ov2.prims[j].outline_color.b, 255)
+            assert_feq(ov2.prims[j].outline_w, 16.0, 0.001)
+        }
+        j = j + 1
+    }
+    assert_true(sawout)
+    // a span with no outline of its own inherits the text node's
+    var r3 = ui::layout::dsl_parse_document("column { gap: 0 text { text: \"\" text_outline_color: [9, 9, 9, 255] text_outline_width_px: 2 span { text: \"x\" } } }")
+    assert_true(r3.ok)
+    var ov3 = ui::layout::layout_overlay(r3.doc.tree, vp)
+    var inherited = false
+    var k = 0
+    while k < ov3.prims.len() {
+        if ov3.prims[k].kind == 2 && ov3.prims[k].outline_w > 0.0 { inherited = true  assert_eq(ov3.prims[k].outline_color.r, 9) }
+        k = k + 1
+    }
+    assert_true(inherited)
+}
+
+fn test_hover_active_styling() {
+    // a rect-ish column with class "card": base gray, hover blue, active red, hover border
+    var kids: Vec<ui::layout::UiNode> = vec()
+    var card = ui::layout::ui_column(0.0, 0.0, kids)
+    card.has_bg = true  card.bg = ui::core::rgba_pack(ui::core::color_gray(50))
+    var cls: Vec<Str> = vec()  cls.push("card")
+    card.classes = cls
+    var sheet = ui::layout::stylesheet_new()
+    var ns = ui::layout::node_style_empty()
+    ns.has_hover_bg = true           ns.hover_bg = ui::core::rgba_pack(ui::core::color_rgb(0, 0, 255))
+    ns.has_active_bg = true          ns.active_bg = ui::core::rgba_pack(ui::core::color_rgb(255, 0, 0))
+    ns.has_hover_border_color = true ns.hover_border_color = ui::core::rgba_pack(ui::core::color_rgb(0, 255, 0))
+    ui::layout::sheet_merge_class(sheet, "card", ns)
+    ui::layout::apply_stylesheet(card, sheet)
+    card.border_w = 2.0
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(100.0, 50.0))
+    var nid: Vec<Str> = vec()
+    var noff: Vec<Float> = vec()
+    // no pointer: base bg, no hover border
+    var ov0 = ui::layout::layout_overlay(card, vp)
+    assert_eq(ov0.prims[0].color.r, 50)
+    assert_eq(ov0.prims.len(), 1)
+    // pointer inside, button up: hover bg + hover border
+    var ov1 = ui::layout::layout_overlay_interactive(card, vp, nid, noff, ui::core::vec2(10.0, 10.0), false)
+    assert_eq(ov1.prims[0].color.b, 255)
+    assert_eq(ov1.prims.len(), 2)                          // bg + hover border
+    assert_eq(ov1.prims[1].color.g, 255)
+    // pointer inside, button down: active bg
+    var ov2 = ui::layout::layout_overlay_interactive(card, vp, nid, noff, ui::core::vec2(10.0, 10.0), true)
+    assert_eq(ov2.prims[0].color.r, 255)
+    // pointer outside: base again
+    var ov3 = ui::layout::layout_overlay_interactive(card, vp, nid, noff, ui::core::vec2(500.0, 500.0), false)
+    assert_eq(ov3.prims[0].color.r, 50)
+    // hover text color on a text node
+    var t = ui::layout::ui_text("link", 12.0)
+    t.has_hover_text_color = true  t.hover_text_color = ui::core::rgba_pack(ui::core::color_rgb(1, 2, 3))
+    var k2: Vec<ui::layout::UiNode> = vec()  k2.push(t)
+    var root2 = ui::layout::ui_column(0.0, 0.0, k2)
+    var ov4 = ui::layout::layout_overlay_interactive(root2, vp, nid, noff, ui::core::vec2(5.0, 5.0), false)
+    var ti = 0
+    while ti < ov4.prims.len() { if ov4.prims[ti].kind == 2 { assert_eq(ov4.prims[ti].color.r, 1) }  ti = ti + 1 }
+}
+
+fn test_multiline_edit_ops() {
+    var q = "" + chr(10)
+    var st = ui::layout::multiline_edit_new("hello" + (q + "world"))
+    // navigation: line/col mapping + vertical movement keeps the column
+    st.caret = 7                                   // 'o' in wOrld -> line 1 col 1
+    let (l1, c1) = ui::layout::me_line_col_at(st.text, st.caret)
+    assert_eq(l1, 1)
+    assert_eq(c1, 1)
+    ui::layout::me_move_up(st, false)
+    assert_eq(st.caret, 1)                          // line 0 col 1
+    // Down from the last line snaps to end-of-document
+    st.caret = 8  st.sel_anchor = 8                 // line 1 col 2
+    ui::layout::me_move_down(st, false)
+    assert_eq(st.caret, 11)
+    st.caret = 1  st.sel_anchor = 1
+    ui::layout::me_move_end(st, false)
+    assert_eq(st.caret, 5)                          // end of "hello"
+    // typing with selection: select "hello" and replace it
+    st.caret = 0
+    st.sel_anchor = 0
+    ui::layout::me_move_word_right(st, true)        // select the word
+    assert_streq(ui::layout::me_selected_text(st), "hello")
+    ui::layout::me_insert(st, "goodbye")
+    assert_streq(st.text, "goodbye" + (q + "world"))
+    assert_eq(st.caret, 7)
+    // backspace joins lines
+    st.caret = 8                                    // just after the newline
+    st.sel_anchor = 8
+    ui::layout::me_backspace(st)
+    assert_streq(st.text, "goodbyeworld")
+    // undo twice restores the original; redo replays
+    ui::layout::me_undo(st)
+    assert_streq(st.text, "goodbye" + (q + "world"))
+    ui::layout::me_undo(st)
+    assert_streq(st.text, "hello" + (q + "world"))
+    ui::layout::me_redo(st)
+    assert_streq(st.text, "goodbye" + (q + "world"))
+    // ---- the branch you left is still there ----
+    //
+    // A stack drops the redo path the moment you type after an undo: three edits undone and one
+    // character typed would destroy all three. An editor that something else also writes into
+    // cannot afford that (undoing what a tool did would mean undoing everything you did after it),
+    // so the history is a tree and an edit made after an undo forks rather than truncates.
+    var tr = ui::layout::multiline_edit_new("a")
+    tr.caret = 1
+    tr.sel_anchor = 1
+    ui::layout::me_insert(tr, "b")                       // "ab"
+    ui::layout::me_insert(tr, "c")                       // "abc"
+    assert_streq(tr.text, "abc")
+    ui::layout::me_undo(tr)
+    assert_streq(tr.text, "ab")
+    let fork = ui::layout::me_hist_cur(tr)               // the node both branches hang from
+    ui::layout::me_insert(tr, "X")                       // a second child of `fork`
+    assert_streq(tr.text, "abX")
+    // redo follows the branch just taken…
+    ui::layout::me_undo(tr)
+    assert_streq(tr.text, "ab")
+    ui::layout::me_redo(tr)
+    assert_streq(tr.text, "abX")
+    // …and the one left behind is still reachable, which a stack could not say
+    var kids = ui::layout::me_hist_children(tr, fork)
+    assert_eq(kids.len(), 2)
+    var back = 0
+    var ki = 0
+    while ki < kids.len() { if ui::layout::me_hist_text(tr, kids[ki]) == "abc" { back = kids[ki] } ki = ki + 1 }
+    assert_true(back > 0)
+    assert_true(ui::layout::me_goto(tr, back))
+    assert_streq(tr.text, "abc")
+    // a node can be named, so a history can say who made it
+    ui::layout::me_hist_name(tr, "chat: turn 7")
+    assert_streq(ui::layout::me_hist_label(tr, ui::layout::me_hist_cur(tr)), "chat: turn 7")
+    // …and `me_goto` to the fork is a rewind: one buffer, one node
+    assert_true(ui::layout::me_goto(tr, fork))
+    assert_streq(tr.text, "ab")
+
+    // newline auto-indent copies leading whitespace
+    var st2 = ui::layout::multiline_edit_new("  li")
+    st2.caret = 4
+    st2.sel_anchor = 4
+    ui::layout::me_insert_newline(st2)
+    assert_streq(st2.text, "  li" + (q + "  "))
+    // tab inserts to the next stop; read_only blocks everything
+    var st3 = ui::layout::multiline_edit_new("ab")
+    st3.caret = 2  st3.sel_anchor = 2
+    ui::layout::me_insert_tab(st3)
+    assert_eq(st3.text.len(), 4)                    // ab + 2 spaces to the 4-stop
+    st3.read_only = true
+    ui::layout::me_insert(st3, "x")
+    assert_eq(st3.text.len(), 4)
+}
+
+fn test_multiline_find_and_paint() {
+    var q = "" + chr(10)
+    var st = ui::layout::multiline_edit_new("The cat sat on the CAT mat")
+    // find: case-insensitive finds both cats; case-sensitive only the exact one
+    var all = ui::layout::me_find_all(st.text, "cat", false)
+    assert_eq(all.len(), 2)
+    var cs = ui::layout::me_find_all(st.text, "cat", true)
+    assert_eq(cs.len(), 1)
+    assert_eq(cs[0].start, 4)
+    // prev from the end lands on the last match
+    var pv = ui::layout::me_find_prev(st.text, "cat", st.text.len(), false)
+    assert_true(pv.found)
+    assert_eq(pv.start, 19)
+    // paint: 3 lines, selection over line 1, caret on, line numbers on
+    var st2 = ui::layout::multiline_edit_new("aaa" + (q + ("bbbbb" + (q + "cc"))))
+    st2.sel_anchor = 4                              // inside line 1
+    st2.caret = 7
+    var rect = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(300.0, 120.0))
+    var prims = ui::layout::layout_multiline_edit(st2, rect, 12.0, true, ui::layout::multiline_paint_opts())
+    // expect: 3 gutter numbers + 3 text lines + 1 selection rect + 1 current-line highlight + 1 caret
+    var texts = 0
+    var rects = 0
+    var i = 0
+    while i < prims.len() { if prims[i].kind == 2 { texts = texts + 1 } else { rects = rects + 1 }  i = i + 1 }
+    assert_eq(texts, 6)                             // 3 numbers + 3 lines
+    assert_eq(rects, 3)                             // selection + current-line + caret
+    // hit-testing round-trips a caret position
+    var content_x = rect.min.x + ui::layout::me_gutter_width(3, 12.0, true) + 8.0
+    var hit = ui::layout::me_hit_to_caret(st2, content_x + 1.0, rect.min.y + 8.0 + 1.0, ui::core::rect_min_size(ui::core::vec2(content_x, rect.min.y + 8.0), ui::core::vec2(200.0, 100.0)), 12.0)
+    assert_eq(hit, 0)
+}
+
+fn test_overlay_fill_and_surface() {
+    // a row with a fixed rect and a fill rect: fill takes the remaining width
+    var kids: Vec<ui::layout::UiNode> = vec()
+    var fixed = ui::layout::ui_rect(ui::layout::ui_px(40.0), ui::layout::ui_px(20.0), ui::core::color_white())
+    var fill = ui::layout::ui_rect(ui::layout::ui_px(0.0), ui::layout::ui_px(20.0), ui::core::color_black())
+    fill.fill_w = true
+    kids.push(fixed)
+    kids.push(fill)
+    var row = ui::layout::ui_row(10.0, 0.0, kids)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(200.0, 40.0))
+    var ov = ui::layout::layout_overlay(row, vp)
+    // 2 fill-rect primitives (white + black)
+    var nrect = 0  var i = 0
+    while i < ov.prims.len() { if ov.prims[i].kind == 0 { nrect = nrect + 1 }  i = i + 1 }
+    assert_eq(nrect, 2)
+    // the black fill rect should be wider than the fixed 40 (filled remaining ~150)
+    var widest = 0.0  var j = 0
+    while j < ov.prims.len() { if ov.prims[j].kind == 0 && ov.prims[j].rect.width() > widest { widest = ov.prims[j].rect.width() }  j = j + 1 }
+    assert_true(widest > 100.0)
+    // surface region
+    var sk: Vec<ui::layout::UiNode> = vec()
+    sk.push(ui::layout::ui_surface("game", ui::layout::ui_px(100.0), ui::layout::ui_px(80.0)))
+    var ov2 = ui::layout::layout_overlay(ui::layout::ui_column(0.0, 0.0, sk), vp)
+    assert_eq(ov2.surfaces.len(), 1)
+    assert_streq(ov2.surfaces[0].id, "game")
+}
+
+fn dsl_src() -> Str {
+    return "column { gap: 10 padding: 12 bg: [20, 20, 24] text { text: \"Title\" size_px: 18 } row { gap: 8 padding: 0 button { label: \"OK\" on_click: ok } button { label: \"Cancel\" on_click: cancel } } }"
+}
+
+fn test_parse_ui() {
+    var root = ui::layout::parse_ui(dsl_src())
+    assert_eq(root.kind, ui::layout::nk_column())
+    assert_feq(root.gap, 10.0, 0.01)
+    assert_feq(root.padding, 12.0, 0.01)
+    assert_true(root.has_bg)
+    assert_eq(ui::core::rgba_color(root.bg).r, 20)
+    assert_eq(root.children.len(), 2)
+    assert_eq(root.children[0].kind, ui::layout::nk_text())
+    assert_streq(root.children[0].text, "Title")
+    assert_feq(root.children[0].size_px, 18.0, 0.01)
+    var row = root.children[1]
+    assert_eq(row.kind, ui::layout::nk_row())
+    assert_eq(row.children.len(), 2)
+    assert_streq(row.children[0].text, "OK")
+    assert_streq(row.children[0].on_click, "ok")
+    assert_streq(row.children[1].on_click, "cancel")
+}
+
+fn test_parse_ui_then_layout() {
+    var root = ui::layout::parse_ui(dsl_src())
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(300.0, 200.0))
+    var ov = ui::layout::layout_overlay(root, vp)
+    assert_eq(ov.hits.len(), 2)
+    // background fill primitive present
+    var has_bg = false  var i = 0
+    while i < ov.prims.len() { if ov.prims[i].kind == 0 { has_bg = true }  i = i + 1 }
+    assert_true(has_bg)
+    // hit a button
+    var hit = ui::layout::overlay_hit_test(ov, ov.hits[0].rect.center())
+    assert_true(hit.on_click.len() > 0)
+}
+
+fn test_parse_ui_lengths_and_align() {
+    var src = "row { padding: 0 cross_align: center rect { w: 50% h: 20 color: [255,0,0] } surface { id: cam w: 100 h: 80 } }"
+    var root = ui::layout::parse_ui(src)
+    assert_eq(root.cross_align, ui::layout::cross_center())
+    var rc = root.children[0]
+    assert_eq(rc.kind, ui::layout::nk_rect())
+    assert_eq(rc.w.unit, 1)          // percent
+    assert_feq(rc.w.value, 50.0, 0.01)
+    assert_eq(ui::core::rgba_color(rc.color).r, 255)
+    var sf = root.children[1]
+    assert_eq(sf.kind, ui::layout::nk_surface())
+    assert_streq(sf.id, "cam")
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(400.0, 100.0))
+    var ov = ui::layout::layout_overlay(root, vp)
+    assert_eq(ov.surfaces.len(), 1)
+}
+
+fn test_gpu_stubs() {
+    var cfg = ui::demo_config_default()
+    assert_eq(cfg.width, 1280)
+    assert_eq(ui::run_wgpu_string_demo(cfg), -1)
+    var nb: Vec<Int> = vec()
+    assert_false(ui::register_image_bytes("k", nb))
+    // dock-layout menu commands
+    var saved: Vec<Str> = vec()  saved.push("Editing")  saved.push("Debug")
+    var items = ui::build_layout_menu_items(saved)
+    assert_eq(items.len(), 4)
+    assert_eq(ui::layout_menu_index(0, saved).kind, 2)   // save
+    assert_eq(ui::layout_menu_index(1, saved).kind, 3)   // reset
+    var load = ui::layout_menu_index(2, saved)
+    assert_eq(load.kind, 1)
+    assert_streq(load.name, "Editing")
+    assert_eq(ui::layout_menu_index(99, saved).kind, 0)  // none
+}
+
+// ---- the strict .ui/.style DSL parser (layout/dsl.nori) ----
+
+fn test_dsl_document_stylesheet_and_hex() {
+    var src = "stylesheet { tag title { size_px: 22 bold: true text_color: #ff8800 } class card { bg: #222 radius: 6 pad: 12 } } column { text { tag: title text: 'x' } }"
+    // swap single quotes for double quotes (source stays backslash-free)
+    var q = "" + chr(34)
+    var fixed = ""
+    var i = 0
+    while i < src.len() {
+        if ord(src.at(i)) == 39 { fixed = fixed + q } else { fixed = fixed + src.slice(i, i + 1) }
+        i = i + 1
+    }
+    var r = ui::layout::dsl_parse_document(fixed)
+    assert_true(r.ok)
+    assert_true(r.doc.has_sheet)
+    var t = ui::layout::sheet_tag(r.doc.sheet, "title")
+    assert_true(t.has_size_px)
+    assert_feq(t.size_px, 22.0, 0.01)
+    assert_true(t.has_font_bold)
+    assert_true(t.font_bold)
+    assert_true(t.has_text_color)
+    assert_eq(ui::core::rgba_color(t.text_color).r, 255)
+    assert_eq(ui::core::rgba_color(t.text_color).g, 136)
+    assert_eq(ui::core::rgba_color(t.text_color).b, 0)
+    assert_eq(ui::core::rgba_color(t.text_color).a, 255)
+    var c = ui::layout::sheet_class(r.doc.sheet, "card")
+    assert_true(c.has_bg)
+    assert_eq(ui::core::rgba_color(c.bg).r, 34)       // #222 shorthand -> 0x22
+    assert_true(c.has_padding)  // `pad` alias
+    assert_feq(c.padding, 12.0, 0.01)
+    assert_streq(r.doc.tree.children[0].tag, "title")
+}
+
+fn test_dsl_comments_and_rgba_hex() {
+    var q = "" + chr(34)
+    var nl = chr(10) + ""
+    var src = ("// leading comment" + nl) + ("# hash comment" + nl) + ("rect { color: #11223344 w: 10 h: 10 } " + ("// trailing" + nl))
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    assert_eq(ui::core::rgba_color(r.doc.tree.color).r, 17)
+    assert_eq(ui::core::rgba_color(r.doc.tree.color).g, 34)
+    assert_eq(ui::core::rgba_color(r.doc.tree.color).b, 51)
+    assert_eq(ui::core::rgba_color(r.doc.tree.color).a, 68)
+    assert_true(r.doc.tree.has_color)
+}
+
+fn test_dsl_error_line_col() {
+    var nl = chr(10) + ""
+    var src = ("column {" + nl) + (("  gap: 4" + nl) + ("  bogus_attr: 3" + nl)) + "}"
+    var r = ui::layout::dsl_parse_document(src)
+    assert_false(r.ok)
+    assert_true(ui::layout::nui_contains(r.err, "bogus_attr"))
+    assert_true(ui::layout::nui_contains(r.err, "3:"))       // DslError Display: "L:C: message"
+    assert_eq(r.eline, 3)
+    // unknown element
+    var r2 = ui::layout::dsl_parse_document("column { wizard { } }")
+    assert_false(r2.ok)
+    assert_true(ui::layout::nui_contains(r2.err, "wizard"))
+    // unknown style property
+    var r3 = ui::layout::dsl_parse_stylesheet("tag t { blorp: 1 }")
+    assert_false(r3.ok)
+    assert_true(ui::layout::nui_contains(r3.err, "blorp"))
+}
+
+fn test_dsl_span_children() {
+    var q = "" + chr(34)
+    var src = "text { span { text: " + q
+    src = src + "Hello "
+    src = src + q
+    src = src + " bold: true } span { text: "
+    src = src + q
+    src = src + "world"
+    src = src + q
+    src = src + " color: #ff0000 transform: uppercase } }"
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    assert_eq(r.doc.tree.spans.len(), 2)
+    assert_streq(r.doc.tree.spans[0].text, "Hello ")
+    assert_true(r.doc.tree.spans[0].bold)
+    assert_streq(r.doc.tree.spans[1].text, "world")
+    assert_true(r.doc.tree.spans[1].has_color)
+    assert_eq(r.doc.tree.spans[1].color.r, 255)
+    assert_eq(r.doc.tree.spans[1].transform, ui::layout::tt_uppercase())
+    // non-span child in text is an error
+    var bad = ui::layout::dsl_parse_document("text { rect { } }")
+    assert_false(bad.ok)
+}
+
+fn test_dsl_string_escapes_and_negatives() {
+    var q = "" + chr(34)
+    var bs = "" + chr(92)
+    var src = "column { text { text: " + q
+    src = src + "a"
+    src = src + bs
+    src = src + "nb"
+    src = src + q
+    src = src + " } rect { z_index: -2 w: 10 h: 2.5 } }"
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    var tx = r.doc.tree.children[0].text
+    assert_eq(tx.len(), 3)
+    assert_eq(ord(tx.at(1)), 10)   // the escape became a real newline
+    var rc = r.doc.tree.children[1]
+    assert_eq(rc.z_index, 0 - 2)
+    assert_feq(rc.h.value, 2.5, 0.001)
+}
+
+fn test_dsl_standalone_style_source() {
+    var nl = chr(10) + ""
+    var src = ("# theme" + nl) + (("tag button { bg: [10, 20, 30, 255] hover_bg: #333333 min_h: 40 }" + nl) + ("class danger { text_color: #f00 border_w: 2 border_color: #ff0000 }" + nl))
+    var r = ui::layout::dsl_parse_stylesheet(src)
+    assert_true(r.ok)
+    var b = ui::layout::sheet_tag(r.sheet, "button")
+    assert_true(b.has_bg)
+    assert_eq(ui::core::rgba_color(b.bg).g, 20)
+    assert_true(b.has_hover_bg)
+    assert_eq(ui::core::rgba_color(b.hover_bg).r, 51)
+    assert_true(b.has_min_height)   // `min_h` alias
+    var d = ui::layout::sheet_class(r.sheet, "danger")
+    assert_true(d.has_text_color)
+    assert_eq(ui::core::rgba_color(d.text_color).r, 255)
+    assert_eq(ui::core::rgba_color(d.text_color).g, 0)
+    assert_feq(d.border_w, 2.0, 0.01)
+    // bad channel is an error
+    var bad = ui::layout::dsl_parse_stylesheet("tag t { bg: [0, 0, 0, 300] }")
+    assert_false(bad.ok)
+}
+
+fn test_dsl_nested_layout_end_to_end() {
+    var q = "" + chr(34)
+    var src = "stylesheet { class pane { bg: #202830 } } column { padding: 0 gap: 0 row { class: pane fill_w: true h: 40 } scroll_column { id: body h: 100 text { text: " + q
+    src = src + "hi"
+    src = src + q
+    src = src + " } } }"
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    var root = inout r.doc.tree
+    assert_eq(root.children.len(), 2)
+    assert_streq(root.children[0].classes[0], "pane")
+    assert_eq(root.children[1].kind, ui::layout::nk_scroll_column())
+    // resolve the cascade for the classed row
+    var st = ui::layout::resolve_node_style(r.doc.sheet, "", root.children[0].classes)
+    assert_true(st.has_bg)
+    assert_eq(ui::core::rgba_color(st.bg).r, 32)
+    // and lay the whole document out
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(300.0, 200.0))
+    var ov = ui::layout::layout_overlay(root, vp)
+    assert_true(ov.prims.len() > 0)
+    assert_eq(ov.scrolls.len(), 1)
+}
+
+// ---- parse-error overlay + full Theme persist ----
+
+fn test_parse_error_lines_and_paint() {
+    var nl = chr(10) + ""
+    var src = ("column {" + nl) + "  nope: 1 }"
+    var res = ui::layout::dsl_parse_document(src)
+    assert_false(res.ok)
+    var lines = ui::layout::parse_error_lines(res)
+    assert_streq(lines[0], "UI parse error")
+    assert_true(ui::layout::nui_contains(lines[1], "nope"))
+    assert_true(ui::layout::nui_contains(lines[2], "Line 2"))
+    assert_true(ui::layout::nui_contains(lines[2], "column"))
+    assert_true(ui::layout::nui_contains(lines[lines.len() - 1], "hot reload"))
+    assert_true(ui::layout::nui_contains(ui::layout::parse_error_summary(res), "2:"))
+    // the empty-document case has no Line/message rows: title + summary + hint
+    var er = ui::layout::dsl_parse_document("   // just a comment")
+    assert_false(er.ok)
+    assert_true(er.src_empty)
+    assert_streq(ui::layout::parse_error_summary(er), "empty overlay document")
+    assert_eq((ui::layout::parse_error_lines(er)).len(), 3)
+    // painting emits a card + border + one text command per line
+    var bounds = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(600.0, 300.0))
+    var ctx = ui::core::context_new(bounds)
+    ui::layout::paint_parse_error(ctx, bounds, res)
+    assert_eq(ctx.main_draw_commands.len(), 2 + lines.len())
+    // an empty stylesheet source is the distinct Empty error too
+    var es = ui::layout::dsl_parse_stylesheet("  ")
+    assert_false(es.ok)
+    assert_true(es.src_empty)
+}
+
+fn test_theme_persist_roundtrip() {
+    var t = ui::core::theme_engine_dark()
+    t.text_styles.custom_names.push("Caption")
+    t.text_styles.custom_fonts.push(ui::core::font_monospace(9.5))
+    var js = ui::core::serialize_theme(t)
+    var back = ui::core::deserialize_theme(js)
+    assert_true(back.ok)
+    var u = back.theme
+    assert_eq(u.visuals.panel_fill.r, t.visuals.panel_fill.r)
+    assert_eq(u.visuals.panel_fill.g, t.visuals.panel_fill.g)
+    assert_true(u.visuals.dark_mode)
+    assert_eq(u.visuals.dock_tab_active_fill.b, t.visuals.dock_tab_active_fill.b)
+    assert_feq(u.visuals.window_stroke.width, t.visuals.window_stroke.width, 0.0001)
+    assert_eq(u.visuals.selection_bg.a, t.visuals.selection_bg.a)
+    assert_eq(u.widgets.active.bg_fill.r, t.widgets.active.bg_fill.r)
+    assert_feq(u.widgets.hovered.expansion, t.widgets.hovered.expansion, 0.0001)
+    assert_feq(u.widgets.open.corner_radius.nw, t.widgets.open.corner_radius.nw, 0.0001)
+    assert_feq(u.spacing.item_spacing.x, t.spacing.item_spacing.x, 0.0001)
+    assert_feq(u.spacing.window_margin.left, t.spacing.window_margin.left, 0.0001)
+    assert_feq(u.spacing.slider_width, t.spacing.slider_width, 0.0001)
+    assert_feq(u.text_styles.heading.size, t.text_styles.heading.size, 0.0001)
+    assert_streq(u.text_styles.monospace.family, "Monospace")
+    assert_eq(u.text_styles.custom_names.len(), 1)
+    assert_streq(u.text_styles.custom_names[0], "Caption")
+    assert_feq(u.text_styles.custom_fonts[0].size, 9.5, 0.0001)
+    assert_streq(u.text_styles.custom_fonts[0].family, "Monospace")
+    assert_feq(u.animation_time, t.animation_time, 0.0001)
+    // optional colors survive both ways
+    if t.visuals.override_text_color.present { assert_true(u.visuals.override_text_color.present) } else { assert_false(u.visuals.override_text_color.present) }
+    if t.visuals.hyperlink_color.present { assert_true(u.visuals.hyperlink_color.present) } else { assert_false(u.visuals.hyperlink_color.present) }
+}
+
+fn test_theme_persist_light_and_errors() {
+    var t = ui::core::theme_default_light()
+    var back = ui::core::deserialize_theme(ui::core::serialize_theme(t))
+    assert_true(back.ok)
+    assert_false(back.theme.visuals.dark_mode)
+    assert_eq(back.theme.visuals.panel_fill.r, t.visuals.panel_fill.r)
+    assert_eq(back.theme.widgets.inactive.bg_stroke.color.r, t.widgets.inactive.bg_stroke.color.r)
+    // scale round-trips too (a scaled theme is what Preferences persists)
+    var sc = t.scale(1.5)
+    var back2 = ui::core::deserialize_theme(ui::core::serialize_theme(sc))
+    assert_true(back2.ok)
+    assert_feq(back2.theme.text_styles.body.size, sc.text_styles.body.size, 0.0001)
+    // malformed input -> ok=false + the default theme
+    var bad = ui::core::deserialize_theme("{ not a theme")
+    assert_false(bad.ok)
+    var bad2 = ui::core::deserialize_theme("")
+    assert_false(bad2.ok)
+}
+
+// ---- lexer and parser edge cases ----
+
+fn test_dsl_lexer_fidelity() {
+    // block comments, exponent numbers, slash idents, the `scroll` kind alias, trailing line comment
+    var nl = chr(10) + ""
+    var src = "/* block" + (nl + ("comment */ column { on_click: p/go rect { w: 2.5e1 h: 1e2 color: #f00 } scroll { id: sc text { text: hi } } } // tail"))
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    assert_streq(r.doc.tree.on_click, "p/go")
+    var rc = r.doc.tree.children[0]
+    assert_feq(rc.w.value, 25.0, 0.0001)
+    assert_feq(rc.h.value, 100.0, 0.0001)
+    assert_eq(r.doc.tree.children[1].kind, ui::layout::nk_scroll_column())
+    // exponent backtrack: `1e` + non-digit is the number 1, then ident
+    var r2 = ui::layout::dsl_parse_document("rect { w: 1e h: 2 color: #f00 }")
+    assert_false(r2.ok)                                  // `e` after 1 backtracks -> stray ident `e` -> error
+    // quoted hex colors (a String starting with '#' is accepted)
+    var q = "" + chr(34)
+    var src3 = "rect { w: 1 h: 1 color: " + (q + ("#0000ff" + (q + " }")))
+    var r3 = ui::layout::dsl_parse_document(src3)
+    assert_true(r3.ok)
+    assert_eq(ui::core::rgba_color(r3.doc.tree.color).b, 255)
+    assert_eq(ui::core::rgba_color(r3.doc.tree.color).r, 0)
+}
+
+fn test_dsl_commas_and_arrays_strict() {
+    // commas are array-only separators: attribute lists reject them
+    var bad = ui::layout::dsl_parse_document("rect { w: 1, h: 1 }")
+    assert_false(bad.ok)
+    // arrays require comma separators
+    var bad2 = ui::layout::dsl_parse_document("rect { w: 1 h: 1 color: [1 2 3 4] }")
+    assert_false(bad2.ok)
+    assert_true(ui::layout::nui_contains(bad2.err, "expected `,` or `]`"))
+    // well-formed arrays still parse
+    var ok = ui::layout::dsl_parse_document("rect { w: 1 h: 1 color: [1, 2, 3, 4] }")
+    assert_true(ok.ok)
+    assert_eq(ui::core::rgba_color(ok.doc.tree.color).g, 2)
+}
+
+fn test_dsl_bools_and_strict_words() {
+    // bool values: numbers coerce (f != 0.0), other kinds error
+    var r = ui::layout::dsl_parse_document("column { text { text: hi wrap: 1 } }")
+    assert_true(r.ok)
+    assert_true(r.doc.tree.children[0].wrap)
+    var bad = ui::layout::dsl_parse_document("column { fill_w: yes rect { w: 1 h: 1 } }")
+    assert_false(bad.ok)
+    assert_true(ui::layout::nui_contains(bad.err, "true or false"))
+    // unknown enum words are errors, not silent defaults
+    assert_false(ui::layout::dsl_parse_document("column { cross_align: middle }").ok)
+    assert_false(ui::layout::dsl_parse_stylesheet("tag t { text_transform: shouty }").ok)
+    assert_false(ui::layout::dsl_parse_document("column { main_align: stretch }").ok)   // stretch is cross-only
+    // line_clamp clamps to >= 1
+    var lc = ui::layout::dsl_parse_stylesheet("tag t { line_clamp: 0 }")
+    assert_true(lc.ok)
+    assert_eq(ui::layout::sheet_tag(lc.sheet, "t").line_clamp, 1)
+}
+
+fn test_dsl_lengths_and_fill() {
+    var r = ui::layout::dsl_parse_document("column { rect { w: 50% h: 40vh } surface { id: cam w: 30vw h: 2ui } }")
+    assert_true(r.ok)
+    var rc = r.doc.tree.children[0]
+    assert_eq(rc.w.unit, 1)
+    assert_feq(rc.w.value, 50.0, 0.0001)
+    assert_eq(rc.h.unit, 3)
+    assert_feq(rc.h.value, 40.0, 0.0001)
+    var sf = r.doc.tree.children[1]
+    assert_eq(sf.w.unit, 2)
+    assert_eq(sf.h.unit, 4)
+    // On rect and surface a bare `w: fill` sets fill_w rather than a length. Everywhere else it is
+    // rejected with the fill_w/fill_h hint.
+    var fw = ui::layout::dsl_parse_document("column { rect { w: fill h: 1 } }")
+    assert_true(fw.ok)
+    assert_true(fw.doc.tree.children[0].fill_w)
+    var bad = ui::layout::dsl_parse_document("column { w: fill }")
+    assert_false(bad.ok)
+    assert_true(ui::layout::nui_contains(bad.err, "fill_w / fill_h"))
+    var ok = ui::layout::dsl_parse_document("column { rect { fill: true h: 1 } }")
+    assert_true(ok.ok)
+    assert_true(ok.doc.tree.children[0].fill_w)
+}
+
+fn test_dsl_parse_defaults() {
+    // containers: gap 0, padding 0, cross_align stretch (not the ui_node_blank builder defaults)
+    var r = ui::layout::dsl_parse_document("column { row { rect { w: 1 h: 1 } } }")
+    assert_true(r.ok)
+    assert_feq(r.doc.tree.gap, 0.0, 0.0001)
+    assert_feq(r.doc.tree.padding, 0.0, 0.0001)
+    assert_eq(r.doc.tree.cross_align, ui::layout::cross_stretch())
+    // scroll fills: column true/true, row true/false
+    var sc = ui::layout::dsl_parse_document("scroll_column { text { text: x } }")
+    assert_true(sc.doc.tree.fill_w)
+    assert_true(sc.doc.tree.fill_h)
+    var sr = ui::layout::dsl_parse_document("scroll_row { text { text: x } }")
+    assert_true(sr.doc.tree.fill_w)
+    assert_false(sr.doc.tree.fill_h)
+    // button: default height 48, label+on_click required
+    // button's `label` must be a quoted string: only DslValue::String is matched, unlike the
+    // lenient string-or-ident used elsewhere. A bare ident is rejected.
+    var b = ui::layout::dsl_parse_document("button { label: \"ok\" on_click: go }")
+    assert_true(b.ok)
+    assert_feq(b.doc.tree.h.value, 48.0, 0.0001)
+    var b2 = ui::layout::dsl_parse_document("button { label: \"ok\" }")
+    assert_false(b2.ok)
+    assert_true(ui::layout::nui_contains(b2.err, "on_click"))
+    var b3 = ui::layout::dsl_parse_document("button { label: ok on_click: go }")
+    assert_false(b3.ok)                               // a bare ident label is an error
+    // text requires text and/or spans
+    var t = ui::layout::dsl_parse_document("column { text { size_px: 12 } }")
+    assert_false(t.ok)
+    // non-containers reject children
+    assert_false(ui::layout::dsl_parse_document("button { label: a on_click: b rect { w: 1 h: 1 } }").ok)
+}
+
+fn test_dsl_padding_axes() {
+    var r = ui::layout::dsl_parse_document("column { pad_x: 10 pad_y: 4 rect { w: 20 h: 8 color: #f00 } }")
+    assert_true(r.ok)
+    assert_true(r.doc.tree.has_padding_x)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(200.0, 100.0))
+    var ov = ui::layout::layout_overlay(r.doc.tree, vp)
+    // the rect child starts at (pad_x, pad_y)
+    var found = false
+    var i = 0
+    while i < ov.prims.len() {
+        if ov.prims[i].kind == 0 && ov.prims[i].color.r == 255 {
+            assert_feq(ov.prims[i].rect.min.x, 10.0, 0.01)
+            assert_feq(ov.prims[i].rect.min.y, 4.0, 0.01)
+            found = true
+        }
+        i = i + 1
+    }
+    assert_true(found)
+}
+
+fn test_dsl_document_forms() {
+    var q = "" + chr(34)
+    // the document { } wrapper with style: + stylesheet + tree
+    var src = "document { style: dark stylesheet { tag t { bold: true } } tree column { rect { w: 1 h: 1 } } }"
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    assert_streq(r.doc.style, "dark")
+    assert_true(r.doc.has_sheet)
+    assert_eq(r.doc.tree.children.len(), 1)
+    // top-level style: + root; stylesheet after the root also legal
+    var r2 = ui::layout::dsl_parse_document("style: light rect { w: 1 h: 1 color: #f00 } stylesheet { tag t { radius: 1 } }")
+    assert_true(r2.ok)
+    assert_streq(r2.doc.style, "light")
+    assert_true(r2.doc.has_sheet)
+    assert_eq(r2.doc.tree.kind, ui::layout::nk_rect())
+    // duplicate stylesheet / second root / missing root are errors
+    assert_false(ui::layout::dsl_parse_document("stylesheet { } stylesheet { } rect { w: 1 h: 1 }").ok)
+    assert_false(ui::layout::dsl_parse_document("rect { w: 1 h: 1 } rect { w: 1 h: 1 }").ok)
+    var nr = ui::layout::dsl_parse_document("stylesheet { tag t { bold: true } }")
+    assert_false(nr.ok)
+    assert_true(ui::layout::nui_contains(nr.err, "root"))
+}
+
+fn test_dsl_sheet_replace_and_aliases() {
+    // duplicate rule replaces wholesale, not field-merge
+    var r = ui::layout::dsl_parse_stylesheet("tag t { bold: true } tag t { radius: 2 }")
+    assert_true(r.ok)
+    var t = ui::layout::sheet_tag(r.sheet, "t")
+    assert_true(t.has_radius)
+    assert_false(t.has_font_bold)
+    // prop aliases: transform / decoration / overflow (+ line_through word)
+    var a = ui::layout::dsl_parse_stylesheet("tag x { transform: uppercase decoration: line_through overflow: ellipsis }")
+    assert_true(a.ok)
+    var x = ui::layout::sheet_tag(a.sheet, "x")
+    assert_eq(x.text_transform, 1)
+    assert_eq(x.text_decoration, 2)
+    assert_eq(x.text_overflow, 1)
+    // node-attr aliases: align_items/justify_content/flex/focus_order/height/text_color on text
+    var n = ui::layout::dsl_parse_document("column { align_items: center justify_content: space_between text { text: hi text_color: #0f0 flex: 2 focus_order: 3 height: 20 } }")
+    assert_true(n.ok)
+    assert_eq(n.doc.tree.cross_align, ui::layout::cross_center())
+    assert_eq(n.doc.tree.main_align, ui::layout::main_space_between())
+    var tx = n.doc.tree.children[0]
+    assert_eq(ui::core::rgba_color(tx.color).g, 255)
+    assert_feq(tx.flex_weight, 2.0, 0.0001)
+    assert_eq(tx.tab_index, 3)
+    assert_feq(tx.h.value, 20.0, 0.0001)
+    // class: single name, never split; classes: must be an array
+    var c = ui::layout::dsl_parse_document("column { rect { w: 1 h: 1 class: one_class } }")
+    assert_true(c.ok)
+    assert_eq(c.doc.tree.children[0].classes.len(), 1)
+    var q = "" + chr(34)
+    var cs = "column { rect { w: 1 h: 1 class: " + (q + ("a b" + (q + " } }")))
+    var c2 = ui::layout::dsl_parse_document(cs)
+    assert_true(c2.ok)
+    assert_eq(c2.doc.tree.children[0].classes.len(), 1)   // "a b" stays one class
+    assert_false(ui::layout::dsl_parse_document("column { rect { w: 1 h: 1 classes: solo } }").ok)
+}
+
+fn test_theme_persist_escaped_strings() {
+    var q = "" + chr(34)
+    var bs = "" + chr(92)
+    var t = ui::core::theme_default()
+    t.text_styles.custom_names.push(("Say " + (q + ("Hi" + (q + (" " + bs))))))
+    t.text_styles.custom_fonts.push(ui::core::FontId { size: 8.0, family: ("Fam" + (q + "ily")) })
+    var back = ui::core::deserialize_theme(ui::core::serialize_theme(t))
+    assert_true(back.ok)
+    assert_streq(back.theme.text_styles.custom_names[0], t.text_styles.custom_names[0])
+    assert_streq(back.theme.text_styles.custom_fonts[0].family, t.text_styles.custom_fonts[0].family)
+}
+
+fn one_id(s: Str) -> Vec<Str> { var v: Vec<Str> = vec()  v.push(copy s)  return v }
+fn preset_leaves(ds: ui::layout::DockState) -> Int {
+    ds.layout_surface(0, ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(800.0, 600.0)), 6.0)
+    return (ui::layout::tree_leaf_rects(ds.surface_tree(0))).len()
+}
+fn test_dock_presets_more() {
+    var valid: Vec<Str> = vec()
+    valid.push("a")  valid.push("b")  valid.push("c")  valid.push("d")
+    var A = one_id("a")  var B = one_id("b")  var C = one_id("c")  var D = one_id("d")
+    assert_eq(preset_leaves(ui::layout::build_vertical_split(valid, A, B, 0.5)), 2)
+    assert_eq(preset_leaves(ui::layout::build_three_pane(valid, A, B, C, 0.33, 0.5)), 3)
+    assert_eq(preset_leaves(ui::layout::build_ide(valid, A, B, C, 0.2, 0.7)), 3)
+    assert_eq(preset_leaves(ui::layout::build_grid_2x2(valid, A, B, C, D, 0.5, 0.5)), 4)
+    var empty: Vec<Str> = vec()
+    assert_eq(preset_leaves(ui::layout::build_vertical_split(valid, A, empty, 0.5)), 1)   // graceful fallback
+}
+
+fn test_window_manager_serde() {
+    var wm = ui::layout::window_manager_new()
+    wm.upsert(ui::layout::window_state_new(1, "Alpha", ui::core::rect_min_size(ui::core::vec2(10.0, 20.0), ui::core::vec2(300.0, 200.0))))
+    wm.upsert(ui::layout::window_state_new(2, "Beta", ui::core::rect_min_size(ui::core::vec2(50.0, 60.0), ui::core::vec2(150.0, 120.0))))
+    wm.set_visible(2, false)
+    var js = ui::layout::serialize_window_manager(wm)
+    var wm2 = ui::layout::deserialize_window_manager(js)
+    assert_eq(wm2.windows.len(), 2)
+    assert_true(wm2.has_window(1))
+    var a = wm2.window(1)
+    assert_true((a.title == "Alpha"))
+    assert_feq(a.rect.min.x, 10.0, 0.001)
+    assert_feq(a.rect.width(), 300.0, 0.001)
+    assert_false(wm2.window(2).visible)
+}
+
+fn test_dock_drag_helper() {
+    var ds = ui::layout::dock_state_new(dk_ids("a", "b"))
+    var rootp: Vec<Int> = vec()
+    ds.split_leaf_and_put_tab(0, rootp, ui::layout::SplitDirection::DirHorizontal, 0.5, false, "c")   // [0]=a,b | [1]=c
+    var dock = ui::core::rect_min_size(ui::core::vec2(0.0, 28.0), ui::core::vec2(800.0, 572.0))
+    ds.layout_surface(0, dock, 6.0)
+    // drag tab "a" (path [0], idx 0) and drop over the right leaf (x=700) -> re-docked
+    var p0: Vec<Int> = vec()  p0.push(0)
+    var drag = ui::layout::dock_drag_begin("a", p0, 0, ui::core::vec2(100.0, 200.0))
+    drag = ui::layout::dock_drag_update(drag, ui::core::vec2(150.0, 200.0), 8.0)
+    assert_true(drag.moved)
+    var res = ui::layout::dock_drag_commit(ds, 0, drag, ui::core::vec2(700.0, 300.0), dock, 6.0)
+    assert_eq(res.outcome, 1)
+    assert_true((ui::layout::tree_tab_locations(ds.surface_tree(0), "a")).len() > 0)
+    // dropping outside any leaf (above the dock rect, y=5) -> outcome 2 (host tears it off)
+    var ds2 = ui::layout::dock_state_new(dk_ids("a", "b"))
+    var rp2: Vec<Int> = vec()
+    ds2.split_leaf_and_put_tab(0, rp2, ui::layout::SplitDirection::DirHorizontal, 0.5, false, "c")
+    ds2.layout_surface(0, dock, 6.0)
+    var p1: Vec<Int> = vec()  p1.push(1)
+    var d2 = ui::layout::dock_drag_begin("c", p1, 0, ui::core::vec2(700.0, 300.0))
+    d2 = ui::layout::dock_drag_update(d2, ui::core::vec2(700.0, 5.0), 8.0)
+    var res2 = ui::layout::dock_drag_commit(ds2, 0, d2, ui::core::vec2(700.0, 5.0), dock, 6.0)
+    assert_eq(res2.outcome, 2)
+}
+
+// ---------------------------------------------------------------------------
+// JSON-valued template environment (render_ui_template_json)
+// ---------------------------------------------------------------------------
+
+fn tj(text: Str) -> Json { return json::parse(text) }
+
+fn test_template_json_flat() {
+    var env = tj("{\"title\": \"He said \\\"hi\\\"\", \"accent\": \"[60,60,80,255]\"}")
+    var q = "" + chr(34)
+    var bs = "" + chr(92)
+    var r = ui::layout::render_ui_template_json(("text { text: " + q) + ("{{title}}" + (q + " color: {{raw:accent}} }")), env)
+    assert_true(r.ok)
+    assert_streq(r.out, ((("text { text: " + q) + "He said ") + ((bs + q) + "hi")) + (((bs + q) + q) + " color: [60,60,80,255] }"))
+    // the raw form of the very same string is not escaped
+    var r2 = ui::layout::render_ui_template_json("{{raw:title}}", env)
+    assert_true(r2.ok)
+    assert_streq(r2.out, ("He said " + q) + ("hi" + q))
+    // null renders empty, bools bare, arrays/objects as JSON text in both forms
+    var env2 = tj("{\"n\": null, \"b\": true, \"a\": [1,2,3], \"o\": {\"k\": \"v\"}}")
+    var r3 = ui::layout::render_ui_template_json("[{{n}}][{{b}}][{{a}}][{{raw:a}}][{{o}}]", env2)
+    assert_true(r3.ok)
+    assert_streq(r3.out, "[][true][[1,2,3]][[1,2,3]][{" + (q + "k") + (q + ":") + (q + "v") + (q + "}]"))
+}
+
+fn test_template_json_dotted_paths() {
+    var env = tj("{\"a\": {\"b\": {\"c\": \"deep\", \"n\": 7}, \"s\": \"two\"}, \"top\": \"one\"}")
+    var r = ui::layout::render_ui_template_json("{{top}}/{{a.s}}/{{a.b.c}}/{{a.b.n}}", env)
+    assert_true(r.ok)
+    assert_streq(r.out, "one/two/deep/7")
+    // a path that stops on a scalar is a miss, not a silent empty
+    var bad = ui::layout::render_ui_template_json("{{top.nope}}", env)
+    assert_false(bad.ok)
+    assert_true(ui::layout::nui_contains(bad.err, "missing template variable: top.nope"))
+    // a member holding JSON null exists -> renders empty rather than erroring
+    var envn = tj("{\"a\": {\"b\": null}}")
+    var rn = ui::layout::render_ui_template_json("[{{a.b}}]", envn)
+    assert_true(rn.ok)
+    assert_streq(rn.out, "[]")
+}
+
+fn test_template_json_numbers() {
+    // an integer prints bare and a float as the shortest round-tripping decimal.
+    assert_streq(ui::layout::tpl_format_number(3.0), "3")
+    assert_streq(ui::layout::tpl_format_number(0.0 - 7.0), "-7")
+    assert_streq(ui::layout::tpl_format_number(0.0), "0")
+    assert_streq(ui::layout::tpl_format_number(3.5), "3.5")
+    assert_streq(ui::layout::tpl_format_number(0.0 - 2.75), "-2.75")
+    assert_streq(ui::layout::tpl_format_number(0.1), "0.1")             // not 0.10000000000000001
+    assert_streq(ui::layout::tpl_format_number(0.1 + 0.2), "0.30000000000000004")
+    assert_streq(ui::layout::tpl_format_number(1.0 / 3.0), "0.3333333333333333")
+    assert_streq(ui::layout::tpl_format_number(3.00000001), "3.00000001")   // six-digit %g would say "3"
+    assert_streq(ui::layout::tpl_format_number(123456789.0), "123456789")
+    assert_streq(ui::layout::tpl_format_number(1.0e20), "1e20")
+    assert_streq(ui::layout::tpl_format_number(1.0e-7), "1e-7")
+    // and through a template, in raw position, where the text becomes DSL source
+    var env = tj("{\"i\": 3, \"neg\": -12, \"f\": 0.5, \"p\": 3.00000001, \"e\": 0.1}")
+    var r = ui::layout::render_ui_template_json("{{raw:i}} {{raw:neg}} {{raw:f}} {{raw:p}} {{raw:e}} {{i}}", env)
+    assert_true(r.ok)
+    assert_streq(r.out, "3 -12 0.5 3.00000001 0.1 3")
+}
+
+fn test_template_json_nested_foreach() {
+    var env = tj("{\"sections\": [{\"title\": \"A\", \"rows\": [{\"n\": \"a1\"}, {\"n\": \"a2\"}]}, {\"title\": \"B\", \"rows\": [{\"n\": \"b1\"}]}]}")
+    // the inner list is reached by a dotted path on the enclosing loop item
+    var t = "{{#foreach s in sections}}<{{s.title}}:{{#foreach r in s.rows}}[{{r.n}}]{{/foreach}}>{{/foreach}}"
+    var r = ui::layout::render_ui_template_json(t, env)
+    assert_true(r.ok)
+    assert_streq(r.out, "<A:[a1][a2]><B:[b1]>")
+    // the inner body still sees the outer item's bindings
+    var t2 = "{{#foreach s in sections}}{{#foreach r in s.rows}}({{s.title}}/{{r.n}}){{/foreach}}{{/foreach}}"
+    var r2 = ui::layout::render_ui_template_json(t2, env)
+    assert_true(r2.ok)
+    assert_streq(r2.out, "(A/a1)(A/a2)(B/b1)")
+    // an empty array expands to nothing, and text around the block survives
+    var r3 = ui::layout::render_ui_template_json("x{{#foreach s in none}}y{{/foreach}}z", tj("{\"none\": []}"))
+    assert_true(r3.ok)
+    assert_streq(r3.out, "xz")
+}
+
+fn test_template_json_three_level_foreach() {
+    // the shape inspector_body.ui uses: section -> number_groups -> numbers
+    var env = tj("{\"sections\": [{\"number_groups\": [{\"classes\": [\"vec_row\"], \"numbers\": [{\"value\": 1.5, \"min\": -1, \"step\": 0.25}, {\"value\": 2, \"min\": 0, \"step\": 1}]}]}]}")
+    var t = "{{#foreach section in sections}}{{#foreach group in section.number_groups}}row { classes: {{raw:group.classes}}{{#foreach row in group.numbers}} number { value: {{raw:row.value}} min: {{raw:row.min}} step: {{raw:row.step}} }{{/foreach}} }{{/foreach}}{{/foreach}}"
+    var r = ui::layout::render_ui_template_json(t, env)
+    assert_true(r.ok)
+    var q = "" + chr(34)
+    assert_streq(r.out, ("row { classes: [" + q) + (("vec_row" + q) + "] number { value: 1.5 min: -1 step: 0.25 } number { value: 2 min: 0 step: 1 } }"))
+}
+
+fn test_template_json_errors() {
+    var env = tj("{\"list\": [{\"x\": 1}], \"scalar\": 5, \"obj\": {\"k\": 1}}")
+    // missing variable
+    var e1 = ui::layout::render_ui_template_json("{{nope}}", env)
+    assert_false(e1.ok)
+    assert_streq(e1.err, "missing template variable: nope")
+    // a missing variable inside a loop body survives the lenient per-item pass and is reported by
+    // the strict top-level pass, as the reference template renderer does
+    var e2 = ui::layout::render_ui_template_json("{{#foreach r in list}}{{r.nope}}{{/foreach}}", env)
+    assert_false(e2.ok)
+    assert_streq(e2.err, "missing template variable: r.nope")
+    // missing list
+    var e3 = ui::layout::render_ui_template_json("{{#foreach r in nolist}}{{/foreach}}", env)
+    assert_false(e3.ok)
+    assert_true(ui::layout::nui_contains(e3.err, "foreach: array variable"))
+    assert_true(ui::layout::nui_contains(e3.err, "nolist"))
+    assert_true(ui::layout::nui_contains(e3.err, "not found or not an array"))
+    // a list path that resolves to a NON-array
+    var e4 = ui::layout::render_ui_template_json("{{#foreach r in scalar}}{{/foreach}}", env)
+    assert_false(e4.ok)
+    assert_true(ui::layout::nui_contains(e4.err, "not found or not an array"))
+    var e5 = ui::layout::render_ui_template_json("{{#foreach r in obj}}{{/foreach}}", env)
+    assert_false(e5.ok)
+    assert_true(ui::layout::nui_contains(e5.err, "not found or not an array"))
+    // unbalanced tags
+    var e6 = ui::layout::render_ui_template_json("{{#foreach r in list}}no close", env)
+    assert_false(e6.ok)
+    assert_true(ui::layout::nui_contains(e6.err, "missing {{/foreach}}"))
+    var e7 = ui::layout::render_ui_template_json("{{#foreach r list}}{{/foreach}}", env)
+    assert_false(e7.ok)
+    assert_true(ui::layout::nui_contains(e7.err, "expected 'ITEM in ARRAY'"))
+    // an unterminated {{ is passed through, not an error (the renderer returns Ok there)
+    var e8 = ui::layout::render_ui_template_json("a {{unterminated", env)
+    assert_true(e8.ok)
+    assert_streq(e8.out, "a {{unterminated")
+}
+
+fn test_template_flat_vec_still_works() {
+    // the parallel-vec entry point is public API and keeps working
+    var ids: Vec<Str> = vec()  ids.push("title")  ids.push("accent")
+    var q = "" + chr(34)
+    var bs = "" + chr(92)
+    var vals: Vec<Str> = vec()  vals.push(("He said " + q) + ("hi" + q))  vals.push("[60,60,80,255]")
+    var rows = ui::layout::template_list_new("rows")
+    var i = 0
+    while i < 3 {
+        var it = ui::layout::template_item_new()
+        it.keys.push("label")
+        it.vals.push("Row" + to_str(i))
+        rows.items.push(it)
+        i = i + 1
+    }
+    var lists: Vec<ui::layout::TemplateList> = vec()
+    lists.push(rows)
+    var r = ui::layout::render_ui_template("[{{title}}] [{{raw:accent}}] {{#foreach r in rows}}<{{r.label}}>{{/foreach}}", ids, vals, lists)
+    assert_true(r.ok)
+    assert_streq(r.out, (("[He said " + (bs + q)) + ("hi" + (bs + q))) + "] [[60,60,80,255]] <Row0><Row1><Row2>")
+    // and its error shapes are unchanged
+    var b1 = ui::layout::render_ui_template("{{nope}}", ids, vals, lists)
+    assert_false(b1.ok)
+    assert_streq(b1.err, "missing template variable: nope")
+    var b2 = ui::layout::render_ui_template("{{#foreach x in nolist}}{{/foreach}}", ids, vals, lists)
+    assert_false(b2.ok)
+    assert_streq(b2.err, "foreach: list not found: nolist")
+}
+
+fn test_template_json_inspector_body() {
+    // The inspector's own .ui, rendered from a JSON environment.
+    var path = os::env_or("NORI_INSPECTOR_BODY_UI", "")
+    var tpl = inspector_body_ui_embedded()
+    if path.len() > 0 && os::path_exists(path) { tpl = read_file(path) }
+    var env = tj(inspector_env_text())
+    var r = ui::layout::render_ui_template_json(tpl, env)
+    assert_streq(r.err, "")
+    assert_true(r.ok)
+    var q = "" + chr(34)
+    var bs = "" + chr(92)
+    // no placeholder survived
+    assert_false(ui::layout::nui_contains(r.out, "{{"))
+    // section header, from the outer loop
+    assert_true(ui::layout::nui_contains(r.out, ("label: " + q) + ("Transform" + q)))
+    assert_true(ui::layout::nui_contains(r.out, ("on_click: " + q) + ("section:transform" + q)))
+    assert_true(ui::layout::nui_contains(r.out, ("label: " + q) + ("Render" + q)))
+    // section.texts -- and the quotes inside the value are escaped for the DSL string
+    assert_true(ui::layout::nui_contains(r.out, "text_input {"))
+    assert_true(ui::layout::nui_contains(r.out, ("value: " + q) + (("Player " + (bs + q)) + ("One" + ((bs + q) + q)))))
+    // section.pickers
+    assert_true(ui::layout::nui_contains(r.out, "picker {"))
+    assert_true(ui::layout::nui_contains(r.out, ("value: " + q) + ("cube" + q)))
+    // section.number_groups -> group.numbers: the three-level case, raw arrays and raw numbers
+    assert_true(ui::layout::nui_contains(r.out, ("classes: [" + q) + ("inspector_vector_row" + (q + "]"))))
+    assert_true(ui::layout::nui_contains(r.out, ("text: " + q) + ("Position" + q)))
+    assert_true(ui::layout::nui_contains(r.out, ("id: " + q) + ("pos.x" + q)))
+    assert_true(ui::layout::nui_contains(r.out, "value: 1.5"))
+    assert_true(ui::layout::nui_contains(r.out, "min: -100"))
+    assert_true(ui::layout::nui_contains(r.out, "step: 0.1"))
+    assert_true(ui::layout::nui_contains(r.out, "precision: 3"))
+    assert_true(ui::layout::nui_contains(r.out, ("suffix: " + q) + ("m" + q)))
+    // section.numbers (the flat one, same item name `row` reused by a sibling loop)
+    assert_true(ui::layout::nui_contains(r.out, ("id: " + q) + ("scale" + q)))
+    assert_true(ui::layout::nui_contains(r.out, "value: 2"))
+    // section.checks -> a bool in raw position
+    assert_true(ui::layout::nui_contains(r.out, "checked: true"))
+    assert_true(ui::layout::nui_contains(r.out, "checked: false"))
+    // section.actions / action_chips -> a raw DSL fragment spliced in
+    assert_true(ui::layout::nui_contains(r.out, ("classes: [" + q) + ("danger" + (q + "]"))))
+    assert_true(ui::layout::nui_contains(r.out, ("on_click: " + q) + ("chip:a" + q)))
+    // both sections were expanded
+    var n = 0
+    var i = 0
+    while i + 18 <= r.out.len() { if (r.out.slice(i, i + 18) == "inspector_section" + q) { n = n + 1 }  i = i + 1 }
+    assert_eq(n, 2)
+}
+
+/// A copy of the inspector plugin's inspector_body.ui, used when the real file is not available, so
+/// the test does not depend on a path the checkout may not have.
+fn inspector_body_ui_embedded() -> Str {
+    var ls: Vec<Str> = vec()
+    ls.push("column {")
+    ls.push("  classes: [panel_root]")
+    ls.push("  padding_x: 8")
+    ls.push("  padding_y: 8")
+    ls.push("  gap: 8")
+    ls.push("  {{#foreach section in sections}}")
+    ls.push("  column {")
+    ls.push("    classes: [\"inspector_section\"]")
+    ls.push("    gap: 6")
+    ls.push("    padding_x: 8")
+    ls.push("    padding_y: 8")
+    ls.push("    button {")
+    ls.push("      classes: [\"inspector_section_header\"]")
+    ls.push("      label: \"{{section.title}}\"")
+    ls.push("      on_click: \"section:{{section.id}}\"")
+    ls.push("    }")
+    ls.push("    {{#foreach row in section.texts}}")
+    ls.push("    text_input {")
+    ls.push("      classes: [\"inspector_field\"]")
+    ls.push("      id: \"{{row.id}}\"")
+    ls.push("      label: \"{{row.label}}\"")
+    ls.push("      value: \"{{row.value}}\"")
+    ls.push("    }")
+    ls.push("    {{/foreach}}")
+    ls.push("    {{#foreach row in section.pickers}}")
+    ls.push("    picker {")
+    ls.push("      classes: [\"inspector_field\"]")
+    ls.push("      id: \"{{row.id}}\"")
+    ls.push("      label: \"{{row.label}}\"")
+    ls.push("      value: \"{{row.value}}\"")
+    ls.push("    }")
+    ls.push("    {{/foreach}}")
+    ls.push("    {{#foreach group in section.number_groups}}")
+    ls.push("    row {")
+    ls.push("      classes: {{raw:group.classes}}")
+    ls.push("      gap: 6")
+    ls.push("      cross_align: center")
+    ls.push("      text { classes: [\"inspector_vector_label\"] text: \"{{group.label}}\" }")
+    ls.push("      {{#foreach row in group.numbers}}")
+    ls.push("      number {")
+    ls.push("        classes: {{raw:row.classes}}")
+    ls.push("        id: \"{{row.id}}\"")
+    ls.push("        label: \"{{row.label}}\"")
+    ls.push("        value: {{raw:row.value}}")
+    ls.push("        min: {{raw:row.min}}")
+    ls.push("        max: {{raw:row.max}}")
+    ls.push("        step: {{raw:row.step}}")
+    ls.push("        suffix: \"{{row.suffix}}\"")
+    ls.push("        precision: {{raw:row.precision}}")
+    ls.push("      }")
+    ls.push("      {{/foreach}}")
+    ls.push("    }")
+    ls.push("    {{/foreach}}")
+    ls.push("    {{#foreach row in section.numbers}}")
+    ls.push("    number {")
+    ls.push("      classes: {{raw:row.classes}}")
+    ls.push("      id: \"{{row.id}}\"")
+    ls.push("      label: \"{{row.label}}\"")
+    ls.push("      value: {{raw:row.value}}")
+    ls.push("      min: {{raw:row.min}}")
+    ls.push("      max: {{raw:row.max}}")
+    ls.push("      step: {{raw:row.step}}")
+    ls.push("      suffix: \"{{row.suffix}}\"")
+    ls.push("      precision: {{raw:row.precision}}")
+    ls.push("    }")
+    ls.push("    {{/foreach}}")
+    ls.push("    {{#foreach row in section.checks}}")
+    ls.push("    checkbox {")
+    ls.push("      classes: [\"inspector_field\"]")
+    ls.push("      id: \"{{row.id}}\"")
+    ls.push("      label: \"{{row.label}}\"")
+    ls.push("      checked: {{raw:row.checked}}")
+    ls.push("    }")
+    ls.push("    {{/foreach}}")
+    ls.push("    {{#foreach row in section.actions}}")
+    ls.push("    button { label: \"{{row.label}}\" on_click: \"{{row.id}}\" {{raw:row.classes_attr}} }")
+    ls.push("    {{/foreach}}")
+    ls.push("    row {")
+    ls.push("      gap: 3")
+    ls.push("      cross_align: center")
+    ls.push("      {{#foreach row in section.action_chips}}")
+    ls.push("      button { label: \"{{row.label}}\" on_click: \"{{row.id}}\" {{raw:row.classes_attr}} }")
+    ls.push("      {{/foreach}}")
+    ls.push("    }")
+    ls.push("  }")
+    ls.push("  {{/foreach}}")
+    ls.push("}")
+    ls.push("")
+    var out = ""
+    var i = 0
+    while i < ls.len() { if i > 0 { out = out + chr(10) }  out = out + ls[i]  i = i + 1 }
+    return out
+}
+
+/// the JSON environment inspector_body.ui expects: one entry per `{{...}}` name it reads.
+fn inspector_env_text() -> Str {
+    var ls: Vec<Str> = vec()
+    ls.push("{")
+    ls.push(" \"app\": \"inspector\",")
+    ls.push(" \"sections\": [")
+    ls.push("  {")
+    ls.push("   \"id\": \"transform\",")
+    ls.push("   \"title\": \"Transform\",")
+    ls.push("   \"texts\": [ { \"id\": \"name\", \"label\": \"Name\", \"value\": \"Player \\\"One\\\"\" } ],")
+    ls.push("   \"pickers\": [ { \"id\": \"mesh\", \"label\": \"Mesh\", \"value\": \"cube\" } ],")
+    ls.push("   \"number_groups\": [")
+    ls.push("    { \"label\": \"Position\",")
+    ls.push("      \"classes\": [\"inspector_vector_row\"],")
+    ls.push("      \"numbers\": [")
+    ls.push("       { \"classes\": [\"num\"], \"id\": \"pos.x\", \"label\": \"X\", \"value\": 1.5, \"min\": -100, \"max\": 100, \"step\": 0.1, \"suffix\": \"m\", \"precision\": 3 },")
+    ls.push("       { \"classes\": [\"num\"], \"id\": \"pos.y\", \"label\": \"Y\", \"value\": 0, \"min\": -100, \"max\": 100, \"step\": 0.1, \"suffix\": \"m\", \"precision\": 3 }")
+    ls.push("      ] }")
+    ls.push("   ],")
+    ls.push("   \"numbers\": [ { \"classes\": [\"num\"], \"id\": \"scale\", \"label\": \"Scale\", \"value\": 2, \"min\": 0, \"max\": 10, \"step\": 1, \"suffix\": \"\", \"precision\": 0 } ],")
+    ls.push("   \"checks\": [ { \"id\": \"vis\", \"label\": \"Visible\", \"checked\": true } ],")
+    ls.push("   \"actions\": [ { \"id\": \"act:reset\", \"label\": \"Reset\", \"classes_attr\": \"classes: [\\\"danger\\\"]\" } ],")
+    ls.push("   \"action_chips\": [ { \"id\": \"chip:a\", \"label\": \"A\", \"classes_attr\": \"\" } ]")
+    ls.push("  },")
+    ls.push("  {")
+    ls.push("   \"id\": \"render\", \"title\": \"Render\",")
+    ls.push("   \"texts\": [], \"pickers\": [], \"number_groups\": [], \"numbers\": [],")
+    ls.push("   \"checks\": [ { \"id\": \"cast\", \"label\": \"Cast shadows\", \"checked\": false } ],")
+    ls.push("   \"actions\": [], \"action_chips\": []")
+    ls.push("  }")
+    ls.push(" ]")
+    ls.push("}")
+    var out = ""
+    var i = 0
+    while i < ls.len() { out = out + ls[i]  i = i + 1 }
+    return out
+}
+
+// overflow: hidden clips the children to the padded box; the box itself (its background and its
+// click target) is emitted once and not clipped. Emitting it twice, once unclipped and once into
+// the clip, would double a translucent background and report the hit region twice.
+fn test_overflow_hidden_emits_the_box_once() {
+    let src = "column { overflow_y: hidden padding: 5 bg: [255, 0, 0, 128] on_click: go rect { w: 10 h: 400 color: #00ff00 } }"
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    let vp = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(100.0, 100.0))
+    var ov = ui::layout::layout_overlay(r.doc.tree, vp)
+    assert_eq(ov.prims.len(), 2)
+    assert_false(ov.prims[0].has_clip)                    // the background: the whole box, unclipped
+    assert_feq(ov.prims[0].rect.max.y, 100.0, 0.0001)
+    assert_true(ov.prims[1].has_clip)                     // the child: cut at the padded box
+    assert_feq(ov.prims[1].rect.max.y, 95.0, 0.0001)
+    assert_eq(ov.hits.len(), 1)
+}

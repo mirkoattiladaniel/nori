@@ -1,0 +1,551 @@
+// std/audio/__native_audio_alsa.nori: the kernel PCM backend of __native_audio.nori: a playback stream
+// on /dev/snd/pcmC{card}D{device}p driven by the ioctls of the kernel's sound UAPI
+// (include/uapi/sound/asound.h), which is the interface libasound's `hw` plugin itself sits on.
+//
+// Negotiation. struct snd_pcm_hw_params (608 bytes) holds, per parameter, the set of values still
+// possible: a 256-bit mask for the enumerated ones (access, format, subformat) and an interval
+// [min, max] with open/integer/empty flags for the numeric ones (sample bits through tick time).
+// HW_REFINE narrows every set to what the driver can do given the others and fails with -EINVAL when
+// one comes out empty; HW_PARAMS commits, choosing a value for whatever is still a range. This backend
+// asks for interleaved access and the requested format, channel count and rate, then brings the buffer
+// near the requested latency with a period of a quarter of it.
+//
+// `hw:` stops there: a card that refuses the parameters is refused with -EINVAL. `plughw:` does what
+// libasound's plug plugin does instead: it lets the card keep the format, channel count and rate it
+// can take and converts on the way in: samples are read as floating point, the channel count is
+// adapted (to one channel by averaging, from one by duplication, otherwise by repeating or dropping
+// the trailing channels), the rate is changed by linear interpolation between neighbouring frames, and
+// the result is written in the card's sample format. Linear interpolation is not band-limited, so a
+// large rate change can alias; libasound's default plug rate converter is also linear.
+//
+// Writing. WRITEI_FRAMES blocks on a descriptor opened without O_NONBLOCK until the ring buffer has
+// room, so a write takes as long as the audio lasts once the buffer is full. The stream starts when
+// the buffer fills. An underrun (-EPIPE) or a suspend (-ESTRPIPE) is recovered with PREPARE and the
+// write carries on.
+
+cstruct NkaPcm {
+    fd: Int, plug: Int, conv: Int,
+    in_ch: Int, in_rate: Int, in_fmt: Int,
+    out_ch: Int, out_rate: Int, out_fmt: Int, out_bps: Int,
+    bufsz: Int, period: Int,
+    frac: Int, last: Int,
+    mix: Int, mixcap: Int, rs: Int, rscap: Int, out: Int, outcap: Int
+}
+
+fn NKA_IOCTL_PVERSION() -> Int { return 2147762432 }        // _IOR('A', 0x00, int)
+fn NKA_IOCTL_HW_REFINE() -> Int { return 3261088016 }       // _IOWR('A', 0x10, struct snd_pcm_hw_params)
+fn NKA_IOCTL_HW_PARAMS() -> Int { return 3261088017 }       // _IOWR('A', 0x11, struct snd_pcm_hw_params)
+fn NKA_IOCTL_SW_PARAMS() -> Int { return 3230155027 }       // _IOWR('A', 0x13, struct snd_pcm_sw_params)
+fn NKA_IOCTL_STATUS() -> Int { return 2157461792 }          // _IOR('A', 0x20, struct snd_pcm_status)
+fn NKA_IOCTL_PREPARE() -> Int { return 16704 }              // _IO('A', 0x40)
+fn NKA_IOCTL_DROP() -> Int { return 16707 }                 // _IO('A', 0x43)
+fn NKA_IOCTL_DRAIN() -> Int { return 16708 }                // _IO('A', 0x44)
+fn NKA_IOCTL_RESUME() -> Int { return 16711 }               // _IO('A', 0x47)
+fn NKA_IOCTL_WRITEI() -> Int { return 1075331408 }          // _IOW('A', 0x50, struct snd_xferi)
+
+fn NKA_HW_SIZE() -> Int { return 608 }
+fn NKA_SW_SIZE() -> Int { return 136 }
+fn NKA_STATUS_SIZE() -> Int { return 152 }
+
+// parameter numbers: masks 0..2, intervals 8..19
+fn NKA_ACCESS() -> Int { return 0 }
+fn NKA_FORMAT() -> Int { return 1 }
+fn NKA_SUBFORMAT() -> Int { return 2 }
+fn NKA_SAMPLE_BITS() -> Int { return 8 }
+fn NKA_CHANNELS() -> Int { return 10 }
+fn NKA_RATE() -> Int { return 11 }
+fn NKA_PERIOD_SIZE() -> Int { return 13 }
+fn NKA_BUFFER_SIZE() -> Int { return 17 }
+fn NKA_TICK_TIME() -> Int { return 19 }
+
+fn NKA_STATE_XRUN() -> Int { return 4 }
+fn NKA_STATE_SUSPENDED() -> Int { return 7 }
+
+fn NKA_UINT_MAX() -> Int { return 4294967295 }
+
+// ---- struct snd_pcm_hw_params ----------------------------------------------------------------------
+// flags @0; masks[3] of 32 bytes each @4; reserved masks @100; intervals[12] of 12 bytes each @260
+// (min u32, max u32, then the bits openmin 1, openmax 2, integer 4, empty 8); reserved intervals @404;
+// rmask @512, cmask @516, info @520, msbits @524, rate_num @528, rate_den @532, fifo_size @536.
+
+fn nka_mask_at(hw: Int, k: Int) -> Int { return hw + 4 + 32 * k }
+fn nka_ival_at(hw: Int, k: Int) -> Int { return hw + 260 + 12 * (k - 8) }
+
+// an snd_pcm_interval, the ALSA ABI's 12-byte range record at `nka_ival_at`: min@0, max@4, and the
+// openmask@8 (bit 0 openmin, bit 1 openmax, bit 2 integer). The masks beside it are bitmaps (32 bytes
+// per parameter, addressed by bit): arrays, not records, so they stay as bitmap code.
+cstruct AlsaIval { lo: U32, hi: U32, mask: U32 }
+
+// every value of every parameter still possible, all of them requested
+fn nka_hw_any(hw: Int) {
+    memset(hw, 0, NKA_HW_SIZE())
+    var k = 0
+    while k <= NKA_SUBFORMAT() { memset(nka_mask_at(hw, k), 255, 32)  k = k + 1 }
+    var i = NKA_SAMPLE_BITS()
+    while i <= NKA_TICK_TIME() {
+        let iv: AlsaIval = nka_ival_at(hw, i)
+        iv.lo = 0
+        iv.hi = NKA_UINT_MAX()
+        iv.mask = 0
+        i = i + 1
+    }
+    poke32(hw + 512, NKA_UINT_MAX())                            // rmask
+    poke32(hw + 516, 0)                                         // cmask
+    poke32(hw + 520, NKA_UINT_MAX())                            // info
+}
+
+fn nka_mask_only(hw: Int, k: Int, bit: Int) {
+    let m = nka_mask_at(hw, k)
+    memset(m, 0, 32)
+    poke32(m + (bit >> 5) * 4, 1 << (bit & 31))
+}
+fn nka_mask_has(hw: Int, k: Int, bit: Int) -> Int {
+    let m = nka_mask_at(hw, k)
+    return (peek32(m + (bit >> 5) * 4) >> (bit & 31)) & 1
+}
+fn nka_first_bit(hw: Int, k: Int) -> Int {
+    var b = 0
+    while b < 256 { if nka_mask_has(hw, k, b) == 1 { return b }  b = b + 1 }
+    return 0 - 1
+}
+fn nka_ival_set(hw: Int, k: Int, lo: Int, hi: Int) {
+    let iv: AlsaIval = nka_ival_at(hw, k)
+    iv.lo = lo
+    iv.hi = hi
+    iv.mask = 4                                                 // integer
+}
+fn nka_ival_min(hw: Int, k: Int) -> Int { let iv: AlsaIval = nka_ival_at(hw, k)  return iv.lo }
+fn nka_ival_max(hw: Int, k: Int) -> Int { let iv: AlsaIval = nka_ival_at(hw, k)  return iv.hi }
+
+fn nka_refine(fd: Int, hw: Int) -> Int {
+    poke32(hw + 512, NKA_UINT_MAX())
+    return ioctl(fd, NKA_IOCTL_HW_REFINE(), hw)
+}
+
+// Would the driver take `hw` narrowed to this format, channel count and rate? On success `hw` holds
+// the refined sets and 0 is returned; otherwise `hw` is untouched.
+fn nka_try_fcr(fd: Int, hw: Int, fmt: Int, ch: Int, rate: Int) -> Int {
+    let t = malloc(NKA_HW_SIZE())
+    memcpy(t, hw, NKA_HW_SIZE())
+    nka_mask_only(t, NKA_FORMAT(), fmt)
+    nka_ival_set(t, NKA_CHANNELS(), ch, ch)
+    nka_ival_set(t, NKA_RATE(), rate, rate)
+    let r = nka_refine(fd, t)
+    if r == 0 { memcpy(hw, t, NKA_HW_SIZE()) }
+    free(t)
+    return r
+}
+
+// Narrow interval `k` to the value nearest `want` the driver accepts: exactly, else the smallest at or
+// above it, else the largest below it. Leaves `hw` as it was when none refines.
+fn nka_near(fd: Int, hw: Int, k: Int, want: Int) {
+    let t = malloc(NKA_HW_SIZE())
+    var done = 0
+    var attempt = 0
+    while done == 0 && attempt < 3 {
+        memcpy(t, hw, NKA_HW_SIZE())
+        if attempt == 0 { nka_ival_set(t, k, want, want) }
+        if attempt == 1 { nka_ival_set(t, k, want, NKA_UINT_MAX()) }
+        if attempt == 2 { nka_ival_set(t, k, 0, want) }
+        if nka_refine(fd, t) == 0 {
+            var v = nka_ival_min(t, k)
+            if attempt == 2 { v = nka_ival_max(t, k) }
+            memcpy(t, hw, NKA_HW_SIZE())
+            nka_ival_set(t, k, v, v)
+            if nka_refine(fd, t) == 0 { memcpy(hw, t, NKA_HW_SIZE())  done = 1 }
+        }
+        attempt = attempt + 1
+    }
+    free(t)
+}
+
+// bytes per sample of the card formats this backend can write
+fn nka_fmt_bytes(f: Int) -> Int {
+    if f == 1 { return 1 }                                      // U8
+    if f == 2 { return 2 }                                      // S16_LE
+    if f == 32 { return 3 }                                     // S24_3LE
+    if f == 6 || f == 10 || f == 14 { return 4 }                // S24_LE, S32_LE, FLOAT_LE
+    return 0
+}
+
+// the card format to convert into: the one asked for when the card has it, else the first of these
+fn nka_pick_fmt(hw: Int, want: Int) -> Int {
+    if nka_mask_has(hw, NKA_FORMAT(), want) == 1 { return want }
+    if nka_mask_has(hw, NKA_FORMAT(), 2) == 1 { return 2 }
+    if nka_mask_has(hw, NKA_FORMAT(), 14) == 1 { return 14 }
+    if nka_mask_has(hw, NKA_FORMAT(), 10) == 1 { return 10 }
+    if nka_mask_has(hw, NKA_FORMAT(), 32) == 1 { return 32 }
+    if nka_mask_has(hw, NKA_FORMAT(), 6) == 1 { return 6 }
+    if nka_mask_has(hw, NKA_FORMAT(), 1) == 1 { return 1 }
+    return 0 - 1
+}
+
+// the rate to convert into when the card refuses the one asked for, tried in this order
+fn nka_rate_candidate(i: Int) -> Int {
+    if i == 0 { return 48000 }
+    if i == 1 { return 44100 }
+    if i == 2 { return 96000 }
+    if i == 3 { return 88200 }
+    if i == 4 { return 32000 }
+    if i == 5 { return 192000 }
+    if i == 6 { return 22050 }
+    if i == 7 { return 16000 }
+    return 8000
+}
+
+// For plughw: settle format, channels and rate on what the card takes, nearest to the request.
+// 0 with `hw` refined, or a negated errno.
+fn nka_plug_choose(fd: Int, hw: Int, want_fmt: Int, want_ch: Int, want_rate: Int) -> Int {
+    let f = nka_pick_fmt(hw, want_fmt)
+    if f < 0 { return 0 - 22 }
+    let cmin = nka_ival_min(hw, NKA_CHANNELS())
+    let cmax = nka_ival_max(hw, NKA_CHANNELS())
+    let rmin = nka_ival_min(hw, NKA_RATE())
+    let rmax = nka_ival_max(hw, NKA_RATE())
+    // channel counts in order of preference: the request, stereo, then the card's own extremes
+    var ci = 0
+    while ci < 4 {
+        var ch = want_ch
+        if ci == 1 { ch = 2 }
+        if ci == 2 { ch = cmin }
+        if ci == 3 { ch = cmax }
+        if ch >= cmin && ch <= cmax && ch >= 1 {
+            if want_rate >= rmin && want_rate <= rmax {
+                if nka_try_fcr(fd, hw, f, ch, want_rate) == 0 { return 0 }
+            }
+            var ri = 0
+            while ri < 11 {
+                var rate = nka_rate_candidate(ri)
+                if ri == 9 { rate = rmin }
+                if ri == 10 { rate = rmax }
+                if rate >= rmin && rate <= rmax && rate > 0 {
+                    if nka_try_fcr(fd, hw, f, ch, rate) == 0 { return 0 }
+                }
+                ri = ri + 1
+            }
+        }
+        ci = ci + 1
+    }
+    return 0 - 22
+}
+
+fn nka_path(card: Int, device: Int) -> Int {
+    let pre = "/dev/snd/pcmC"
+    let p = malloc(64)
+    memcpy(p, nori_str_ptr(pre), pre.len())
+    var n = pre.len()
+    n = n + nka_put_dec(p + n, card)
+    poke8(p + n, 68)                                            // 'D'
+    n = n + 1
+    n = n + nka_put_dec(p + n, device)
+    poke8(p + n, 112)                                           // 'p'
+    poke8(p + n + 1, 0)
+    return p
+}
+fn nka_put_dec(p: Int, v: Int) -> Int {
+    var digits = 1
+    var t = v
+    while t >= 10 { t = t / 10  digits = digits + 1 }
+    var i = digits - 1
+    var w = v
+    while i >= 0 { poke8(p + i, 48 + w % 10)  w = w / 10  i = i - 1 }
+    return digits
+}
+
+fn nka_fail(fd: Int, hw: Int, r: Int) -> Int {
+    free(hw)
+    close(fd)
+    return r
+}
+
+// Open a playback stream on card `card`, device `device`. `plug` = 1 converts when the card refuses
+// the parameters. `fmt` is 0 for S16_LE and 1 for FLOAT_LE. Returns the stream, or a negated errno.
+fn nka_open(card: Int, device: Int, plug: Int, rate: Int, ch: Int, fmt: Int, latency_us: Int) -> Int {
+    let path = nka_path(card, device)
+    // opened non-blocking so a device another process holds answers -EBUSY at once instead of
+    // waiting for it; blocking writes are switched back on below
+    let fd = open(path, 2 | 2048 | 524288)                      // O_RDWR | O_NONBLOCK | O_CLOEXEC
+    free(path)
+    if fd < 0 { return fd }
+    let pv = malloc(8)
+    poke(pv, 0)
+    let pr = ioctl(fd, NKA_IOCTL_PVERSION(), pv)
+    let proto = peek32(pv)
+    free(pv)
+    if pr < 0 { close(fd)  return pr }
+    fcntl(fd, 4, 2)                                             // F_SETFL: O_RDWR, blocking
+
+    var want_fmt = 2                                            // SNDRV_PCM_FORMAT_S16_LE
+    if fmt == 1 { want_fmt = 14 }                               // SNDRV_PCM_FORMAT_FLOAT_LE
+    let hw = malloc(NKA_HW_SIZE())
+    nka_hw_any(hw)
+    nka_mask_only(hw, NKA_ACCESS(), 3)                          // SNDRV_PCM_ACCESS_RW_INTERLEAVED
+    var r = nka_refine(fd, hw)
+    if r < 0 { return nka_fail(fd, hw, r) }
+    if nka_try_fcr(fd, hw, want_fmt, ch, rate) != 0 {
+        if plug == 0 { return nka_fail(fd, hw, 0 - 22) }
+        r = nka_plug_choose(fd, hw, want_fmt, ch, rate)
+        if r < 0 { return nka_fail(fd, hw, r) }
+    }
+    let out_fmt = nka_first_bit(hw, NKA_FORMAT())
+    let out_ch = nka_ival_min(hw, NKA_CHANNELS())
+    let out_rate = nka_ival_min(hw, NKA_RATE())
+    if nka_fmt_bytes(out_fmt) == 0 { return nka_fail(fd, hw, 0 - 22) }
+
+    var lat = latency_us
+    if lat < 1000 { lat = 1000 }
+    var target = out_rate * lat / 1000000
+    if target < 16 { target = 16 }
+    nka_near(fd, hw, NKA_BUFFER_SIZE(), target)
+    var per = nka_ival_max(hw, NKA_BUFFER_SIZE()) / 4
+    if per < 1 { per = 1 }
+    nka_near(fd, hw, NKA_PERIOD_SIZE(), per)
+    r = ioctl(fd, NKA_IOCTL_HW_PARAMS(), hw)
+    if r < 0 { return nka_fail(fd, hw, r) }
+
+    let k: NkaPcm = calloc(1, sizeof(NkaPcm))
+    k.fd = fd
+    k.plug = plug
+    k.in_ch = ch
+    k.in_rate = rate
+    k.in_fmt = fmt
+    k.out_fmt = nka_first_bit(hw, NKA_FORMAT())
+    k.out_ch = nka_ival_min(hw, NKA_CHANNELS())
+    k.out_rate = nka_ival_min(hw, NKA_RATE())
+    k.out_bps = nka_fmt_bytes(k.out_fmt)
+    k.bufsz = nka_ival_min(hw, NKA_BUFFER_SIZE())
+    k.period = nka_ival_min(hw, NKA_PERIOD_SIZE())
+    free(hw)
+    if k.out_bps == 0 || k.out_ch < 1 || k.out_rate < 1 || k.bufsz < 1 { nka_free(k)  return 0 - 22 }
+    if k.out_fmt != want_fmt || k.out_ch != ch || k.out_rate != rate { k.conv = 1 }
+    k.frac = k.out_rate
+    k.last = calloc(k.out_ch, 8)
+
+    // software parameters: wake when a period is free, start once the buffer is full, stop on underrun
+    let sw = calloc(1, NKA_SW_SIZE())
+    var per_n = k.period
+    if per_n < 1 { per_n = 1 }
+    poke32(sw + 4, 1)                                           // period_step
+    poke(sw + 16, per_n)                                        // avail_min
+    poke(sw + 24, 1)                                            // xfer_align
+    poke(sw + 32, (k.bufsz / per_n) * per_n)                    // start_threshold
+    poke(sw + 40, k.bufsz)                                      // stop_threshold
+    poke32(sw + 72, proto)                                      // proto
+    r = ioctl(fd, NKA_IOCTL_SW_PARAMS(), sw)
+    free(sw)
+    if r < 0 { nka_free(k)  return r }
+    r = ioctl(fd, NKA_IOCTL_PREPARE(), 0)
+    if r < 0 { nka_free(k)  return r }
+    return k
+}
+
+fn nka_free(k: NkaPcm) {
+    close(k.fd)
+    if k.last != 0 { free(k.last) }
+    if k.mix != 0 { free(k.mix) }
+    if k.rs != 0 { free(k.rs) }
+    if k.out != 0 { free(k.out) }
+    free(k)
+}
+
+// ---- conversion ------------------------------------------------------------------------------------
+
+fn nka_s16(v: Int) -> Int { if v >= 32768 { return v - 65536 }  return v }
+
+// sample `c` of frame `f` of the caller's buffer, as a Float in [-1, 1]
+fn nka_in_sample(k: NkaPcm, buf: Int, f: Int, c: Int) -> Float {
+    let at = f * k.in_ch + c
+    if k.in_fmt == 1 { return peekf32(buf + at * 4) }
+    return to_float(nka_s16(peek16(buf + at * 2))) / 32768.0
+}
+
+fn nka_round(x: Float) -> Int {
+    if x >= 0.0 { return to_int(x + 0.5) }
+    return 0 - to_int(0.5 - x)
+}
+
+fn nka_put_sample(k: NkaPcm, p: Int, x: Float) {
+    var v = x
+    if v > 1.0 { v = 1.0 }
+    if v < -1.0 { v = -1.0 }
+    let f = k.out_fmt
+    if f == 14 { pokef32(p, v)  return }
+    if f == 2 { poke16(p, nka_round(v * 32767.0) & 65535)  return }
+    if f == 10 { poke32(p, nka_round(v * 2147483647.0) & 4294967295)  return }
+    if f == 6 { poke32(p, nka_round(v * 8388607.0) & 4294967295)  return }
+    if f == 32 {
+        let s24 = nka_round(v * 8388607.0) & 16777215
+        poke8(p, s24 & 255)  poke8(p + 1, (s24 >> 8) & 255)  poke8(p + 2, (s24 >> 16) & 255)
+        return
+    }
+    poke8(p, nka_round(v * 127.0) + 128)                        // U8
+}
+
+fn nka_reserve(p: Int, cap: Int, need: Int) -> Int {
+    if need <= cap && p != 0 { return p }
+    if p != 0 { free(p) }
+    return malloc(need)
+}
+
+// Convert `frames` frames at `buf` into k.out in the card's format; returns the card frames produced.
+fn nka_convert(k: NkaPcm, buf: Int, frames: Int) -> Int {
+    let oc = k.out_ch
+    // 1. read as Float and adapt the channel count, into k.mix
+    let mixneed = frames * oc * 8 + 8
+    k.mix = nka_reserve(k.mix, k.mixcap, mixneed)
+    if mixneed > k.mixcap { k.mixcap = mixneed }
+    var f = 0
+    while f < frames {
+        var c = 0
+        while c < oc {
+            var x = 0.0
+            if oc == k.in_ch { x = nka_in_sample(k, buf, f, c) }
+            else if oc == 1 {
+                var sum = 0.0
+                var ic = 0
+                while ic < k.in_ch { sum = sum + nka_in_sample(k, buf, f, ic)  ic = ic + 1 }
+                x = sum / to_float(k.in_ch)
+            }
+            else if k.in_ch == 1 { x = nka_in_sample(k, buf, f, 0) }
+            else if c < k.in_ch { x = nka_in_sample(k, buf, f, c) }
+            else { x = nka_in_sample(k, buf, f, c % k.in_ch) }
+            pokef64(k.mix + (f * oc + c) * 8, x)
+            c = c + 1
+        }
+        f = f + 1
+    }
+    // 2. change the rate by linear interpolation, into k.rs. Frame 0 of the interpolation is the last
+    // frame of the previous write and frames 1..n are this one's; `frac` is the next output position in
+    // units of 1/out_rate of an input frame.
+    var src = k.mix
+    var n_out = frames
+    if k.in_rate != k.out_rate {
+        let ir = k.in_rate
+        let orr = k.out_rate
+        let rsneed = ((frames * orr) / ir + 2) * oc * 8 + 8
+        k.rs = nka_reserve(k.rs, k.rscap, rsneed)
+        if rsneed > k.rscap { k.rscap = rsneed }
+        let limit = frames * orr
+        var o = 0
+        while k.frac < limit {
+            let i = k.frac / orr
+            let w = to_float(k.frac - i * orr) / to_float(orr)
+            var cc = 0
+            while cc < oc {
+                var a = 0.0
+                if i == 0 { a = peekf64(k.last + cc * 8) } else { a = peekf64(k.mix + ((i - 1) * oc + cc) * 8) }
+                let b = peekf64(k.mix + (i * oc + cc) * 8)
+                pokef64(k.rs + (o * oc + cc) * 8, a + (b - a) * w)
+                cc = cc + 1
+            }
+            o = o + 1
+            k.frac = k.frac + ir
+        }
+        k.frac = k.frac - limit
+        if frames > 0 { memcpy(k.last, k.mix + (frames - 1) * oc * 8, oc * 8) }
+        src = k.rs
+        n_out = o
+    }
+    // 3. encode in the card's sample format, into k.out
+    let fb = oc * k.out_bps
+    let outneed = n_out * fb + 8
+    k.out = nka_reserve(k.out, k.outcap, outneed)
+    if outneed > k.outcap { k.outcap = outneed }
+    var s = 0
+    while s < n_out * oc {
+        nka_put_sample(k, k.out + s * k.out_bps, peekf64(src + s * 8))
+        s = s + 1
+    }
+    return n_out
+}
+
+// ---- the stream ------------------------------------------------------------------------------------
+
+// after an underrun or a suspend: resume if the driver can, then prepare for writing again
+fn nka_recover(k: NkaPcm, err: Int) -> Int {
+    if err == 0 - 86 {                                          // ESTRPIPE
+        var tries = 0
+        var r = ioctl(k.fd, NKA_IOCTL_RESUME(), 0)
+        while r == 0 - 11 && tries < 100 { usleep(10000)  r = ioctl(k.fd, NKA_IOCTL_RESUME(), 0)  tries = tries + 1 }
+        if r == 0 { return 0 }
+    }
+    return ioctl(k.fd, NKA_IOCTL_PREPARE(), 0)
+}
+
+fn nka_write(h: Int, buf: Int, frames: Int) -> Int {
+    let k: NkaPcm = h
+    var p = buf
+    var n = frames
+    var fb = k.in_ch * 2
+    if k.in_fmt == 1 { fb = k.in_ch * 4 }
+    if k.conv == 1 {
+        n = nka_convert(k, buf, frames)
+        p = k.out
+        fb = k.out_ch * k.out_bps
+    }
+    let x = calloc(1, 24)                                       // struct snd_xferi { result, buf, frames }
+    var off = 0
+    var failures = 0
+    while off < n {
+        poke(x, 0)
+        poke(x + 8, p + off * fb)
+        poke(x + 16, n - off)
+        let r = ioctl(k.fd, NKA_IOCTL_WRITEI(), x)
+        if r < 0 {
+            if r == 0 - 4 || r == 0 - 11 {
+                nau_wait(k.fd, 4, 1000)
+            } else {
+                failures = failures + 1
+                if (r != 0 - 32 && r != 0 - 86) || failures > 16 { free(x)  return r }
+                let rr = nka_recover(k, r)
+                if rr < 0 { free(x)  return rr }
+            }
+        } else {
+            off = off + peek(x)
+        }
+    }
+    free(x)
+    return frames
+}
+
+fn nka_avail(h: Int) -> Int {
+    let k: NkaPcm = h
+    let st = calloc(1, NKA_STATUS_SIZE())
+    var r = ioctl(k.fd, NKA_IOCTL_STATUS(), st)
+    var state = peek32(st)
+    if r == 0 && (state == NKA_STATE_XRUN() || state == NKA_STATE_SUSPENDED()) {
+        if state == NKA_STATE_XRUN() { nka_recover(k, 0 - 32) } else { nka_recover(k, 0 - 86) }
+        r = ioctl(k.fd, NKA_IOCTL_STATUS(), st)
+    }
+    var avail = peek(st + 64)
+    free(st)
+    if r < 0 { return r }
+    if avail > k.bufsz { avail = k.bufsz }
+    if k.in_rate != k.out_rate { avail = avail * k.in_rate / k.out_rate }
+    return avail
+}
+
+fn nka_drain(h: Int) -> Int {
+    let k: NkaPcm = h
+    var r = ioctl(k.fd, NKA_IOCTL_DRAIN(), 0)
+    while r == 0 - 4 { r = ioctl(k.fd, NKA_IOCTL_DRAIN(), 0) }
+    if r == 0 - 32 { r = 0 }
+    return r
+}
+
+// discard what is queued, then leave the stream prepared for the next write
+fn nka_drop(h: Int) -> Int {
+    let k: NkaPcm = h
+    let r = ioctl(k.fd, NKA_IOCTL_DROP(), 0)
+    ioctl(k.fd, NKA_IOCTL_PREPARE(), 0)
+    k.frac = k.out_rate
+    memset(k.last, 0, k.out_ch * 8)
+    return r
+}
+
+fn nka_close(h: Int) -> Int {
+    let k: NkaPcm = h
+    ioctl(k.fd, NKA_IOCTL_DROP(), 0)
+    nka_free(k)
+    return 0
+}

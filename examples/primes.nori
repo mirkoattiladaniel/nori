@@ -1,0 +1,30 @@
+// A small but nontrivial program: recursion, arrays, foreach, mutation,
+// if, and the built-ins print/fill, all type-checked and memory-safe.
+
+// Recursive Fibonacci.
+fn fib(n: Int) -> Int {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+// Count primes below n with a sieve of Eratosthenes (bounds-checked array writes).
+fn count_primes(let n: Int) -> Int {
+    var sieve = fill(n, true)
+    var count = 0
+    foreach i in 2..n {
+        if sieve[i] {
+            count = count + 1
+            // mark multiples of i; k stays small enough that i*k < n (no overflow / OOB)
+            foreach k in 2..((n - 1) / i + 1) {
+                sieve[i * k] = false
+            }
+        }
+    }
+    return count
+}
+
+fn main() -> Int {
+    printl(fib(10))          // 55
+    printl(count_primes(30)) // 10  (2,3,5,7,11,13,17,19,23,29)
+    return 0
+}

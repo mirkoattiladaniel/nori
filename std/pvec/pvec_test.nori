@@ -1,0 +1,69 @@
+import "std/pvec" as pv
+
+fn veq(a: Vec<Int>, b: Vec<Int>) -> Bool {
+    if a.len() != b.len() { return false }
+    var i = 0
+    while i < a.len() { if a[i] != b[i] { return false }  i = i + 1 }
+    return true
+}
+fn mkrange(n: Int) -> Vec<Int> { var a: Vec<Int> = vec()  var i = 0  while i < n { a.push(i * 3)  i = i + 1 }  return a }
+
+fn test_roundtrip() {
+    var t = pv::trie()
+    let a = mkrange(70)                                  // spans multiple trie levels
+    assert_true(veq(pv::to_vec(t, pv::of_vec(t, a)), a))
+}
+fn test_append_and_index() {
+    var t = pv::trie()
+    var v = pv::empty()
+    var i = 0
+    while i < 40 { v = pv::append(t, v, i * i)  i = i + 1 }
+    assert_eq(pv::count(v), 40)
+    assert_eq(pv::at(t, v, 0), 0)
+    assert_eq(pv::at(t, v, 39), 39 * 39)
+}
+fn test_persistence() {                                  // assoc returns a new version; the old is untouched
+    var t = pv::trie()
+    let v = pv::of_vec(t, mkrange(50))
+    let w = pv::assoc(t, v, 10, 999)
+    assert_eq(pv::at(t, v, 10), 30)                      // v unchanged (structural sharing preserves it)
+    assert_eq(pv::at(t, w, 10), 999)
+    assert_eq(pv::count(v), 50)
+}
+fn test_many_versions_coexist() {                        // 30 versions, each differing by one element, all intact
+    var t = pv::trie()
+    let base = pv::of_vec(t, mkrange(60))
+    var k = 0
+    while k < 30 {
+        let w = pv::assoc(t, base, k, 0 - k)             // fork from base each time -> each shares base's other nodes
+        assert_eq(pv::at(t, w, k), 0 - k)
+        assert_eq(pv::at(t, base, k), k * 3)             // base never changes
+        k = k + 1
+    }
+}
+fn test_sharing_is_real() {                              // a fork copies only the path to the change
+    var t = pv::trie()
+    let base = pv::of_vec(t, mkrange(1100))              // three levels
+    let before = pv::node_count(t)
+    let w = pv::assoc(t, base, 5, 1)
+    assert_eq(pv::node_count(t) - before, 3)             // one node per level, nothing else
+    assert_eq(pv::at(t, w, 5), 1)
+}
+
+// ---- laws ----
+law pvec_roundtrip(v: Vec<Int>) { var t = pv::trie()  assert(veq(pv::to_vec(t, pv::of_vec(t, v)), v)) }
+law pvec_append_grows(v: Vec<Int>, x: Int) {
+    var t = pv::trie()
+    let p = pv::append(t, pv::of_vec(t, v), x)
+    assert(pv::count(p) == v.len() + 1)
+    assert(pv::at(t, p, v.len()) == x)
+}
+law pvec_assoc_is_persistent(v: Vec<Int>, x: Int) {
+    if v.len() > 0 {
+        var t = pv::trie()
+        let p = pv::of_vec(t, v)
+        let q = pv::assoc(t, p, 0, x)
+        assert(pv::at(t, q, 0) == x)                     // new version has the change
+        assert(pv::at(t, p, 0) == v[0])                  // old version is unchanged
+    }
+}

@@ -1,0 +1,221 @@
+//! std/math, quat.nori: unit quaternions.
+//!
+//! Convention: `Quat { x, y, z, w }` with the scalar last (glam / GLSL order), Hamilton product,
+//! and right-handed rotations: `quat_from_axis_angle(vec3_y(), pi/2)` takes +X to -Z, the same
+//! turn `mat3_from_rotation_y(pi/2)` performs. `quat_mul(a, b)` applies `b` first, exactly as
+//! `mat4_mul` does, so a quaternion and its matrix compose in the same order.
+//!
+//! Every rotation function here assumes a unit quaternion. The two-argument constructors produce
+//! one; after a long chain of multiplications, renormalize with `quat_normalize`.
+//!
+//! The Mat3/Mat4 constructors that take a Quat live here rather than in mat.nori: they are the
+//! quaternion's business, and the module's root files share one scope, so the name is the same
+//! either way.
+
+pub struct Quat { x: Float, y: Float, z: Float, w: Float }
+
+// ---------------- construction ----------------
+/// a quaternion from raw components. Does not normalize.
+pub fn quat(x: Float, y: Float, z: Float, w: Float) -> Quat { return Quat { x: x, y: y, z: z, w: w } }
+/// the identity rotation.
+pub fn quat_identity() -> Quat { return Quat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 } }
+/// rotation of `angle` radians about `axis` (normalized here, so any non-zero axis works).
+pub fn quat_from_axis_angle(axis: Vec3, angle: Float) -> Quat {
+    let a = vec3_normalize(axis)
+    let h = angle * 0.5
+    let s = sin(h)
+    return Quat { x: a.x * s, y: a.y * s, z: a.z * s, w: cos(h) }
+}
+/// rotation about +X.
+pub fn quat_from_rotation_x(r: Float) -> Quat { return Quat { x: sin(r * 0.5), y: 0.0, z: 0.0, w: cos(r * 0.5) } }
+/// rotation about +Y.
+pub fn quat_from_rotation_y(r: Float) -> Quat { return Quat { x: 0.0, y: sin(r * 0.5), z: 0.0, w: cos(r * 0.5) } }
+/// rotation about +Z.
+pub fn quat_from_rotation_z(r: Float) -> Quat { return Quat { x: 0.0, y: 0.0, z: sin(r * 0.5), w: cos(r * 0.5) } }
+/// euler angles, intrinsic Y-X-Z: the yaw/pitch/roll order.
+///
+/// The composed rotation is `Ry(y) * Rx(x) * Rz(z)`: roll about Z happens first, then pitch about
+/// X, then yaw about Y. This is the order a camera or a character controller wants, because yaw is
+/// applied last and therefore stays about the world up axis however far the thing is pitched.
+/// `quat_to_euler` is its exact inverse away from the poles.
+pub fn quat_from_euler(x: Float, y: Float, z: Float) -> Quat { return quat_mul(quat_mul(quat_from_rotation_y(y), quat_from_rotation_x(x)), quat_from_rotation_z(z)) }
+/// the rotation part of a 3x3, via Shepperd's method.
+///
+/// `a` must be a pure rotation (orthonormal, det +1); a scaled matrix gives a scaled quaternion.
+pub fn quat_from_mat3(a: Mat3) -> Quat {
+    // whichever of the four expressions has the largest divisor is the numerically stable one:
+    // near a 180-degree turn `w` itself goes to zero and dividing by it loses every digit
+    let t = a.x_axis.x + a.y_axis.y + a.z_axis.z
+    if t > 0.0 {
+        let s = sqrt(t + 1.0) * 2.0
+        return Quat { x: (a.y_axis.z - a.z_axis.y) / s, y: (a.z_axis.x - a.x_axis.z) / s, z: (a.x_axis.y - a.y_axis.x) / s, w: 0.25 * s }
+    }
+    if a.x_axis.x > a.y_axis.y && a.x_axis.x > a.z_axis.z {
+        let s = sqrt(1.0 + a.x_axis.x - a.y_axis.y - a.z_axis.z) * 2.0
+        return Quat { x: 0.25 * s, y: (a.y_axis.x + a.x_axis.y) / s, z: (a.z_axis.x + a.x_axis.z) / s, w: (a.y_axis.z - a.z_axis.y) / s }
+    }
+    if a.y_axis.y > a.z_axis.z {
+        let s = sqrt(1.0 + a.y_axis.y - a.x_axis.x - a.z_axis.z) * 2.0
+        return Quat { x: (a.y_axis.x + a.x_axis.y) / s, y: 0.25 * s, z: (a.z_axis.y + a.y_axis.z) / s, w: (a.z_axis.x - a.x_axis.z) / s }
+    }
+    let s = sqrt(1.0 + a.z_axis.z - a.x_axis.x - a.y_axis.y) * 2.0
+    return Quat { x: (a.z_axis.x + a.x_axis.z) / s, y: (a.z_axis.y + a.y_axis.z) / s, z: 0.25 * s, w: (a.x_axis.y - a.y_axis.x) / s }
+}
+/// the rotation part of the upper-left 3x3 of a 4x4. The matrix must carry no scale.
+pub fn quat_from_mat4(a: Mat4) -> Quat { return quat_from_mat3(mat3_from_mat4(a)) }
+/// the shortest rotation taking unit vector `from` to unit vector `to`.
+pub fn quat_from_rotation_arc(from: Vec3, to: Vec3) -> Quat {
+    let f = vec3_normalize(from)
+    let t = vec3_normalize(to)
+    let d = vec3_dot(f, t)
+    // antiparallel: every axis perpendicular to `f` is a valid half-turn, and the cross product
+    // that would normally pick one is zero, so pick one arbitrarily
+    if d < -0.999999 { return quat_from_axis_angle(vec3_any_orthonormal(f), pi()) }
+    let c = vec3_cross(f, t)
+    return quat_normalize(Quat { x: c.x, y: c.y, z: c.z, w: 1.0 + d })
+}
+
+// ---------------- algebra ----------------
+/// the Hamilton product `a * b`: `b`'s rotation is applied first.
+pub fn quat_mul(a: Quat, b: Quat) -> Quat {
+    return Quat {
+        x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z }
+}
+/// componentwise sum: for blending, not composition.
+pub fn quat_add(a: Quat, b: Quat) -> Quat { return Quat { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z, w: a.w + b.w } }
+/// componentwise difference.
+pub fn quat_sub(a: Quat, b: Quat) -> Quat { return Quat { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z, w: a.w - b.w } }
+/// scale every component.
+pub fn quat_scale(a: Quat, s: Float) -> Quat { return Quat { x: a.x * s, y: a.y * s, z: a.z * s, w: a.w * s } }
+/// negate every component. The same rotation: q and -q are the double cover's two names for it.
+pub fn quat_neg(a: Quat) -> Quat { return Quat { x: -a.x, y: -a.y, z: -a.z, w: -a.w } }
+/// the four-component dot product; cos of half the angle between the two rotations.
+pub fn quat_dot(a: Quat, b: Quat) -> Float { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w }
+/// squared norm.
+pub fn quat_length_sq(a: Quat) -> Float { return quat_dot(a, a) }
+/// norm; 1 for a rotation.
+pub fn quat_length(a: Quat) -> Float { return sqrt(quat_length_sq(a)) }
+/// the unit quaternion in the same direction; the identity for a (near) zero input.
+pub fn quat_normalize(a: Quat) -> Quat {
+    let l = quat_length(a)
+    if l <= 1.0e-30 { return quat_identity() }
+    return quat_scale(a, 1.0 / l)
+}
+/// the conjugate: the inverse rotation, for a unit quaternion.
+pub fn quat_conjugate(a: Quat) -> Quat { return Quat { x: -a.x, y: -a.y, z: -a.z, w: a.w } }
+/// the true inverse, conjugate over the squared norm. Equals the conjugate when `a` is a unit quaternion.
+pub fn quat_inverse(a: Quat) -> Quat {
+    let n = quat_length_sq(a)
+    if n <= 1.0e-30 { return quat_identity() }
+    return quat_scale(quat_conjugate(a), 1.0 / n)
+}
+/// true when every component is within `eps` of the other's. Note that `q` and `-q` are the same
+/// rotation and this says false for them: compare `quat_dot` against ±1 if that is what you mean.
+pub fn quat_approx_eq(a: Quat, b: Quat, eps: Float) -> Bool { return fabs(a.x - b.x) <= eps && fabs(a.y - b.y) <= eps && fabs(a.z - b.z) <= eps && fabs(a.w - b.w) <= eps }
+/// the angle, in radians in [0, pi], between two rotations.
+pub fn quat_angle_between(a: Quat, b: Quat) -> Float { return 2.0 * acos(fclamp(fabs(quat_dot(a, b)), -1.0, 1.0)) }
+
+// ---------------- applying and decomposing ----------------
+/// rotate a vector by a unit quaternion: v + 2w(u x v) + 2(u x (u x v)), with u the vector part.
+///
+/// This is the expanded `q v q*`, which costs two cross products instead of two quaternion
+/// multiplications and never leaves the imaginary part to round away.
+pub fn quat_rotate_vec3(q: Quat, v: Vec3) -> Vec3 {
+    let u = vec3(q.x, q.y, q.z)
+    let c = vec3_cross(u, v)
+    return vec3_add(v, vec3_add(vec3_scale(c, 2.0 * q.w), vec3_scale(vec3_cross(u, c), 2.0)))
+}
+/// the 3x3 rotation matrix of a unit quaternion.
+pub fn mat3_from_quat(q: Quat) -> Mat3 {
+    let x2 = q.x + q.x
+    let y2 = q.y + q.y
+    let z2 = q.z + q.z
+    let xx = q.x * x2
+    let xy = q.x * y2
+    let xz = q.x * z2
+    let yy = q.y * y2
+    let yz = q.y * z2
+    let zz = q.z * z2
+    let wx = q.w * x2
+    let wy = q.w * y2
+    let wz = q.w * z2
+    return Mat3 {
+        x_axis: vec3(1.0 - (yy + zz), xy + wz, xz - wy),
+        y_axis: vec3(xy - wz, 1.0 - (xx + zz), yz + wx),
+        z_axis: vec3(xz + wy, yz - wx, 1.0 - (xx + yy)) }
+}
+/// the 4x4 rotation matrix of a unit quaternion.
+pub fn mat4_from_quat(q: Quat) -> Mat4 { return mat4_from_mat3(mat3_from_quat(q)) }
+/// scale, then rotate, then translate: the model matrix, built in one step.
+///
+/// Equal to `mul(from_translation(t), mul(from_quat(r), from_scale(s)))` and cheaper: the scale
+/// only ever multiplies the corresponding column.
+pub fn mat4_from_scale_rotation_translation(s: Vec3, r: Quat, t: Vec3) -> Mat4 {
+    let b = mat3_from_quat(r)
+    return Mat4 {
+        x_axis: vec3_extend(vec3_scale(b.x_axis, s.x), 0.0),
+        y_axis: vec3_extend(vec3_scale(b.y_axis, s.y), 0.0),
+        z_axis: vec3_extend(vec3_scale(b.z_axis, s.z), 0.0),
+        w_axis: vec4(t.x, t.y, t.z, 1.0) }
+}
+/// axis and angle packed into a Vec4: `xyz` is the unit axis, `w` the angle in radians in [0, pi].
+///
+/// Nori has no tuple return, so the pair travels in a Vec4: the alternative, two `set` parameters,
+/// reads worse at every call site. The identity yields axis +X and angle 0.
+pub fn quat_to_axis_angle(q: Quat) -> Vec4 {
+    let n = quat_normalize(q)
+    // q and -q name the same rotation; the +w branch is the one whose angle lands in [0, pi]
+    var u = vec3(n.x, n.y, n.z)
+    var w = n.w
+    if w < 0.0 { u = vec3_neg(u)  w = -w }
+    let s = vec3_length(u)
+    if s <= 1.0e-12 { return vec4(1.0, 0.0, 0.0, 0.0) }
+    // atan2(sin(h), cos(h)) rather than 2*acos(w): acos loses half its digits for a small angle,
+    // where the sine is still fully accurate
+    return vec3_extend(vec3_scale(u, 1.0 / s), 2.0 * atan2(s, w))
+}
+/// euler angles as a Vec3 (x = pitch, y = yaw, z = roll), the inverse of `quat_from_euler`'s Y-X-Z.
+///
+/// At the poles (pitch = +/-90 degrees) yaw and roll describe the same turn; roll is reported as 0
+/// and the whole rotation is folded into yaw.
+pub fn quat_to_euler(q: Quat) -> Vec3 {
+    let r = mat3_from_quat(quat_normalize(q))
+    // element (row, col) is `r.<col>_axis.<row>`; for Ry*Rx*Rz, (1,2) is -sin(pitch)
+    let r12 = r.z_axis.y
+    let sx = fclamp(0.0 - r12, -1.0, 1.0)
+    let px = asin(sx)
+    if fabs(r12) > 0.9999999 {
+        // gimbal lock: only yaw-minus-roll (or yaw-plus-roll) is determined, so pin roll at zero
+        return vec3(px, atan2(sx * r.y_axis.x, r.x_axis.x), 0.0)
+    }
+    return vec3(px, atan2(r.z_axis.x, r.z_axis.z), atan2(r.x_axis.y, r.y_axis.y))
+}
+
+// ---------------- interpolation ----------------
+/// normalized linear interpolation: cheap, always a unit result, but not constant angular speed.
+/// Takes the short way around.
+pub fn quat_nlerp(a: Quat, b: Quat, t: Float) -> Quat {
+    var e = copy b
+    if quat_dot(a, b) < 0.0 { e = quat_neg(b) }
+    return quat_normalize(quat_add(quat_scale(a, 1.0 - t), quat_scale(e, t)))
+}
+/// spherical linear interpolation: constant angular speed, the short way around.
+///
+/// `t = 0` returns `a` and `t = 1` returns `b` exactly (the weights are `sin(x)/sin(x)` and `0`),
+/// so an animation never drifts at its keyframes.
+pub fn quat_slerp(a: Quat, b: Quat, t: Float) -> Quat {
+    var d = quat_dot(a, b)
+    var e = copy b
+    if d < 0.0 { e = quat_neg(b)  d = -d }
+    // near-parallel: sin(theta) has cancelled away and the division is noise. nlerp is within an
+    // ulp of slerp there anyway, so use it and keep the endpoints exact.
+    if d > 0.9995 { return quat_normalize(quat_add(quat_scale(a, 1.0 - t), quat_scale(e, t))) }
+    let th = acos(fclamp(d, -1.0, 1.0))
+    let st = sin(th)
+    let s0 = sin((1.0 - t) * th) / st
+    let s1 = sin(t * th) / st
+    return quat_add(quat_scale(a, s0), quat_scale(e, s1))
+}

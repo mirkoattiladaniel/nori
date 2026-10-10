@@ -1,0 +1,518 @@
+// ECDSA over the NIST prime curves P-256 and P-384: verification, and RFC 6979 deterministic signing.
+//
+// Both curves are needed. Of ten real sites sampled while writing this, six had a
+// P-384 certificate somewhere in their chain (usually the intermediate or the root), so a client
+// with P-256 alone can verify the leaf and then fail to verify what signed it. P-384 is not an
+// extra here; it is the difference between validating most of the web and validating little of it.
+//
+// One implementation for both. The field is Montgomery-reduced (std/crypto/mont.nori) rather than
+// using each prime's Solinas shape, which costs some speed and buys the thing that matters: there
+// is no second reduction to get subtly wrong for one curve and not the other.
+//
+// None of X25519 transfers here. That is a Montgomery curve used for Diffie-Hellman with a ladder
+// that never needs a point addition; these are short Weierstrass curves used for signatures, over
+// different primes, needing full point arithmetic and a modular inverse.
+//
+// Verification works on public values only: a public key, a signature, a message hash. Nothing
+// here is constant-time and nothing needs to be; a signing operation that must resist timing
+// attacks would need a different implementation rather than one more function.
+
+frozen global P256_P: [Int] = [
+    0xffffffff, 0xffffffff, 0xffffffff, 0x00000000,
+    0x00000000, 0x00000000, 0x00000001, 0xffffffff
+]
+frozen global P256_N: [Int] = [
+    0xfc632551, 0xf3b9cac2, 0xa7179e84, 0xbce6faad,
+    0xffffffff, 0xffffffff, 0x00000000, 0xffffffff
+]
+frozen global P256_B: [Int] = [
+    0x27d2604b, 0x3bce3c3e, 0xcc53b0f6, 0x651d06b0,
+    0x769886bc, 0xb3ebbd55, 0xaa3a93e7, 0x5ac635d8
+]
+frozen global P256_GX: [Int] = [
+    0xd898c296, 0xf4a13945, 0x2deb33a0, 0x77037d81,
+    0x63a440f2, 0xf8bce6e5, 0xe12c4247, 0x6b17d1f2
+]
+frozen global P256_GY: [Int] = [
+    0x37bf51f5, 0xcbb64068, 0x6b315ece, 0x2bce3357,
+    0x7c0f9e16, 0x8ee7eb4a, 0xfe1a7f9b, 0x4fe342e2
+]
+frozen global P384_P: [Int] = [
+    0xffffffff, 0x00000000, 0x00000000, 0xffffffff,
+    0xfffffffe, 0xffffffff, 0xffffffff, 0xffffffff,
+    0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff
+]
+frozen global P384_N: [Int] = [
+    0xccc52973, 0xecec196a, 0x48b0a77a, 0x581a0db2,
+    0xf4372ddf, 0xc7634d81, 0xffffffff, 0xffffffff,
+    0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff
+]
+frozen global P384_B: [Int] = [
+    0xd3ec2aef, 0x2a85c8ed, 0x8a2ed19d, 0xc656398d,
+    0x5013875a, 0x0314088f, 0xfe814112, 0x181d9c6e,
+    0xe3f82d19, 0x988e056b, 0xe23ee7e4, 0xb3312fa7
+]
+frozen global P384_GX: [Int] = [
+    0x72760ab7, 0x3a545e38, 0xbf55296c, 0x5502f25d,
+    0x82542a38, 0x59f741e0, 0x8ba79b98, 0x6e1d3b62,
+    0xf320ad74, 0x8eb1c71e, 0xbe8b0537, 0xaa87ca22
+]
+frozen global P384_GY: [Int] = [
+    0x90ea0e5f, 0x7a431d7c, 0x1d7e819d, 0x0a60b1ce,
+    0xb5f0b8c0, 0xe9da3113, 0x289a147c, 0xf8f41dbd,
+    0x9292dc29, 0x5d9e98bf, 0x96262c6f, 0x3617de4a
+]
+
+/// A curve, with everything the Montgomery arithmetic needs precomputed.
+pub struct EcCurve {
+    len: Int,                       // limbs per field element
+    p: Vec<Int>, n: Vec<Int>,
+    p0inv: Int, prr: Vec<Int>,      // for arithmetic mod p
+    n0inv: Int, nrr: Vec<Int>,      // and mod the group order
+    one: Vec<Int>,                  // 1 in Montgomery form, i.e. R mod p
+    b: Vec<Int>, gx: Vec<Int>, gy: Vec<Int>    // all in Montgomery form
+}
+
+fn ec_vec(g: [Int], n: Int) -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    var i = 0
+    while i < n { v.push(g[i])  i = i + 1 }
+    return v
+}
+
+// `copy` because a bare binding is a view, and a view cannot be stored in the struct that
+// outlives this call. The curve is built once per verification, so the copies cost nothing.
+fn ec_make(len: Int, copy p: Vec<Int>, copy n: Vec<Int>, b: Vec<Int>, gx: Vec<Int>, gy: Vec<Int>) -> EcCurve {
+    let p0inv = mont_n0inv(p[0])
+    let prr = mont_r_squared(p)
+    let n0inv = mont_n0inv(n[0])
+    let nrr = mont_r_squared(n)
+    let one = mont_mul(mont_one(len), prr, p, p0inv)
+    // the Montgomery forms are computed before the record takes `p` and `prr`
+    let bm = mont_mul(b, prr, p, p0inv)
+    let gxm = mont_mul(gx, prr, p, p0inv)
+    let gym = mont_mul(gy, prr, p, p0inv)
+    return EcCurve { len: len, p: p, n: n, p0inv: p0inv, prr: prr, n0inv: n0inv, nrr: nrr,
+                     one: one, b: bm, gx: gxm, gy: gym }
+}
+
+/// secp256r1 / prime256v1.
+pub fn ec_p256() -> EcCurve {
+    return ec_make(8, ec_vec(P256_P, 8), ec_vec(P256_N, 8), ec_vec(P256_B, 8),
+                   ec_vec(P256_GX, 8), ec_vec(P256_GY, 8))
+}
+/// secp384r1.
+pub fn ec_p384() -> EcCurve {
+    return ec_make(12, ec_vec(P384_P, 12), ec_vec(P384_N, 12), ec_vec(P384_B, 12),
+                   ec_vec(P384_GX, 12), ec_vec(P384_GY, 12))
+}
+
+// ---- the field, in Montgomery form -------------------------------------------------------------
+// Addition and subtraction are unaffected by the Montgomery scaling, (aR) + (bR) = (a+b)R, so
+// only multiplication needs the special routine.
+
+fn ec_is_zero(a: Vec<Int>) -> Bool {
+    var i = 0
+    while i < a.len() { if a[i] != 0 { return false }  i = i + 1 }
+    return true
+}
+fn ec_eq(a: Vec<Int>, b: Vec<Int>) -> Bool {
+    var i = 0
+    while i < a.len() { if a[i] != b[i] { return false }  i = i + 1 }
+    return true
+}
+fn ec_copy(a: Vec<Int>) -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    var i = 0
+    while i < a.len() { v.push(a[i])  i = i + 1 }
+    return v
+}
+fn ec_add_mod(a: Vec<Int>, b: Vec<Int>, m: Vec<Int>) -> Vec<Int> {
+    var r = mont_zeros(m.len())
+    var carry = 0
+    var i = 0
+    while i < m.len() {
+        let v = ((a[i] + b[i]) + carry)
+        r[i] = (v & 0xffffffff)
+        carry = ((v >> 32) & 1)
+        i = i + 1
+    }
+    if carry != 0 { mont_sub_in_place(r, m)  return r }
+    if mont_ge(r, m) { mont_sub_in_place(r, m) }
+    return r
+}
+fn ec_sub_mod(a: Vec<Int>, b: Vec<Int>, m: Vec<Int>) -> Vec<Int> {
+    var r = mont_zeros(m.len())
+    var borrow = 0
+    var i = 0
+    while i < m.len() {
+        let v = ((a[i] - b[i]) - borrow)
+        if v < 0 { r[i] = (v + 4294967296)  borrow = 1 } else { r[i] = v  borrow = 0 }
+        i = i + 1
+    }
+    if borrow != 0 {
+        var c2 = 0
+        i = 0
+        while i < m.len() {
+            let v = ((r[i] + m[i]) + c2)
+            r[i] = (v & 0xffffffff)
+            c2 = ((v >> 32) & 1)
+            i = i + 1
+        }
+    }
+    return r
+}
+fn ec_fmul(c: EcCurve, a: Vec<Int>, b: Vec<Int>) -> Vec<Int> { return mont_mul(a, b, c.p, c.p0inv) }
+fn ec_fsqr(c: EcCurve, a: Vec<Int>) -> Vec<Int> { return mont_mul(a, a, c.p, c.p0inv) }
+fn ec_fadd(c: EcCurve, a: Vec<Int>, b: Vec<Int>) -> Vec<Int> { return ec_add_mod(a, b, c.p) }
+fn ec_fsub(c: EcCurve, a: Vec<Int>, b: Vec<Int>) -> Vec<Int> { return ec_sub_mod(a, b, c.p) }
+
+// k * a for a small k, by repeated addition. The multipliers in the point formulas are 2, 3, 4 and
+// 8, so this is never more than a handful of adds and is cheaper than a full multiplication.
+fn ec_fmul_small(c: EcCurve, a: Vec<Int>, k: Int) -> Vec<Int> {
+    var r = ec_copy(a)
+    var i = 1
+    while i < k { r = ec_fadd(c, r, a)  i = i + 1 }
+    return r
+}
+
+// a^(m-2) mod m, in Montgomery form: the inverse for a prime m. Square-and-multiply over the bits
+// of m-2, read from the modulus rather than stored as an addition chain: slower than a tuned chain
+// and far easier to be sure of.
+fn ec_pow_inv(a: Vec<Int>, m: Vec<Int>, m0inv: Int, one: Vec<Int>) -> Vec<Int> {
+    var e = ec_copy(m)
+    e[0] = (e[0] - 2)
+    var result = ec_copy(one)
+    var base = ec_copy(a)
+    var i = 0
+    let bits = (m.len() * 32)
+    while i < bits {
+        if ((e[(i / 32)] >> (i % 32)) & 1) == 1 { result = mont_mul(result, base, m, m0inv) }
+        base = mont_mul(base, base, m, m0inv)
+        i = i + 1
+    }
+    return result
+}
+fn ec_finv(c: EcCurve, a: Vec<Int>) -> Vec<Int> { return ec_pow_inv(a, c.p, c.p0inv, c.one) }
+
+// ---- points, in Jacobian coordinates -----------------------------------------------------------
+//
+// (X : Y : Z) stands for the affine point (X/Z^2, Y/Z^3), which keeps every step free of the
+// modular inverse an affine addition would need: one inverse at the end instead of one per step.
+// Z = 0 is the point at infinity.
+
+pub struct EcPoint { x: Vec<Int>, y: Vec<Int>, z: Vec<Int> }
+
+fn ec_infinity(c: EcCurve) -> EcPoint {
+    return EcPoint { x: mont_zeros(c.len), y: mont_zeros(c.len), z: mont_zeros(c.len) }
+}
+fn ec_is_infinity(p: EcPoint) -> Bool { return ec_is_zero(p.z) }
+
+// Doubling in the a = -3 form. Every NIST prime curve has a = -3, and that is what lets
+// alpha be 3(X-Z^2)(X+Z^2) instead of 3X^2 + aZ^4.
+fn ec_double(c: EcCurve, p: EcPoint) -> EcPoint {
+    if ec_is_infinity(p) { return ec_infinity(c) }
+    if ec_is_zero(p.y) { return ec_infinity(c) }
+    let delta = ec_fsqr(c, p.z)
+    let gamma = ec_fsqr(c, p.y)
+    let beta = ec_fmul(c, p.x, gamma)
+    let alpha = ec_fmul_small(c, ec_fmul(c, ec_fsub(c, p.x, delta), ec_fadd(c, p.x, delta)), 3)
+    let x3 = ec_fsub(c, ec_fsqr(c, alpha), ec_fmul_small(c, beta, 8))
+    let yz = ec_fsqr(c, ec_fadd(c, p.y, p.z))
+    let z3 = ec_fsub(c, ec_fsub(c, yz, gamma), delta)
+    let y3 = ec_fsub(c, ec_fmul(c, alpha, ec_fsub(c, ec_fmul_small(c, beta, 4), x3)),
+                     ec_fmul_small(c, ec_fsqr(c, gamma), 8))
+    return EcPoint { x: x3, y: y3, z: z3 }
+}
+
+fn ec_point_add(c: EcCurve, p: EcPoint, q: EcPoint) -> EcPoint {
+    if ec_is_infinity(p) { return EcPoint { x: ec_copy(q.x), y: ec_copy(q.y), z: ec_copy(q.z) } }
+    if ec_is_infinity(q) { return EcPoint { x: ec_copy(p.x), y: ec_copy(p.y), z: ec_copy(p.z) } }
+    let z1z1 = ec_fsqr(c, p.z)
+    let z2z2 = ec_fsqr(c, q.z)
+    let u1 = ec_fmul(c, p.x, z2z2)
+    let u2 = ec_fmul(c, q.x, z1z1)
+    let s1 = ec_fmul(c, ec_fmul(c, p.y, q.z), z2z2)
+    let s2 = ec_fmul(c, ec_fmul(c, q.y, p.z), z1z1)
+    let h = ec_fsub(c, u2, u1)
+    let rr = ec_fmul_small(c, ec_fsub(c, s2, s1), 2)
+    if ec_is_zero(h) {
+        // The same x. Either the same point (where the addition formula would divide by zero and
+        // doubling is what is meant) or opposite points, whose sum is infinity.
+        if ec_is_zero(rr) { return ec_double(c, p) }
+        return ec_infinity(c)
+    }
+    let ii = ec_fsqr(c, ec_fmul_small(c, h, 2))
+    let j = ec_fmul(c, h, ii)
+    let v = ec_fmul(c, u1, ii)
+    let x3 = ec_fsub(c, ec_fsub(c, ec_fsqr(c, rr), j), ec_fmul_small(c, v, 2))
+    let y3 = ec_fsub(c, ec_fmul(c, rr, ec_fsub(c, v, x3)), ec_fmul_small(c, ec_fmul(c, s1, j), 2))
+    let zz = ec_fsqr(c, ec_fadd(c, p.z, q.z))
+    let z3 = ec_fmul(c, ec_fsub(c, ec_fsub(c, zz, z1z1), z2z2), h)
+    return EcPoint { x: x3, y: y3, z: z3 }
+}
+
+// k * P, most significant bit first. Not constant-time: the branch reveals the bits of k, and
+// every k reaching this file is public.
+fn ec_scalar_mul(c: EcCurve, k: Vec<Int>, p: EcPoint) -> EcPoint {
+    var r = ec_infinity(c)
+    var i = ((c.len * 32) - 1)
+    while i >= 0 {
+        r = ec_double(c, r)
+        if ((k[(i / 32)] >> (i % 32)) & 1) == 1 { r = ec_point_add(c, r, p) }
+        i = i - 1
+    }
+    return r
+}
+
+// Is (x, y) on the curve? y^2 = x^3 - 3x + b, with everything in Montgomery form.
+//
+// A public key must be checked. A point off the curve is not a public key, and computing with one
+// works in a group that is not this curve's (the invalid-curve attack).
+fn ec_on_curve(c: EcCurve, x: Vec<Int>, y: Vec<Int>) -> Bool {
+    let lhs = ec_fsqr(c, y)
+    let x3 = ec_fmul(c, ec_fsqr(c, x), x)
+    let rhs = ec_fadd(c, ec_fsub(c, x3, ec_fmul_small(c, x, 3)), c.b)
+    return ec_eq(lhs, rhs)
+}
+
+// A big-endian byte string as limbs, reduced mod m by conditional subtraction. The values reduced
+// this way (a hash and an x coordinate) are less than 2m, so a few passes suffice.
+fn ec_reduce_bytes(s: Str, m: Vec<Int>, len: Int) -> Vec<Int> {
+    var v = mont_limbs_of(s)
+    while v.len() < len { v.push(0) }
+    if v.len() > len {
+        var t = mont_zeros(len)
+        var i = 0
+        while i < len { t[i] = v[i]  i = i + 1 }
+        v = sink t
+    }
+    var k = 0
+    while k < 4 {
+        if mont_ge(v, m) { mont_sub_in_place(v, m) }
+        k = k + 1
+    }
+    return v
+}
+
+/// Verify an ECDSA signature.
+///
+/// `pubkey` is an uncompressed point (0x04 ‖ X ‖ Y), `digest` the message hash, and `r` and `s` the
+/// signature halves, each as many bytes as the curve is wide.
+///
+/// Every precondition below is a rejection that matters. A public key off the curve is not a key.
+/// An r or s of zero, or one at or above the group order, is a signature no signer produces and
+/// several verifiers have accepted, which is what a good share of the Wycheproof vectors test.
+pub fn ecdsa_verify(c: EcCurve, pubkey: Str, digest: Str, r: Str, s: Str) -> Bool {
+    let flen = (c.len * 4)
+    if pubkey.len() != ((2 * flen) + 1) { return false }
+    if ord(pubkey.at(0)) != 4 { return false }
+    if r.len() != flen { return false }
+    if s.len() != flen { return false }
+
+    var qx = mont_limbs_of(pubkey.slice(1, (1 + flen)))
+    var qy = mont_limbs_of(pubkey.slice((1 + flen), (1 + (2 * flen))))
+    while qx.len() < c.len { qx.push(0) }
+    while qy.len() < c.len { qy.push(0) }
+    if mont_ge(qx, c.p) { return false }
+    if mont_ge(qy, c.p) { return false }
+    let qxm = mont_mul(qx, c.prr, c.p, c.p0inv)
+    let qym = mont_mul(qy, c.prr, c.p, c.p0inv)
+    if !ec_on_curve(c, qxm, qym) { return false }
+
+    var rv = mont_limbs_of(r)
+    var sv = mont_limbs_of(s)
+    while rv.len() < c.len { rv.push(0) }
+    while sv.len() < c.len { sv.push(0) }
+    if ec_is_zero(rv) { return false }
+    if ec_is_zero(sv) { return false }
+    if mont_ge(rv, c.n) { return false }
+    if mont_ge(sv, c.n) { return false }
+
+    // e is the leftmost bits of the hash, at most as wide as the order. A longer hash is truncated
+    // rather than reduced; truncation is what the standard says, and reducing instead would
+    // verify a signature over a different value.
+    var h = digest
+    if h.len() > flen { h = h.slice(0, flen) }
+    var hp = ""
+    var pad = 0
+    while pad < (flen - h.len()) { hp = (hp + chr(0))  pad = pad + 1 }
+    let ev = ec_reduce_bytes((hp + h), c.n, c.len)
+
+    // w = s^-1 mod n, then u1 = e*w and u2 = r*w, all in Montgomery form modulo the order.
+    let n_one = mont_mul(mont_one(c.len), c.nrr, c.n, c.n0inv)
+    let svm = mont_mul(sv, c.nrr, c.n, c.n0inv)
+    let wm = ec_pow_inv(svm, c.n, c.n0inv, n_one)
+    let evm = mont_mul(ev, c.nrr, c.n, c.n0inv)
+    let rvm = mont_mul(rv, c.nrr, c.n, c.n0inv)
+    let u1 = mont_mul(mont_mul(evm, wm, c.n, c.n0inv), mont_one(c.len), c.n, c.n0inv)
+    let u2 = mont_mul(mont_mul(rvm, wm, c.n, c.n0inv), mont_one(c.len), c.n, c.n0inv)
+
+    let g = EcPoint { x: ec_copy(c.gx), y: ec_copy(c.gy), z: ec_copy(c.one) }
+    let q = EcPoint { x: qxm, y: qym, z: ec_copy(c.one) }
+    let pt = ec_point_add(c, ec_scalar_mul(c, u1, g), ec_scalar_mul(c, u2, q))
+    if ec_is_infinity(pt) { return false }
+
+    // the affine x, back out of Montgomery form, reduced mod n and compared with r
+    let zi = ec_finv(c, pt.z)
+    let xm = ec_fmul(c, pt.x, ec_fsqr(c, zi))
+    let x = mont_mul(xm, mont_one(c.len), c.p, c.p0inv)
+    let xb = mont_bytes_of(x, flen)
+    let xr = ec_reduce_bytes(xb, c.n, c.len)
+    return ec_eq(xr, rv)
+}
+
+// ---- signing -----------------------------------------------------------------------------------
+//
+// Anything that wants to be an authority over its own statements (a TLS server, a signed log, a
+// release manifest) needs this half.
+//
+// The nonce is the whole problem. `s = k^-1 (e + r·d) mod n` gives up the private key to anyone who
+// learns k, and reveals it outright if the same k is ever used for two different messages: the two
+// equations then have two unknowns and are trivially solved. That is not hypothetical: it is how
+// the PS3 signing key and a long line of Bitcoin wallets were taken. So k here is not random. It is
+// derived deterministically from the private key and the message, RFC 6979, using HMAC-SHA256: the
+// same message signs to the same signature every time, a different message cannot collide, and a
+// broken or missing entropy source cannot produce a repeat.
+
+fn ec_rfc6979_k(c: EcCurve, d: Str, h1: Str, flen: Int) -> Vec<Int> {
+    // RFC 6979 §3.2, with hlen = 256. V and K are the HMAC state; bits2octets(h1) is the hash
+    // reduced mod n and re-encoded, which is what the standard feeds in alongside the key.
+    let hn = ec_reduce_bytes(h1, c.n, c.len)
+    let h1o = mont_bytes_of(hn, flen)
+    var v = ""
+    var kk = ""
+    var i = 0
+    while i < 32 { v = (v + chr(1))  kk = (kk + chr(0))  i = i + 1 }
+    kk = hmac_sha256_raw(kk, (v + (chr(0) + (d + h1o))))
+    v = hmac_sha256_raw(kk, v)
+    kk = hmac_sha256_raw(kk, (v + (chr(1) + (d + h1o))))
+    v = hmac_sha256_raw(kk, v)
+    var guard = 0
+    while guard < 64 {
+        var t = ""
+        while t.len() < flen {
+            v = hmac_sha256_raw(kk, v)
+            t = (t + v)
+        }
+        var kv = mont_limbs_of(t.slice(0, flen))
+        while kv.len() < c.len { kv.push(0) }
+        // in [1, n-1] or try again, as the standard says
+        if !ec_is_zero(kv) && !mont_ge(kv, c.n) { return kv }
+        kk = hmac_sha256_raw(kk, (v + chr(0)))
+        v = hmac_sha256_raw(kk, v)
+        guard = guard + 1
+    }
+    return mont_zeros(c.len)
+}
+
+/// The public key for a private scalar, as the uncompressed 04‖X‖Y a verifier expects.
+pub fn ecdsa_public(c: EcCurve, priv: Str) -> Str {
+    let flen = (c.len * 4)
+    var dv = mont_limbs_of(priv)
+    while dv.len() < c.len { dv.push(0) }
+    if ec_is_zero(dv) || mont_ge(dv, c.n) { return "" }
+    let g = EcPoint { x: ec_copy(c.gx), y: ec_copy(c.gy), z: ec_copy(c.one) }
+    let q = ec_scalar_mul(c, dv, g)
+    if ec_is_infinity(q) { return "" }
+    let zi = ec_finv(c, q.z)
+    let z2 = ec_fsqr(c, zi)
+    let xm = ec_fmul(c, q.x, z2)
+    let ym = ec_fmul(c, q.y, ec_fmul(c, z2, zi))
+    let x = mont_mul(xm, mont_one(c.len), c.p, c.p0inv)
+    let y = mont_mul(ym, mont_one(c.len), c.p, c.p0inv)
+    return (chr(4) + (mont_bytes_of(x, flen) + mont_bytes_of(y, flen)))
+}
+
+/// A private scalar from raw bytes; rejected unless it lands in [1, n-1], which is what makes a
+/// key generated from any random source usable without the caller having to know the order.
+pub fn ecdsa_valid_private(c: EcCurve, priv: Str) -> Bool {
+    var dv = mont_limbs_of(priv)
+    while dv.len() < c.len { dv.push(0) }
+    if ec_is_zero(dv) { return false }
+    return !mont_ge(dv, c.n)
+}
+
+/// Sign `digest` (already hashed) with `priv`. Returns r‖s, each field-width, or "" if the private
+/// key is not a scalar on this curve.
+pub fn ecdsa_sign(c: EcCurve, priv: Str, digest: Str) -> Str {
+    let flen = (c.len * 4)
+    var dv = mont_limbs_of(priv)
+    while dv.len() < c.len { dv.push(0) }
+    if ec_is_zero(dv) || mont_ge(dv, c.n) { return "" }
+
+    // e: the leftmost bits of the hash, truncated to the order's width and then reduced. This is the
+    // same rule ecdsa_verify applies; signing it differently would produce signatures that verify
+    // against a different value than the one anybody checks.
+    var h = digest
+    if h.len() > flen { h = h.slice(0, flen) }
+    var hp = ""
+    var pad = 0
+    while pad < (flen - h.len()) { hp = (hp + chr(0))  pad = pad + 1 }
+    let hfull = (hp + h)
+    let ev = ec_reduce_bytes(hfull, c.n, c.len)
+
+    var dpriv = priv
+    if dpriv.len() < flen {
+        var dp = ""
+        var q2 = 0
+        while q2 < (flen - dpriv.len()) { dp = (dp + chr(0))  q2 = q2 + 1 }
+        dpriv = (dp + dpriv)
+    }
+    let kv = ec_rfc6979_k(c, dpriv, hfull, flen)
+    if ec_is_zero(kv) { return "" }
+
+    let g = EcPoint { x: ec_copy(c.gx), y: ec_copy(c.gy), z: ec_copy(c.one) }
+    let pt = ec_scalar_mul(c, kv, g)
+    if ec_is_infinity(pt) { return "" }
+    let zi = ec_finv(c, pt.z)
+    let xm = ec_fmul(c, pt.x, ec_fsqr(c, zi))
+    let x = mont_mul(xm, mont_one(c.len), c.p, c.p0inv)
+    let rv = ec_reduce_bytes(mont_bytes_of(x, flen), c.n, c.len)
+    if ec_is_zero(rv) { return "" }
+
+    // s = k^-1 (e + r·d) mod n, in Montgomery form modulo the order throughout
+    let n_one = mont_mul(mont_one(c.len), c.nrr, c.n, c.n0inv)
+    let km = mont_mul(kv, c.nrr, c.n, c.n0inv)
+    let kinv = ec_pow_inv(km, c.n, c.n0inv, n_one)
+    let rm = mont_mul(rv, c.nrr, c.n, c.n0inv)
+    let dm = mont_mul(dv, c.nrr, c.n, c.n0inv)
+    let em = mont_mul(ev, c.nrr, c.n, c.n0inv)
+    let rd = mont_mul(rm, dm, c.n, c.n0inv)
+    let sum = ec_add_mod(em, rd, c.n)
+    let sm = mont_mul(kinv, sum, c.n, c.n0inv)
+    let sv = mont_mul(sm, mont_one(c.len), c.n, c.n0inv)
+    if ec_is_zero(sv) { return "" }
+    return (mont_bytes_of(rv, flen) + mont_bytes_of(sv, flen))
+}
+
+// ---- test seams --------------------------------------------------------------------------------
+// Exposed so tests can cross-check the field against an independent implementation before
+// anything is built on it. A wrong multiply produces points that are self-consistent and verify
+// nothing, and finding that out at the ECDSA layer means debugging the wrong file.
+
+fn ec_field_op(c: EcCurve, a: Str, b: Str, op: Int) -> Str {
+    let flen = (c.len * 4)
+    var av = mont_limbs_of(a)
+    var bv = mont_limbs_of(b)
+    while av.len() < c.len { av.push(0) }
+    while bv.len() < c.len { bv.push(0) }
+    if op == 0 {
+        let am = mont_mul(av, c.prr, c.p, c.p0inv)
+        let bm = mont_mul(bv, c.prr, c.p, c.p0inv)
+        return mont_bytes_of(mont_mul(ec_fmul(c, am, bm), mont_one(c.len), c.p, c.p0inv), flen)
+    }
+    if op == 1 { return mont_bytes_of(ec_add_mod(av, bv, c.p), flen) }
+    if op == 2 { return mont_bytes_of(ec_sub_mod(av, bv, c.p), flen) }
+    // inverse
+    let am = mont_mul(av, c.prr, c.p, c.p0inv)
+    return mont_bytes_of(mont_mul(ec_finv(c, am), mont_one(c.len), c.p, c.p0inv), flen)
+}
+/// a * b mod p, operands and result as field-width big-endian bytes.
+pub fn ec_field_mul(c: EcCurve, a: Str, b: Str) -> Str { return ec_field_op(c, a, b, 0) }
+/// a + b mod p
+pub fn ec_field_add(c: EcCurve, a: Str, b: Str) -> Str { return ec_field_op(c, a, b, 1) }
+/// a - b mod p
+pub fn ec_field_sub(c: EcCurve, a: Str, b: Str) -> Str { return ec_field_op(c, a, b, 2) }
+/// a^-1 mod p
+pub fn ec_field_inv(c: EcCurve, a: Str) -> Str { return ec_field_op(c, a, a, 3) }

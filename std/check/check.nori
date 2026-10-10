@@ -1,0 +1,473 @@
+//! std/check: property generators, shrinkers, and value renderers for `law` fuzzing.
+//!
+//! You do not normally import this by hand. `noric --fuzz-laws FILE` (or `roll law`) generates a harness
+//! that imports this module, draws random + adversarial inputs for every `law`, calls the law, and on
+//! any input that makes the law return false **shrinks** it to a minimal failing case using the
+//! `shrink_*` candidate lists here. Generators are biased toward the boundary values
+//! (0, ±1, empty, all-equal, ascending) that curated tests miss.
+//!
+//! Supported `law` parameter types: Int, Float, Bool, Char, Str and Vec of each.
+
+import "std/rand" as rand
+
+// =====================================================================================
+//  generators: a value from an Rng, biased small early (small `iter`) so counterexamples stay readable
+// =====================================================================================
+
+/// a random Int: often a boundary value (0, ±1, ±2), otherwise magnitude grows with `iter`.
+pub fn gen_int(inout r: rand::Rng, iter: Int) -> Int {
+    let pick = r.below(10)
+    if pick == 0 {
+        return 0
+    }
+    if pick == 1 {
+        return 1
+    }
+    if pick == 2 {
+        return -1
+    }
+    if pick == 3 {
+        return 2
+    }
+    if pick == 4 {
+        return -2
+    }
+    var bound = (iter + 1) * 4
+    if bound > 100000 {
+        bound = 100000
+    }
+    return r.between(0 - bound, bound + 1)
+}
+
+/// a random Float: often 0/±1, otherwise uniform in [-bound, bound] with bound growing with `iter`.
+pub fn gen_float(inout r: rand::Rng, iter: Int) -> Float {
+    let pick = r.below(8)
+    if pick == 0 {
+        return 0.0
+    }
+    if pick == 1 {
+        return 1.0
+    }
+    if pick == 2 {
+        return -1.0
+    }
+    let bound = to_float((iter + 1) * 4)
+    return(r.float01() * 2.0 - 1.0) * bound
+}
+
+/// a fair coin.
+pub fn gen_bool(inout r: rand::Rng, iter: Int) -> Bool {
+    return r.flip()
+}
+
+/// a Char: often 'a'/'A'/'0'/space, otherwise a random printable ASCII char.
+pub fn gen_char(inout r: rand::Rng, iter: Int) -> Byte {
+    let pick = r.below(6)
+    if pick == 0 {
+        return chr(97)
+    }
+    if pick == 1 {
+        return chr(65)
+    }
+    if pick == 2 {
+        return chr(48)
+    }
+    if pick == 3 {
+        return chr(32)
+    }
+    return chr(r.between(33, 127))
+}
+
+/// a Str: sometimes empty, otherwise a short run of generated chars (length grows with `iter`).
+pub fn gen_str(inout r: rand::Rng, iter: Int) -> Str {
+    if r.below(6) == 0 {
+        return ""
+    }
+    let n = r.below(iter + 3)
+    var out = ""
+    var i = 0
+    while i < n {
+        out = (out + gen_char(r, iter))
+        i = i + 1
+    }
+    return out
+}
+
+// Vec generators pick a "shape" first so adversarial structures (empty / all-equal / ascending) show up
+// far more often than uniform-random sampling would produce them.
+
+/// a Vec<Int>: empty, all-equal, ascending 0..n, or random elements (length grows with `iter`).
+pub fn gen_veci(inout r: rand::Rng, iter: Int) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    let shape = r.below(6)
+    let n = r.below(iter + 4)
+    if shape == 0 {
+        return out
+    }
+    if shape == 1 {
+        let v = gen_int(r, iter)
+        var i = 0
+        while i < n {
+            out.push(v)
+            i = i + 1
+        }
+        return out
+    }
+    if shape == 2 {
+        var i = 0
+        while i < n {
+            out.push(i)
+            i = i + 1
+        }
+        return out
+    }
+    var i = 0
+    while i < n {
+        out.push(gen_int(r, iter))
+        i = i + 1
+    }
+    return out
+}
+
+/// a Vec<Float> of random elements (length grows with `iter`; sometimes empty).
+pub fn gen_vecf(inout r: rand::Rng, iter: Int) -> Vec<Float> {
+    var out: Vec<Float> = vec()
+    if r.below(6) == 0 {
+        return out
+    }
+    let n = r.below(iter + 4)
+    var i = 0
+    while i < n {
+        out.push(gen_float(r, iter))
+        i = i + 1
+    }
+    return out
+}
+
+/// a Vec<Bool> of random elements (length grows with `iter`; sometimes empty).
+pub fn gen_vecb(inout r: rand::Rng, iter: Int) -> Vec<Bool> {
+    var out: Vec<Bool> = vec()
+    if r.below(6) == 0 {
+        return out
+    }
+    let n = r.below(iter + 4)
+    var i = 0
+    while i < n {
+        out.push(r.flip())
+        i = i + 1
+    }
+    return out
+}
+
+/// a Vec<Str> of random elements (length grows with `iter`; sometimes empty).
+pub fn gen_vecs(inout r: rand::Rng, iter: Int) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    if r.below(6) == 0 {
+        return out
+    }
+    let n = r.below(iter + 3)
+    var i = 0
+    while i < n {
+        out.push(gen_str(r, iter))
+        i = i + 1
+    }
+    return out
+}
+
+// =====================================================================================
+//  shrinkers: "simpler" candidates for a failing value, ordered simplest-first. The driver replaces one
+//  argument with each candidate (holding the others fixed) and keeps any that still fails, to a fixpoint.
+// =====================================================================================
+
+/// simpler Ints than `x`: 0, then halfway to 0, then one step toward 0.
+pub fn shrink_int(x: Int) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    if x == 0 {
+        return out
+    }
+    out.push(0)
+    if x != 1 {
+        if x != -1 {
+            out.push(x / 2)
+        }
+    }
+    if x > 0 {
+        out.push(x - 1)
+    } else {
+        out.push(x + 1)
+    }
+    return out
+}
+
+/// simpler Floats than `x`: 0.0, then half.
+pub fn shrink_float(x: Float) -> Vec<Float> {
+    var out: Vec<Float> = vec()
+    if x == 0.0 {
+        return out
+    }
+    out.push(0.0)
+    out.push(x / 2.0)
+    return out
+}
+
+/// the simpler Bool: only `false` is simpler than `true`.
+pub fn shrink_bool(b: Bool) -> Vec<Bool> {
+    var out: Vec<Bool> = vec()
+    if b {
+        out.push(false)
+    }
+    return out
+}
+
+/// simpler Chars than `c`: 'a' (the canonical simplest char).
+pub fn shrink_char(c: Byte) -> Vec<Byte> {
+    var out: Vec<Byte> = vec()
+    if ord(c) != 97 {
+        out.push(chr(97))
+    }
+    return out
+}
+
+/// simpler Strs than `s`: empty, first half, drop-last-char.
+pub fn shrink_str(s: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let n = s.len()
+    if n == 0 {
+        return out
+    }
+    out.push("")
+    if n > 1 {
+        out.push(s.slice(0, n / 2))
+    }
+    out.push(s.slice(0, n - 1))
+    return out
+}
+
+fn veci_slice(v: Vec<Int>, lo: Int, hi: Int) -> Vec<Int> {
+    var o: Vec<Int> = vec()
+    var i = lo
+    while i < hi {
+        o.push(v[i])
+        i = i + 1
+    }
+    return o
+}
+fn veci_drop(v: Vec<Int>, k: Int) -> Vec<Int> {
+    var o: Vec<Int> = vec()
+    var i = 0
+    while i < v.len() {
+        if i != k {
+            o.push(v[i])
+        }
+        i = i + 1
+    }
+    return o
+}
+
+/// simpler Vec<Int>s than `v`: empty, halves, and each single-element deletion.
+pub fn shrink_veci(v: Vec<Int>) -> Vec<Vec<Int>> {
+    var out: Vec<Vec<Int>> = vec()
+    let n = v.len()
+    if n == 0 {
+        return out
+    }
+    var empty: Vec<Int> = vec()
+    out.push(empty)
+    if n > 1 {
+        out.push(veci_slice(v, 0, n / 2))
+        out.push(veci_slice(v, n / 2, n))
+    }
+    var i = 0
+    while i < n {
+        out.push(veci_drop(v, i))
+        i = i + 1
+    }
+    return out
+}
+
+fn vecf_slice(v: Vec<Float>, lo: Int, hi: Int) -> Vec<Float> {
+    var o: Vec<Float> = vec()
+    var i = lo
+    while i < hi {
+        o.push(v[i])
+        i = i + 1
+    }
+    return o
+}
+fn vecf_drop(v: Vec<Float>, k: Int) -> Vec<Float> {
+    var o: Vec<Float> = vec()
+    var i = 0
+    while i < v.len() {
+        if i != k {
+            o.push(v[i])
+        }
+        i = i + 1
+    }
+    return o
+}
+
+/// simpler Vec<Float>s than `v`: empty, halves, and each single-element deletion.
+pub fn shrink_vecf(v: Vec<Float>) -> Vec<Vec<Float>> {
+    var out: Vec<Vec<Float>> = vec()
+    let n = v.len()
+    if n == 0 {
+        return out
+    }
+    var empty: Vec<Float> = vec()
+    out.push(empty)
+    if n > 1 {
+        out.push(vecf_slice(v, 0, n / 2))
+        out.push(vecf_slice(v, n / 2, n))
+    }
+    var i = 0
+    while i < n {
+        out.push(vecf_drop(v, i))
+        i = i + 1
+    }
+    return out
+}
+
+fn vecb_drop(v: Vec<Bool>, k: Int) -> Vec<Bool> {
+    var o: Vec<Bool> = vec()
+    var i = 0
+    while i < v.len() {
+        if i != k {
+            o.push(v[i])
+        }
+        i = i + 1
+    }
+    return o
+}
+
+/// simpler Vec<Bool>s than `v`: empty, then each single-element deletion.
+pub fn shrink_vecb(v: Vec<Bool>) -> Vec<Vec<Bool>> {
+    var out: Vec<Vec<Bool>> = vec()
+    let n = v.len()
+    if n == 0 {
+        return out
+    }
+    var empty: Vec<Bool> = vec()
+    out.push(empty)
+    var i = 0
+    while i < n {
+        out.push(vecb_drop(v, i))
+        i = i + 1
+    }
+    return out
+}
+
+fn vecs_drop(v: Vec<Str>, k: Int) -> Vec<Str> {
+    var o: Vec<Str> = vec()
+    var i = 0
+    while i < v.len() {
+        if i != k {
+            o.push(copy v[i])
+        }
+        i = i + 1
+    }
+    return o
+}
+
+/// simpler Vec<Str>s than `v`: empty, then each single-element deletion.
+pub fn shrink_vecs(v: Vec<Str>) -> Vec<Vec<Str>> {
+    var out: Vec<Vec<Str>> = vec()
+    let n = v.len()
+    if n == 0 {
+        return out
+    }
+    var empty: Vec<Str> = vec()
+    out.push(empty)
+    var i = 0
+    while i < n {
+        out.push(vecs_drop(v, i))
+        i = i + 1
+    }
+    return out
+}
+
+// =====================================================================================
+//  renderers: a readable source-like rendering of a counterexample value
+//
+//  A shrunk counterexample is only useful if you can read it, and then paste it into a test. These
+//  print values the way source writes them, quotes on strings and chars included, so `""` and `" "`
+//  are not the same blank on the page.
+// =====================================================================================
+
+/// render an `Int` for a counterexample line.
+pub fn show_int(x: Int) -> Str {
+    return "" + x
+}
+/// render a `Float` for a counterexample line.
+pub fn show_float(x: Float) -> Str {
+    return "" + x
+}
+/// render a `Bool` as `true` / `false`.
+pub fn show_bool(x: Bool) -> Str {
+    if x {
+        return "true"
+    }
+    return "false"
+}
+/// render a `Byte` in single quotes, the way it is written in source.
+pub fn show_char(x: Byte) -> Str {
+    let q = "" + chr(39)
+    return q + x + q
+}
+/// render a `Str` in double quotes, so an empty or space-only counterexample is visible.
+pub fn show_str(x: Str) -> Str {
+    let q = "" + chr(34)
+    return q + x + q
+}
+
+/// render a `Vec<Int>` as `[1, 2, 3]`.
+pub fn show_veci(v: Vec<Int>) -> Str {
+    var out = "["
+    var i = 0
+    while i < v.len() {
+        if i > 0 {
+            out = (out + ", ")
+        }
+        out = (out + v[i])
+        i = i + 1
+    }
+    return(out + "]")
+}
+/// render a `Vec<Float>` as `[1.5, 2.0]`.
+pub fn show_vecf(v: Vec<Float>) -> Str {
+    var out = "["
+    var i = 0
+    while i < v.len() {
+        if i > 0 {
+            out = (out + ", ")
+        }
+        out = (out + v[i])
+        i = i + 1
+    }
+    return(out + "]")
+}
+/// render a `Vec<Bool>` as `[true, false]`.
+pub fn show_vecb(v: Vec<Bool>) -> Str {
+    var out = "["
+    var i = 0
+    while i < v.len() {
+        if i > 0 {
+            out = (out + ", ")
+        }
+        out = (out + show_bool(v[i]))
+        i = i + 1
+    }
+    return(out + "]")
+}
+/// render a `Vec<Str>` with each element quoted: `["a", "b"]`.
+pub fn show_vecs(v: Vec<Str>) -> Str {
+    var out = "["
+    var i = 0
+    while i < v.len() {
+        if i > 0 {
+            out = (out + ", ")
+        }
+        out = (out + show_str(v[i]))
+        i = i + 1
+    }
+    return(out + "]")
+}

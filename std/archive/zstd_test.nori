@@ -1,0 +1,267 @@
+// .nori tests for the Zstandard decompressor, run with
+//   noric --test std/archive/zstd_test.nori compiler/runtime.nori --import-root .
+//
+// Where the vectors come from. There is a real oracle for this format (`zstd` 1.5.7), so almost every
+// fixture in std/archive/testdata is a frozen comparison against the reference tool: the .zst was produced
+// by the CLI and the expected bytes are what `zstd -d` returned for it. The project's test suite re-runs
+// that comparison live over a much wider corpus when the CLI is present; these vectors are the part
+// that still runs on a machine without it. Two fixtures are instead hand-derived, byte by
+// byte, from the format spec (`z_rle_seq` and `z_rle_lit` below) because the reference encoder does
+// not emit those two encodings in practice and a corpus alone would never reach them. Both were
+// checked against `zstd -d` after being written by hand.
+//
+// The large fixtures are checked by decoded length plus an FNV-1a hash of the output rather than by
+// shipping a 140 KB expected file next to a 20 KB compressed one. The hash constants were computed
+// from `zstd -d` output, not from this decoder.
+//
+// What the corpus is for. Small inputs do not exercise this format. A 40-byte stream is one block with
+// predefined FSE tables and raw literals; it never reaches Huffman literals, never reaches a second
+// block, and never reaches the repeat-offset states that only matter once a match reuses an earlier
+// distance. The mutation sweep behind these vectors put numbers on that: breaking the repeat-offset
+// update rule is invisible below 1 KB, and breaking the "offset code 3 with no literals means r0 - 1"
+// case is invisible below 8 KB. Hence z_multi and z_treeless, both of which decode to more than
+// 128 KiB and therefore span several blocks.
+import "std/archive" as ar
+
+// FNV-1a (32-bit), a cheap independent digest so a 140 KB expected output does not have to be
+// committed next to its 20 KB compressed form.
+fn zt_fnv(s: Str) -> Int {
+    var h = 2166136261
+    var i = 0
+    let n = s.len()
+    while i < n {
+        h = (h ^ ord(s.at(i))) & 4294967295
+        h = (h * 16777619) & 4294967295
+        i = i + 1
+    }
+    return h
+}
+fn zt_path(name: Str) -> Str { return ("std/archive/testdata/" + name) }
+
+// decode a fixture and assert it equals a committed plain file, byte for byte.
+fn zt_check_file(zname: Str, plain: Str) {
+    let r = ar::zstd_decompress_checked(read_file(zt_path(zname)))
+    assert_streq(ar::zstd_result_error(r), "")
+    let got = ar::zstd_result_data(r)
+    let want = read_file(zt_path(plain))
+    assert_eq(got.len(), want.len())
+    assert_streq(got, want)
+}
+// decode a fixture and assert it equals a literal string.
+fn zt_check_str(zname: Str, want: Str) {
+    let r = ar::zstd_decompress_checked(read_file(zt_path(zname)))
+    assert_streq(ar::zstd_result_error(r), "")
+    let got = ar::zstd_result_data(r)
+    assert_eq(got.len(), want.len())
+    assert_streq(got, want)
+}
+// decode a fixture and assert its length and FNV-1a digest.
+fn zt_check_hash(zname: Str, n: Int, h: Int) {
+    let r = ar::zstd_decompress_checked(read_file(zt_path(zname)))
+    assert_streq(ar::zstd_result_error(r), "")
+    let got = ar::zstd_result_data(r)
+    assert_eq(got.len(), n)
+    assert_eq(zt_fnv(got), h)
+}
+// decode a fixture that must fail, and assert the reason names the problem.
+fn zt_check_fail(zname: Str) -> Str {
+    let r = ar::zstd_decompress_checked(read_file(zt_path(zname)))
+    assert_true(!ar::zstd_result_ok(r))
+    assert_eq(ar::zstd_result_data(r).len(), 0)
+    assert_true(ar::zstd_result_error(r).len() > 0)
+    return copy ar::zstd_result_error(r)
+}
+fn zt_repeat(unit: Str, times: Int) -> Str {
+    var s = ""
+    var i = 0
+    while i < times {
+        s = s + unit
+        i = i + 1
+    }
+    return s
+}
+
+// ── the motivating fixture: the entry a game cannot start without ─────────────────────────────────
+// a scene file, taken unchanged out of two real exported content packs. Both
+// were written by the reference encoder with no frame content size and no checksum, which is the
+// minimal frame header form and the one least covered by CLI-generated corpora.
+fn test_zstd_real_pak_scene() {
+    zt_check_file("z_scene.zst", "z_scene.bin")
+    zt_check_file("z_scene2.zst", "z_scene2.bin")
+}
+
+// The two big entries from the same paks: a 117 KB WebAssembly module and a 126 KB voxel asset.
+fn test_zstd_real_pak_binaries() {
+    zt_check_hash("z_wasm.zst", 117001, 1019708684)
+    zt_check_hash("z_rvox.zst", 126032, 2404231173)
+}
+
+// ── level coverage: -1 and -19 lay the same bytes out differently ─────────────────────────────────
+// Level 1 and level 19 do not just compress harder, they use different machinery: table reuse,
+// treeless literal blocks, and different FSE mode selections. Both must decode to the same file.
+fn test_zstd_text_levels() {
+    zt_check_file("z_text_l1.zst", "z_text.bin")
+    zt_check_file("z_text_l19.zst", "z_text.bin")
+}
+
+// ── multi-block frames ────────────────────────────────────────────────────────────────────────────
+// 140000 bytes is past zstd's 128 KiB block maximum, so these are several blocks in one frame: the
+// repeat offsets and (for z_treeless) the Huffman table and the FSE tables carry across the boundary.
+// z_treeless is source text sprinkled with noise, which is what makes the encoder emit
+// Treeless_Literals_Blocks and Repeat_Mode sequence tables rather than fresh ones per block.
+fn test_zstd_multiblock() {
+    zt_check_hash("z_multi.zst", 140000, 2120030590)
+}
+fn test_zstd_treeless_and_repeat_tables() {
+    zt_check_hash("z_treeless.zst", 144200, 2367109368)
+}
+
+// ── the predefined FSE distributions ──────────────────────────────────────────────────────────────
+// Two very short inputs, where the encoder finds that describing its own FSE tables costs more than
+// the sequences save and so selects Predefined mode for all three symbol streams. Nothing else in this
+// file reaches those three constant distributions: everything larger carries its own tables, so a
+// wrong entry in LL_defaultNorm / ML_defaultNorm / OF_defaultNorm would sail past the rest of the
+// suite. 200 bytes pins the match-length and offset distributions, 400 the literal-length one.
+fn test_zstd_predefined_tables() {
+    zt_check_file("z_pre200.zst", "z_pre200.bin")
+    zt_check_file("z_pre400.zst", "z_pre400.bin")
+}
+
+// ── the two ends of the compressibility range ─────────────────────────────────────────────────────
+// 2048 bytes of PRNG output: no match is worth taking, so this comes back as raw literals in a block
+// that barely compresses, the path that must not be confused with a Huffman one.
+fn test_zstd_incompressible() {
+    zt_check_file("z_rand.zst", "z_rand.bin")
+}
+// 200000 zero bytes: RLE blocks, where Block_Size is the regenerated size and only one byte of it is
+// actually present in the stream. A decoder that bounds-checks the block against Block_Size rejects
+// this as truncated, which is the bug this vector caught.
+fn test_zstd_rle_blocks() {
+    zt_check_str("z_rle_block.zst", zt_repeat("" + chr(0), 200000))
+}
+
+// ── hand-derived fixtures for encodings the reference encoder does not produce ────────────────────
+// RLE_Literals_Block: one byte, repeated Regenerated_Size times, and a sequences section of a single
+// zero byte meaning "no sequences". Written out by hand from the spec:
+//   28 b5 2f fd | 20 14 | 1d 00 00 | a1 61 | 00
+//   magic       | hdr   | block hdr| lits  | nbSeq = 0
+// where a1 = 0b10100_0_01: literal type 1 (RLE), size format 0, Regenerated_Size 20.
+fn test_zstd_rle_literals() {
+    zt_check_str("z_rle_lit.zst", zt_repeat("a", 20))
+}
+// RLE mode for all three sequence FSE tables (Symbol_Compression_Modes = 0x54), which makes every
+// sequence use the same literal-length, offset and match-length symbol and costs zero state bits:
+//   ... 20 61 62 63 64 | 01 54 04 00 02 | 01
+//       raw lits "abcd"| 1 seq, 3x RLE  | bitstream
+// LL symbol 4, offset code 0 (Offset_Value 1, so repeat slot 0 = the initial 1), ML symbol 2
+// (match length 5). Result: "abcd" then five more 'd' from a distance-1 overlapping copy.
+fn test_zstd_rle_sequence_tables() {
+    zt_check_str("z_rle_seq.zst", "abcdddddd")
+}
+
+// ── frame-level structure ─────────────────────────────────────────────────────────────────────────
+fn test_zstd_empty_and_one_byte() {
+    zt_check_str("z_empty.zst", "")
+    zt_check_str("z_one.zst", "Q")
+}
+// A skippable frame (magic 0x184D2A50, four bytes of user data) followed by two real frames. The
+// skippable frame contributes nothing and the two payloads concatenate.
+fn test_zstd_skippable_and_concatenated_frames() {
+    let a = read_file(zt_path("z_scene.bin"))
+    let b = read_file(zt_path("z_scene2.bin"))
+    zt_check_str("z_frames.zst", a + b)
+}
+
+// ── errors are reported, not guessed at ───────────────────────────────────────────────────────────
+// One byte of a checksummed payload flipped. The frame still parses; only the XXH64 catches it, so
+// this fails if the checksum is skipped rather than verified.
+fn test_zstd_detects_corruption() {
+    let e = zt_check_fail("z_badchk.zst")
+    assert_true(e.len() > 0)
+}
+// A frame header with a Dictionary_ID. Refused by name rather than decoded without the dictionary.
+fn test_zstd_refuses_dictionary() {
+    let e = zt_check_fail("z_dict.zst")
+    assert_true(e.len() > 0)
+}
+// Block_Type 3 is reserved.
+fn test_zstd_refuses_reserved_block_type() {
+    let e = zt_check_fail("z_badtype.zst")
+    assert_true(e.len() > 0)
+}
+// Garbage in, error out: not a trap, and not silent empty output that a caller could mistake for a
+// valid empty stream (which is why the checked form exists at all).
+fn test_zstd_rejects_non_zstd_input() {
+    let r = ar::zstd_decompress_checked("this is not a zstd stream at all")
+    assert_true(!ar::zstd_result_ok(r))
+    let r2 = ar::zstd_decompress_checked("")
+    assert_true(!ar::zstd_result_ok(r2))
+}
+// Every prefix of a real stream must be refused rather than trapping or returning partial bytes.
+fn test_zstd_truncation_is_refused() {
+    let full = read_file(zt_path("z_scene.zst"))
+    var i = 1
+    while i < full.len() {
+        let r = ar::zstd_decompress_checked(full.slice(0, i))
+        assert_true(!ar::zstd_result_ok(r))
+        i = i + 7
+    }
+}
+
+// ── the store-only writer, so a round-trip exists without the CLI ─────────────────────────────────
+fn test_zstd_store_roundtrip() {
+    let a = read_file(zt_path("z_text.bin"))
+    zt_check_store(a)
+    zt_check_store("")
+    zt_check_store("x")
+    zt_check_store(zt_repeat("abcdefgh", 30000))
+}
+fn zt_check_store(s: Str) {
+    let z = ar::zstd_store(s)
+    let r = ar::zstd_decompress_checked(z)
+    assert_streq(ar::zstd_result_error(r), "")
+    assert_eq(ar::zstd_result_data(r).len(), s.len())
+    assert_streq(ar::zstd_result_data(r), s)
+}
+
+// ── corrupt input must be an error, never a trap ──────────────────────────────────────────────────
+// Every byte read out of the input is bounds-checked by the runtime, so a decoder that trusts a length
+// field does not return wrong bytes: it kills the process. This mutates two real streams with a
+// deterministic PRNG (bit flips, byte replacements and truncations) and requires that every one of
+// them comes back through the normal error channel. It says nothing about the output being right; the
+// vectors above do that. It is only about the failure mode.
+fn test_zstd_corrupt_input_never_traps() {
+    zt_fuzz(read_file(zt_path("z_scene.zst")), 12345, 400)
+    zt_fuzz(read_file(zt_path("z_text_l19.zst")), 777, 400)
+    zt_fuzz(read_file(zt_path("z_rle_block.zst")), 99, 200)
+    zt_fuzz(read_file(zt_path("z_rle_seq.zst")), 5, 200)
+}
+fn zt_fuzz(base: Str, seed: Int, rounds: Int) {
+    var x = seed
+    var i = 0
+    while i < rounds {
+        x = ((x * 1103515245) + 12345) & 2147483647
+        var d = base
+        // 0-2 byte replacements at PRNG positions, then sometimes a truncation
+        var k = 0
+        let nmut = (x >> 5) % 3
+        while k <= nmut {
+            x = ((x * 1103515245) + 12345) & 2147483647
+            let pos = (x >> 7) % d.len()
+            x = ((x * 1103515245) + 12345) & 2147483647
+            let byte = (x >> 9) & 255
+            d = (d.slice(0, pos) + chr(byte)) + d.slice(pos + 1, d.len())
+            k = k + 1
+        }
+        x = ((x * 1103515245) + 12345) & 2147483647
+        if ((x >> 11) & 3) == 0 {
+            x = ((x * 1103515245) + 12345) & 2147483647
+            d = d.slice(0, 1 + ((x >> 13) % d.len()))
+        }
+        let r = ar::zstd_decompress_checked(d)
+        // either it decoded (the mutation happened to be harmless) or it said why. Never a trap, and
+        // never a non-empty payload alongside an error.
+        if !ar::zstd_result_ok(r) { assert_eq(ar::zstd_result_data(r).len(), 0) }
+        i = i + 1
+    }
+}

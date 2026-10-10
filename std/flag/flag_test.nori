@@ -1,0 +1,126 @@
+import "std/flag" as flag
+
+fn mkargs() -> Vec<Str> {
+    var v: Vec<Str> = vec()
+    return v
+}
+
+// --name=value and --name value forms; int parsing; defaults.
+fn test_str_and_int_forms() {
+    var f = flag::new()
+    f.add_str("name", "world")
+    f.add_int("count", 1)
+    f.add_str("host", "localhost")
+    var a = mkargs()
+    a.push("--name=alice")
+    a.push("--count")
+    a.push("42")
+    f.parse(a)
+    var nm = f.get_str("name")
+    assert_streq(nm, "alice")
+    assert_eq(f.get_int("count"), 42)
+    // host absent -> default
+    var h = f.get_str("host")
+    assert_streq(h, "localhost")
+    // count via =-form would also work; covered below
+}
+
+fn test_eq_int_form() {
+    var f = flag::new()
+    f.add_int("count", 0)
+    var a = mkargs()
+    a.push("--count=7")
+    f.parse(a)
+    assert_eq(f.get_int("count"), 7)
+}
+
+// bool by presence vs default false.
+fn test_bool() {
+    var f = flag::new()
+    f.add_bool("verbose")
+    f.add_bool("quiet")
+    var a = mkargs()
+    a.push("--verbose")
+    f.parse(a)
+    assert_true(f.get_bool("verbose"))
+    assert_false(f.get_bool("quiet"))
+}
+
+// positionals collected in order, interleaved with flags.
+fn test_positionals_interleaved() {
+    var f = flag::new()
+    f.add_str("name", "")
+    f.add_bool("v")
+    var a = mkargs()
+    a.push("alpha")
+    a.push("--name")
+    a.push("bob")
+    a.push("beta")
+    a.push("--v")
+    a.push("gamma")
+    f.parse(a)
+    var nm = f.get_str("name")
+    assert_streq(nm, "bob")
+    assert_true(f.get_bool("v"))
+    var p = f.positionals()
+    assert_eq(p.len(), 3)
+    var p0 = p[0]
+    var p1 = p[1]
+    var p2 = p[2]
+    assert_streq(p0, "alpha")
+    assert_streq(p1, "beta")
+    assert_streq(p2, "gamma")
+}
+
+// -- terminator: rest are positional even if they look like flags.
+fn test_double_dash_terminator() {
+    var f = flag::new()
+    f.add_str("name", "")
+    var a = mkargs()
+    a.push("--name")
+    a.push("x")
+    a.push("--")
+    a.push("--not-a-flag")
+    a.push("-z")
+    a.push("plain")
+    f.parse(a)
+    var nm = f.get_str("name")
+    assert_streq(nm, "x")
+    var p = f.positionals()
+    assert_eq(p.len(), 3)
+    var p0 = p[0]
+    var p1 = p[1]
+    var p2 = p[2]
+    assert_streq(p0, "--not-a-flag")
+    assert_streq(p1, "-z")
+    assert_streq(p2, "plain")
+}
+
+// short -x form treated like --x.
+fn test_short_form() {
+    var f = flag::new()
+    f.add_str("o", "")
+    f.add_bool("d")
+    var a = mkargs()
+    a.push("-o")
+    a.push("out.txt")
+    a.push("-d")
+    f.parse(a)
+    var o = f.get_str("o")
+    assert_streq(o, "out.txt")
+    assert_true(f.get_bool("d"))
+}
+
+// defaults returned when flag absent.
+fn test_defaults() {
+    var f = flag::new()
+    f.add_str("s", "def")
+    f.add_int("i", 99)
+    f.add_bool("b")
+    var a = mkargs()
+    f.parse(a)
+    var s = f.get_str("s")
+    assert_streq(s, "def")
+    assert_eq(f.get_int("i"), 99)
+    assert_false(f.get_bool("b"))
+}

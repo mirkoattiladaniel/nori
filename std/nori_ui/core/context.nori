@@ -1,0 +1,529 @@
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// input state, interaction, and draw-command recording
+// ===========================================================================
+
+// KeyCode is the platform-agnostic key identifier. Each key has a stable integer
+// tag (key_code_tag); InputState stores pressed/held keys as Vec<Int> of those
+// tags.
+
+/// a platform-agnostic keyboard key.
+pub enum KeyCode {
+    KUnknown KEscape KTab KBackspace KEnter KSpace
+    KArrowLeft KArrowRight KArrowUp KArrowDown
+    KHome KEnd KPageUp KPageDown KInsert KDelete
+    KKey0 KKey1 KKey2 KKey3 KKey4 KKey5 KKey6 KKey7 KKey8 KKey9
+    KMinus KPeriod
+    KA KB KC KD KE KF KG KH KI KJ KK KL KM
+    KN KO KP KQ KR KS KT KU KV KW KX KY KZ
+    KF1 KF2 KF3 KF4 KF5 KF6 KF7 KF8 KF9 KF10 KF11 KF12
+}
+
+/// the stable integer tag of a KeyCode (0 = Unknown; order matches the enum).
+pub fn key_code_tag(k: KeyCode) -> Int {
+    match k {
+        KeyCode::KUnknown => { return 0 }
+        KeyCode::KEscape => { return 1 }
+        KeyCode::KTab => { return 2 }
+        KeyCode::KBackspace => { return 3 }
+        KeyCode::KEnter => { return 4 }
+        KeyCode::KSpace => { return 5 }
+        KeyCode::KArrowLeft => { return 6 }
+        KeyCode::KArrowRight => { return 7 }
+        KeyCode::KArrowUp => { return 8 }
+        KeyCode::KArrowDown => { return 9 }
+        KeyCode::KHome => { return 10 }
+        KeyCode::KEnd => { return 11 }
+        KeyCode::KPageUp => { return 12 }
+        KeyCode::KPageDown => { return 13 }
+        KeyCode::KInsert => { return 14 }
+        KeyCode::KDelete => { return 15 }
+        KeyCode::KKey0 => { return 16 }
+        KeyCode::KKey1 => { return 17 }
+        KeyCode::KKey2 => { return 18 }
+        KeyCode::KKey3 => { return 19 }
+        KeyCode::KKey4 => { return 20 }
+        KeyCode::KKey5 => { return 21 }
+        KeyCode::KKey6 => { return 22 }
+        KeyCode::KKey7 => { return 23 }
+        KeyCode::KKey8 => { return 24 }
+        KeyCode::KKey9 => { return 25 }
+        KeyCode::KMinus => { return 26 }
+        KeyCode::KPeriod => { return 27 }
+        KeyCode::KA => { return 28 }
+        KeyCode::KB => { return 29 }
+        KeyCode::KC => { return 30 }
+        KeyCode::KD => { return 31 }
+        KeyCode::KE => { return 32 }
+        KeyCode::KF => { return 33 }
+        KeyCode::KG => { return 34 }
+        KeyCode::KH => { return 35 }
+        KeyCode::KI => { return 36 }
+        KeyCode::KJ => { return 37 }
+        KeyCode::KK => { return 38 }
+        KeyCode::KL => { return 39 }
+        KeyCode::KM => { return 40 }
+        KeyCode::KN => { return 41 }
+        KeyCode::KO => { return 42 }
+        KeyCode::KP => { return 43 }
+        KeyCode::KQ => { return 44 }
+        KeyCode::KR => { return 45 }
+        KeyCode::KS => { return 46 }
+        KeyCode::KT => { return 47 }
+        KeyCode::KU => { return 48 }
+        KeyCode::KV => { return 49 }
+        KeyCode::KW => { return 50 }
+        KeyCode::KX => { return 51 }
+        KeyCode::KY => { return 52 }
+        KeyCode::KZ => { return 53 }
+        KeyCode::KF1 => { return 54 }
+        KeyCode::KF2 => { return 55 }
+        KeyCode::KF3 => { return 56 }
+        KeyCode::KF4 => { return 57 }
+        KeyCode::KF5 => { return 58 }
+        KeyCode::KF6 => { return 59 }
+        KeyCode::KF7 => { return 60 }
+        KeyCode::KF8 => { return 61 }
+        KeyCode::KF9 => { return 62 }
+        KeyCode::KF10 => { return 63 }
+        KeyCode::KF11 => { return 64 }
+        KeyCode::KF12 => { return 65 }
+    }
+}
+
+/// linear membership test for an Int in a Vec<Int> (internal helper for tiny key sets).
+pub fn ints_contains(v: Vec<Int>, x: Int) -> Bool {
+    var i = 0
+    while i < v.len() { if v[i] == x { return true }  i = i + 1 }
+    return false
+}
+
+/// current-frame input from the runner (mouse, scroll, keys, modifiers).
+pub struct InputState {
+    cursor: Vec2,
+    pointer_primary_down: Bool,
+    pointer_primary_pressed: Bool,
+    pointer_primary_released: Bool,
+    has_press_origin: Bool,
+    pointer_press_origin: Vec2,
+    pointer_secondary_down: Bool,
+    pointer_secondary_clicked: Bool,
+    pointer_delta: Vec2,
+    scroll_delta: Vec2,
+    modifier_ctrl: Bool,
+    modifier_shift: Bool,
+    modifier_alt: Bool,
+    keys_pressed: Vec<Int>,
+    keys_down: Vec<Int>,
+    text_input: Str,
+    ime_preedit: Str,
+    ime_preedit_cursor_begin: Int,
+    ime_preedit_cursor_end: Int
+}
+
+/// an empty InputState (no buttons, no keys, cursor at origin).
+pub fn input_state_default() -> InputState {
+    var kp: Vec<Int> = vec()
+    var kd: Vec<Int> = vec()
+    return InputState {
+        cursor: vec2_zero(),
+        pointer_primary_down: false, pointer_primary_pressed: false, pointer_primary_released: false,
+        has_press_origin: false, pointer_press_origin: vec2_zero(),
+        pointer_secondary_down: false, pointer_secondary_clicked: false,
+        pointer_delta: vec2_zero(), scroll_delta: vec2_zero(),
+        modifier_ctrl: false, modifier_shift: false, modifier_alt: false,
+        keys_pressed: kp, keys_down: kd,
+        text_input: "", ime_preedit: "",
+        ime_preedit_cursor_begin: 0, ime_preedit_cursor_end: 0
+    }
+}
+
+/// desired interaction level for a widget.
+pub enum Sense { SNone SHover SClick SDrag SClickAndDrag }
+
+/// the rank of a Sense (None=0, Hover=1, Click=2, Drag=3, ClickAndDrag=4).
+pub fn sense_rank(s: Sense) -> Int {
+    match s {
+        Sense::SNone => { return 0 }
+        Sense::SHover => { return 1 }
+        Sense::SClick => { return 2 }
+        Sense::SDrag => { return 3 }
+        Sense::SClickAndDrag => { return 4 }
+    }
+}
+
+/// true if `self` includes at least the interaction level of `other`.
+/// Sense ordering: ClickAndDrag covers everything;
+/// otherwise a higher rank covers a lower one, and anything covers None.
+pub fn sense_at_least(s: Sense, other: Sense) -> Bool {
+    var ro = sense_rank(other)
+    if ro == 0 { return true }
+    var rs = sense_rank(s)
+    if rs == 0 { return false }
+    if rs == 4 { return true }
+    return rs >= ro
+}
+
+/// the result of interacting with a rect (hover, click, drag).
+pub struct InteractionResponse {
+    hovered: Bool, clicked: Bool, dragged: Bool, changed: Bool,
+    drag_started: Bool, drag_delta: Vec2
+}
+
+/// a response with no interaction.
+pub fn interaction_none() -> InteractionResponse {
+    return InteractionResponse { hovered: false, clicked: false, dragged: false, changed: false, drag_started: false, drag_delta: vec2_zero() }
+}
+
+/// a stable widget id derived from a string (djb2 hash, masked to 63 bits).
+pub fn widget_id_from_str(s: Str) -> Int {
+    var h = 5381
+    var i = 0
+    while i < s.len() {
+        // djb2 wraps before the 63-bit mask, so the multiply is explicitly wrapping
+        h = (wrapping_add(wrapping_mul(h, 33), ord(s.at(i))) & 9223372036854775807)
+        i = i + 1
+    }
+    return h
+}
+
+/// a string->float note kept in a Vec.
+pub struct FloatNote { id: Str, value: Float }
+
+/// max-merge `value` into the note named `id` in `notes` (insert if absent); ignores non-positive.
+pub fn float_note_max(inout notes: Vec<FloatNote>, id: Str, value: Float) {
+    if value <= 0.0 { return }
+    var i = 0
+    while i < notes.len() {
+        if (notes[i].id == id) {
+            if value > notes[i].value { notes[i] = FloatNote { id: copy id, value: value } }
+            return
+        }
+        i = i + 1
+    }
+    notes.push(FloatNote { id: copy id, value: value })
+}
+
+/// the value of the note named `id`, or 0.0 if absent.
+pub fn float_note_get(notes: Vec<FloatNote>, id: Str) -> Float {
+    var i = 0
+    while i < notes.len() { if (notes[i].id == id) { return notes[i].value }  i = i + 1 }
+    return 0.0
+}
+
+/// set the note named `id` to `value` (insert if absent).
+pub fn float_note_set(inout notes: Vec<FloatNote>, id: Str, value: Float) {
+    var i = 0
+    while i < notes.len() { if (notes[i].id == id) { notes[i] = FloatNote { id: copy id, value: value }  return }  i = i + 1 }
+    notes.push(FloatNote { id: copy id, value: value })
+}
+
+/// a per-region scroll request kept in a Vec (region id -> request).
+pub struct RegionScrollReq { id: Str, req: PanelScrollRequest }
+
+/// per-frame UI context: screen rect, layout cursor, input, and draw-command buffers.
+pub struct Context {
+    screen_rect: Rect,
+    cursor: Vec2,
+    layout_cursor: Vec2,
+    input: InputState,
+    repaint_requested: Bool,
+    disabled_depth: Int,
+    main_draw_commands: Vec<DrawCommand>,
+    overlay_draw_commands: Vec<DrawCommand>,
+    has_active_id: Bool,
+    active_id: Int,
+    has_dragging_id: Bool,
+    dragging_id: Int,
+    next_widget_id: Int,
+    want_cursor_grab: Bool,
+    panel_scroll_extent_from_top: Float,
+    has_panel_viewport: Bool,
+    panel_viewport: Rect,
+    has_panel_scroll_request: Bool,
+    panel_scroll_request: PanelScrollRequest,
+    host_scroll_offsets: Vec<FloatNote>,
+    registered_scroll_regions: Vec<RegisteredScrollRegion>,
+    scroll_region_requests: Vec<RegionScrollReq>,
+    scroll_region_extents: Vec<FloatNote>,
+    wheel_scroll_capture_rects: Vec<Rect>
+}
+
+/// a Context for `screen_rect` with no input and empty buffers.
+pub fn context_new(screen_rect: Rect) -> Context {
+    var main: Vec<DrawCommand> = vec()
+    var ovl: Vec<DrawCommand> = vec()
+    var hso: Vec<FloatNote> = vec()
+    var rsr: Vec<RegisteredScrollRegion> = vec()
+    var srr: Vec<RegionScrollReq> = vec()
+    var sre: Vec<FloatNote> = vec()
+    var wcr: Vec<Rect> = vec()
+    let cursor0 = vec2(screen_rect.min.x, screen_rect.min.y)
+    return Context {
+        screen_rect: rect_copy(screen_rect),
+        cursor: vec2_zero(),
+        layout_cursor: cursor0,
+        input: input_state_default(),
+        repaint_requested: false,
+        disabled_depth: 0,
+        main_draw_commands: main,
+        overlay_draw_commands: ovl,
+        has_active_id: false, active_id: 0,
+        has_dragging_id: false, dragging_id: 0,
+        next_widget_id: 1,
+        want_cursor_grab: false,
+        panel_scroll_extent_from_top: 0.0,
+        has_panel_viewport: false, panel_viewport: rect_min_max(vec2_zero(), vec2_zero()),
+        has_panel_scroll_request: false, panel_scroll_request: scroll_to(0.0),
+        host_scroll_offsets: hso,
+        registered_scroll_regions: rsr,
+        scroll_region_requests: srr,
+        scroll_region_extents: sre,
+        wheel_scroll_capture_rects: wcr
+    }
+}
+
+/// a Context for a frame built from screen rect and current input.
+pub fn context_from_input(screen_rect: Rect, sink input: InputState) -> Context {
+    var c = context_new(screen_rect)
+    c.cursor = copy input.cursor
+    c.input = input
+    return c
+}
+
+impl Context {
+    /// reset per-frame state (layout cursor, repaint flag, draw buffers, auto ids); keeps screen_rect/input.
+    fn begin_frame(inout self) {
+        self.layout_cursor = vec2(self.screen_rect.min.x, self.screen_rect.min.y)
+        self.repaint_requested = false
+        // new buffers bound to names first: a store of a bare `vec()` into a field keeps the
+        // previous buffer alive, and this runs once per frame
+        var main: Vec<DrawCommand> = vec()
+        var ovl: Vec<DrawCommand> = vec()
+        self.main_draw_commands = main
+        self.overlay_draw_commands = ovl
+        self.has_active_id = false
+        self.next_widget_id = 1
+    }
+    /// request a repaint next frame.
+    fn request_repaint(inout self) { self.repaint_requested = true }
+    /// take and clear the repaint-requested flag.
+    fn take_repaint_requested(inout self) -> Bool { var r = self.repaint_requested  self.repaint_requested = false  return r }
+    /// enter a disabled region (nesting supported).
+    fn begin_disabled(inout self) { self.disabled_depth = self.disabled_depth + 1 }
+    /// leave the current disabled region.
+    fn end_disabled(inout self) { if self.disabled_depth > 0 { self.disabled_depth = self.disabled_depth - 1 } }
+    /// true if inside any disabled region.
+    fn is_disabled(self) -> Bool { return self.disabled_depth > 0 }
+    /// allocate a fresh unique widget id.
+    fn widget_id(inout self) -> Int { var id = self.next_widget_id  self.next_widget_id = self.next_widget_id + 1  return id }
+    /// true if the cursor is inside `rect`.
+    fn cursor_in_rect(self, rect: Rect) -> Bool { return rect.contains(self.cursor) }
+    /// the rect available for layout (layout cursor to screen max).
+    fn available_rect(self) -> Rect { return rect_min_max(self.layout_cursor, self.screen_rect.max) }
+    /// record total scrollable height from the top of screen_rect (keeps the max seen).
+    fn note_panel_scroll_extent_from_top(inout self, extent: Float) {
+        if extent > 0.0 { self.panel_scroll_extent_from_top = math::fmax(self.panel_scroll_extent_from_top, extent) }
+    }
+    /// the reported scrollable height from screen_rect.min.y (0 if unset).
+    fn scroll_extent_from_top(self) -> Float { return self.panel_scroll_extent_from_top }
+    /// set the visible panel viewport (not scroll-shifted).
+    fn set_panel_viewport(inout self, viewport: Rect) { self.has_panel_viewport = true  self.panel_viewport = rect_copy(viewport) }
+    /// the rect to paint into: the panel viewport if set, else available_rect.
+    fn panel_paint_rect(self) -> Rect { if self.has_panel_viewport { return rect_copy(self.panel_viewport) }  return self.available_rect() }
+    /// host injects a scroll offset for a region (includes the root region).
+    fn set_host_scroll_offset(self, region_id: Str, offset: Float) { float_note_set(self.host_scroll_offsets, region_id, offset) }
+    /// the host scroll offset for a region (0 if none).
+    fn host_scroll_offset(self, region_id: Str) -> Float { return float_note_get(self.host_scroll_offsets, region_id) }
+    /// register (or replace by id) a scroll region reported this frame.
+    fn register_scroll_region(inout self, sink reg: RegisteredScrollRegion) {
+        var i = 0
+        while i < self.registered_scroll_regions.len() {
+            if (self.registered_scroll_regions[i].id == reg.id) { self.registered_scroll_regions[i] = reg  return }
+            i = i + 1
+        }
+        self.registered_scroll_regions.push(reg)
+    }
+    /// take and clear the registered scroll regions.
+    fn take_registered_scroll_regions(inout self) -> Vec<RegisteredScrollRegion> {
+        return sink self.registered_scroll_regions
+    }
+    /// true if any registered region is not the root (i.e. nested region scrolling is in use).
+    fn panel_uses_region_scroll(self) -> Bool {
+        var i = 0
+        while i < self.registered_scroll_regions.len() {
+            if !(self.registered_scroll_regions[i].id == panel_scroll_root()) { return true }
+            i = i + 1
+        }
+        return false
+    }
+    /// record a region's content extent (keeps the max seen).
+    fn note_scroll_region_extent(self, region_id: Str, extent: Float) { float_note_max(self.scroll_region_extents, region_id, extent) }
+    /// a region's recorded content extent (0 if none).
+    fn scroll_region_extent(self, region_id: Str) -> Float { return float_note_get(self.scroll_region_extents, region_id) }
+    /// request a region scroll to bottom (also sets the root request when it's the root).
+    fn request_panel_scroll_bottom_for(inout self, region_id: Str) {
+        self.set_region_request(region_id, scroll_to_bottom())
+        if (region_id == panel_scroll_root()) { self.has_panel_scroll_request = true  self.panel_scroll_request = scroll_to_bottom() }
+    }
+    /// request a region scroll to an absolute offset (also sets the root request when it's the root).
+    fn request_panel_scroll_for(inout self, region_id: Str, y: Float) {
+        self.set_region_request(region_id, scroll_to(y))
+        if (region_id == panel_scroll_root()) { self.has_panel_scroll_request = true  self.panel_scroll_request = scroll_to(y) }
+    }
+    /// request the root region scroll to bottom.
+    fn request_panel_scroll_bottom(inout self) { self.request_panel_scroll_bottom_for(panel_scroll_root()) }
+    /// request the root region scroll to an absolute offset.
+    fn request_panel_scroll(inout self, y: Float) { self.request_panel_scroll_for(panel_scroll_root(), y) }
+    /// insert/replace a region request by id (internal).
+    fn set_region_request(inout self, region_id: Str, sink req: PanelScrollRequest) {
+        var i = 0
+        while i < self.scroll_region_requests.len() {
+            if (self.scroll_region_requests[i].id == region_id) { self.scroll_region_requests[i] = RegionScrollReq { id: copy region_id, req: req }  return }
+            i = i + 1
+        }
+        self.scroll_region_requests.push(RegionScrollReq { id: copy region_id, req: req })
+    }
+    /// take and clear the per-region scroll requests.
+    fn take_scroll_region_requests(inout self) -> Vec<RegionScrollReq> { return sink self.scroll_region_requests }
+
+    /// interact with `rect` using a fresh auto id; updates active/dragging state.
+    fn interact_rect(inout self, rect: Rect, sense: Sense) -> InteractionResponse {
+        return self.interact_rect_id(self.widget_id(), rect, sense)
+    }
+    /// interact with `rect` using an explicit id, testing against the cursor.
+    fn interact_rect_id(inout self, id: Int, rect: Rect, sense: Sense) -> InteractionResponse {
+        return self.interact_rect_id_at_pointer(id, rect, sense, self.cursor)
+    }
+    /// interact with `rect` using an explicit id, testing against `pointer`.
+    fn interact_rect_id_at_pointer(inout self, id: Int, rect: Rect, sense: Sense, pointer: Vec2) -> InteractionResponse {
+        var hovered = !self.is_disabled() && rect.contains(pointer)
+        var primary_down = self.input.pointer_primary_down
+        var primary_pressed = self.input.pointer_primary_pressed
+        var primary_released = self.input.pointer_primary_released
+        var delta = self.input.pointer_delta
+        var srank = sense_rank(sense)
+
+        if hovered && srank != 0 { self.has_active_id = true  self.active_id = id }
+
+        var press_origin_ok = true
+        if self.input.has_press_origin { press_origin_ok = rect.contains(self.input.pointer_press_origin) }
+        var clicked = hovered && sense_at_least(sense, Sense::SClick) && primary_released && press_origin_ok
+        var is_drag_sense = srank == 3 || srank == 4
+        var drag_started_raw = hovered && is_drag_sense && primary_pressed
+        var was_dragging = self.has_dragging_id && self.dragging_id == id
+        var is_dragging = is_drag_sense && primary_down && (was_dragging || (hovered && primary_pressed))
+        if is_dragging { self.has_dragging_id = true  self.dragging_id = id }
+        else if !primary_down && was_dragging { self.has_dragging_id = false }
+
+        var dragged = was_dragging && primary_down && (delta.x != 0.0 || delta.y != 0.0)
+        var drag_delta = vec2_zero()
+        if was_dragging { drag_delta = copy delta }
+        var changed = clicked || dragged
+        return InteractionResponse {
+            hovered: hovered && sense_at_least(sense, Sense::SHover),
+            clicked: clicked,
+            dragged: dragged,
+            changed: changed,
+            drag_started: drag_started_raw && !was_dragging,
+            drag_delta: drag_delta
+        }
+    }
+    /// allocate a rect for layout and interact with it; advances the layout cursor only when Sense is None.
+    fn allocate_interact_rect(inout self, id: Int, rect: Rect, sense: Sense) -> InteractionResponse {
+        var response = self.interact_rect_id(id, rect, sense)
+        if sense_rank(sense) == 0 {
+            self.layout_cursor = vec2(rect.max.x, self.layout_cursor.y)
+        }
+        return response
+    }
+
+    /// true if `key` was pressed this frame.
+    fn key_pressed(self, key: KeyCode) -> Bool { return ints_contains(self.input.keys_pressed, key_code_tag(key)) }
+    /// true if `key` is currently held.
+    fn key_down(self, key: KeyCode) -> Bool { return ints_contains(self.input.keys_down, key_code_tag(key)) }
+    /// the current mouse position.
+    fn mouse_pos(self) -> view Vec2 { return self.cursor }
+    /// the mouse delta this frame.
+    fn pointer_delta(self) -> view Vec2 { return self.input.pointer_delta }
+    /// the scroll delta this frame.
+    fn scroll_delta(self) -> view Vec2 { return self.input.scroll_delta }
+
+    /// record a command on the given layer.
+    fn record_draw(inout self, layer: PaintLayer, sink cmd: DrawCommand) {
+        match layer {
+            PaintLayer::LayerMain => { self.main_draw_commands.push(cmd) }
+            PaintLayer::LayerOverlay => { self.overlay_draw_commands.push(cmd) }
+        }
+    }
+    /// push a command to the main layer.
+    fn push_command(inout self, sink cmd: DrawCommand) { self.main_draw_commands.push(cmd) }
+    /// record a command on the overlay (top) layer.
+    fn overlay_command(inout self, sink cmd: DrawCommand) { self.overlay_draw_commands.push(cmd) }
+    /// clear both draw-command buffers.
+    fn clear_draw_commands(inout self) {
+        var main: Vec<DrawCommand> = vec()
+        var ovl: Vec<DrawCommand> = vec()
+        self.main_draw_commands = main
+        self.overlay_draw_commands = ovl
+    }
+    /// the draw commands for a layer.
+    fn draw_commands(self, layer: PaintLayer) -> view Vec<DrawCommand> {
+        match layer {
+            PaintLayer::LayerMain => { return self.main_draw_commands }
+            PaintLayer::LayerOverlay => { return self.overlay_draw_commands }
+        }
+    }
+
+    /// draw a filled rect on the main layer.
+    fn rect_filled(inout self, rect: Rect, color: Color, corner_radius: Float) {
+        self.push_command(dc_rect_filled(rect, color, corner_radius))
+    }
+    /// draw a stroked rect on the main layer.
+    fn rect_stroke(inout self, rect: Rect, strk: Stroke, corner_radius: Float) {
+        self.push_command(dc_rect_stroke(rect, strk, corner_radius))
+    }
+    /// draw a bilinear gradient rect on the main layer.
+    fn gradient_rect(inout self, rect: Rect, copy tl: Color, copy tr: Color, copy bl: Color, copy br: Color, corner_radius: Float) {
+        self.push_command(DrawCommand::DcGradientRect(GradientRectCommand { rect: rect_copy(rect), color_tl: tl, color_tr: tr, color_bl: bl, color_br: br, corner_radius: corner_radius }))
+    }
+    /// draw a line on the main layer.
+    fn line(inout self, from: Vec2, to: Vec2, strk: Stroke) { self.push_command(dc_line(from, to, strk)) }
+    /// draw a filled circle on the main layer.
+    fn circle_filled(inout self, center: Vec2, radius: Float, color: Color) { self.push_command(dc_circle_filled(center, radius, color)) }
+    /// draw a stroked circle on the main layer.
+    fn circle_stroke(inout self, copy center: Vec2, radius: Float, strk: Stroke) { self.push_command(DrawCommand::DcCircleStroke(CircleStrokeCmd { center: center, radius: radius, stroke: stroke_copy(strk) })) }
+    /// draw text on the main layer.
+    fn text(inout self, pos: Vec2, text: Str, color: Color, size: Float) { self.push_command(dc_text(text_cmd(pos, text, color, size))) }
+    /// draw a full TextCommand (with outline/gradient/font) on the main layer.
+    fn text_styled(inout self, sink cmd: TextCommand) { self.push_command(DrawCommand::DcText(cmd)) }
+    /// draw a PNG letterboxed into `rect` on the main layer.
+    fn image_png(inout self, rect: Rect, path: Str) { self.push_command(DrawCommand::DcImage(ImageCmd { rect: rect_copy(rect), path: copy path })) }
+
+    /// draw a filled rect on the overlay layer.
+    fn overlay_rect_filled(inout self, rect: Rect, color: Color, corner_radius: Float) { self.overlay_command(dc_rect_filled(rect, color, corner_radius)) }
+    /// draw a stroked rect on the overlay layer.
+    fn overlay_rect_stroke(inout self, rect: Rect, strk: Stroke, corner_radius: Float) { self.overlay_command(dc_rect_stroke(rect, strk, corner_radius)) }
+    /// draw a line on the overlay layer.
+    fn overlay_line(inout self, from: Vec2, to: Vec2, strk: Stroke) { self.overlay_command(dc_line(from, to, strk)) }
+    /// draw text on the overlay layer.
+    fn overlay_text(inout self, pos: Vec2, text: Str, color: Color, size: Float) { self.overlay_command(dc_text(text_cmd(pos, text, color, size))) }
+
+    /// allocate a rect at the layout cursor and advance the cursor right (same row).
+    fn allocate_rect(inout self, size: Vec2) -> Rect {
+        var rect = rect_min_size(self.layout_cursor, size)
+        self.layout_cursor = vec2(self.layout_cursor.x + size.x, self.layout_cursor.y)
+        return rect
+    }
+    /// allocate a rect with trailing spacing; cursor advances right by width+spacing_x and down to rect bottom+spacing_y.
+    fn allocate_rect_with_spacing(inout self, size: Vec2, spacing_x: Float, spacing_y: Float) -> Rect {
+        var rect = rect_min_size(self.layout_cursor, size)
+        self.layout_cursor = vec2(self.layout_cursor.x + size.x + spacing_x, rect.max.y + spacing_y)
+        return rect
+    }
+    /// allocate a rect at an explicit position without moving the layout cursor.
+    fn allocate_rect_at(self, min: Vec2, size: Vec2) -> Rect { return rect_min_size(min, size) }
+}
+

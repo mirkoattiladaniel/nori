@@ -1,0 +1,65 @@
+// `#define` constants: every object-like macro a header left defined is expanded as a use at the
+// end of the unit would expand it, and kept when the result is a constant expression or a string.
+
+fn ccn_constants(inout s: St) {
+    var m = 0
+    let nm = s.m_name.len()
+    while m < nm {
+        let name = s.m_name[m]
+        if s.m_kind[m] == MK_OBJECT && (s.m_loc[m] >> 24) != 0 && s.m_len[m] > 0 && (s.mac_of[name] else (0 - 1)) == m {
+            ccn_one(s, m, name)
+        }
+        m = m + 1
+    }
+}
+
+fn ccn_one(inout s: St, m: Int, name: Int) {
+    let loc = s.m_loc[m]
+    // expand the name on its own
+    let mark = s.tt.len()
+    cpp_push_sentinel(s)
+    cpp_push1(s, ctk_make(name, TK_IDENT, 0), loc, 0)
+    while cpp_expand_one(s, true) { }
+    var xt: Vec<Int> = vec()
+    var all_str = true
+    var any = false
+    var k = mark
+    while k < s.tt.len() {
+        let t = s.tt[k]
+        let tk = ctk_kind(t)
+        if tk != TK_STR && !(tk == TK_PUNCT && (ctk_id(t) == P_LPAREN || ctk_id(t) == P_RPAREN)) { all_str = false }
+        if tk == TK_STR { any = true }
+        xt.push(t)
+        k = k + 1
+    }
+    while s.tt.len() > mark { s.tt.pop()  s.tl.pop()  s.th.pop() }
+    if xt.len() == 0 { return }
+    let file = loc >> 24
+    let line = loc & 0xFFFFFF
+    if all_str && any {
+        var parts: Vec<Str> = vec()
+        foreach t2 in xt {
+            if ctk_kind(t2) == TK_STR {
+                let sp = s.names[ctk_id(t2)]
+                if ord(sp.at(0)) != 34 { return }
+                parts.push(cev_string_bytes(sp))
+            }
+        }
+        s.unit.constants.push(Constant { name: copy s.names[name], kind: CONST_STRING, ivalue: 0, fvalue: 0.0, svalue: cty_join(parts, ""), unsigned: false, file: file, line: line })
+        return
+    }
+    // a lone identifier that is not an enumerator names a type or a function, not a constant
+    if xt.len() == 1 && ctk_kind(xt[0]) != TK_NUM && ctk_kind(xt[0]) != TK_CHAR && !s.econst.has(ctk_id(xt[0])) { return }
+    let v = cev_eval_tokens(s, xt, loc, false)
+    let ok = !s.ev_fail
+    let isf = s.ev_isf
+    let fv = s.ev_fv
+    let uns = s.ev_uns
+    s.ev_fail = false
+    if !ok { return }
+    if isf {
+        s.unit.constants.push(Constant { name: copy s.names[name], kind: CONST_FLOAT, ivalue: 0, fvalue: fv, svalue: "", unsigned: false, file: file, line: line })
+    } else {
+        s.unit.constants.push(Constant { name: copy s.names[name], kind: CONST_INT, ivalue: v, fvalue: 0.0, svalue: "", unsigned: uns, file: file, line: line })
+    }
+}

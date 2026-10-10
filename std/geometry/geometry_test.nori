@@ -1,0 +1,278 @@
+// Native .nori tests for std/geometry: rays, boxes, planes, spheres, frusta and their intersections.
+//
+//   noric --test std/geometry/geometry_test.nori compiler/runtime.nori --import-root .
+//
+// Every expectation is a value computed by hand or taken from the published formula, never from
+// the implementation being tested. The vector/matrix/quaternion tests live in std/math/math3d_test.nori.
+//
+// Both modules are glob-imported so the bodies read unqualified: `std/math` supplies the Vec3s the
+// shapes are built from, `std/geometry` the shapes themselves.
+import "std/math" as m
+use m::*
+import "std/geometry" as geo
+use geo::*
+
+// tolerance for anything that has been through std/math's transcendentals (~1e-12 there)
+fn eps() -> Float { return 1.0e-10 }
+// tolerance for pure arithmetic, where the only error is the operations' own rounding
+fn teps() -> Float { return 1.0e-14 }
+
+fn assert_v3(got: Vec3, wx: Float, wy: Float, wz: Float, e: Float) {
+    assert_feq(got.x, wx, e)
+    assert_feq(got.y, wy, e)
+    assert_feq(got.z, wz, e)
+}
+
+// ================= geometry =================
+fn unit_box() -> Aabb { return aabb(vec3_splat(-1.0), vec3_splat(1.0)) }
+
+fn test_aabb_basics() {
+    let b = aabb(vec3(-1.0, -2.0, -3.0), vec3(1.0, 2.0, 3.0))
+    assert_v3(aabb_center(b), 0.0, 0.0, 0.0, teps())
+    assert_v3(aabb_extents(b), 1.0, 2.0, 3.0, teps())
+    assert_v3(aabb_size(b), 2.0, 4.0, 6.0, teps())
+    let off = aabb(vec3(2.0, 2.0, 2.0), vec3(4.0, 6.0, 8.0))
+    assert_v3(aabb_center(off), 3.0, 4.0, 5.0, teps())
+    assert_v3(aabb_extents(off), 1.0, 2.0, 3.0, teps())
+    assert_true(aabb_approx_same(aabb_from_center_extents(vec3(3.0, 4.0, 5.0), vec3(1.0, 2.0, 3.0)), off))
+    assert_true(aabb_approx_same(aabb_from_corners(vec3(4.0, 2.0, 8.0), vec3(2.0, 6.0, 2.0)), off))
+    // the empty box loses to everything it is merged with
+    assert_true(aabb_is_empty(aabb_empty()))
+    assert_false(aabb_is_empty(b))
+    assert_true(aabb_approx_same(aabb_merge_point(aabb_merge_point(aabb_empty(), vec3(2.0, 2.0, 2.0)), vec3(4.0, 6.0, 8.0)), off))
+    assert_true(aabb_approx_same(aabb_merge(aabb(vec3_splat(-1.0), vec3_splat(0.0)), aabb(vec3_splat(0.0), vec3_splat(2.0))), aabb(vec3_splat(-1.0), vec3_splat(2.0))))
+    assert_true(aabb_approx_same(aabb_expand(unit_box(), 0.5), aabb(vec3_splat(-1.5), vec3_splat(1.5))))
+}
+fn aabb_approx_same(a: Aabb, b: Aabb) -> Bool { return vec3_approx_eq(a.min, b.min, 1.0e-12) && vec3_approx_eq(a.max, b.max, 1.0e-12) }
+
+fn test_aabb_containment() {
+    let b = unit_box()
+    assert_true(aabb_contains_point(b, vec3_zero()))
+    assert_true(aabb_contains_point(b, vec3(1.0, 1.0, 1.0)))         // the boundary counts as inside
+    assert_true(aabb_contains_point(b, vec3(-1.0, 0.0, 0.5)))
+    assert_false(aabb_contains_point(b, vec3(1.0001, 0.0, 0.0)))
+    assert_false(aabb_contains_point(b, vec3(0.0, 0.0, -2.0)))
+    assert_true(aabb_contains_aabb(b, aabb(vec3_splat(-0.5), vec3_splat(0.5))))
+    assert_false(aabb_contains_aabb(aabb(vec3_splat(-0.5), vec3_splat(0.5)), b))
+    // overlap: touching counts, a gap does not
+    assert_true(aabb_intersects_aabb(b, aabb(vec3_splat(0.5), vec3_splat(2.0))))
+    assert_true(aabb_intersects_aabb(b, aabb(vec3_splat(1.0), vec3_splat(2.0))))
+    assert_false(aabb_intersects_aabb(b, aabb(vec3_splat(1.001), vec3_splat(2.0))))
+    assert_false(aabb_intersects_aabb(b, aabb(vec3(5.0, 0.0, 0.0), vec3(6.0, 0.0, 0.0))))
+    // separated on one axis only is still separated
+    assert_false(aabb_intersects_aabb(b, aabb(vec3(0.0, 0.0, 3.0), vec3(1.0, 1.0, 4.0))))
+    assert_v3(aabb_closest_point(b, vec3(5.0, 0.5, -9.0)), 1.0, 0.5, -1.0, teps())
+    assert_v3(aabb_closest_point(b, vec3(0.25, 0.5, 0.75)), 0.25, 0.5, 0.75, teps())
+}
+fn test_aabb_transform() {
+    // translation just moves it
+    assert_true(aabb_approx_same(aabb_transform(unit_box(), mat4_from_translation(vec3(5.0, 0.0, 0.0))), aabb(vec3(4.0, -1.0, -1.0), vec3(6.0, 1.0, 1.0))))
+    // scale scales it
+    assert_true(aabb_approx_same(aabb_transform(unit_box(), mat4_from_scale(vec3(2.0, 3.0, 4.0))), aabb(vec3(-2.0, -3.0, -4.0), vec3(2.0, 3.0, 4.0))))
+    // a 45-degree turn about Z grows the x and y half-extents to sqrt(2) and leaves z alone
+    let rot = aabb_transform(unit_box(), mat4_from_rotation_z(m::pi() * 0.25))
+    assert_v3(aabb_center(rot), 0.0, 0.0, 0.0, eps())
+    assert_v3(aabb_extents(rot), sqrt(2.0), sqrt(2.0), 1.0, eps())
+    // a 90-degree turn maps the box onto itself
+    assert_true(vec3_approx_eq(aabb_extents(aabb_transform(unit_box(), mat4_from_rotation_z(m::pi() * 0.5))), vec3_splat(1.0), eps()))
+    // and the result must contain every transformed corner, whatever the transform
+    let mm = mat4_mul(mat4_from_translation(vec3(1.0, 2.0, 3.0)), mat4_from_axis_angle(vec3(1.0, 1.0, 0.0), 0.8))
+    let out = aabb_transform(unit_box(), mm)
+    assert_true(aabb_contains_point(out, mat4_transform_point3(mm, vec3(1.0, 1.0, 1.0))))
+    assert_true(aabb_contains_point(out, mat4_transform_point3(mm, vec3(-1.0, 1.0, -1.0))))
+    assert_true(aabb_contains_point(out, mat4_transform_point3(mm, vec3(1.0, -1.0, -1.0))))
+    assert_true(aabb_contains_point(out, mat4_transform_point3(mm, vec3(-1.0, -1.0, 1.0))))
+}
+fn test_plane() {
+    // the ground plane: y = 0, normal +Y
+    let g = plane_from_point_normal(vec3_zero(), vec3_y())
+    assert_v3(g.normal, 0.0, 1.0, 0.0, teps())
+    assert_feq(g.d, 0.0, teps())
+    assert_feq(plane_signed_distance(g, vec3(3.0, 5.0, -2.0)), 5.0, teps())
+    assert_feq(plane_signed_distance(g, vec3(3.0, -5.0, -2.0)), -5.0, teps())
+    assert_v3(plane_project_point(g, vec3(3.0, 5.0, -2.0)), 3.0, 0.0, -2.0, teps())
+    // a plane through y = 2 has d = -2, so that dot(n,p) + d is zero on it
+    let h = plane_from_point_normal(vec3(0.0, 2.0, 0.0), vec3(0.0, 5.0, 0.0))
+    assert_v3(h.normal, 0.0, 1.0, 0.0, teps())                       // normalized for you
+    assert_feq(h.d, -2.0, teps())
+    assert_feq(plane_signed_distance(h, vec3(0.0, 2.0, 0.0)), 0.0, teps())
+    assert_feq(plane_signed_distance(h, vec3(0.0, 7.0, 0.0)), 5.0, teps())
+    // three points, right-hand rule around them
+    let t = plane_from_points(vec3_zero(), vec3_x(), vec3_y())
+    assert_v3(t.normal, 0.0, 0.0, 1.0, teps())
+    assert_feq(t.d, 0.0, teps())
+    assert_v3(plane_from_points(vec3_zero(), vec3_y(), vec3_x()).normal, 0.0, 0.0, -1.0, teps())
+    // normalizing scales d along with the normal
+    let un = plane_normalize(Plane { normal: vec3(0.0, 3.0, 0.0), d: -6.0 })
+    assert_v3(un.normal, 0.0, 1.0, 0.0, teps())
+    assert_feq(un.d, -2.0, teps())
+}
+fn test_sphere() {
+    let s = sphere(vec3(1.0, 0.0, 0.0), 2.0)
+    assert_true(sphere_contains_point(s, vec3(1.0, 0.0, 0.0)))
+    assert_true(sphere_contains_point(s, vec3(3.0, 0.0, 0.0)))       // exactly on the surface
+    assert_false(sphere_contains_point(s, vec3(3.01, 0.0, 0.0)))
+    assert_true(sphere_intersects_sphere(s, sphere(vec3(5.0, 0.0, 0.0), 2.0)))
+    assert_false(sphere_intersects_sphere(s, sphere(vec3(5.1, 0.0, 0.0), 2.0)))
+    assert_true(sphere_intersects_aabb(s, unit_box()))
+    assert_true(sphere_intersects_aabb(sphere(vec3(3.0, 0.0, 0.0), 2.0), unit_box()))
+    assert_false(sphere_intersects_aabb(sphere(vec3(3.1, 0.0, 0.0), 2.0), unit_box()))
+}
+fn test_ray_aabb() {
+    let b = unit_box()
+    // a hit from outside: the ray enters the far face at t = 4 and leaves the near one at t = 6
+    let h = ray_aabb(ray(vec3(0.0, 0.0, 5.0), vec3_neg_z()), b)
+    assert_true(h.hit)
+    assert_feq(h.t_min, 4.0, teps())
+    assert_feq(h.t_max, 6.0, teps())
+    // a ray starting inside enters at 0 and leaves at the wall
+    let inside = ray_aabb(ray(vec3_zero(), vec3_neg_z()), b)
+    assert_true(inside.hit)
+    assert_feq(inside.t_min, 0.0, teps())
+    assert_feq(inside.t_max, 1.0, teps())
+    let inoff = ray_aabb(ray(vec3(0.5, 0.0, 0.0), vec3_x()), b)
+    assert_true(inoff.hit)
+    assert_feq(inoff.t_min, 0.0, teps())
+    assert_feq(inoff.t_max, 0.5, teps())
+    // a miss: parallel to the box and off to one side
+    assert_false(ray_aabb(ray(vec3(5.0, 5.0, 5.0), vec3_neg_z()), b).hit)
+    assert_false(ray_aabb(ray(vec3(0.0, 2.0, 5.0), vec3_neg_z()), b).hit)
+    // pointing away from the box is a miss too (a ray is a half-line)
+    assert_false(ray_aabb(ray(vec3(0.0, 0.0, 5.0), vec3_z()), b).hit)
+    // a grazing hit along an edge still counts, and a diagonal one reports the right entry
+    assert_true(ray_aabb(ray(vec3(1.0, 0.0, 5.0), vec3_neg_z()), b).hit)
+    let diag = ray_aabb(ray(vec3(-3.0, -3.0, 0.0), vec3_normalize(vec3(1.0, 1.0, 0.0))), b)
+    assert_true(diag.hit)
+    assert_feq(diag.t_min, vec3_length(vec3(2.0, 2.0, 0.0)), eps())
+    // a ray exactly along an axis, where the other two slabs divide by zero, still works
+    assert_true(ray_aabb(ray(vec3(0.0, 0.0, -5.0), vec3_z()), b).hit)
+    assert_false(ray_aabb(ray(vec3(0.0, 9.0, -5.0), vec3_z()), b).hit)
+}
+fn test_ray_plane() {
+    let g = plane_from_point_normal(vec3_zero(), vec3_y())
+    let h = ray_plane(ray(vec3(2.0, 5.0, 3.0), vec3_neg_y()), g)
+    assert_true(h.hit)
+    assert_feq(h.t, 5.0, teps())
+    assert_v3(ray_at(ray(vec3(2.0, 5.0, 3.0), vec3_neg_y()), h.t), 2.0, 0.0, 3.0, teps())
+    // a non-unit direction scales t: half the speed, twice the parameter
+    assert_feq(ray_plane(ray(vec3(0.0, 5.0, 0.0), vec3(0.0, -0.5, 0.0)), g).t, 10.0, teps())
+    // parallel misses, even lying in the plane
+    assert_false(ray_plane(ray(vec3(0.0, 5.0, 0.0), vec3_x()), g).hit)
+    assert_false(ray_plane(ray(vec3(0.0, 0.0, 0.0), vec3_x()), g).hit)
+    // pointing away misses
+    assert_false(ray_plane(ray(vec3(0.0, 5.0, 0.0), vec3_y()), g).hit)
+    // a slanted plane and a slanted ray
+    let s = plane_from_point_normal(vec3(0.0, 0.0, 0.0), vec3_normalize(vec3(1.0, 1.0, 0.0)))
+    let sh = ray_plane(ray(vec3(4.0, 0.0, 0.0), vec3_neg_x()), s)
+    assert_true(sh.hit)
+    assert_feq(sh.t, 4.0, eps())
+}
+fn test_ray_sphere() {
+    let s = sphere(vec3_zero(), 1.0)
+    // straight at it from outside: the near surface, at t = 4
+    let h = ray_sphere(ray(vec3(0.0, 0.0, 5.0), vec3_neg_z()), s)
+    assert_true(h.hit)
+    assert_feq(h.t, 4.0, teps())
+    // from inside: the exit point
+    let i = ray_sphere(ray(vec3_zero(), vec3_neg_z()), s)
+    assert_true(i.hit)
+    assert_feq(i.t, 1.0, teps())
+    // a tangent ray grazes at exactly one point
+    let t = ray_sphere(ray(vec3(1.0, 0.0, 5.0), vec3_neg_z()), s)
+    assert_true(t.hit)
+    assert_feq(t.t, 5.0, 1.0e-7)
+    // misses: past the edge, and behind
+    assert_false(ray_sphere(ray(vec3(1.001, 0.0, 5.0), vec3_neg_z()), s).hit)
+    assert_false(ray_sphere(ray(vec3(0.0, 0.0, 5.0), vec3_z()), s).hit)
+    // an offset sphere, hand-checked: centre 10 away, radius 2, so the near hit is at 8
+    assert_feq(ray_sphere(ray(vec3_zero(), vec3_x()), sphere(vec3(10.0, 0.0, 0.0), 2.0)).t, 8.0, teps())
+}
+fn test_ray_triangle() {
+    // the unit right triangle in the z = 0 plane
+    let v0 = vec3(0.0, 0.0, 0.0)
+    let v1 = vec3(1.0, 0.0, 0.0)
+    let v2 = vec3(0.0, 1.0, 0.0)
+    // a hit through the centroid, straight down -Z from z = 2
+    let third = 1.0 / 3.0
+    let c = ray_triangle(ray(vec3(third, third, 2.0), vec3_neg_z()), v0, v1, v2)
+    assert_true(c.hit)
+    assert_feq(c.t, 2.0, teps())
+    assert_feq(c.u, third, teps())
+    assert_feq(c.v, third, teps())
+    // the barycentrics really do reconstruct the hit point
+    let p = vec3_add(vec3_add(vec3_scale(v0, 1.0 - c.u - c.v), vec3_scale(v1, c.u)), vec3_scale(v2, c.v))
+    assert_v3(p, third, third, 0.0, teps())
+    // a hit at a vertex, and one inside near an edge
+    let at1 = ray_triangle(ray(vec3(1.0, 0.0, 2.0), vec3_neg_z()), v0, v1, v2)
+    assert_true(at1.hit)
+    assert_feq(at1.u, 1.0, teps())
+    assert_feq(at1.v, 0.0, teps())
+    assert_true(ray_triangle(ray(vec3(0.49, 0.49, 2.0), vec3_neg_z()), v0, v1, v2).hit)
+    // a miss just outside the hypotenuse: u + v is 1.02, barely over
+    assert_false(ray_triangle(ray(vec3(0.51, 0.51, 2.0), vec3_neg_z()), v0, v1, v2).hit)
+    // and just outside the other two edges
+    assert_false(ray_triangle(ray(vec3(-0.001, 0.5, 2.0), vec3_neg_z()), v0, v1, v2).hit)
+    assert_false(ray_triangle(ray(vec3(0.5, -0.001, 2.0), vec3_neg_z()), v0, v1, v2).hit)
+    // a parallel ray never hits, in the plane or above it
+    assert_false(ray_triangle(ray(vec3(0.25, 0.25, 2.0), vec3_x()), v0, v1, v2).hit)
+    assert_false(ray_triangle(ray(vec3(-1.0, 0.25, 0.0), vec3_x()), v0, v1, v2).hit)
+    // behind the origin is a miss
+    assert_false(ray_triangle(ray(vec3(third, third, -2.0), vec3_neg_z()), v0, v1, v2).hit)
+    // double-sided: the same triangle hit from the back face
+    let bk = ray_triangle(ray(vec3(third, third, -2.0), vec3_z()), v0, v1, v2)
+    assert_true(bk.hit)
+    assert_feq(bk.t, 2.0, teps())
+    // a triangle nowhere near the axes, checked through its own centroid
+    let w0 = vec3(1.0, 2.0, 3.0)
+    let w1 = vec3(4.0, 0.0, 1.0)
+    let w2 = vec3(-2.0, 5.0, 0.0)
+    let cen = vec3_scale(vec3_add(vec3_add(w0, w1), w2), third)
+    let n = vec3_normalize(vec3_cross(vec3_sub(w1, w0), vec3_sub(w2, w0)))
+    let hit = ray_triangle(ray(vec3_add(cen, vec3_scale(n, 3.0)), vec3_neg(n)), w0, w1, w2)
+    assert_true(hit.hit)
+    assert_feq(hit.t, 3.0, eps())
+    assert_feq(hit.u, third, eps())
+    assert_feq(hit.v, third, eps())
+}
+fn test_frustum_cull() {
+    // a camera at +10 on Z looking at the origin, 90 degrees vertical fov, square, near 1 far 100
+    let cam = look_at_rh(vec3(0.0, 0.0, 10.0), vec3_zero(), vec3_y())
+    let proj = perspective_rh(m::pi() * 0.5, 1.0, 1.0, 100.0)
+    let f = frustum_from_mat4(mat4_mul(proj, cam))
+    // the near plane sits 1 in front of the eye, at world z = 9, and points into the frustum
+    assert_feq(plane_signed_distance(f.near, vec3(0.0, 0.0, 9.0)), 0.0, eps())
+    assert_v3(f.near.normal, 0.0, 0.0, -1.0, eps())
+    assert_feq(plane_signed_distance(f.far, vec3(0.0, 0.0, -90.0)), 0.0, eps())
+    // points: the origin is visible, behind the camera is not, past the far plane is not
+    assert_true(frustum_contains_point(f, vec3_zero()))
+    assert_true(frustum_contains_point(f, vec3(0.0, 0.0, 8.0)))
+    assert_false(frustum_contains_point(f, vec3(0.0, 0.0, 9.5)))     // inside the near plane
+    assert_false(frustum_contains_point(f, vec3(0.0, 0.0, 20.0)))    // behind the camera
+    assert_false(frustum_contains_point(f, vec3(0.0, 0.0, -95.0)))   // past the far plane
+    // at 90 degrees fov the frustum is as wide as it is deep: at the origin (10 away) the
+    // half-extent is 10, so x = 9 is in and x = 11 is out
+    assert_true(frustum_contains_point(f, vec3(9.0, 0.0, 0.0)))
+    assert_false(frustum_contains_point(f, vec3(11.0, 0.0, 0.0)))
+    assert_true(frustum_contains_point(f, vec3(0.0, -9.0, 0.0)))
+    assert_false(frustum_contains_point(f, vec3(0.0, 11.0, 0.0)))
+    // boxes: one at the origin is visible, one far off to the side is culled
+    assert_true(frustum_intersects_aabb(f, unit_box()))
+    assert_false(frustum_intersects_aabb(f, aabb(vec3(999.0, -1.0, -1.0), vec3(1001.0, 1.0, 1.0))))
+    assert_false(frustum_intersects_aabb(f, aabb(vec3(-1.0, -1.0, 100.0), vec3(1.0, 1.0, 102.0))))
+    assert_false(frustum_intersects_aabb(f, aabb(vec3(-1.0, -1.0, -200.0), vec3(1.0, 1.0, -150.0))))
+    // a box whose centre is outside but which reaches in is kept
+    assert_true(frustum_intersects_aabb(f, aabb(vec3(9.5, -0.5, -0.5), vec3(20.0, 0.5, 0.5))))
+    // an enormous box containing the whole camera is kept too
+    assert_true(frustum_intersects_aabb(f, aabb(vec3_splat(-1000.0), vec3_splat(1000.0))))
+    // spheres, including one whose centre is outside but whose radius reaches in
+    assert_true(frustum_intersects_sphere(f, sphere(vec3_zero(), 1.0)))
+    assert_false(frustum_intersects_sphere(f, sphere(vec3(1000.0, 0.0, 0.0), 1.0)))
+    assert_true(frustum_intersects_sphere(f, sphere(vec3(11.0, 0.0, 0.0), 5.0)))
+    assert_false(frustum_intersects_sphere(f, sphere(vec3(0.0, 0.0, 20.0), 5.0)))
+    // an orthographic frustum works the same way
+    let of = frustum_from_mat4(mat4_mul(orthographic_rh(-2.0, 2.0, -2.0, 2.0, 1.0, 50.0), cam))
+    assert_true(frustum_contains_point(of, vec3_zero()))
+    assert_true(frustum_contains_point(of, vec3(1.9, 1.9, 0.0)))
+    assert_false(frustum_contains_point(of, vec3(2.1, 0.0, 0.0)))
+    assert_false(frustum_contains_point(of, vec3(0.0, 0.0, 9.5)))
+}

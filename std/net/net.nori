@@ -1,0 +1,683 @@
+//! std/net: IPv4/IPv6 address types (parse/format/convert/classify) and TCP & UDP sockets.
+//! No C shim: the socket layer calls the POSIX socket API directly via `extern fn` to libc
+//! (linked automatically) with per-OS constants behind `cfg`. Fallible parsers return a struct with an
+//! `ok` field (1/0); a recv returns `Recv { n, data }` (n>0 bytes, 0 = closed, <0 = error).
+//!
+//! **Platform support.** Socket calls suspend the calling task rather than blocking its thread, so they
+//! need a readiness backend for the stackless scheduler: Linux uses epoll, Windows uses WSAPoll. Both
+//! are one-shot readiness, so the same code runs on either: a handler parks on each op instead of
+//! occupying an OS thread. macOS is unported (kqueue fits the same shape); a socket call there aborts
+//! with a clear message rather than misbehaving. A listening/bound `Socket` in a global re-establishes
+//! itself across a program image on Linux and Windows.
+
+// ---------------- IPv4 ----------------
+/// An IPv4 address. `ok` is 0 when it did not parse.
+pub struct Ip4 { ok: Int, a: Int, b: Int, c: Int, d: Int }   // four octets 0..255
+
+/// build a valid Ip4 from four octets a.b.c.d (ok=1).
+pub fn ipv4(a: Int, b: Int, c: Int, d: Int) -> Ip4 { return Ip4 { ok: 1, a: a, b: b, c: c, d: d } }
+/// internal: the sentinel "parse failed" Ip4 (ok=0).
+pub fn ipv4_bad() -> Ip4 { return Ip4 { ok: 0, a: 0, b: 0, c: 0, d: 0 } }
+
+/// parse "a.b.c.d" (decimal octets, each 0..255, 1..3 digits). ok=0 on any malformation.
+pub fn parse_ipv4(s: Str) -> Ip4 {
+    var oct: Vec<Int> = vec()
+    var cur = 0
+    var digits = 0
+    var i = 0
+    let n = s.len()
+    while i < n {
+        let c = ord(s.at(i))
+        if c == 46 {                                     // '.'
+            if digits == 0 { return ipv4_bad() }
+            oct.push(cur)
+            cur = 0
+            digits = 0
+        } else if c >= 48 && c <= 57 {
+            cur = cur * 10 + (c - 48)
+            digits = digits + 1
+            if cur > 255 { return ipv4_bad() }
+            if digits > 3 { return ipv4_bad() }
+        } else { return ipv4_bad() }
+        i = i + 1
+    }
+    if digits == 0 { return ipv4_bad() }
+    oct.push(cur)
+    if oct.len() != 4 { return ipv4_bad() }
+    return Ip4 { ok: 1, a: oct[0], b: oct[1], c: oct[2], d: oct[3] }
+}
+/// "a.b.c.d"
+pub fn ipv4_str(ip: Ip4) -> Str {
+    return (to_str(ip.a) + ("." + (to_str(ip.b) + ("." + (to_str(ip.c) + ("." + to_str(ip.d)))))))
+}
+/// 32-bit big-endian integer form, and back
+pub fn ipv4_u32(ip: Ip4) -> Int { return ip.a * 16777216 + ip.b * 65536 + ip.c * 256 + ip.d }
+/// build an Ip4 from a 32-bit big-endian integer.
+pub fn ipv4_from_u32(x: Int) -> Ip4 {
+    return Ip4 { ok: 1, a: ((x >> 24) & 255), b: ((x >> 16) & 255), c: ((x >> 8) & 255), d: (x & 255) }
+}
+/// true if the two addresses have equal octets (ignores the ok flag).
+pub fn ipv4_eq(p: Ip4, q: Ip4) -> Bool { return p.a == q.a && p.b == q.b && p.c == q.c && p.d == q.d }
+
+/// true if loopback (127.0.0.0/8).
+pub fn ipv4_is_loopback(ip: Ip4) -> Bool { return ip.a == 127 }                               // 127.0.0.0/8
+/// true if the unspecified address 0.0.0.0.
+pub fn ipv4_is_unspecified(ip: Ip4) -> Bool { return ip.a == 0 && ip.b == 0 && ip.c == 0 && ip.d == 0 }  // 0.0.0.0
+/// true if the limited broadcast address 255.255.255.255.
+pub fn ipv4_is_broadcast(ip: Ip4) -> Bool { return ip.a == 255 && ip.b == 255 && ip.c == 255 && ip.d == 255 }
+/// true if multicast (224.0.0.0/4).
+pub fn ipv4_is_multicast(ip: Ip4) -> Bool { return ip.a >= 224 && ip.a <= 239 }              // 224.0.0.0/4
+/// true if in a private RFC1918 range (10/8, 172.16/12, 192.168/16).
+pub fn ipv4_is_private(ip: Ip4) -> Bool {                                                     // RFC1918
+    if ip.a == 10 { return true }
+    if ip.a == 172 && ip.b >= 16 && ip.b <= 31 { return true }
+    if ip.a == 192 && ip.b == 168 { return true }
+    return false
+}
+
+// ---------------- IPv6 ----------------
+/// An IPv6 address. `ok` is 0 when it did not parse.
+pub struct Ip6 { ok: Int, g0: Int, g1: Int, g2: Int, g3: Int, g4: Int, g5: Int, g6: Int, g7: Int }  // eight 16-bit groups
+
+/// internal: the sentinel "parse failed" Ip6 (ok=0).
+pub fn ip6_bad() -> Ip6 { return Ip6 { ok: 0, g0: 0, g1: 0, g2: 0, g3: 0, g4: 0, g5: 0, g6: 0, g7: 0 } }
+/// build an Ip6 from a Vec of exactly 8 group values
+pub fn ip6_of(g: Vec<Int>) -> Ip6 {
+    if g.len() != 8 { return ip6_bad() }
+    return Ip6 { ok: 1, g0: g[0], g1: g[1], g2: g[2], g3: g[3], g4: g[4], g5: g[5], g6: g[6], g7: g[7] }
+}
+/// the i-th 16-bit group (0..7) of the address.
+pub fn ip6_group(ip: Ip6, i: Int) -> Int {
+    if i == 0 { return ip.g0 }
+    if i == 1 { return ip.g1 }
+    if i == 2 { return ip.g2 }
+    if i == 3 { return ip.g3 }
+    if i == 4 { return ip.g4 }
+    if i == 5 { return ip.g5 }
+    if i == 6 { return ip.g6 }
+    return ip.g7
+}
+/// internal: decode one hex digit char code to its value 0..15, or -1 if not a hex digit.
+pub fn hexd(c: Int) -> Int {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    return 0 - 1
+}
+/// internal: format a 16-bit group as lowercase hex with no leading zeros ("0" for zero).
+pub fn hex16(c: Int) -> Str {                                                                 // lowercase hex, no leading zeros
+    if c == 0 { return "0" }
+    var s = ""
+    var v = c
+    while v > 0 { let d = (v & 15)  var ch = d + 48  if d >= 10 { ch = d + 87 }  s = (chr(ch) + s)  v = (v >> 4) }
+    return s
+}
+/// internal: true if the string contains a '.' (used to detect an embedded IPv4 in an IPv6 group).
+pub fn has_dot(s: Str) -> Bool { var i = 0  while i < s.len() { if ord(s.at(i)) == 46 { return true }  i = i + 1 }  return false }
+/// parse one ':'-delimited run of groups into `out` (empty `seg` = no groups). Each group is 1..4 hex
+/// digits, or a trailing embedded IPv4 dotted-quad (e.g. ::ffff:1.2.3.4) which expands to two groups.
+pub fn parse_groups(seg: Str, inout out: Vec<Int>) -> Bool {
+    if (seg == "") { return true }
+    var start = 0
+    var i = 0
+    let n = seg.len()
+    while i <= n {
+        if i == n || ord(seg.at(i)) == 58 {             // ':' or end -> one token
+            let tok = seg.slice(start, i)
+            if (tok == "") { return false }
+            if has_dot(tok) {                            // embedded IPv4 -> two 16-bit groups
+                let ip = parse_ipv4(tok)
+                if ip.ok == 0 { return false }
+                out.push(ip.a * 256 + ip.b)
+                out.push(ip.c * 256 + ip.d)
+            } else {
+                if tok.len() > 4 { return false }
+                var v = 0
+                var k = 0
+                while k < tok.len() { let h = hexd(tok.at(k))  if h < 0 { return false }  v = v * 16 + h  k = k + 1 }
+                out.push(v)
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+/// the byte index of the "::" in `s`, or -1.
+pub fn find_dcolon(s: Str) -> Int {
+    var i = 0
+    let n = s.len()
+    while i + 1 < n { if ord(s.at(i)) == 58 && ord(s.at(i + 1)) == 58 { return i }  i = i + 1 }
+    return 0 - 1
+}
+/// parse an IPv6 textual address: optional one "::" zero-compression + optional trailing embedded IPv4.
+pub fn parse_ipv6(s: Str) -> Ip6 {
+    let n = s.len()
+    let dc = find_dcolon(s)
+    if dc < 0 {                                          // no "::": exactly 8 groups
+        var g: Vec<Int> = vec()
+        if !parse_groups(s, g) { return ip6_bad() }
+        return ip6_of(g)
+    }
+    // split around "::": head = [0,dc), tail = [dc+2, n)
+    var head: Vec<Int> = vec()
+    var tail: Vec<Int> = vec()
+    if !parse_groups(s.slice(0, dc), head) { return ip6_bad() }
+    if !parse_groups(s.slice(dc + 2, n), tail) { return ip6_bad() }
+    let fill = 8 - (head.len() + tail.len())
+    if fill < 1 { return ip6_bad() }                    // "::" must stand for at least one zero group
+    var g: Vec<Int> = vec()
+    var i = 0
+    while i < head.len() { g.push(head[i])  i = i + 1 }
+    var z = 0
+    while z < fill { g.push(0)  z = z + 1 }
+    i = 0
+    while i < tail.len() { g.push(tail[i])  i = i + 1 }
+    return ip6_of(g)
+}
+/// canonical text form, with "::" over the longest run (>=2) of zero groups.
+pub fn ipv6_str(ip: Ip6) -> Str {
+    // find the longest zero run
+    var bestlen = 0
+    var beststart = 0 - 1
+    var runlen = 0
+    var runstart = 0
+    var i = 0
+    while i < 8 {
+        if ip6_group(ip, i) == 0 {
+            if runlen == 0 { runstart = i }
+            runlen = runlen + 1
+            if runlen > bestlen { bestlen = runlen  beststart = runstart }
+        } else { runlen = 0 }
+        i = i + 1
+    }
+    if bestlen < 2 { beststart = 0 - 1 }                 // only compress runs of 2+
+    var s = ""
+    i = 0
+    while i < 8 {
+        if beststart >= 0 && i == beststart {
+            s = (s + "::")
+            i = beststart + bestlen                      // skip the compressed run
+        } else {
+            if s.len() > 0 && !ends_colon(s) { s = (s + ":") }
+            s = (s + hex16(ip6_group(ip, i)))
+            i = i + 1
+        }
+    }
+    if (s == "") { return "::" }
+    return s
+}
+/// internal: true if the string ends with ':' (used while formatting around "::").
+pub fn ends_colon(s: Str) -> Bool { let n = s.len()  if n == 0 { return false }  return ord(s.at(n - 1)) == 58 }
+/// true if the loopback address ::1.
+pub fn ipv6_is_loopback(ip: Ip6) -> Bool { return ip.g0 == 0 && ip.g1 == 0 && ip.g2 == 0 && ip.g3 == 0 && ip.g4 == 0 && ip.g5 == 0 && ip.g6 == 0 && ip.g7 == 1 }  // ::1
+/// true if the unspecified address ::.
+pub fn ipv6_is_unspecified(ip: Ip6) -> Bool { return ip.g0 == 0 && ip.g1 == 0 && ip.g2 == 0 && ip.g3 == 0 && ip.g4 == 0 && ip.g5 == 0 && ip.g6 == 0 && ip.g7 == 0 }  // ::
+
+// ================ sockets (TCP + UDP) ================
+/// Calls the POSIX socket API via `extern fn` to libc (linked automatically, no C shim). The
+/// calls are identical across Linux/macOS; only a few constants + the sockaddr header differ, so those
+/// live in cfg() blocks. A recv returns `Recv { n, data }` (n>0 bytes, 0 = peer closed, <0 = error).
+
+extern fn socket(Int, Int, Int) -> Int
+extern fn connect(Int, Int, Int) -> Int
+extern fn bind(Int, Int, Int) -> Int
+extern fn listen(Int, Int) -> Int
+extern fn accept(Int, Int, Int) -> Int
+extern fn send(Int, Int, Int, Int) -> Int
+extern fn recv(Int, Int, Int, Int) -> Int
+extern fn sendto(Int, Int, Int, Int, Int, Int) -> Int
+extern fn recvfrom(Int, Int, Int, Int, Int, Int) -> Int
+extern fn setsockopt(Int, Int, Int, Int, Int) -> Int
+/// async-IO runtime ops: on POSIX these park the coroutine on EAGAIN (epoll), so a TCP server scales to
+/// many connections without an OS thread each; on Windows they're plain blocking calls. TCP routes
+/// through these instead of the raw syscalls.
+extern fn nori_net_accept(Int) -> Int
+extern fn getpeername(Int, Int, Int) -> Int
+extern fn nori_net_recv(Int, Int, Int) -> Int
+extern fn nori_net_send(Int, Int, Int) -> Int
+extern fn nori_net_connect(Int, Int, Int) -> Int
+extern fn shutdown(Int, Int) -> Int
+extern fn malloc(Int) -> Int
+extern fn free(Int)
+
+/// platform socket primitives that differ on Windows (Winsock): close->closesocket, fcntl->ioctlsocket,
+/// poll->WSAPoll, plus WSAStartup. sock_close/set_nonblocking/poll_fd/wsa_init wrap them per OS.
+cfg(linux) {
+    extern fn close(Int) -> I32        // C `int`: see std/os
+    extern fn fcntl(Int, Int, Int) -> Int
+    extern fn poll(Int, Int, Int) -> Int
+    /// close a socket fd; returns 0 on success, -1 on error.
+    pub fn sock_close(fd: Int) -> Int { nori_res_unregister(fd)  return to_int(close(fd)) }
+    /// init the socket subsystem (no-op on POSIX; WSAStartup on Windows).
+    pub fn wsa_init() { }
+    /// set/clear O_NONBLOCK on fd; returns 0 on success, -1 on error.
+    pub fn set_nonblocking(fd: Int, on: Bool) -> Int {
+        let fl = fcntl(fd, 3, 0)                          // F_GETFL
+        if fl < 0 { return 0 - 1 }
+        var nf = (fl & (~2048))                     // O_NONBLOCK = 0o4000
+        if on { nf = (fl | 2048) }
+        return fcntl(fd, 4, nf)                           // F_SETFL
+    }
+    /// poll fd for `events` up to ms; returns revents bitmask, 0 on timeout, <=0 from poll on error.
+    pub fn poll_fd(fd: Int, events: Int, ms: Int) -> Int {   // struct pollfd { i32 fd; i16 events; i16 revents }
+        let pf = malloc(8)
+        unsafe {
+            poke8(pf, (fd & 255))  poke8(pf + 1, ((fd >> 8) & 255))  poke8(pf + 2, ((fd >> 16) & 255))  poke8(pf + 3, ((fd >> 24) & 255))
+            poke8(pf + 4, (events & 255))  poke8(pf + 5, ((events >> 8) & 255))  poke8(pf + 6, 0)  poke8(pf + 7, 0)
+        }
+        let r = poll(pf, 1, ms)
+        var rev = 0
+        unsafe { rev = (peek8(pf + 6) | (peek8(pf + 7) << 8)) }
+        free(pf)
+        if r <= 0 { return r }
+        return rev
+    }
+}
+cfg(macos) {
+    extern fn close(Int) -> I32        // C `int`: see std/os
+    extern fn fcntl(Int, Int, Int) -> Int
+    extern fn poll(Int, Int, Int) -> Int
+    /// close a socket fd; returns 0 on success, -1 on error.
+    pub fn sock_close(fd: Int) -> Int { nori_res_unregister(fd)  return to_int(close(fd)) }
+    /// init the socket subsystem (no-op on POSIX; WSAStartup on Windows).
+    pub fn wsa_init() { }
+    /// set/clear O_NONBLOCK on fd; returns 0 on success, -1 on error.
+    pub fn set_nonblocking(fd: Int, on: Bool) -> Int {
+        let fl = fcntl(fd, 3, 0)
+        if fl < 0 { return 0 - 1 }
+        var nf = (fl & (~4))                        // O_NONBLOCK = 0x0004 on macOS
+        if on { nf = (fl | 4) }
+        return fcntl(fd, 4, nf)
+    }
+    /// poll fd for `events` up to ms; returns revents bitmask, 0 on timeout, <=0 from poll on error.
+    pub fn poll_fd(fd: Int, events: Int, ms: Int) -> Int {
+        let pf = malloc(8)
+        unsafe {
+            poke8(pf, (fd & 255))  poke8(pf + 1, ((fd >> 8) & 255))  poke8(pf + 2, ((fd >> 16) & 255))  poke8(pf + 3, ((fd >> 24) & 255))
+            poke8(pf + 4, (events & 255))  poke8(pf + 5, ((events >> 8) & 255))  poke8(pf + 6, 0)  poke8(pf + 7, 0)
+        }
+        let r = poll(pf, 1, ms)
+        var rev = 0
+        unsafe { rev = (peek8(pf + 6) | (peek8(pf + 7) << 8)) }
+        free(pf)
+        if r <= 0 { return r }
+        return rev
+    }
+}
+cfg(windows) {
+    extern fn closesocket(Int) -> Int
+    extern fn ioctlsocket(Int, Int, Int) -> Int
+    extern fn WSAPoll(Int, Int, Int) -> Int
+    /// close a socket fd; returns 0 on success, -1 on error (closesocket on Windows).
+    pub fn sock_close(fd: Int) -> Int { nori_res_unregister(fd)  return closesocket(fd) }
+    /// init the socket subsystem (no-op: the runtime already ran WSAStartup at process start).
+    pub fn wsa_init() { }   // no-op so it stays callable + task-safe (no global touch -> usable from async socket tasks)
+    /// set/clear non-blocking mode on fd via ioctlsocket(FIONBIO); returns 0 on success, nonzero on error.
+    pub fn set_nonblocking(fd: Int, on: Bool) -> Int {
+        let m = malloc(4)
+        var mode = 0
+        if on { mode = 1 }
+        unsafe { poke8(m, mode)  poke8(m + 1, 0)  poke8(m + 2, 0)  poke8(m + 3, 0) }
+        let rc = ioctlsocket(fd, 2147772030, m)          // FIONBIO = 0x8004667E
+        free(m)
+        return rc
+    }
+    // WSAPoll does not use POSIX's bits. Winsock numbers them differently: readable is
+    // POLLRDNORM|POLLRDBAND (0x0300) and writable is POLLWRNORM (0x0010), while 1 and 4 mean POLLERR
+    // and POLLNVAL, which WSAPoll ignores in `events`. Asking to read with the POSIX 1 would ask for
+    // nothing at all: every wait would run to its timeout and every read would look like a server
+    // that had stopped answering. Callers stay POSIX; the translation lives here, both ways.
+    fn win_ev_in(ev: Int) -> Int {
+        var w = 0
+        if (ev & 1) != 0 { w = (w | 0x0300) }             // POLLIN  -> POLLRDNORM | POLLRDBAND
+        if (ev & 2) != 0 { w = (w | 0x0400) }             // POLLPRI -> POLLPRI
+        if (ev & 4) != 0 { w = (w | 0x0010) }             // POLLOUT -> POLLWRNORM
+        return w
+    }
+    fn win_ev_out(rev: Int) -> Int {
+        var p = 0
+        if (rev & 0x0300) != 0 { p = (p | 1) }
+        if (rev & 0x0400) != 0 { p = (p | 2) }
+        if (rev & 0x0010) != 0 { p = (p | 4) }
+        if (rev & 0x0001) != 0 { p = (p | 8) }            // POLLERR
+        if (rev & 0x0002) != 0 { p = (p | 16) }           // POLLHUP
+        if (rev & 0x0004) != 0 { p = (p | 32) }           // POLLNVAL
+        return p
+    }
+    /// poll fd for `events` up to ms via WSAPoll; returns revents bitmask, 0 on timeout, <=0 on error.
+    /// `events` and the result are the POSIX bits, as on every other platform here.
+    pub fn poll_fd(fd: Int, events: Int, ms: Int) -> Int {   // WSAPOLLFD { SOCKET fd (8 bytes); SHORT events; SHORT revents }
+        let pf = malloc(16)
+        let wev = win_ev_in(events)
+        unsafe {
+            poke(pf, fd)                                  // 8-byte SOCKET handle
+            poke8(pf + 8, (wev & 255))  poke8(pf + 9, ((wev >> 8) & 255))  poke8(pf + 10, 0)  poke8(pf + 11, 0)
+        }
+        let r = WSAPoll(pf, 1, ms)
+        var rev = 0
+        unsafe { rev = (peek8(pf + 10) | (peek8(pf + 11) << 8)) }
+        free(pf)
+        if r <= 0 { return r }
+        return win_ev_out(rev)
+    }
+}
+
+cfg(linux) {
+    /// AF_INET6 address-family constant for this OS.
+    pub fn af_inet6() -> Int { return 10 }
+    /// SOL_SOCKET option-level constant for this OS.
+    pub fn sol_socket() -> Int { return 1 }
+    /// SO_REUSEADDR option-name constant for this OS.
+    pub fn so_reuseaddr() -> Int { return 2 }
+    // Linux sockaddr: 2-byte family at offset 0 (no sa_len). `salen` is unused.
+    /// write the sockaddr header (family) at the start of buffer b for this OS layout.
+    pub fn put_sa_head(b: Int, salen: Int, fam: Int) { unsafe { poke8(b, (fam & 255))  poke8(b + 1, ((fam >> 8) & 255)) } }
+}
+cfg(macos) {
+    /// AF_INET6 address-family constant for this OS.
+    pub fn af_inet6() -> Int { return 30 }
+    /// SOL_SOCKET option-level constant for this OS.
+    pub fn sol_socket() -> Int { return 65535 }
+    /// SO_REUSEADDR option-name constant for this OS.
+    pub fn so_reuseaddr() -> Int { return 4 }
+    // BSD/macOS sockaddr: 1-byte sa_len at offset 0, 1-byte family at offset 1.
+    /// write the sockaddr header (sa_len + family) at the start of buffer b for this OS layout.
+    pub fn put_sa_head(b: Int, salen: Int, fam: Int) { unsafe { poke8(b, salen)  poke8(b + 1, fam) } }
+}
+cfg(windows) {
+    /// AF_INET6 address-family constant for this OS.
+    pub fn af_inet6() -> Int { return 23 }
+    /// SOL_SOCKET option-level constant for this OS.
+    pub fn sol_socket() -> Int { return 65535 }
+    /// SO_REUSEADDR option-name constant for this OS.
+    pub fn so_reuseaddr() -> Int { return 4 }
+    /// write the sockaddr header (family) at the start of buffer b for this OS layout.
+    pub fn put_sa_head(b: Int, salen: Int, fam: Int) { unsafe { poke8(b, (fam & 255))  poke8(b + 1, ((fam >> 8) & 255)) } }
+}
+
+// ---- byte buffers <-> Nori strings ----
+/// One receive: `n` bytes read (0 = empty, <0 = error) and the bytes themselves.
+pub struct Recv { n: Int, data: Str }
+/// internal: build a Nori Str from the first n bytes of raw buffer b ("" if n<=0).
+pub fn buf_to_str(b: Int, n: Int) -> Str {
+    if n <= 0 { return "" }
+    var s = ""
+    unsafe { s = str_from_buf(b, n) }                        // one O(n) runtime build (not byte-by-byte concat)
+    return s
+}
+/// internal: copy the bytes of string s into raw buffer b (caller must size b >= slen(s)).
+pub fn str_to_buf(s: Str, b: Int) {
+    var i = 0
+    let n = s.len()
+    unsafe { while i < n { poke8(b + i, s.at(i))  i = i + 1 } }
+}
+
+// ---- sockaddr construction (caller frees the returned buffer) ----
+/// internal: allocate + fill a 16-byte AF_INET sockaddr_in for ip:port (caller frees the returned ptr).
+pub fn new_sa4(ip: Ip4, port: Int) -> Int {
+    let b = malloc(16)
+    put_sa_head(b, 16, 2)                                 // AF_INET = 2
+    unsafe {
+        poke8(b + 2, ((port >> 8) & 255))            // sin_port (network byte order)
+        poke8(b + 3, (port & 255))
+        poke8(b + 4, ip.a)  poke8(b + 5, ip.b)  poke8(b + 6, ip.c)  poke8(b + 7, ip.d)   // sin_addr
+        var i = 8
+        while i < 16 { poke8(b + i, 0)  i = i + 1 }
+    }
+    return b
+}
+/// internal: allocate + fill a 28-byte AF_INET6 sockaddr_in6 for ip:port (caller frees the returned ptr).
+pub fn new_sa6(ip: Ip6, port: Int) -> Int {
+    let b = malloc(28)
+    put_sa_head(b, 28, af_inet6())
+    unsafe {
+        poke8(b + 2, ((port >> 8) & 255))
+        poke8(b + 3, (port & 255))
+        var i = 4
+        while i < 8 { poke8(b + i, 0)  i = i + 1 }        // sin6_flowinfo
+        var k = 0
+        while k < 8 { let g = ip6_group(ip, k)  poke8(b + 8 + k * 2, ((g >> 8) & 255))  poke8(b + 8 + k * 2 + 1, (g & 255))  k = k + 1 }
+        i = 24
+        while i < 28 { poke8(b + i, 0)  i = i + 1 }        // sin6_scope_id
+    }
+    return b
+}
+/// internal: enable SO_REUSEADDR on fd (best-effort; return value ignored).
+pub fn set_reuseaddr(fd: Int) {
+    let opt = malloc(4)
+    unsafe { poke8(opt, 1)  poke8(opt + 1, 0)  poke8(opt + 2, 0)  poke8(opt + 3, 0) }
+    setsockopt(fd, sol_socket(), so_reuseaddr(), opt, 4)
+    free(opt)
+}
+
+// register user-held socket fds so snapshot() can enforce the safe-subset (no open resources).
+extern fn nori_res_register(Int)
+extern fn nori_res_unregister(Int)
+fn rsock(fd: Int) -> Int { if fd >= 0 { nori_res_register(fd) }  return fd }
+
+// ---- TCP ----
+/// connect to a peer; returns a socket fd (>=0) or -1.
+pub fn tcp_connect4(ip: Ip4, port: Int) -> Int {
+    wsa_init()  let fd = rsock(socket(2, 1, 0))                              // AF_INET, SOCK_STREAM
+    if fd < 0 { return 0 - 1 }
+    let sa = new_sa4(ip, port)
+    let rc = nori_net_connect(fd, sa, 16)
+    free(sa)
+    if rc < 0 { sock_close(fd)  return 0 - 1 }
+    return fd
+}
+/// connect (TCP/IPv6) to a peer; returns a socket fd (>=0) or -1.
+pub fn tcp_connect6(ip: Ip6, port: Int) -> Int {
+    wsa_init()  let fd = rsock(socket(af_inet6(), 1, 0))
+    if fd < 0 { return 0 - 1 }
+    let sa = new_sa6(ip, port)
+    let rc = nori_net_connect(fd, sa, 28)
+    free(sa)
+    if rc < 0 { sock_close(fd)  return 0 - 1 }
+    return fd
+}
+/// bind + listen; returns a listening fd or -1.
+pub fn tcp_listen4(ip: Ip4, port: Int, backlog: Int) -> Int {
+    wsa_init()  let fd = rsock(socket(2, 1, 0))
+    if fd < 0 { return 0 - 1 }
+    set_reuseaddr(fd)
+    let sa = new_sa4(ip, port)
+    let rc = bind(fd, sa, 16)
+    free(sa)
+    if rc < 0 { sock_close(fd)  return 0 - 1 }
+    if listen(fd, backlog) < 0 { sock_close(fd)  return 0 - 1 }
+    return fd
+}
+/// accept one pending connection on listening fd; returns a client fd or -1.
+pub fn tcp_accept(fd: Int) -> Int { return nori_net_accept(fd) }     // -> client fd or -1
+
+/// Who is at the other end of an accepted socket (IPv4). ok=0 when it cannot be had: the socket
+/// is closed, or the peer is not AF_INET.
+///
+/// A server usually does not care. It matters when the answer it is about to give depends on where
+/// the asker is: handing 127.0.0.1 to something across the internet is not a smaller answer, it is
+/// a wrong one, and the failure lands somewhere else entirely: on a phone, as a connection that
+/// times out against itself.
+pub fn peer_ip4(fd: Int) -> Ip4 {
+    if fd < 0 { return Ip4 { ok: 0, a: 0, b: 0, c: 0, d: 0 } }
+    let sa = malloc(16)
+    let ln = malloc(4)
+    unsafe {
+        poke8(ln, 16)  poke8(ln + 1, 0)  poke8(ln + 2, 0)  poke8(ln + 3, 0)
+        var i = 0
+        while i < 16 { poke8(sa + i, 0)  i = i + 1 }
+    }
+    var rc = 0
+    unsafe { rc = getpeername(fd, sa, ln) }
+    var out = Ip4 { ok: 0, a: 0, b: 0, c: 0, d: 0 }
+    if rc == 0 {
+        var fam = 0
+        unsafe { fam = peek8(sa) }                      // sa_family, low byte (little-endian hosts)
+        if fam == 2 {
+            unsafe { out = Ip4 { ok: 1, a: peek8(sa + 4), b: peek8(sa + 5), c: peek8(sa + 6), d: peek8(sa + 7) } }
+        }
+    }
+    unsafe { free(sa)  free(ln) }
+    return out
+}
+
+/// Is this address on this machine? 127.0.0.0/8, which is useful to anything local and to nothing else.
+pub fn is_loopback4(ip: Ip4) -> Bool { return ip.ok == 1 && ip.a == 127 }
+
+/// A re-establishable listening/bound socket. Unlike a bare listening fd (which
+/// snapshot() refuses over), a `Socket` carries its bind address, so snapshot()/resume() re-listen on
+/// the same ip:port on resume. Field order is fixed (runtime nori_sock_ser/de): fd@0, kind@1
+/// (1=tcp-listen, 2=udp-bind), ip@2 (u32 host form), port@3. Accepted/connected client sockets are not
+/// re-establishable and stay bare fds under the refuse rule.
+pub struct Socket { fd: Int, kind: Int, ip: Int, port: Int }
+
+/// bind + listen as a re-establishable Socket (re-binds itself on resume).
+pub fn socket_listen4(ip: Ip4, port: Int, backlog: Int) -> Socket {
+    let fd = tcp_listen4(ip, port, backlog)
+    nori_res_unregister(fd)                              // a Socket re-establishes -> not an opaque refuse-blocker
+    return Socket { fd: fd, kind: 1, ip: ipv4_u32(ip), port: port }
+}
+/// the raw listening fd (for accept loops / interop).
+pub fn socket_fd(s: Socket) -> Int { return s.fd }
+/// accept the next client connection; returns a client fd (>=0) or -1.
+pub fn socket_accept(s: Socket) -> Int { return tcp_accept(s.fd) }
+/// close the listening socket.
+pub fn socket_close(s: Socket) -> Int { return sock_close(s.fd) }
+/// send all bytes of `data`; returns bytes sent or -1.
+pub fn tcp_send(fd: Int, data: Str) -> Int {
+    let n = data.len()
+    if n == 0 { return 0 }
+    let b = malloc(n)
+    str_to_buf(data, b)
+    let sent = nori_net_send(fd, b, n)
+    free(b)
+    return sent
+}
+/// receive up to `max` bytes.
+pub fn tcp_recv(fd: Int, max: Int) -> Recv {
+    let b = malloc(max)
+    let got = nori_net_recv(fd, b, max)
+    var r = Recv { n: got, data: "" }
+    if got > 0 { r = Recv { n: got, data: buf_to_str(b, got) } }
+    free(b)
+    return r
+}
+/// close a TCP socket fd; returns 0 on success, -1 on error.
+pub fn tcp_close(fd: Int) -> Int { return sock_close(fd) }
+/// shut down part of a TCP connection (how: 0=read, 1=write, 2=both); returns 0 or -1.
+pub fn tcp_shutdown(fd: Int, how: Int) -> Int { return shutdown(fd, how) }   // how: 0=rd, 1=wr, 2=both
+
+// ---- UDP ----
+/// open a UDP/IPv4 socket bound to ip:port; returns the fd or -1.
+pub fn udp_bind4(ip: Ip4, port: Int) -> Int {
+    wsa_init()  let fd = rsock(socket(2, 2, 0))                              // AF_INET, SOCK_DGRAM
+    if fd < 0 { return 0 - 1 }
+    set_reuseaddr(fd)
+    let sa = new_sa4(ip, port)
+    let rc = bind(fd, sa, 16)
+    free(sa)
+    if rc < 0 { sock_close(fd)  return 0 - 1 }
+    return fd
+}
+/// open an unbound UDP/IPv4 socket (for sending); returns the fd or -1.
+pub fn udp_open4() -> Int { wsa_init()  return rsock(socket(2, 2, 0)) }         // an unbound UDP socket (for sending)
+/// send `data` as one UDP datagram to ip:port; returns bytes sent or -1.
+pub fn udp_send_to4(fd: Int, ip: Ip4, port: Int, data: Str) -> Int {
+    let n = data.len()
+    let b = malloc(n)
+    str_to_buf(data, b)
+    let sa = new_sa4(ip, port)
+    let sent = sendto(fd, b, n, 0, sa, 16)
+    free(b)  free(sa)
+    return sent
+}
+/// receive one UDP datagram, up to `max` bytes; Recv.n>0 bytes, 0=empty, <0=error.
+pub fn udp_recv(fd: Int, max: Int) -> Recv {
+    let b = malloc(max)
+    let got = recvfrom(fd, b, max, 0, 0, 0)
+    var r = Recv { n: got, data: "" }
+    if got > 0 { r = Recv { n: got, data: buf_to_str(b, got) } }
+    free(b)
+    return r
+}
+/// close a UDP socket fd; returns 0 on success, -1 on error.
+pub fn udp_close(fd: Int) -> Int { return sock_close(fd) }
+
+// ================ timeouts (set_nonblocking / poll_fd are defined per-OS above) ================
+extern fn getsockopt(Int, Int, Int, Int, Int) -> Int
+
+cfg(linux) {
+    /// SO_RCVTIMEO option-name constant for this OS.
+    pub fn so_rcvtimeo() -> Int { return 20 }
+    /// SO_SNDTIMEO option-name constant for this OS.
+    pub fn so_sndtimeo() -> Int { return 21 }
+    /// SO_ERROR option-name constant for this OS.
+    pub fn so_error() -> Int { return 4 }
+}
+cfg(macos) {
+    /// SO_RCVTIMEO option-name constant for this OS.
+    pub fn so_rcvtimeo() -> Int { return 4102 }     // 0x1006
+    /// SO_SNDTIMEO option-name constant for this OS.
+    pub fn so_sndtimeo() -> Int { return 4101 }     // 0x1005
+    /// SO_ERROR option-name constant for this OS.
+    pub fn so_error() -> Int { return 4103 }        // 0x1007
+}
+cfg(windows) {
+    /// SO_RCVTIMEO option-name constant for this OS.
+    pub fn so_rcvtimeo() -> Int { return 4102 }
+    /// SO_SNDTIMEO option-name constant for this OS.
+    pub fn so_sndtimeo() -> Int { return 4101 }
+    /// SO_ERROR option-name constant for this OS.
+    pub fn so_error() -> Int { return 4103 }
+}
+
+/// per-socket recv/send timeout in milliseconds (0 = block forever). After it elapses, recv/send return <0.
+pub fn set_timeo(fd: Int, opt: Int, ms: Int) -> Int {
+    let tv = malloc(16)                          // struct timeval { i64 tv_sec; i64 tv_usec }
+    let sec = ms / 1000
+    unsafe { poke(tv, sec)  poke(tv + 8, (ms - sec * 1000) * 1000) }
+    let rc = setsockopt(fd, sol_socket(), opt, tv, 16)
+    free(tv)
+    return rc
+}
+/// set the receive timeout (ms; 0 = block forever) on fd; returns 0 or -1.
+pub fn set_recv_timeout(fd: Int, ms: Int) -> Int { return set_timeo(fd, so_rcvtimeo(), ms) }
+/// set the send timeout (ms; 0 = block forever) on fd; returns 0 or -1.
+pub fn set_send_timeout(fd: Int, ms: Int) -> Int { return set_timeo(fd, so_sndtimeo(), ms) }
+
+/// wait until `fd` is readable / writable: 1 = ready, 0 = timeout, -1 = error.
+/// wait until fd is readable: 1 = ready, 0 = timeout, -1 = error.
+pub fn poll_read(fd: Int, timeout_ms: Int) -> Int { let r = poll_fd(fd, 1, timeout_ms)  if r > 0 { return 1 }  return r }
+/// wait until fd is writable: 1 = ready, 0 = timeout, -1 = error.
+pub fn poll_write(fd: Int, timeout_ms: Int) -> Int { let r = poll_fd(fd, 4, timeout_ms)  if r > 0 { return 1 }  return r }
+
+/// connect with a timeout (non-blocking connect + poll for writable + SO_ERROR check). fd or -1.
+pub fn tcp_connect_timeout4(ip: Ip4, port: Int, ms: Int) -> Int {
+    wsa_init()  let fd = rsock(socket(2, 1, 0))
+    if fd < 0 { return 0 - 1 }
+    set_nonblocking(fd, true)
+    let sa = new_sa4(ip, port)
+    // The raw connect, not nori_net_connect. The runtime intercepts the latter and lowers it into
+    // the scheduler: the task parks until the socket is writable, with no bound. On a destination
+    // that silently drops packets (a port nobody forwarded, which is what this function
+    // exists to detect) that park lasts until the kernel gives up, minutes later, and the poll
+    // below never runs. A function whose entire purpose is a bound must not call the one thing
+    // that ignores it.
+    var rc = 0
+    unsafe { rc = connect(fd, sa, 16) }
+    free(sa)
+    if rc != 0 {                                 // in progress (or refused): wait for writable
+        if poll_write(fd, ms) != 1 { sock_close(fd)  return 0 - 1 }
+        let ev = malloc(4)
+        let ol = malloc(4)
+        unsafe { poke8(ev, 0)  poke8(ev + 1, 0)  poke8(ev + 2, 0)  poke8(ev + 3, 0)  poke8(ol, 4)  poke8(ol + 1, 0)  poke8(ol + 2, 0)  poke8(ol + 3, 0) }
+        getsockopt(fd, sol_socket(), so_error(), ev, ol)
+        var soerr = 0
+        unsafe { soerr = ((peek8(ev) | (peek8(ev + 1) << 8)) | ((peek8(ev + 2) << 16) | (peek8(ev + 3) << 24))) }
+        free(ev)  free(ol)
+        if soerr != 0 { sock_close(fd)  return 0 - 1 }   // connection failed (refused/timeout/unreachable)
+    }
+    set_nonblocking(fd, false)                   // restore blocking for ordinary send/recv
+    return fd
+}

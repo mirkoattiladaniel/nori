@@ -1,0 +1,34 @@
+// Tests for std/csv. Run with
+//   noric --test std/csv/csv_test.nori compiler/runtime.nori --import-root .
+import "std/csv" as csv
+
+fn test_parse_basic() {
+    let rows = csv::parse("a,b,c\n1,2,3\n")
+    assert_eq(rows.len(), 2)
+    assert_eq(rows[0].len(), 3)
+    assert_streq(rows[0][0], "a")
+    assert_streq(rows[0][2], "c")
+    assert_streq(rows[1][2], "3")
+}
+
+fn test_quoted_fields() {
+    let rows = csv::parse("name,note\n\"Smith, Jr\",\"a\nb\"\n")
+    assert_eq(rows.len(), 2)
+    assert_streq(rows[1][0], "Smith, Jr") // embedded comma
+    assert_streq(rows[1][1], "a\nb") // embedded newline
+}
+
+fn test_escaped_quote() {
+    let rows = csv::parse("\"he said \"\"hi\"\"\"\n")
+    assert_streq(rows[0][0], "he said \"hi\"") // "" -> "
+}
+
+fn test_write_and_roundtrip() {
+    var r1: Vec<Str> = vec() r1.push("a,b") r1.push("plain") r1.push("q\"x")
+    var rows: Vec<Vec<Str>> = vec() rows.push(r1)
+    let text = csv::write(rows)
+    let back = csv::parse(text)
+    assert_streq(back[0][0], "a,b")
+    assert_streq(back[0][1], "plain")
+    assert_streq(back[0][2], "q\"x")
+}

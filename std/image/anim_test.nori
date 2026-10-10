@@ -1,0 +1,223 @@
+// std/image animated pictures: GIF, APNG and WebP frame by frame, against what the host's own decoders make of
+// the same files (std/image/make_anim_testdata.py made them and printed these numbers: ImageMagick for GIF, Pillow
+// for APNG, libwebp's anim_dump and dwebp for WebP). Each frame is compared as the FNV-1a of the whole canvas
+// (straight RGBA8, a fully transparent pixel counted as 0,0,0,0: what colour a hole has is not the picture's);
+// lossy WebP is compared on its YUV planes, bit for bit, before any conversion to RGB.
+//   noric --test std/image/anim_test.nori compiler/runtime.nori --import-root .
+import "std/image" as image
+
+fn fnv_canvas(p: Int, n: Int) -> Int {
+    var h = 2166136261
+    var i = 0
+    unsafe {
+        while i < n {
+            var v = peek8(p + i)
+            if peek8(p + (i | 3)) == 0 { v = 0 }
+            h = ((h ^ v) * 16777619) & 4294967295
+            i = i + 1
+        }
+    }
+    return h
+}
+fn fnv_alpha(p: Int, n: Int) -> Int {
+    var h = 2166136261
+    var i = 3
+    unsafe { while i < n { h = ((h ^ peek8(p + i)) * 16777619) & 4294967295  i = i + 4 } }
+    return h
+}
+fn fnv_plane(p: Int, w: Int, h: Int, s: Int) -> Int {
+    var hh = 2166136261
+    var y = 0
+    unsafe { while y < h { var x = 0  while x < w { hh = ((hh ^ peek8(p + y * s + x)) * 16777619) & 4294967295  x = x + 1 }  y = y + 1 } }
+    return hh
+}
+fn td(name: Str) -> Str { return read_file("std/image/testdata/anim/" + name) }
+
+/// play the file through once: each frame's canvas hash and delay must be the host's
+fn check_frames(name: Str, want: Vec<Int>, delays: Vec<Int>) {
+    var a = image::anim_open(td(name))
+    assert_true(image::anim_ok(a))
+    assert_eq(image::anim_frames(a), want.len())
+    var i = 0
+    while image::anim_next(a) {
+        let n = image::anim_width(a) * image::anim_height(a) * 4
+        assert_eq(fnv_canvas(image::anim_pixels(a), n), want[i])
+        assert_eq(image::anim_delay_ms(a), delays[i])
+        i = i + 1
+    }
+    assert_eq(i, want.len())
+    assert_streq(image::anim_error(a), "")
+    // and again from the start: the same first frame
+    image::anim_rewind(a)
+    assert_true(image::anim_next(a))
+    assert_eq(fnv_canvas(image::anim_pixels(a), image::anim_width(a) * image::anim_height(a) * 4), want[0])
+    image::anim_close(a)
+}
+
+fn test_gif_disposals() {
+    // five frames of different sizes and places: none, background (cleared), previous (put back), a local colour
+    // table, transparency, a delay of 0 (shown as 100 ms) and one of 5 cs
+    check_frames("disposal.gif", [1586792673, 219436133, 606186815, 1145714861, 456083759], [100, 200, 300, 100, 50])
+    var a = image::anim_open(td("disposal.gif"))
+    assert_eq(image::anim_kind(a), image::ANIM_GIF())
+    assert_eq(image::anim_width(a), 40)
+    assert_eq(image::anim_height(a), 30)
+    assert_eq(image::anim_loops(a), 3)                         // NETSCAPE2.0 says 2 repetitions: three plays
+    image::anim_close(a)
+}
+
+fn test_gif_interlaced() {
+    check_frames("interlaced.gif", [1586792673, 219436133, 606186815, 1145714861, 456083759], [100, 200, 300, 100, 50])
+}
+
+fn test_gif_load_is_first_frame() {
+    var im = image::load(td("disposal.gif"))
+    assert_true(image::ok(im))
+    assert_eq(fnv_canvas(image::pixels(im), 40 * 30 * 4), 1586792673)
+    image::dispose(im)
+}
+
+fn test_apng_blend_and_dispose() {
+    // dispose none/background/previous/none, blend source/over/over/source; the default image is frame 0
+    check_frames("blend.png", [3457342985, 504671483, 88242249, 1241333734], [100, 50, 200, 40])
+    var a = image::anim_open(td("blend.png"))
+    assert_eq(image::anim_kind(a), image::ANIM_PNG())
+    assert_eq(image::anim_loops(a), 0)
+    image::anim_close(a)
+}
+
+fn test_apng_hidden_default() {
+    // the default image is not part of the animation: two frames (Pillow lists the default image as its frame 0)
+    check_frames("hidden_default.png", [199036576, 88242249], [70, 80])
+    var a = image::anim_open(td("hidden_default.png"))
+    assert_eq(image::anim_loops(a), 2)
+    image::anim_close(a)
+    // a viewer of still pictures shows the default image
+    var im = image::load(td("hidden_default.png"))
+    assert_eq(fnv_canvas(image::pixels(im), 32 * 24 * 4), 3457342985)
+    image::dispose(im)
+}
+
+fn test_still_png_is_one_frame() {
+    var a = image::anim_open(read_file("std/image/testdata/corners_rgb.png"))
+    assert_eq(image::anim_kind(a), image::ANIM_STILL())
+    assert_eq(image::anim_frames(a), 1)
+    assert_false(image::anim_moves(a))
+    assert_true(image::anim_next(a))
+    assert_eq(image::anim_delay_ms(a), 0)
+    assert_false(image::anim_next(a))
+    image::anim_close(a)
+}
+
+fn test_webp_lossless_animation() {
+    // VP8L frames, sub-rectangles blended or not, disposed or not, as img2webp chose
+    check_frames("lossless.webp", [2668931069, 4267145868, 894337557, 4115234649], [80, 120, 60, 30])
+    var a = image::anim_open(td("lossless.webp"))
+    assert_eq(image::anim_kind(a), image::ANIM_WEBP())
+    assert_eq(image::anim_loops(a), 4)
+    image::anim_close(a)
+}
+
+fn test_webp_lossy_animation_alpha() {
+    // VP8 frames with ALPH chunks: the alpha, exact (the colours are converted from YUV: compared as YUV below)
+    var a = image::anim_open(td("lossy_anim.webp"))
+    assert_eq(image::anim_frames(a), 3)
+    let want = [1840294853, 4008490066, 4008490066]
+    var i = 0
+    while image::anim_next(a) {
+        assert_eq(fnv_alpha(image::anim_pixels(a), 48 * 32 * 4), want[i])
+        assert_eq(image::anim_delay_ms(a), 100)
+        i = i + 1
+    }
+    assert_eq(i, 3)
+    image::anim_close(a)
+}
+
+fn test_webp_lossless_stills() {
+    var im = image::load(td("lossless_alpha.webp"))
+    assert_true(image::ok(im))
+    assert_eq(fnv_canvas(image::pixels(im), 100 * 70 * 4), 2345654608)
+    image::dispose(im)
+    var ph = image::load(td("lossless_photo.webp"))
+    assert_eq(fnv_canvas(image::pixels(ph), 64 * 48 * 4), 3183181125)
+    image::dispose(ph)
+}
+
+fn check_yuv(name: Str, w: Int, h: Int, fy: Int, fu: Int, fv: Int) {
+    var im = image::load_webp_yuv(td(name))
+    assert_true(image::yuv_ok(im))
+    assert_eq(im.w, w)
+    assert_eq(im.h, h)
+    let cw = (w + 1) / 2
+    let ch = (h + 1) / 2
+    assert_eq(fnv_plane(im.y, w, h, im.ystride), fy)
+    assert_eq(fnv_plane(im.u, cw, ch, im.uvstride), fu)
+    assert_eq(fnv_plane(im.v, cw, ch, im.uvstride), fv)
+    image::yuv_dispose(im)
+}
+
+fn test_webp_lossy_bit_exact() {
+    // dwebp -nofancy -yuv's planes, bit for bit: B_PRED and the 16x16 modes, the normal loop filter, segments
+    // with their own quantizers and filter levels, sharpness
+    check_yuv("lossy.webp", 100, 70, 1908882160, 1913032221, 1807944308)
+    check_yuv("lossy_seg.webp", 100, 70, 156558655, 2944941746, 2965105886)
+    check_yuv("lossy_nostrong.webp", 100, 70, 2364723787, 1729296928, 1406698246)
+    check_yuv("lossy_photo.webp", 230, 150, 2048967124, 2222518314, 2157644400)
+    check_yuv("lossy_alpha.webp", 100, 70, 1139111065, 1186723895, 2167270604)
+    // the alpha of a lossy picture: an ALPH chunk, compressed losslessly and filtered
+    var im = image::load(td("lossy_alpha.webp"))
+    assert_eq(fnv_alpha(image::pixels(im), 100 * 70 * 4), 2364769278)
+    image::dispose(im)
+}
+
+fn test_broken_files() {
+    // a canvas larger than any allowed: refused at open, nothing allocated for it
+    var a = image::anim_open(td("bad_huge.gif"))
+    assert_false(image::anim_ok(a))
+    assert_false(image::anim_next(a))
+    image::anim_close(a)
+    var b = image::anim_open(td("bad_huge.webp"))
+    assert_false(image::anim_ok(b))
+    image::anim_close(b)
+    // truncated: the frames that are there, then the end with an error (GIF: the cut frame's rows so far)
+    var c = image::anim_open(td("bad_truncated.gif"))
+    assert_true(image::anim_ok(c))
+    var n = 0
+    while image::anim_next(c) { n = n + 1 }
+    assert_eq(n, 2)
+    image::anim_close(c)
+    var d = image::anim_open(td("bad_truncated.png"))
+    n = 0
+    while image::anim_next(d) { n = n + 1 }
+    assert_eq(n, 2)
+    assert_true(image::anim_error(d).len() > 0)
+    image::anim_close(d)
+    var e = image::anim_open(td("bad_truncated.webp"))
+    n = 0
+    while image::anim_next(e) { n = n + 1 }
+    assert_eq(n, 2)
+    image::anim_close(e)
+    var f = image::anim_open(td("bad_truncated_lossy.webp"))
+    assert_false(image::anim_next(f))
+    assert_true(image::anim_error(f).len() > 0)
+    image::anim_close(f)
+    // sizes that lie: an APNG frame wider than its canvas is an error; a GIF frame wider than its data decodes
+    // what the data holds, clipped to the canvas: neither reads or writes outside a buffer
+    var g = image::anim_open(td("bad_lying.png"))
+    n = 0
+    while image::anim_next(g) { n = n + 1 }
+    assert_eq(n, 1)
+    image::anim_close(g)
+    var h = image::anim_open(td("bad_lying.gif"))
+    n = 0
+    while image::anim_next(h) { n = n + 1 }
+    assert_eq(n, 5)
+    image::anim_close(h)
+    // not a picture at all, and nothing
+    var i = image::anim_open("GIF89a")
+    assert_false(image::anim_ok(i))
+    image::anim_close(i)
+    var j = image::anim_open("")
+    assert_false(image::anim_ok(j))
+    image::anim_close(j)
+}

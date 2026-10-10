@@ -1,0 +1,13 @@
+[Icon Theme]
+Name=Hicolor (fixture)
+Directories=48x48/apps,scalable/apps;
+
+[48x48/apps]
+Size=48
+Type=Fixed
+
+[scalable/apps]
+Size=48
+Type=Scalable
+MinSize=8
+MaxSize=999

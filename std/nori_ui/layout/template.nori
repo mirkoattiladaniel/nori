@@ -1,0 +1,418 @@
+use core::*
+import "std/math" as math
+import "std/result" as result
+import "std/json" as json
+import "std/fmt" as fmt
+
+// ===========================================================================
+// `.ui` template rendering.
+//
+// `render_ui_template` replaces `{{var}}` placeholders and expands
+// `{{#foreach ITEM in LIST}}...{{/foreach}}` blocks (nesting supported).
+// The variable environment is string-valued parallel vecs (the same shape as
+// apply_binds); foreach lists are TemplateList records (each item = parallel
+// field keys/values), substituted as `{{ITEM.field}}`. `{{name}}` escapes the
+// value for a DSL quoted-string context; `{{raw:name}}` inserts it as-is.
+// A missing variable/list is an error (ok=false).
+// ===========================================================================
+
+/// one foreach item: parallel field keys/values (`{{ITEM.key}}` -> value).
+pub struct TemplateItem { keys: Vec<Str>, vals: Vec<Str> }
+pub fn template_item_new() -> TemplateItem {
+    var k: Vec<Str> = vec()
+    var v: Vec<Str> = vec()
+    return TemplateItem { keys: k, vals: v }
+}
+/// a named list for `{{#foreach ITEM in name}}`.
+pub struct TemplateList { name: Str, items: Vec<TemplateItem> }
+pub fn template_list_new(sink name: Str) -> TemplateList {
+    var it: Vec<TemplateItem> = vec()
+    return TemplateList { name: name, items: it }
+}
+/// the render outcome: `out` when ok, else `err` names the missing variable/list.
+pub struct TemplateResult { ok: Bool, out: Str, err: Str }
+
+/// true when `s` begins with `pfx`.
+fn tpl_starts(s: Str, pfx: Str) -> Bool {
+    if s.len() < pfx.len() { return false }
+    return (s.slice(0, pfx.len()) == pfx)
+}
+/// index of `needle` in `s` at/after `start`, or -1.
+fn tpl_find(s: Str, needle: Str, start: Int) -> Int {
+    var n = s.len()
+    var m = needle.len()
+    if m == 0 { return start }
+    var i = start
+    while i + m <= n {
+        if (s.slice(i, i + m) == needle) { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+/// escape a value for a DSL quoted-string context: backslash, quote, and newline/CR/tab.
+fn tpl_escape(v: Str) -> Str {
+    var out = ""
+    var i = 0
+    var n = v.len()
+    while i < n {
+        var c = ord(v.at(i))
+        if c == 92 { out = ((out + chr(92)) + chr(92)) }
+        else if c == 34 { out = ((out + chr(92)) + chr(34)) }
+        else if c == 10 { out = ((out + chr(92)) + "n") }
+        else if c == 13 { out = ((out + chr(92)) + "r") }
+        else if c == 9 { out = ((out + chr(92)) + "t") }
+        else { out = (out + v.slice(i, i + 1)) }
+        i = i + 1
+    }
+    return out
+}
+fn tpl_env_get(ids: Vec<Str>, vals: Vec<Str>, name: Str, inout found: Vec<Int>) -> Str {
+    var i = 0
+    while i < ids.len() { if (ids[i] == name) { found[0] = 1  return copy vals[i] }  i = i + 1 }
+    found[0] = 0
+    return ""
+}
+
+/// substitute simple `{{name}}` / `{{raw:name}}` placeholders (no foreach handling).
+fn tpl_substitute(template: Str, ids: Vec<Str>, vals: Vec<Str>) -> TemplateResult {
+    var out = ""
+    var pos = 0
+    var n = template.len()
+    while pos < n {
+        var open = tpl_find(template, "{{", pos)
+        if open < 0 { out = (out + template.slice(pos, n))  return TemplateResult { ok: true, out: out, err: "" } }
+        out = (out + template.slice(pos, open))
+        var close = tpl_find(template, "}}", open + 2)
+        if close < 0 { out = (out + template.slice(open, n))  return TemplateResult { ok: true, out: out, err: "" } }
+        var key = nui_trim(template.slice(open + 2, close))
+        // stray foreach control tags pass through untouched (not expected to occur)
+        if tpl_starts(key, "#") || tpl_starts(key, "/") {
+            out = (out + template.slice(open, close + 2))
+            pos = close + 2
+        } else {
+            var raw = false
+            if tpl_starts(key, "raw:") { raw = true  key = nui_trim(key.slice(4, key.len())) }
+            var found: Vec<Int> = vec()
+            found.push(0)
+            var v = tpl_env_get(ids, vals, key, found)
+            if found[0] == 0 { return TemplateResult { ok: false, out: "", err: ("missing template variable: " + key) } }
+            if raw { out = (out + v) } else { out = (out + tpl_escape(v)) }
+            pos = close + 2
+        }
+    }
+    return TemplateResult { ok: true, out: out, err: "" }
+}
+
+/// the offset just past the matching `{{/foreach}}` for a block starting after an open tag, honoring
+/// nesting; returns -1 when unbalanced. (out: [block_end, resume_pos])
+fn tpl_matching_close(s: Str, start: Int, inout res: Vec<Int>) -> Bool {
+    var depth = 0
+    var pos = start
+    while true {
+        var nopen = tpl_find(s, "{{#foreach ", pos)
+        var nclose = tpl_find(s, "{{/foreach}}", pos)
+        if nclose < 0 { return false }
+        if nopen >= 0 && nopen < nclose { depth = depth + 1  pos = nopen + 11 }
+        else {
+            if depth == 0 { res[0] = nclose  res[1] = nclose + 12  return true }
+            depth = depth - 1
+            pos = nclose + 12
+        }
+    }
+    return false
+}
+
+/// expand `{{#foreach ITEM in LIST}}...{{/foreach}}` blocks (recursively), then leave simple
+/// placeholders for the caller's substitution pass.
+fn tpl_expand_foreach(template: Str, ids: Vec<Str>, vals: Vec<Str>, lists: Vec<TemplateList>) -> TemplateResult {
+    var out = ""
+    var pos = 0
+    var n = template.len()
+    while true {
+        var tag = tpl_find(template, "{{#foreach ", pos)
+        if tag < 0 { out = (out + template.slice(pos, n))  return TemplateResult { ok: true, out: out, err: "" } }
+        out = (out + template.slice(pos, tag))
+        var hdr_end = tpl_find(template, "}}", tag + 11)
+        if hdr_end < 0 { return TemplateResult { ok: false, out: "", err: "foreach: unclosed tag" } }
+        var header = nui_trim(template.slice(tag + 11, hdr_end))
+        var insep = tpl_find(header, " in ", 0)
+        if insep < 0 { return TemplateResult { ok: false, out: "", err: ("foreach: expected ITEM in LIST, got " + header) } }
+        var item_name = nui_trim(header.slice(0, insep))
+        var list_name = nui_trim(header.slice(insep + 4, header.len()))
+        var body_start = hdr_end + 2
+        var res: Vec<Int> = vec()
+        res.push(0)
+        res.push(0)
+        if !tpl_matching_close(template, body_start, res) { return TemplateResult { ok: false, out: "", err: "foreach: missing close tag" } }
+        var block = template.slice(body_start, res[0])
+        pos = res[1]
+        // find the list
+        var li = 0 - 1
+        var k = 0
+        while k < lists.len() { if (lists[k].name == list_name) { li = k }  k = k + 1 }
+        if li < 0 { return TemplateResult { ok: false, out: "", err: ("foreach: list not found: " + list_name) } }
+        var items = lists[li].items
+        var e = 0
+        while e < items.len() {
+            // item env = base env + ITEM.field entries
+            var eids: Vec<Str> = vec()
+            var evals: Vec<Str> = vec()
+            var b = 0
+            while b < ids.len() { eids.push(copy ids[b])  evals.push(copy vals[b])  b = b + 1 }
+            var f = 0
+            while f < items[e].keys.len() { eids.push((item_name + ("." + items[e].keys[f])))  evals.push(copy items[e].vals[f])  f = f + 1 }
+            var inner = tpl_expand_foreach(block, eids, evals, lists)     // nested loops see the item env
+            if !inner.ok { return inner }
+            var subd = tpl_substitute(inner.out, eids, evals)
+            if !subd.ok { return subd }
+            out = (out + subd.out)
+            e = e + 1
+        }
+    }
+    return TemplateResult { ok: true, out: out, err: "" }
+}
+
+/// render a `.ui` template: expand foreach blocks, then substitute `{{name}}` (string-escaped) and
+/// `{{raw:name}}` (as-is) from the parallel (ids, vals) environment.
+pub fn render_ui_template(template: Str, var_ids: Vec<Str>, var_vals: Vec<Str>, lists: Vec<TemplateList>) -> TemplateResult {
+    var expanded = tpl_expand_foreach(template, var_ids, var_vals, lists)
+    if !expanded.ok { return expanded }
+    return tpl_substitute(expanded.out, var_ids, var_vals)
+}
+
+
+// ===========================================================================
+// JSON-valued template environment.
+//
+// `render_ui_template_json` takes the environment as a `Json` object instead of
+// parallel string vecs. A placeholder key is a dotted path walked through the
+// tree (`{{a.b.c}}`), and `{{#foreach ITEM in a.b}}` iterates the array a JSON
+// path resolves to, binding ITEM to each element so `{{ITEM.field}}`,
+// `{{ITEM.x.y}}` ... resolve to arbitrary depth.
+//
+// An alternative keeps the environment flat and binds a loop with
+// one entry per field under the literal key `"ITEM.field"`; a dotted path there
+// is a flat key that happens to contain dots. Walking the tree resolves every
+// path that flat-key lookup resolves, plus the deeper ones flat keys cannot
+// name; see the notes on `tplj_bind` for the one shadowing case where the two
+// models differ.
+// ===========================================================================
+
+// ---- number rendering ------------------------------------------------------
+// An integer prints as an integer, and a non-integral number prints as the
+// shortest round-tripping decimal (`0.1`, not `0.10000000000000001`). Nori's
+// `Json` keeps every number as one Float, so the int/float tag is gone; an
+// integral value therefore prints in integer form and a fractional one gets the
+// shortest decimal that reads back as the same double. Nori's own `"" + f` is a
+// six-significant-digit %g and would turn 3.00000001 into "3", which is why
+// this exists.
+
+/// render a JSON number: integral values in integer form, others as the shortest decimal that
+/// reads back as the same double.
+///
+/// This forwards to `std/fmt::float_json`. `null` is printed for NaN/inf, and the scientific
+/// form is used when the decimal exponent `e < -5 || e >= 17`. Negative zero renders `-0`.
+pub fn tpl_format_number(x: Float) -> Str { return fmt::float_json(x) }
+
+// ---- value -> token --------------------------------------------------------
+
+/// compact JSON text for a value, using `tpl_format_number` for numbers.
+fn tplj_stringify(v: Json) -> Str {
+    match v {
+        Json::JsNull => { return "null" }
+        Json::JsBool(b) => { if b { return "true" }  return "false" }
+        Json::JsNum(n) => { return tpl_format_number(n) }
+        Json::JsStr(s) => { return chr(34) + (json::js_escape(s) + chr(34)) }
+        Json::JsArr(a) => {
+            var out = "["
+            var i = 0
+            while i < a.len() { if i > 0 { out = out + "," }  out = out + tplj_stringify(a[i])  i = i + 1 }
+            return out + "]"
+        }
+        Json::JsObj(es) => {
+            var out = "{"
+            var i = 0
+            while i < es.len() {
+                if i > 0 { out = out + "," }
+                out = out + (chr(34) + (json::js_escape(json::entry_key(es[i])) + (chr(34) + ":")))
+                out = out + tplj_stringify(json::entry_val(es[i]))
+                i = i + 1
+            }
+            return out + "}"
+        }
+    }
+}
+/// the text a `{{name}}` (raw=false, strings escaped for a DSL string) or `{{raw:name}}` placeholder
+/// expands to: null is empty, numbers/bools print bare, and
+/// arrays/objects print as their JSON text in both forms (they are never string-escaped).
+pub fn tpl_json_token(v: Json, raw: Bool) -> Str {
+    match v {
+        Json::JsStr(s) => { if raw { return copy s }  return tpl_escape(s) }
+        Json::JsNum(n) => { return tpl_format_number(n) }
+        Json::JsBool(b) => { if b { return "true" }  return "false" }
+        Json::JsNull => { return "" }
+        Json::JsArr(a) => { return tplj_stringify(v) }
+        Json::JsObj(es) => { return tplj_stringify(v) }
+    }
+}
+
+// ---- dotted-path lookup ----------------------------------------------------
+
+/// one step of a path: the member `path[a, b)` of `cur`, with found[0] saying whether the key exists
+/// (a present member holding JSON null is found; an absent one is not).
+fn tplj_step(cur: Json, path: Str, a: Int, b: Int, inout found: Vec<Int>) -> view Json {
+    match cur {
+        Json::JsObj(es) => {
+            var seg = path.slice(a, b)
+            var hit = 0 - 1
+            var i = 0
+            while i < es.len() { if (json::entry_key(es[i]) == seg) { hit = i }  i = i + 1 }   // last duplicate key wins
+            if hit < 0 { found[0] = 0  return Json::JsNull }
+            found[0] = 1
+            return json::entry_val(es[hit])
+        }
+        Json::JsNull => { found[0] = 0  return Json::JsNull }
+        Json::JsBool(b) => { found[0] = 0  return Json::JsNull }
+        Json::JsNum(n) => { found[0] = 0  return Json::JsNull }
+        Json::JsStr(s) => { found[0] = 0  return Json::JsNull }
+        Json::JsArr(a) => { found[0] = 0  return Json::JsNull }
+    }
+}
+/// resolve a dotted path (`a`, `a.b`, `a.b.c`, ...) against a Json environment; found[0] = 1 on a hit.
+pub fn tpl_json_lookup(env: Json, path: Str, inout found: Vec<Int>) -> Json {
+    var cur = env
+    var start = 0
+    var n = path.len()
+    var going = true
+    while going {
+        var dot = tpl_find(path, ".", start)
+        var stop = n
+        if dot >= 0 { stop = dot }
+        cur = tplj_step(cur, path, start, stop, found)
+        if found[0] == 0 { return Json::JsNull }
+        if dot < 0 { going = false } else { start = dot + 1 }
+    }
+    found[0] = 1
+    return copy cur
+}
+/// the environment with `name` bound to `item` (shadowing any existing member of that name).
+///
+/// A flat-environment design instead inserts one flat `"ITEM.field"` key per field of the element, so an inner
+/// loop reusing an outer loop's item name leaves the outer item's other fields reachable. Binding
+/// the name itself shadows the whole subtree, which is ordinary lexical scoping; it differs from
+/// that design only when two nested loops share an item name and the inner body reads a field the
+/// inner element does not have.
+fn tplj_bind(env: Json, name: Str, item: Json) -> Json {
+    var out: Vec<json::Entry> = vec()
+    match env {
+        Json::JsObj(es) => {
+            var i = 0
+            while i < es.len() { if !(json::entry_key(es[i]) == name) { out.push(copy es[i]) }  i = i + 1 }
+        }
+        Json::JsNull => { }
+        Json::JsBool(b) => { }
+        Json::JsNum(n) => { }
+        Json::JsStr(s) => { }
+        Json::JsArr(a) => { }
+    }
+    out.push(json::Entry { key: copy name, val: copy item })
+    return Json::JsObj(out)
+}
+
+// ---- the two passes --------------------------------------------------------
+
+/// substitute `{{name}}` / `{{raw:name}}` from a Json environment. `strict` picks one of two
+/// behaviours for an unresolved key: the top-level pass errors (`render_ui_template`), the per-item
+/// pass leaves the placeholder in place (`substitute_simple`) so the top-level pass reports it.
+fn tplj_substitute(template: Str, env: Json, strict: Bool) -> TemplateResult {
+    var out = ""
+    var pos = 0
+    var n = template.len()
+    while pos < n {
+        var open = tpl_find(template, "{{", pos)
+        if open < 0 { out = (out + template.slice(pos, n))  return TemplateResult { ok: true, out: out, err: "" } }
+        out = (out + template.slice(pos, open))
+        var close = tpl_find(template, "}}", open + 2)
+        if close < 0 { out = (out + template.slice(open, n))  return TemplateResult { ok: true, out: out, err: "" } }
+        var key = nui_trim(template.slice(open + 2, close))
+        if tpl_starts(key, "#") || tpl_starts(key, "/") {
+            out = (out + template.slice(open, close + 2))
+            pos = close + 2
+        } else {
+            var raw = false
+            if tpl_starts(key, "raw:") { raw = true  key = nui_trim(key.slice(4, key.len())) }
+            var found: Vec<Int> = vec()
+            found.push(0)
+            var v = tpl_json_lookup(env, key, found)
+            if found[0] == 0 {
+                if strict { return TemplateResult { ok: false, out: "", err: ("missing template variable: " + key) } }
+                out = (out + template.slice(open, close + 2))
+            } else { out = (out + tpl_json_token(v, raw)) }
+            pos = close + 2
+        }
+    }
+    return TemplateResult { ok: true, out: out, err: "" }
+}
+
+/// expand `{{#foreach ITEM in PATH}}...{{/foreach}}` blocks over a Json environment (recursively).
+fn tplj_expand_foreach(template: Str, env: Json) -> TemplateResult {
+    var out = ""
+    var pos = 0
+    var n = template.len()
+    var q = "" + chr(34)
+    while true {
+        var tag = tpl_find(template, "{{#foreach ", pos)
+        if tag < 0 { out = (out + template.slice(pos, n))  return TemplateResult { ok: true, out: out, err: "" } }
+        out = (out + template.slice(pos, tag))
+        var hdr_end = tpl_find(template, "}}", tag + 11)
+        if hdr_end < 0 { return TemplateResult { ok: false, out: "", err: "missing template variable: foreach: unclosed {{ tag" } }
+        var header = nui_trim(template.slice(tag + 11, hdr_end))
+        var insep = tpl_find(header, " in ", 0)
+        if insep < 0 { return TemplateResult { ok: false, out: "", err: ((("missing template variable: foreach: expected 'ITEM in ARRAY', got " + q) + header) + q) } }
+        var item_name = nui_trim(header.slice(0, insep))
+        var list_path = nui_trim(header.slice(insep + 4, header.len()))
+        var body_start = hdr_end + 2
+        var res: Vec<Int> = vec()
+        res.push(0)
+        res.push(0)
+        if !tpl_matching_close(template, body_start, res) { return TemplateResult { ok: false, out: "", err: "missing template variable: foreach: missing {{/foreach}}" } }
+        var block = template.slice(body_start, res[0])
+        pos = res[1]
+        var found: Vec<Int> = vec()
+        found.push(0)
+        var lv = tpl_json_lookup(env, list_path, found)
+        var items: Vec<Json> = vec()
+        var is_arr = false
+        match lv {
+            Json::JsArr(a) => { is_arr = true  items = a }
+            Json::JsNull => { }
+            Json::JsBool(b) => { }
+            Json::JsNum(m) => { }
+            Json::JsStr(s) => { }
+            Json::JsObj(es) => { }
+        }
+        if found[0] == 0 || !is_arr {
+            return TemplateResult { ok: false, out: "", err: ((("missing template variable: foreach: array variable " + q) + list_path) + (q + " not found or not an array")) }
+        }
+        var e = 0
+        while e < items.len() {
+            var ienv = tplj_bind(env, item_name, items[e])
+            var inner = tplj_expand_foreach(block, ienv)             // nested loops see the item binding
+            if !inner.ok { return inner }
+            var subd = tplj_substitute(inner.out, ienv, false)       // unresolved keys stay for the top-level pass
+            if !subd.ok { return subd }
+            out = (out + subd.out)
+            e = e + 1
+        }
+    }
+    return TemplateResult { ok: true, out: out, err: "" }
+}
+
+/// render a `.ui` template against a JSON environment: expand `{{#foreach ITEM in PATH}}` blocks,
+/// then substitute `{{path}}` (strings escaped for a DSL string) and `{{raw:path}}` (as-is). Keys
+/// are dotted paths into the tree.
+pub fn render_ui_template_json(template: Str, env: Json) -> TemplateResult {
+    var expanded = tplj_expand_foreach(template, env)
+    if !expanded.ok { return expanded }
+    return tplj_substitute(expanded.out, env, true)
+}

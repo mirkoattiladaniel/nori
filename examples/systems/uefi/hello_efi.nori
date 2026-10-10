@@ -1,0 +1,40 @@
+// hello_efi.nori, the smallest Nori UEFI application: prints to the firmware console and returns.
+// Built with `noric --build hello_efi.nori BOOTX64.EFI --uefi`, put on the ESP as EFI/BOOT/BOOTX64.EFI,
+// and booted under OVMF.
+//
+// The entry is the UEFI floor's EfiMain: firmware calls it as
+// `EfiMain(ImageHandle, SystemTable)` under the Microsoft x64 calling convention. The floor sets up
+// this image's thread-locals, seeds the runtime's argc/argv, runs `main`, and returns its code to the
+// firmware as an EFI_STATUS. printl goes through the runtime to the floor, which writes the string to
+// SystemTable->ConOut->OutputString (a real firmware call), which puts it on the firmware console and,
+// under `-serial stdio`, on the terminal.
+//
+// The full heap-backed language runs on the floor's Boot-Services pool: Vec, Map, Str + and Float all
+// work, as they do on the bare floor's bump heap.
+
+fn main() -> Int {
+    printl("")
+    printl("hello from Nori on UEFI")
+    printl("===============================")
+    let who = "the firmware console"
+    printl("noric built this, and it boots on " + who)
+
+    var primes: Vec<Int> = vec()
+    var n = 2
+    while primes.len() < 8 {
+        var isp = true
+        var d = 2
+        while d * d <= n { if n % d == 0 { isp = false }  d = d + 1 }
+        if isp { primes.push(n) }
+        n = n + 1
+    }
+    var line = "first 8 primes:"
+    var i = 0
+    while i < primes.len() { line = line + " " + to_str(primes[i])  i = i + 1 }
+    printl(line)
+
+    printl("floats too: 6.25 * 4.0 = " + to_str(6.25 * 4.0))
+
+    printl("UEFI: all systems go")
+    return 0
+}

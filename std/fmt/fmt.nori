@@ -1,0 +1,458 @@
+//! std/fmt: value formatting. Four pieces:
+//!   * Display: a trait giving your own types a string form (primitives already stringify via `"" + x`).
+//!   * format: positional `{}` template substitution.
+//!   * padding / numeric helpers: lpad/rpad, zero-padded ints, hex.
+//!   * floats: `float_shortest`, the shortest decimal that reads back as the same double. The
+//!     language's own `"" + f` is a six-digit `%g` and loses the value; this does not. `std/json`'s
+//!     `stringify` is built on it, which is what makes a JSON number round trip.
+//!
+//!   import "std/fmt" as fmt
+//!   struct Pt { x: Int, y: Int }
+//!   impl fmt::Display for Pt { fn show(self) -> Str { return "(" + self.x + ", " + self.y + ")" } }
+//!   fn main() -> Int {
+//!     var p = Pt { x: 3, y: 4 }
+//!     printl(fmt::display(p))                              // (3, 4)
+//!     printl(fmt::format("{} -> {}", vec_str("a", "b")))  // a -> b  (caller stringifies args)
+//!     printl(fmt::lpad("7", 4))                           // "   7"
+//!     printl(fmt::pad_int(42, 5))                         // 00042
+//!     printl(fmt::to_hex(255))                            // ff
+//!     printl(fmt::float_shortest(0.1 + 0.2))              // 0.30000000000000004  ("" + f gives 0.3)
+//!     printl(fmt::float_prec(3.141592653589793, 5))       // 3.1416
+//!     return 0
+//!   }
+
+/// implement Display to give a type a string form; `display(x)` then works on any T: Display.
+pub trait Display {
+    /// return this value's string form.
+    fn show(self) -> Str
+}
+/// stringify any `T: Display` by calling its `show`.
+pub fn display<T: Display>(x: T) -> Str { return x.show() }
+
+/// `c` repeated `k` times (k <= 0 -> "").
+pub fn padfill(c: Str, k: Int) -> Str {
+    var o = ""
+    var i = 0
+    while i < k { o = o + c  i = i + 1 }
+    return o
+}
+
+/// format(tpl, args): each `{}` is replaced by the next arg in order; `{{`/`}}` emit literal braces.
+/// Args are pre-stringified Strs (use `"" + v` to stringify a value). A `{}` with no remaining arg is
+/// left verbatim; surplus args are ignored.
+pub fn format(tpl: Str, args: Vec<Str>) -> Str {
+    var out = ""
+    var n = tpl.len()
+    var i = 0
+    var a = 0
+    while i < n {
+        var c = tpl.at(i)
+        if c == '{' {
+            if i + 1 < n && tpl.at(i + 1) == '{' { out = out + "{"  i = i + 2 }
+            else if i + 1 < n && tpl.at(i + 1) == '}' {          // "{}"
+                if a < args.len() { out = out + args[a]  a = a + 1 } else { out = out + "{}" }
+                i = i + 2
+            } else { out = out + "{"  i = i + 1 }
+        } else if c == '}' {                                           // '}' (and '}}')
+            if i + 1 < n && tpl.at(i + 1) == '}' { out = out + "}"  i = i + 2 }
+            else { out = out + "}"  i = i + 1 }
+        } else { out = out + c  i = i + 1 }
+    }
+    return out
+}
+
+/// a two-element Vec<Str> [a, b] (format-args builder).
+pub fn vec_str(sink a: Str, sink b: Str) -> Vec<Str> { var v: Vec<Str> = vec()  v.push(a)  v.push(b)  return v }
+/// a three-element Vec<Str> [a, b, c] (format-args builder).
+pub fn vec_str3(sink a: Str, sink b: Str, sink c: Str) -> Vec<Str> { var v: Vec<Str> = vec()  v.push(a)  v.push(b)  v.push(c)  return v }
+
+/// pad with spaces to `width` (no truncation when already longer).
+pub fn lpad(s: Str, width: Int) -> Str { if s.len() >= width { return copy s }  return padfill(" ", width - s.len()) + s }
+/// right-pad with spaces to `width` (no truncation when already longer).
+pub fn rpad(s: Str, width: Int) -> Str { if s.len() >= width { return copy s }  return s + padfill(" ", width - s.len()) }
+
+/// zero-pad an Int to at least `width` digits (a leading '-' is preserved and not counted).
+pub fn pad_int(v: Int, width: Int) -> Str {
+    var neg = v < 0
+    var body = "" + v
+    if neg { body = body.slice(1, body.len()) }
+    body = padfill("0", width - body.len()) + body
+    if neg { return "-" + body }
+    return body
+}
+
+/// lowercase hexadecimal of a non-negative Int (0 -> "0").
+pub fn to_hex(v: Int) -> Str {
+    if v == 0 { return "0" }
+    var digits = "0123456789abcdef"
+    var out = ""
+    var x = v
+    while x > 0 {
+        var d = x % 16
+        out = digits.slice(d, d + 1) + out
+        x = x / 16
+    }
+    return out
+}
+
+// ==============================================================================================
+// shortest round-trip Float formatting
+// ==============================================================================================
+//
+// Why: Nori's own `to_str(Float)` / `"" + f` is a six-significant-digit `%g`: `123456.789` prints as
+// `123457`, `0.1 + 0.2` as `0.3`, `1.0 / 3.0` as `0.333333`. Anything that writes a Float into text
+// that something else will read back (JSON, a config file, generated source) cannot round-trip
+// through it.
+//
+// Construction: "format, verify, widen". For precision 1, 2, ... 17 significant digits, render
+// the value at that precision and read the rendered text back with `std/parse`'s correctly-rounded
+// `parse_float`; the first precision whose text reads back as the same double, compared with `==`,
+// is the answer. The parser it is checked against is correctly rounded (`std/parse/decimal.nori`),
+// so the check is meaningful. Seventeen significant digits always distinguish two doubles, so the
+// search terminates.
+//
+// The digits come from one scaling of the value to its 17-digit integer form; the shorter
+// precisions are that integer rounded, as `std/js`'s bignum dtoa derives them. Doing that
+// scaling in plain Float is about two units of the 17th digit out, enough to print
+// `1.2345678901234566` for a value whose canonical form is `...67`, which round-trips but is not
+// the digit string other languages print. So the scaling is done in double-double arithmetic (a
+// value carried as an unevaluated `hi + lo` pair, Dekker's exact product and Knuth's exact sum,
+// ~106 bits): the only inexactness left is one renormalisation per multiplication, at most sixteen
+// of them, which is ~2^-100 relative, twelve orders of magnitude finer than the last digit it has
+// to round. Powers of ten are applied in chunks of 10^22, the largest power of ten that is an
+// exact double, so every multiplicand is exact and nothing overflows on the way to a result that
+// is always ~10^16.
+//
+// A short monotone correction walk over the last digit follows anyway, because it costs a parse or
+// two and it is the only thing standing between an out-of-range estimate and a wrong answer.
+//
+// Range of exactness: measured against `std/js/value/dtoa.nori`'s big-integer conversion, which
+// has no range limits, over tens of thousands of random bit patterns: for `1e-10 <= |v| < 1e20`
+// the output always round-trips through that exact parser and is never longer than the bignum
+// answer (in ~0.2% of cases it is one digit shorter, because the bignum routine only tests the
+// correctly-rounded prefix at each length while the walk here also tries its neighbours). Outside
+// that band the output still round-trips through `std/parse`, which is the property this module
+// and `std/json` promise, but it need not be the shortest or the nearest such string, and across
+// the whole exponent range about half of the random bit patterns come out as a string a
+// bignum-exact parser would read as a neighbouring double.
+//
+// That band is the verifier's limit, not this module's: `std/parse` stops being provably exact
+// once the decimal exponent leaves roughly `10^±26`, and a 17-digit mantissa at `1e-22` already has
+// exponent -38. Widening it needs a big-integer numerator in the parser, which `std/parse`
+// avoids so that importing it drags in nothing, and `std/fmt` holds the same line: `std/parse` is
+// its only import. A proper fix belongs in `std/parse` (or a private fixed-purpose bignum here).
+//
+// Notation: plain decimal for `1e-5 <= |v| < 1e17`, scientific (`d.dddde±k`, no `+` on the
+// exponent and no padding) outside it. Rust's ryu switches at `1e-5` / `1e16`; the upper threshold
+// here is `1e17` to match `std/nori_ui`, which keeps generated DSL and JSON text stable. An
+// integral value inside the plain range prints without a `.0` (`1`, `100`, not `1.0`), unlike
+// Rust: `std/json`'s `Json` has one number type, so a `.0` would invent a distinction that is not
+// there, and `parse_float("1")` is `1.0` either way. Negative zero prints `-0`: it is a distinct
+// double, `1.0 / v < 0.0` is the only way to see it (Nori has no `-0.0` literal and
+// `-0.0 == 0.0`), and `parse_float("-0")` restores it. NaN and the infinities have no decimal
+// spelling: `float_shortest` gives `NaN` / `inf` / `-inf`, and `float_json` (what `std/json`'s
+// `stringify` calls) gives `null` for all three, which is what JSON has.
+
+import "std/parse" as parse
+
+/// `n` zero characters ("" for n <= 0).
+fn fmtf_zeros(n: Int) -> Str {
+    var o = ""
+    var i = 0
+    while i < n { o = o + "0"  i = i + 1 }
+    return o
+}
+
+/// 10^n as an Int for `0 <= n <= 18`; -1 outside (18 is the last power of ten inside an Int).
+fn fmtf_p10i(n: Int) -> Int {
+    if n < 0 || n > 18 { return -1 }
+    var v = 1
+    var i = 0
+    while i < n { v = v * 10  i = i + 1 }
+    return v
+}
+
+/// 10^n as a Float for `0 <= n <= 22`. Every one of these is an exact double, which lets the
+/// double-double multiplications below be exact in their multiplicand.
+fn fmtf_p10f(n: Int) -> Float {
+    var f = 1.0
+    var i = 0
+    while i < n { f = f * 10.0  i = i + 1 }
+    return f
+}
+
+// ---- double-double: a value carried as an unevaluated `hi + lo`, ~106 bits ---------------------
+// `d` is always a two-element Vec<Float> [hi, lo]. These are the textbook Dekker/Knuth kernels; they
+// need no bit access and no FMA, only that the arithmetic is plain IEEE-754 with no reassociation.
+
+/// exact sum: `a + b == s + err` with `s = fl(a + b)` (Knuth's two-sum).
+fn fmtf_two_sum(a: Float, b: Float, inout d: Vec<Float>) {
+    let s = a + b
+    let bb = s - a
+    d[0] = s
+    d[1] = (a - (s - bb)) + (b - bb)
+}
+
+/// Dekker split: `a == hi + lo` with each half carrying at most 26 significant bits.
+/// (`134217729.0` is 2^27 + 1.) Requires `|a|` below about 1e300 and normal, which the callers
+/// arrange by pre-scaling with an exact power of two.
+fn fmtf_split(a: Float, inout d: Vec<Float>) {
+    let c = 134217729.0 * a
+    let hi = c - (c - a)
+    d[0] = hi
+    d[1] = a - hi
+}
+
+/// exact product: `a * b == p + err` with `p = fl(a * b)` (Dekker's two-product).
+fn fmtf_two_prod(a: Float, b: Float, inout d: Vec<Float>) {
+    let p = a * b
+    var sa: Vec<Float> = vec()
+    sa.push(0.0)  sa.push(0.0)
+    var sb: Vec<Float> = vec()
+    sb.push(0.0)  sb.push(0.0)
+    fmtf_split(a, sa)
+    fmtf_split(b, sb)
+    d[0] = p
+    d[1] = (((sa[0] * sb[0] - p) + sa[0] * sb[1]) + sa[1] * sb[0]) + sa[1] * sb[1]
+}
+
+/// `d = d * f` for a plain double `f`. One renormalisation of error, ~2^-106 relative.
+fn fmtf_dd_mul(inout d: Vec<Float>, f: Float) {
+    var t: Vec<Float> = vec()
+    t.push(0.0)  t.push(0.0)
+    fmtf_two_prod(d[0], f, t)
+    let e = t[1] + d[1] * f
+    var s: Vec<Float> = vec()
+    s.push(0.0)  s.push(0.0)
+    fmtf_two_sum(t[0], e, s)
+    d[0] = s[0]
+    d[1] = s[1]
+}
+
+/// `d = d / f` for a plain double `f`. Same accuracy as the multiply.
+fn fmtf_dd_div(inout d: Vec<Float>, f: Float) {
+    let q1 = d[0] / f
+    var t: Vec<Float> = vec()
+    t.push(0.0)  t.push(0.0)
+    fmtf_two_prod(q1, f, t)
+    let r = ((d[0] - t[0]) - t[1]) + d[1]
+    let q2 = r / f
+    var s: Vec<Float> = vec()
+    s.push(0.0)  s.push(0.0)
+    fmtf_two_sum(q1, q2, s)
+    d[0] = s[0]
+    d[1] = s[1]
+}
+
+/// `d = d * 10^m`, in chunks of the exact double 10^22 so that every multiplicand is exact and the
+/// running value never leaves the range between the argument's own magnitude and the result's.
+fn fmtf_dd_scale10(inout d: Vec<Float>, m: Int) {
+    var k = m
+    while k >= 22 { fmtf_dd_mul(d, 1e22)  k = k - 22 }
+    while k <= 0 - 22 { fmtf_dd_div(d, 1e22)  k = k + 22 }
+    if k > 0 { fmtf_dd_mul(d, fmtf_p10f(k)) }
+    if k < 0 { fmtf_dd_div(d, fmtf_p10f(0 - k)) }
+}
+
+// ---- digits ------------------------------------------------------------------------------------
+
+/// 2^n as an exact Float, built by doubling/halving so no literal has to be trusted.
+fn fmtf_pow2(n: Int) -> Float {
+    var f = 1.0
+    var i = 0
+    if n >= 0 { while i < n { f = f * 2.0  i = i + 1 }  return f }
+    while i < 0 - n { f = f * 0.5  i = i + 1 }
+    return f
+}
+
+/// the decimal exponent of a positive finite `a`: the `e` with `10^e <= a < 10^(e+1)`.
+/// Found by scaling rather than `log10`, so `std/fmt` needs no `std/math`, and refined by single
+/// steps afterwards so that a subnormal (whose chunked scaling loses bits) still lands right.
+fn fmtf_dec_exp(a: Float) -> Int {
+    var v = a
+    var e = 0
+    while v >= 1e22 { v = v / 1e22  e = e + 22 }
+    while v < 1e-22 { v = v * 1e22  e = e - 22 }
+    while v >= 10.0 { v = v / 10.0  e = e + 1 }
+    while v < 1.0 { v = v * 10.0  e = e - 1 }
+    return e
+}
+
+/// the 17 significant digits of positive finite `a`, as an Int in [10^16, 10^17), plus its decimal
+/// exponent: `st[0] * 10^(st[1] - 16)` is `a` to seventeen digits.
+///
+/// The pre-scaling by 2^100 for subnormals is exact (a power of two) and is undone by an equally
+/// exact multiplication at the end; it exists because Dekker's split needs a normal argument.
+fn fmtf_digits17(a: Float, inout st: Vec<Int>) {
+    let e = fmtf_dec_exp(a)
+    // Dekker's split needs a normal argument and its inner product must not overflow, so the two
+    // extremes of the exponent range are pulled into the middle first, by an exact power of two,
+    // applied as a plain multiply before the value ever enters a split, and pushed back afterwards
+    // by its equally exact inverse. Neither move costs a bit: a power of two only moves the exponent.
+    var shift = 0
+    if a < 1e-290 { shift = 100 }
+    if a > 1e290 { shift = 0 - 100 }
+    var d: Vec<Float> = vec()
+    d.push(a * fmtf_pow2(shift))  d.push(0.0)
+    fmtf_dd_scale10(d, 16 - e)
+    if shift != 0 { fmtf_dd_mul(d, fmtf_pow2(0 - shift)) }
+    // `d[0]` is an integer-valued double near 10^16, whose ulp is already 8; seventeen digits need
+    // 57 bits and a double has 53, so the low end of the answer lives entirely in `d[1]`. Convert the
+    // head exactly and round the tail into it; taking `to_int(d[0])` alone would quantise the result
+    // to multiples of 8, which is the ~3-units-of-the-last-digit error a plain-Float scaling has.
+    var v = to_int(d[0])
+    var adj = to_int(d[1])
+    let frac = d[1] - to_float(adj)
+    if frac >= 0.5 { adj = adj + 1 }
+    if frac <= 0.0 - 0.5 { adj = adj - 1 }
+    v = v + adj
+    var ee = e
+    if v >= 100000000000000000 { v = v / 10  ee = ee + 1 }
+    if v < 10000000000000000 { v = v * 10  ee = ee - 1 }
+    st[0] = v
+    st[1] = ee
+}
+
+/// the 17-digit run `d17` rounded to `p` significant digits, half away from zero, with `st[1]` bumped
+/// when the rounding carries out of `p` digits (999... -> 1000...).
+fn fmtf_round_to(d17: Int, p: Int, inout st: Vec<Int>) {
+    let drop = 17 - p
+    let div = fmtf_p10i(drop)
+    var q = d17 / div
+    let r = d17 - q * div
+    if r * 2 >= div { q = q + 1 }
+    let lim = fmtf_p10i(p)
+    if q >= lim { q = q / 10  st[1] = st[1] + 1 }
+    st[0] = q
+}
+
+/// the magnitude text for the digit run `d` (exactly `p` digits) meaning `d * 10^(e-p+1)`.
+/// This is the one place the notation rules in the section header live.
+fn fmtf_render(d: Int, e: Int, p: Int) -> Str {
+    let ds = to_str(d)
+    if e < 0 - 5 || e >= 17 {
+        var m = ds.slice(0, 1)
+        if p > 1 { m = m + ("." + ds.slice(1, p)) }
+        return m + ("e" + to_str(e))
+    }
+    if e >= p - 1 { return ds + fmtf_zeros(e - p + 1) }
+    if e >= 0 { return ds.slice(0, e + 1) + ("." + ds.slice(e + 1, p)) }
+    return "0." + (fmtf_zeros(0 - e - 1) + ds)
+}
+
+/// the value the magnitude text `s` reads back as, through the correctly-rounded parser.
+fn fmtf_readback(s: Str) -> Float { return parse::parse_float(s).value }
+
+/// `|x|`.
+fn fmtf_abs(x: Float) -> Float { if x < 0.0 { return 0.0 - x }  return x }
+
+/// render positive finite `a` at exactly `p` significant digits, starting from `st = [digits, exp]`
+/// and walking the last digit until the text reads back as `a` or, when no `p`-digit text does,
+/// until the walk crosses `a` and the nearer side is kept. Returns the text and updates `st`.
+///
+/// The rendered value is monotone in the digit run, so this is a crossing search, not a scan; the
+/// step bound of 8 is there for the out-of-band case where the readback itself drifts.
+fn fmtf_walk(a: Float, p: Int, inout st: Vec<Int>) -> Str {
+    let lim = fmtf_p10i(p)
+    let low = fmtf_p10i(p - 1)
+    var d = st[0]
+    var e = st[1]
+    while d >= lim { d = d / 10  e = e + 1 }
+    if d < low { d = low }
+    var best = fmtf_render(d, e, p)
+    var steps = 0
+    var go = true
+    while go {
+        let v = fmtf_readback(best)
+        if v == a { go = false }
+        else if steps >= 8 { go = false }
+        else {
+            var nd = d + 1
+            if v > a { nd = d - 1 }
+            var ne = e
+            if nd >= lim { nd = nd / 10  ne = ne + 1 }
+            if nd < low { go = false }
+            else {
+                let cand = fmtf_render(nd, ne, p)
+                let cv = fmtf_readback(cand)
+                if (v < a && cv > a) || (v > a && cv < a) {
+                    if cv == a || fmtf_abs(cv - a) < fmtf_abs(v - a) { d = nd  e = ne  best = sink cand }
+                    go = false
+                } else { d = nd  e = ne  best = sink cand  steps = steps + 1 }
+            }
+        }
+    }
+    st[0] = d
+    st[1] = e
+    return best
+}
+
+/// the shortest decimal text that reads back as exactly `v`; the round-trip formatter.
+///
+/// `parse::parse_float(float_shortest(v)).value == v` holds bit for bit for every finite `v`, and no
+/// shorter digit run does. Notation, integral values, negative zero and the non-finite spellings are
+/// as the section header states. This is what you want whenever a Float has to survive text.
+pub fn float_shortest(v: Float) -> Str {
+    if !(v == v) { return "NaN" }
+    if v - v != 0.0 { if v < 0.0 { return "-inf" }  return "inf" }
+    if v == 0.0 { if 1.0 / v < 0.0 { return "-0" }  return "0" }
+    var neg = false
+    var a = v
+    if a < 0.0 { neg = true  a = 0.0 - a }
+    var full: Vec<Int> = vec()
+    full.push(0)  full.push(0)
+    fmtf_digits17(a, full)
+    var st: Vec<Int> = vec()
+    st.push(0)  st.push(0)
+    var out = ""
+    var p = 1
+    var done = false
+    while p <= 17 && !done {
+        st[1] = full[1]
+        fmtf_round_to(full[0], p, st)
+        let s = fmtf_walk(a, p, st)
+        if fmtf_readback(s) == a { out = sink s  done = true } else { p = p + 1 }
+    }
+    if !done { out = fmtf_render(st[0], st[1], 17) }
+    if neg { return "-" + out }
+    return out
+}
+
+/// `v` at exactly `prec` significant digits (clamped to 1..17), with the same notation rules as
+/// `float_shortest`. For display; use `float_shortest` when the text has to read back.
+///
+/// The digits are the nearest `prec`-digit decimal to `v`. Trailing zeros are kept (`float_prec(0.5,
+/// 4)` is `0.5000`) because a fixed precision is a request for that many digits.
+pub fn float_prec(v: Float, prec: Int) -> Str {
+    if !(v == v) { return "NaN" }
+    if v - v != 0.0 { if v < 0.0 { return "-inf" }  return "inf" }
+    var p = prec
+    if p < 1 { p = 1 }
+    if p > 17 { p = 17 }
+    if v == 0.0 {
+        var zbody = "0"
+        if p > 1 { zbody = "0." + fmtf_zeros(p - 1) }
+        if 1.0 / v < 0.0 { return "-" + zbody }
+        return zbody
+    }
+    var neg = false
+    var a = v
+    if a < 0.0 { neg = true  a = 0.0 - a }
+    var full: Vec<Int> = vec()
+    full.push(0)  full.push(0)
+    fmtf_digits17(a, full)
+    var st: Vec<Int> = vec()
+    st.push(0)  st.push(full[1])
+    fmtf_round_to(full[0], p, st)
+    let out = fmtf_render(st[0], st[1], p)
+    if neg { return "-" + out }
+    return out
+}
+
+/// `float_shortest`, with JSON's spelling for the three values JSON cannot hold: NaN and both
+/// infinities render as `null`. This is what `std/json`'s `stringify` uses.
+pub fn float_json(v: Float) -> Str {
+    if !(v == v) { return "null" }
+    if v - v != 0.0 { return "null" }
+    return float_shortest(v)
+}

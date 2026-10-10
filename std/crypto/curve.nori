@@ -1,0 +1,246 @@
+// X25519 (RFC 7748): scalar multiplication on Curve25519, the key agreement used to
+// wrap a content key for someone and to give two nodes a shared secret without a certificate.
+//
+// Why it is here. Browsers get X25519 from WebCrypto (audited and constant-time), but code that
+// runs outside a browser, such as a node, has no equivalent: it could neither wrap a content key
+// for someone nor agree a key with another node. Both need this on the Nori side.
+//
+// Representation. A field element is 16 limbs of 16 bits (radix 2^16), held in i64. A limb product
+// is 32 bits and the widest sum of sixteen of them is about 36, so nothing here can overflow an
+// i64 and no 128-bit multiply is needed. The alternative packing (5 limbs of 51 bits) is faster
+// but would require one.
+//
+// Timing. The ladder runs a fixed 255 iterations and swaps with a mask rather than a branch, so
+// the sequence of operations does not depend on the scalar. Limb arithmetic is plain i64 work
+// with no table lookups, so there is no data-dependent memory access either. This does not
+// claim the compiler preserves that: constant time is a property of emitted code, and
+// nothing here verifies the emitted code.
+
+/// floor division by 2^16, written out rather than left to `>>`, because carry propagation here
+/// needs floor semantics on negative limbs, and the sign-bit behaviour of a shift is the
+/// kind of thing that is right on one target and silently wrong on the next.
+fn shr16(x: Int) -> Int {
+    if x >= 0 { return (x >> 16) }
+    return (0 - (((0 - x) + 65535) >> 16))
+}
+
+fn fe_zero() -> Vec<Int> {
+    var o: Vec<Int> = vec()
+    var i = 0
+    while i < 16 { o.push(0)  i = i + 1 }
+    return o
+}
+
+fn fe_one() -> Vec<Int> {
+    var o = fe_zero()
+    o[0] = 1
+    return o
+}
+
+/// a fresh copy: assigning a parameter would bind a view of the caller's element and every
+/// later write would reach back into it.
+fn fe_dup(a: Vec<Int>) -> Vec<Int> {
+    var o: Vec<Int> = vec()
+    var i = 0
+    while i < 16 { o.push(a[i])  i = i + 1 }
+    return o
+}
+
+fn fe_carry(inout o: Vec<Int>) {
+    var i = 0
+    while i < 16 {
+        let c = shr16(o[i])
+        o[i] = (o[i] - (c << 16))
+        if i < 15 { o[i + 1] = (o[i + 1] + c) } else { o[0] = (o[0] + (38 * c)) }
+        i = i + 1
+    }
+}
+
+fn fe_add(a: Vec<Int>, b: Vec<Int>) -> Vec<Int> {
+    var o: Vec<Int> = vec()
+    var i = 0
+    while i < 16 { o.push((a[i] + b[i]))  i = i + 1 }
+    return o
+}
+
+fn fe_sub(a: Vec<Int>, b: Vec<Int>) -> Vec<Int> {
+    var o: Vec<Int> = vec()
+    var i = 0
+    while i < 16 { o.push((a[i] - b[i]))  i = i + 1 }
+    return o
+}
+
+fn fe_mul(a: Vec<Int>, b: Vec<Int>) -> Vec<Int> {
+    var t: Vec<Int> = vec()
+    var i = 0
+    while i < 31 { t.push(0)  i = i + 1 }
+    i = 0
+    while i < 16 {
+        var j = 0
+        while j < 16 { t[i + j] = (t[i + j] + (a[i] * b[j]))  j = j + 1 }
+        i = i + 1
+    }
+    // fold the top half back in: 2^256 == 38 (mod 2^255 - 19)
+    i = 0
+    while i < 15 { t[i] = (t[i] + (38 * t[i + 16]))  i = i + 1 }
+    var o: Vec<Int> = vec()
+    i = 0
+    while i < 16 { o.push(t[i])  i = i + 1 }
+    fe_carry(o)
+    fe_carry(o)
+    return o
+}
+
+fn fe_sq(a: Vec<Int>) -> Vec<Int> { return fe_mul(a, a) }
+
+/// swap p and q when b is 1, with a mask, never a branch, so the scalar's bits do not steer
+/// control flow.
+fn fe_cswap(inout p: Vec<Int>, inout q: Vec<Int>, b: Int) {
+    let m = (0 - b)                    // 0 or -1, i.e. all bits
+    var i = 0
+    while i < 16 {
+        let t = (m & (p[i] ^ q[i]))
+        p[i] = (p[i] ^ t)
+        q[i] = (q[i] ^ t)
+        i = i + 1
+    }
+}
+
+/// a^(p-2) mod p, which is a^-1. The exponent's bit pattern is all ones except positions 2 and 4,
+/// so the chain is a plain square-and-multiply with two skips.
+fn fe_inv(a: Vec<Int>) -> Vec<Int> {
+    var c = fe_dup(a)
+    var i = 253
+    while i >= 0 {
+        c = fe_sq(c)
+        if !(i == 2 || i == 4) { c = fe_mul(c, a) }
+        i = i - 1
+    }
+    return c
+}
+
+fn fe_unpack(s: Str) -> Vec<Int> {
+    var o = fe_zero()
+    var i = 0
+    while i < 16 {
+        o[i] = (ord(s.at(2 * i)) + (ord(s.at((2 * i) + 1)) << 8))
+        i = i + 1
+    }
+    o[15] = (o[15] & 0x7fff)          // the top bit of a u-coordinate is ignored (RFC 7748)
+    return o
+}
+
+/// reduce fully and emit 32 little-endian bytes. The two conditional subtractions are what turn
+/// "congruent to" into "equal to"; without them the same value can pack two ways.
+fn fe_pack(n: Vec<Int>) -> Str {
+    var t = fe_dup(n)
+    fe_carry(t)
+    fe_carry(t)
+    fe_carry(t)
+    var j = 0
+    while j < 2 {
+        var m = fe_zero()
+        m[0] = (t[0] - 0xffed)
+        var i = 1
+        while i < 15 {
+            m[i] = ((t[i] - 0xffff) - (shr16(m[i - 1]) & 1))
+            m[i - 1] = (m[i - 1] & 0xffff)
+            i = i + 1
+        }
+        m[15] = ((t[15] - 0x7fff) - (shr16(m[14]) & 1))
+        let b = (shr16(m[15]) & 1)
+        m[14] = (m[14] & 0xffff)
+        fe_cswap(t, m, (1 - b))
+        j = j + 1
+    }
+    var out = ""
+    var i2 = 0
+    while i2 < 16 {
+        out = (out + chr((t[i2] & 255)))
+        out = (out + chr(((t[i2] >> 8) & 255)))
+        i2 = i2 + 1
+    }
+    return out
+}
+
+/// X25519: multiply the u-coordinate `upoint` by `scalar`. Both are 32 bytes; the answer is 32.
+/// Returns "" on a wrong length.
+///
+/// An all-zero result means the input point had small order and the shared secret is worthless.
+/// RFC 7748 leaves rejecting that to the caller, so `x25519_shared` below does it and this does
+/// not; the raw primitive stays raw.
+pub fn x25519(scalar: Str, upoint: Str) -> Str {
+    if scalar.len() != 32 { return "" }
+    if upoint.len() != 32 { return "" }
+
+    // clamp: clear the low three bits, clear the top bit, set the second-highest
+    var z: Vec<Int> = vec()
+    var i = 0
+    while i < 32 { z.push(ord(scalar.at(i)))  i = i + 1 }
+    z[0] = (z[0] & 248)
+    z[31] = ((z[31] & 127) | 64)
+
+    let x = fe_unpack(upoint)
+    var a = fe_one()
+    var b = fe_dup(x)
+    var c = fe_zero()
+    var d = fe_one()
+
+    var pos = 254
+    while pos >= 0 {
+        let bit = ((z[pos >> 3] >> (pos & 7)) & 1)
+        fe_cswap(a, b, bit)
+        fe_cswap(c, d, bit)
+        var e = fe_add(a, c)
+        a = fe_sub(a, c)
+        c = fe_add(b, d)
+        b = fe_sub(b, d)
+        d = fe_sq(e)
+        let f = fe_sq(a)
+        a = fe_mul(c, a)
+        c = fe_mul(b, e)
+        e = fe_add(a, c)
+        a = fe_sub(a, c)
+        b = fe_sq(a)
+        c = fe_sub(d, f)
+        var k = fe_zero()
+        // a24 = 121665 = 0x1DB41, which is seventeen bits and so does not fit one 16-bit limb:
+        // it is 0xdb41 in limb 0 plus a carry of 1 into limb 1. Dropping that second limb leaves
+        // 56129, which still produces a well-formed 32-byte answer for every input, but on the
+        // wrong curve. Only a known-answer test catches that.
+        k[0] = 0xdb41
+        k[1] = 1
+        a = fe_mul(c, k)
+        a = fe_add(a, d)
+        c = fe_mul(c, a)
+        a = fe_mul(d, f)
+        d = fe_mul(b, x)
+        b = fe_sq(e)
+        fe_cswap(a, b, bit)
+        fe_cswap(c, d, bit)
+        pos = pos - 1
+    }
+    return fe_pack(fe_mul(a, fe_inv(c)))
+}
+
+/// the public key for a private scalar: the scalar times the base point, u = 9.
+pub fn x25519_base(scalar: Str) -> Str {
+    var g = ""
+    g = (g + chr(9))
+    var i = 1
+    while i < 32 { g = (g + chr(0))  i = i + 1 }
+    return x25519(scalar, g)
+}
+
+/// A shared secret, with the check RFC 7748 says the caller owes: an all-zero output means the
+/// peer sent a small-order point and every party would agree the same worthless value. Returning
+/// "" makes that a refusal rather than a secret nobody had to guess.
+pub fn x25519_shared(mine: Str, theirs: Str) -> Str {
+    let s = x25519(mine, theirs)
+    if s.len() != 32 { return "" }
+    var acc = 0
+    var i = 0
+    while i < 32 { acc = (acc | ord(s.at(i)))  i = i + 1 }   // no early exit: constant time
+    if acc == 0 { return "" }
+    return s
+}

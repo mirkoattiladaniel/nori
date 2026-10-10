@@ -1,0 +1,841 @@
+use core::*
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// floating-window manager (z-order, drag, resize, chrome)
+//
+// WindowId is an Int. Option<...> state is modeled as has_* flags. The window
+// list is kept z-sorted by insertion sort (small counts). Chrome output reuses
+// DrawRect / TextLabel from dock_ui.
+// ===========================================================================
+
+/// height of a window title bar.
+pub fn window_title_bar_height() -> Float { return 28.0 }
+/// width of the resize handle band at a window edge.
+pub fn window_resize_handle() -> Float { return 6.0 }
+/// size of the close button square.
+pub fn window_close_button_size() -> Float { return 18.0 }
+/// size of the minimize button square.
+pub fn window_minimize_button_size() -> Float { return 18.0 }
+/// inner padding inside a window.
+pub fn window_inner_padding() -> Float { return 8.0 }
+
+/// a resize edge/corner. Tags: 0 Left,1 Right,2 Top,3 Bottom,4 TopLeft,5 TopRight,6 BottomLeft,7 BottomRight, -1 none.
+pub enum ResizeEdge { EdLeft EdRight EdTop EdBottom EdTopLeft EdTopRight EdBottomLeft EdBottomRight EdNone }
+
+/// integer tag of a ResizeEdge.
+pub fn resize_edge_tag(e: ResizeEdge) -> Int {
+    match e {
+        ResizeEdge::EdLeft => { return 0 } ResizeEdge::EdRight => { return 1 }
+        ResizeEdge::EdTop => { return 2 } ResizeEdge::EdBottom => { return 3 }
+        ResizeEdge::EdTopLeft => { return 4 } ResizeEdge::EdTopRight => { return 5 }
+        ResizeEdge::EdBottomLeft => { return 6 } ResizeEdge::EdBottomRight => { return 7 }
+        ResizeEdge::EdNone => { return -1 }
+    }
+}
+
+/// per-window size constraints (min, optional max, optional aspect lock).
+pub struct WindowConstraints { min_size: Vec2, has_max_size: Bool, max_size: Vec2, keep_aspect_ratio: Bool }
+/// the default window constraints (min 160x120, no max, free aspect).
+pub fn window_constraints_default() -> WindowConstraints { return WindowConstraints { min_size: vec2(160.0, 120.0), has_max_size: false, max_size: vec2(0.0, 0.0), keep_aspect_ratio: false } }
+
+/// per-window behavior flags.
+pub struct WindowBehavior {
+    closable: Bool, minimizable: Bool, draggable: Bool, resizable: Bool,
+    lock_position: Bool, lock_size: Bool, drag_anywhere: Bool, always_on_bottom: Bool
+}
+/// the default window behavior (closable/minimizable/draggable/resizable, nothing locked).
+pub fn window_behavior_default() -> WindowBehavior {
+    return WindowBehavior { closable: true, minimizable: true, draggable: true, resizable: true, lock_position: false, lock_size: false, drag_anywhere: false, always_on_bottom: false }
+}
+
+/// per-window chrome style. Optional overrides are gated by has_* / OptColor.
+pub struct WindowStyle {
+    show_title_bar: Bool,
+    title_bar_height: Float,
+    draw_default_background: Bool,
+    draw_default_border: Bool,
+    draw_default_title_text: Bool,
+    draw_default_controls: Bool,
+    background_color_override: OptColor,
+    title_bar_color_override: OptColor,
+    border_color_override: OptColor
+}
+/// the default window style (all built-in chrome on, no overrides).
+pub fn window_style_default() -> WindowStyle {
+    return WindowStyle { show_title_bar: true, title_bar_height: window_title_bar_height(), draw_default_background: true, draw_default_border: true, draw_default_title_text: true, draw_default_controls: true, background_color_override: no_color(), title_bar_color_override: no_color(), border_color_override: no_color() }
+}
+/// a transparent/fully-custom style (no built-in chrome; host renders everything).
+pub fn window_style_fully_custom() -> WindowStyle {
+    return WindowStyle { show_title_bar: false, title_bar_height: window_title_bar_height(), draw_default_background: false, draw_default_border: false, draw_default_title_text: false, draw_default_controls: false, background_color_override: no_color(), title_bar_color_override: no_color(), border_color_override: no_color() }
+}
+
+/// persistent state for one window.
+pub struct WindowState {
+    id: Int, title: Str, rect: Rect, visible: Bool, minimized: Bool, z_index: Int,
+    behavior: WindowBehavior, constraints: WindowConstraints, style: WindowStyle
+}
+/// a window with default behavior/constraints/style, visible and at z 0.
+pub fn window_state_new(id: Int, sink title: Str, rect: Rect) -> WindowState {
+    return WindowState { id: id, title: title, rect: rect_dup(rect), visible: true, minimized: false, z_index: 0, behavior: window_behavior_default(), constraints: window_constraints_default(), style: window_style_default() }
+}
+
+/// the result of a window-manager frame: which window (if any) was focused/closed/etc.
+pub struct WindowInteractionResult {
+    has_focused: Bool, focused_window: Int,
+    has_closed: Bool, closed_window: Int,
+    has_toggled_minimized: Bool, toggled_minimized_window: Int,
+    has_moved: Bool, moved_window: Int,
+    has_resized: Bool, resized_window: Int
+}
+/// an empty interaction result (nothing happened).
+pub fn window_interaction_none() -> WindowInteractionResult {
+    return WindowInteractionResult { has_focused: false, focused_window: 0, has_closed: false, closed_window: 0, has_toggled_minimized: false, toggled_minimized_window: 0, has_moved: false, moved_window: 0, has_resized: false, resized_window: 0 }
+}
+
+/// the floating-window manager: a z-sorted window list plus drag/resize/focus state.
+pub struct WindowManager {
+    windows: Vec<WindowState>,
+    has_active: Bool, active_window: Int,
+    has_drag: Bool, drag_id: Int, drag_offset: Vec2,
+    has_resize: Bool, resize_id: Int, resize_edge: ResizeEdge, resize_start_cursor: Vec2, resize_start_rect: Rect,
+    max_z: Int
+}
+/// a new, empty WindowManager.
+pub fn window_manager_new() -> WindowManager {
+    var ws: Vec<WindowState> = vec()
+    return WindowManager { windows: ws, has_active: false, active_window: 0, has_drag: false, drag_id: 0, drag_offset: vec2_zero(), has_resize: false, resize_id: 0, resize_edge: ResizeEdge::EdNone, resize_start_cursor: vec2_zero(), resize_start_rect: rect_min_max(vec2_zero(), vec2_zero()), max_z: 0 }
+}
+
+/// the index of the window with id `id`, or -1 if absent.
+pub fn wm_index(wm: WindowManager, id: Int) -> Int {
+    var i = 0
+    while i < wm.windows.len() { if wm.windows[i].id == id { return i }  i = i + 1 }
+    return -1
+}
+
+impl WindowManager {
+    /// the window with id `id` (call only when present; check wm_index first).
+    fn window(self, id: Int) -> view WindowState { return self.windows[wm_index(self, id)] }
+    /// true if a window with id `id` exists.
+    fn has_window(self, id: Int) -> Bool { return wm_index(self, id) >= 0 }
+    /// insert `win` or replace the existing one with the same id (preserving its z); assigns z on insert.
+    fn upsert(inout self, sink win: WindowState) {
+        var idx = wm_index(self, win.id)
+        if idx >= 0 { win.z_index = self.windows[idx].z_index  self.windows[idx] = win  return }
+        self.max_z = self.max_z + 1
+        win.z_index = self.max_z
+        self.windows.push(win)
+        self.sort_by_z()
+    }
+    /// set a window's visibility.
+    fn set_visible(self, id: Int, visible: Bool) { var i = wm_index(self, id)  if i >= 0 { var w = self.windows[i]  w.visible = visible } }
+    /// raise window `id` above the others (unless it is always-on-bottom).
+    fn bring_to_front(inout self, id: Int) {
+        var i = wm_index(self, id)
+        if i < 0 { return }
+        if self.windows[i].behavior.always_on_bottom { return }
+        self.max_z = self.max_z + 1
+        var w = self.windows[i]
+        w.z_index = self.max_z
+    }
+    /// the topmost visible window containing point `p`, or -1.
+    fn topmost_window_at(self, p: Vec2) -> Int {
+        var best = -1
+        var best_key = -1
+        var i = 0
+        while i < self.windows.len() {
+            var w = self.windows[i]
+            if w.visible && w.rect.contains(p) {
+                var onbottom = 0
+                if !w.behavior.always_on_bottom { onbottom = 1 }
+                var key = onbottom * 1000000000 + w.z_index
+                if key > best_key { best_key = key  best = w.id }
+            }
+            i = i + 1
+        }
+        return best
+    }
+    /// re-sort the window list so later indices paint on top (on-bottom first, then by z).
+    fn sort_by_z(self) {
+        var n = self.windows.len()
+        var i = 1
+        while i < n {
+            var cur = sink self.windows[i]
+            var ck = wm_sort_key(cur)
+            var j = i - 1
+            var go = true
+            while go {
+                if j < 0 { go = false }
+                else if wm_sort_key(self.windows[j]) > ck { self.windows[j + 1] = sink self.windows[j]  j = j - 1 }
+                else { go = false }
+            }
+            self.windows[j + 1] = cur
+            i = i + 1
+        }
+    }
+    /// process one input frame: focus/drag/resize/close/minimize; returns what changed.
+    fn begin_frame(inout self, input: InputState, screen_rect: Rect) -> WindowInteractionResult {
+        var result = window_interaction_none()
+        var cursor = input.cursor
+
+        if input.pointer_primary_pressed {
+            var id = self.topmost_window_at(cursor)
+            if id >= 0 {
+                self.bring_to_front(id)
+                result.has_focused = true  result.focused_window = id
+                self.has_active = true  self.active_window = id
+                // everything read from the window is read before the manager is written to
+                var w = self.window(id)
+                var edge = wm_edge_at(w, cursor)
+                var starts_resize = resize_edge_tag(edge) >= 0 && w.behavior.resizable && !w.behavior.lock_size
+                var starts_drag = !starts_resize && (wm_in_title_bar(w, cursor) || wm_in_drag_region(w, cursor)) && w.behavior.draggable && !w.behavior.lock_position
+                var wrect = rect_dup(w.rect)
+                if starts_resize {
+                    self.has_resize = true  self.resize_id = id  self.resize_edge = edge
+                    self.resize_start_cursor = copy cursor  self.resize_start_rect = wrect
+                } else if starts_drag {
+                    self.has_drag = true  self.drag_id = id  self.drag_offset = cursor.sub(wrect.min)
+                }
+            } else {
+                self.has_active = false
+            }
+        }
+
+        if self.has_drag && input.pointer_primary_down {
+            var i = wm_index(self, self.drag_id)
+            if i >= 0 {
+                var w = self.windows[i]
+                var size = w.rect.size()
+                var minx = math::fmax(math::fmin(cursor.x - self.drag_offset.x, screen_rect.max.x - size.x), screen_rect.min.x)
+                var miny = math::fmax(math::fmin(cursor.y - self.drag_offset.y, screen_rect.max.y - size.y), screen_rect.min.y)
+                w.rect = rect_min_size(vec2(minx, miny), size)
+                result.has_moved = true  result.moved_window = self.drag_id
+            }
+        }
+
+        if self.has_resize && input.pointer_primary_down {
+            var i = wm_index(self, self.resize_id)
+            if i >= 0 {
+                var w = self.windows[i]
+                if !w.behavior.lock_size {
+                    var dx = cursor.x - self.resize_start_cursor.x
+                    var dy = cursor.y - self.resize_start_cursor.y
+                    var sr = self.resize_start_rect
+                    var minx = sr.min.x  var miny = sr.min.y  var maxx = sr.max.x  var maxy = sr.max.y
+                    var et = resize_edge_tag(self.resize_edge)
+                    if et == 0 { minx = minx + dx }
+                    else if et == 1 { maxx = maxx + dx }
+                    else if et == 2 { miny = miny + dy }
+                    else if et == 3 { maxy = maxy + dy }
+                    else if et == 4 { minx = minx + dx  miny = miny + dy }
+                    else if et == 5 { maxx = maxx + dx  miny = miny + dy }
+                    else if et == 6 { minx = minx + dx  maxy = maxy + dy }
+                    else if et == 7 { maxx = maxx + dx  maxy = maxy + dy }
+                    var sx = math::fmax(math::fmax(maxx - minx, 1.0), w.constraints.min_size.x)
+                    var sy = math::fmax(math::fmax(maxy - miny, 1.0), w.constraints.min_size.y)
+                    if w.constraints.has_max_size { sx = math::fmin(sx, w.constraints.max_size.x)  sy = math::fmin(sy, w.constraints.max_size.y) }
+                    if w.constraints.keep_aspect_ratio && sr.height() > 0.0 {
+                        var ratio = sr.width() / sr.height()
+                        sy = math::fmax(sx / ratio, w.constraints.min_size.y)
+                    }
+                    var ox = math::fmax(math::fmin(minx, screen_rect.max.x - sx), screen_rect.min.x)
+                    var oy = math::fmax(math::fmin(miny, screen_rect.max.y - sy), screen_rect.min.y)
+                    w.rect = rect_min_size(vec2(ox, oy), vec2(sx, sy))
+                    result.has_resized = true  result.resized_window = self.resize_id
+                }
+            }
+        }
+
+        if input.pointer_primary_released {
+            if self.has_active {
+                var id = self.active_window
+                var i = wm_index(self, id)
+                if i >= 0 {
+                    var w = self.windows[i]
+                    if wm_in_close_button(w, cursor) && w.behavior.closable {
+                        w.visible = false
+                        result.has_closed = true  result.closed_window = id
+                    } else if wm_in_minimize_button(w, cursor) && w.behavior.minimizable {
+                        w.minimized = !w.minimized
+                        result.has_toggled_minimized = true  result.toggled_minimized_window = id
+                    }
+                }
+            }
+            self.has_drag = false
+            self.has_resize = false
+        }
+
+        self.sort_by_z()
+        return result
+    }
+
+    /// remove a window entirely (e.g. when a floating tab is re-docked into the dock tree).
+    fn remove(inout self, id: Int) {
+        var i = wm_index(self, id)
+        if i < 0 { return }
+        var nw: Vec<WindowState> = vec()
+        var k = 0
+        while k < self.windows.len() { if k != i { nw.push(sink self.windows[k]) }  k = k + 1 }
+        self.windows = nw
+        if self.has_active && self.active_window == id { self.has_active = false }
+        if self.has_drag && self.drag_id == id { self.has_drag = false }
+    }
+}
+
+/// the z-sort key of a window (on-bottom windows sort first, then by ascending z).
+pub fn wm_sort_key(w: WindowState) -> Int {
+    var onbottom = 0
+    if !w.behavior.always_on_bottom { onbottom = 1 }
+    return onbottom * 1000000000 + w.z_index
+}
+
+/// the title-bar rect of `w` (full width x title height); zero-height if the bar is hidden.
+pub fn wm_title_bar_rect(w: WindowState) -> Rect {
+    if !w.style.show_title_bar { return rect_min_size(w.rect.min, vec2(w.rect.width(), 0.0)) }
+    return rect_min_size(w.rect.min, vec2(w.rect.width(), math::fmax(w.style.title_bar_height, 0.0)))
+}
+
+/// the close-button rect (top-right of the title bar) for window `w`.
+pub fn wm_close_button_rect(w: WindowState) -> Rect {
+    return rect_min_size(vec2(w.rect.max.x - window_inner_padding() - window_close_button_size(), w.rect.min.y + (w.style.title_bar_height - window_close_button_size()) / 2.0), vec2(window_close_button_size(), window_close_button_size()))
+}
+
+/// the minimize-button rect (left of the close button if present) for window `w`.
+pub fn wm_minimize_button_rect(w: WindowState) -> Rect {
+    var x = w.rect.max.x - window_inner_padding() - window_minimize_button_size()
+    if w.behavior.closable { x = w.rect.max.x - window_inner_padding() * 2.0 - window_close_button_size() - window_minimize_button_size() }
+    return rect_min_size(vec2(x, w.rect.min.y + (w.style.title_bar_height - window_minimize_button_size()) / 2.0), vec2(window_minimize_button_size(), window_minimize_button_size()))
+}
+
+/// true if `p` is over `w`'s close button (and the button is shown).
+pub fn wm_in_close_button(w: WindowState, p: Vec2) -> Bool {
+    if !w.behavior.closable || !w.style.show_title_bar || !w.style.draw_default_controls { return false }
+    return wm_close_button_rect(w).contains(p)
+}
+/// true if `p` is over `w`'s minimize button (and the button is shown).
+pub fn wm_in_minimize_button(w: WindowState, p: Vec2) -> Bool {
+    if !w.behavior.minimizable || !w.style.show_title_bar || !w.style.draw_default_controls { return false }
+    return wm_minimize_button_rect(w).contains(p)
+}
+/// true if `p` is in the title bar of `w` (excluding the control buttons).
+pub fn wm_in_title_bar(w: WindowState, p: Vec2) -> Bool {
+    if !w.style.show_title_bar { return false }
+    return wm_title_bar_rect(w).contains(p) && !wm_in_close_button(w, p) && !wm_in_minimize_button(w, p)
+}
+/// true if `p` is in `w`'s drag-anywhere body region (excluding control buttons).
+pub fn wm_in_drag_region(w: WindowState, p: Vec2) -> Bool {
+    return w.behavior.drag_anywhere && w.rect.contains(p) && !wm_in_close_button(w, p) && !wm_in_minimize_button(w, p)
+}
+/// the resize edge of `w` under `p` (EdNone if not on a resize band or not resizable).
+pub fn wm_edge_at(w: WindowState, p: Vec2) -> ResizeEdge {
+    if !w.rect.contains(p) || !w.behavior.resizable { return ResizeEdge::EdNone }
+    var h = window_resize_handle()
+    var left = p.x <= w.rect.min.x + h
+    var right = p.x >= w.rect.max.x - h
+    var top = p.y <= w.rect.min.y + h
+    var bottom = p.y >= w.rect.max.y - h
+    if left && top { return ResizeEdge::EdTopLeft }
+    if right && top { return ResizeEdge::EdTopRight }
+    if left && bottom { return ResizeEdge::EdBottomLeft }
+    if right && bottom { return ResizeEdge::EdBottomRight }
+    if left { return ResizeEdge::EdLeft }
+    if right { return ResizeEdge::EdRight }
+    if top { return ResizeEdge::EdTop }
+    if bottom { return ResizeEdge::EdBottom }
+    return ResizeEdge::EdNone
+}
+/// reserved: a non-None placeholder.
+pub fn wm_window_hit_edge(w: WindowState) -> Bool { return w.behavior.resizable }
+
+/// layout result of chrome: a window's rects, plus its content/title/button rects.
+pub struct WindowLayout {
+    window_id: Int, window_rect: Rect, has_title_bar: Bool, title_bar_rect: Rect, content_rect: Rect,
+    has_close: Bool, close_button_rect: Rect, has_minimize: Bool, minimize_button_rect: Rect
+}
+/// the full window-chrome draw output: rect list, label list, per-window layout.
+pub struct WindowLayoutResult { rects: Vec<DrawRect>, labels: Vec<TextLabel>, windows: Vec<WindowLayout> }
+
+/// build the backend-agnostic chrome (rects + labels + per-window layout) for all visible windows.
+pub fn layout_windows(manager: WindowManager, theme: Theme) -> WindowLayoutResult {
+    var rects: Vec<DrawRect> = vec()
+    var labels: Vec<TextLabel> = vec()
+    var windows: Vec<WindowLayout> = vec()
+    var v = theme.visuals
+    var i = 0
+    while i < manager.windows.len() {
+        var w = manager.windows[i]
+        if w.visible {
+            var title_h = 0.0
+            if w.style.show_title_bar { title_h = math::fmax(w.style.title_bar_height, 0.0) }
+            var content_h = math::fmax(w.rect.height() - title_h, 0.0)
+            if w.minimized { content_h = 0.0 }
+            var content_rect = rect_min_size(vec2(w.rect.min.x, w.rect.min.y + title_h), vec2(w.rect.width(), content_h))
+            var title_bar_rect = rect_min_size(w.rect.min, vec2(w.rect.width(), title_h))
+
+            if w.style.draw_default_background {
+                var bg = copy v.window_fill
+                if w.style.background_color_override.present { bg = color_dup(w.style.background_color_override.color) }
+                rects.push(DrawRect { rect: rect_dup(w.rect), color: color_dup(bg) })
+            }
+            if w.style.show_title_bar && w.style.draw_default_background {
+                var tbc = color_dup(v.dock_tab_bar_fill)
+                if w.style.title_bar_color_override.present { tbc = color_dup(w.style.title_bar_color_override.color) }
+                rects.push(DrawRect { rect: rect_dup(title_bar_rect), color: color_dup(tbc) })
+                var bc0 = copy v.window_stroke.color
+                if w.style.border_color_override.present { bc0 = color_dup(w.style.border_color_override.color) }
+                rects.push(DrawRect { rect: rect_min_size(vec2(w.rect.min.x, title_bar_rect.max.y - 1.0), vec2(w.rect.width(), 1.0)), color: color_dup(bc0) })
+            }
+            if !w.minimized && w.style.draw_default_background {
+                rects.push(DrawRect { rect: rect_dup(content_rect), color: color_dup(v.panel_fill) })
+            }
+            if w.style.draw_default_border {
+                var bc = copy v.window_stroke.color
+                if w.style.border_color_override.present { bc = color_dup(w.style.border_color_override.color) }
+                rects.push(DrawRect { rect: rect_min_size(w.rect.min, vec2(w.rect.width(), 1.0)), color: color_dup(bc) })
+                rects.push(DrawRect { rect: rect_min_size(vec2(w.rect.min.x, w.rect.max.y - 1.0), vec2(w.rect.width(), 1.0)), color: color_dup(bc) })
+                rects.push(DrawRect { rect: rect_min_size(w.rect.min, vec2(1.0, w.rect.height())), color: color_dup(bc) })
+                rects.push(DrawRect { rect: rect_min_size(vec2(w.rect.max.x - 1.0, w.rect.min.y), vec2(1.0, w.rect.height())), color: bc })
+            }
+            if w.style.show_title_bar && w.style.draw_default_title_text {
+                labels.push(text_label_clipped(w.rect.min.x + window_inner_padding(), w.rect.min.y + (title_h - 16.0) / 2.0, w.title, title_bar_rect))
+            }
+            var has_close = false
+            var close_rect = rect_min_max(vec2_zero(), vec2_zero())
+            if w.behavior.closable && w.style.show_title_bar && w.style.draw_default_controls {
+                close_rect = wm_close_button_rect(w)
+                has_close = true
+                if w.style.draw_default_background { rects.push(DrawRect { rect: rect_dup(close_rect), color: color_rgb(160, 50, 50) }) }
+                labels.push(text_label_clipped(close_rect.min.x + 5.0, close_rect.min.y + 1.0, "x", close_rect))
+            }
+            var has_min = false
+            var min_rect = rect_min_max(vec2_zero(), vec2_zero())
+            if w.behavior.minimizable && w.style.show_title_bar && w.style.draw_default_controls {
+                min_rect = wm_minimize_button_rect(w)
+                has_min = true
+                if w.style.draw_default_background { rects.push(DrawRect { rect: rect_dup(min_rect), color: color_rgb(75, 75, 85) }) }
+                var glyph = "-"
+                if w.minimized { glyph = "+" }
+                labels.push(text_label_clipped(min_rect.min.x + 5.0, min_rect.min.y + 1.0, glyph, min_rect))
+            }
+            windows.push(WindowLayout { window_id: w.id, window_rect: rect_dup(w.rect), has_title_bar: w.style.show_title_bar, title_bar_rect: title_bar_rect, content_rect: content_rect, has_close: has_close, close_button_rect: close_rect, has_minimize: has_min, minimize_button_rect: min_rect })
+        }
+        i = i + 1
+    }
+    return WindowLayoutResult { rects: rects, labels: labels, windows: windows }
+}
+
+/// subtract `cut` from `base`, pushing the (up to four) remaining fragments into `out`.
+pub fn subtract_rect(base: Rect, cut: Rect, inout out: Vec<Rect>) {
+    if !base.overlaps(cut) { out.push(rect_dup(base))  return }
+    var ix0 = math::fmax(base.min.x, cut.min.x)
+    var iy0 = math::fmax(base.min.y, cut.min.y)
+    var ix1 = math::fmin(base.max.x, cut.max.x)
+    var iy1 = math::fmin(base.max.y, cut.max.y)
+    if iy0 > base.min.y { out.push(rect_min_max(vec2(base.min.x, base.min.y), vec2(base.max.x, iy0))) }
+    if iy1 < base.max.y { out.push(rect_min_max(vec2(base.min.x, iy1), vec2(base.max.x, base.max.y))) }
+    if ix0 > base.min.x { out.push(rect_min_max(vec2(base.min.x, iy0), vec2(ix0, iy1))) }
+    if ix1 < base.max.x { out.push(rect_min_max(vec2(ix1, iy0), vec2(base.max.x, iy1))) }
+}
+
+/// the visible fragments of `base` after subtracting every rect in `overlays`.
+pub fn visible_fragments(base: Rect, overlays: Vec<Rect>) -> Vec<Rect> {
+    var fragments: Vec<Rect> = vec()
+    fragments.push(rect_dup(base))
+    var o = 0
+    while o < overlays.len() {
+        var next: Vec<Rect> = vec()
+        var f = 0
+        while f < fragments.len() {
+            var tmp: Vec<Rect> = vec()
+            subtract_rect(fragments[f], overlays[o], tmp)
+            var t = 0
+            while t < tmp.len() { if tmp[t].width() > 0.0 && tmp[t].height() > 0.0 { next.push(sink tmp[t]) }  t = t + 1 }
+            f = f + 1
+        }
+        fragments = sink next
+        o = o + 1
+    }
+    return fragments
+}
+
+/// the window rects above index `owner_index` in z-order (higher-z windows).
+pub fn overlays_above(windows: Vec<WindowLayout>, owner_index: Int) -> Vec<Rect> {
+    var out: Vec<Rect> = vec()
+    var i = owner_index + 1
+    while i < windows.len() { out.push(rect_dup(windows[i].window_rect))  i = i + 1 }
+    return out
+}
+
+// ===========================================================================
+// pure overlay-image path sanitizers (the filesystem resolver
+// is host I/O and lives elsewhere). Inline string helpers (nui_*) avoid importing
+// std/strutil.
+// ===========================================================================
+
+/// a present flag + string value.
+pub struct StrOpt { ok: Bool, value: Str }
+
+/// trim ASCII whitespace.
+pub fn nui_trim(s: Str) -> Str {
+    var lo = 0  var go = true
+    while go && lo < s.len() { var c = ord(s.at(lo))  if c == 32 || c == 9 || c == 10 || c == 13 { lo = lo + 1 } else { go = false } }
+    var hi = s.len()  var go2 = true
+    while go2 && hi > lo { var c = ord(s.at(hi - 1))  if c == 32 || c == 9 || c == 10 || c == 13 { hi = hi - 1 } else { go2 = false } }
+    return s.slice(lo, hi)
+}
+/// true if `sub` occurs anywhere in `s`.
+pub fn nui_contains(s: Str, sub: Str) -> Bool {
+    var n = s.len()  var m = sub.len()
+    if m == 0 { return true }
+    var i = 0
+    while i + m <= n { if (s.slice(i, i + m) == sub) { return true }  i = i + 1 }
+    return false
+}
+/// true if `s` starts with `p`.
+pub fn nui_starts_with(s: Str, p: Str) -> Bool { if p.len() > s.len() { return false }  return (s.slice(0, p.len()) == p) }
+
+/// validate a save-thumb filename: trimmed, non-empty, no '/', '\\', or ".."; ok=false otherwise.
+pub fn sanitize_save_thumb_filename(name: Str) -> StrOpt {
+    var t = nui_trim(name)
+    if t.len() == 0 || nui_contains(t, "/") || nui_contains(t, "" + chr(92)) || nui_contains(t, "..") { return StrOpt { ok: false, value: "" } }
+    return StrOpt { ok: true, value: t }
+}
+
+/// validate an overlay image path: trimmed, non-empty, no '\\' or "..", not absolute ('/' start or
+/// "X:" drive prefix); ok=false otherwise.
+pub fn sanitize_overlay_image_path(path: Str) -> StrOpt {
+    var t = nui_trim(path)
+    if t.len() == 0 { return StrOpt { ok: false, value: "" } }
+    if nui_contains(t, "" + chr(92)) || nui_contains(t, "..") { return StrOpt { ok: false, value: "" } }
+    if nui_starts_with(t, "/") { return StrOpt { ok: false, value: "" } }
+    if t.len() >= 2 && ord(t.at(1)) == 58 { return StrOpt { ok: false, value: "" } }
+    return StrOpt { ok: true, value: t }
+}
+
+// ===========================================================================
+// DockState <-> JSON (editor layout save/restore). Theme serialization and
+// filesystem I/O are not covered; this is the pure string round-trip.
+// ===========================================================================
+
+/// minimal JSON string escape (quote + backslash).
+pub fn json_escape(s: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        var c = ord(s.at(i))
+        if c == 34 { out = out + "" + chr(92) + chr(34) }
+        else if c == 92 { out = out + "" + chr(92) + chr(92) }
+        else { out = out + chr(c) }
+        i = i + 1
+    }
+    return out
+}
+
+/// render a Float compactly for JSON.
+pub fn float_to_str(f: Float) -> Str { return to_str(f) }
+
+/// serialize one dock tree to compact JSON.
+pub fn dock_tree_to_json(t: Tree) -> Str {
+    var q = "" + chr(34)
+    var nd = t.node
+    if node_is_empty(nd) { return "{" + q + "empty" + q + ":true}" }
+    if node_is_leaf(nd) {
+        var tabs = node_leaf_tabs(nd)
+        var out = "{" + q + "leaf" + q + ":{" + q + "tabs" + q + ":["
+        var i = 0
+        while i < tabs.len() { if i > 0 { out = out + "," }  out = out + q + json_escape(tabs[i]) + q  i = i + 1 }
+        out = out + "]," + q + "active" + q + ":" + to_str(node_leaf_active(nd)) + "}}"
+        return out
+    }
+    var dir = "h"
+    if split_direction_tag(node_split_dir(nd)) == 1 { dir = "v" }
+    var fc = "false"
+    if node_split_fc(nd) { fc = "true" }
+    var sc = "false"
+    if node_split_sc(nd) { sc = "true" }
+    return "{" + q + "split" + q + ":{" + q + "dir" + q + ":" + q + dir + q + "," + q + "ratio" + q + ":" + float_to_str(node_split_ratio(nd)) + "," + q + "fc" + q + ":" + fc + "," + q + "sc" + q + ":" + sc + "," + q + "first" + q + ":" + dock_tree_to_json(node_split_first(nd)) + "," + q + "second" + q + ":" + dock_tree_to_json(node_split_second(nd)) + "}}"
+}
+
+/// serialize a DockState to a JSON string (surfaces + their trees).
+pub fn serialize_dock_state(ds: DockState) -> Str {
+    var q = "" + chr(34)
+    var out = "{" + q + "surfaces" + q + ":["
+    var i = 0
+    while i < ds.surfaces.len() {
+        if i > 0 { out = out + "," }
+        out = out + "{" + q + "tree" + q + ":" + dock_tree_to_json(ds.surfaces[i].tree) + "}"
+        i = i + 1
+    }
+    out = out + "]}"
+    return out
+}
+
+// A self-contained mini-parser for the exact format dock_tree_to_json emits
+// (no std/json import, to keep the module's imports small).
+// `pos` is a 1-element cursor cell into the source string.
+
+/// the byte at the cursor, or -1 at end.
+pub fn dp_peek(s: Str, pos: Vec<Int>) -> Int { if pos[0] < s.len() { return ord(s.at(pos[0])) }  return -1 }
+/// advance the cursor by one.
+pub fn dp_adv(inout pos: Vec<Int>) { pos[0] = pos[0] + 1 }
+/// skip ASCII whitespace at the cursor.
+pub fn dp_ws(s: Str, inout pos: Vec<Int>) { var go = true  while go { var c = dp_peek(s, pos)  if c == 32 || c == 9 || c == 10 || c == 13 { dp_adv(pos) } else { go = false } } }
+/// advance past `c` if it's at the cursor.
+pub fn dp_eat(s: Str, inout pos: Vec<Int>, c: Int) { dp_ws(s, pos)  if dp_peek(s, pos) == c { dp_adv(pos) } }
+/// parse a JSON string literal at the cursor.
+pub fn dp_string(s: Str, inout pos: Vec<Int>) -> Str {
+    dp_ws(s, pos)
+    var out = ""
+    if dp_peek(s, pos) != 34 { return out }
+    dp_adv(pos)
+    var go = true
+    while go {
+        var c = dp_peek(s, pos)
+        if c < 0 { go = false }
+        else if c == 34 { dp_adv(pos)  go = false }
+        else if c == 92 { dp_adv(pos)  var e = dp_peek(s, pos)  dp_adv(pos)  out = out + chr(e) }
+        else { out = out + chr(c)  dp_adv(pos) }
+    }
+    return out
+}
+/// parse the decimal Float in s[a, b).
+pub fn parse_float_sub(s: Str, a: Int, b: Int) -> Float {
+    var i = a
+    var neg = false
+    if i < b && ord(s.at(i)) == 45 { neg = true  i = i + 1 }
+    else if i < b && ord(s.at(i)) == 43 { i = i + 1 }         // a leading `+` is accepted
+    var v = 0.0
+    while i < b && ord(s.at(i)) >= 48 && ord(s.at(i)) <= 57 { v = v * 10.0 + to_float(ord(s.at(i)) - 48)  i = i + 1 }
+    if i < b && ord(s.at(i)) == 46 {
+        i = i + 1
+        var scale = 0.1
+        while i < b && ord(s.at(i)) >= 48 && ord(s.at(i)) <= 57 { v = v + to_float(ord(s.at(i)) - 48) * scale  scale = scale * 0.1  i = i + 1 }
+    }
+    // an exponent (`1e3`, `-1.5e-2`). Reading it matters: stopping at the `e` would make "1.5e2" read
+    // back as 1.5, a wrong number, silently, which is worse than refusing the text outright.
+    if i < b && (ord(s.at(i)) == 101 || ord(s.at(i)) == 69) {
+        var j = i + 1
+        var eneg = false
+        if j < b && ord(s.at(j)) == 45 { eneg = true  j = j + 1 }
+        else if j < b && ord(s.at(j)) == 43 { j = j + 1 }
+        var ed = 0
+        var ev = 0
+        while j < b && ord(s.at(j)) >= 48 && ord(s.at(j)) <= 57 { ev = ev * 10 + (ord(s.at(j)) - 48)  j = j + 1  ed = ed + 1 }
+        if ed > 0 {
+            var k = 0
+            while k < ev { if eneg { v = v / 10.0 } else { v = v * 10.0 }  k = k + 1 }
+        }
+    }
+    if neg { return 0.0 - v }
+    return v
+}
+/// is `s[a..b)` a well-formed number: optional sign, digits with at most one `.` and at least one
+/// digit overall, an optional exponent, and nothing else?
+///
+/// This exists because `parse_float_sub` is best-effort: it answers 0.0 for text that is not a number
+/// at all and has no way to say so. Anything that turns user-authored text into a length or a
+/// coordinate has to ask this first, or a typo becomes a silent zero.
+pub fn is_number_sub(s: Str, a: Int, b: Int) -> Bool {
+    var i = a
+    if i >= b { return false }
+    if ord(s.at(i)) == 45 || ord(s.at(i)) == 43 { i = i + 1 }
+    var digits = 0
+    while i < b && ord(s.at(i)) >= 48 && ord(s.at(i)) <= 57 { i = i + 1  digits = digits + 1 }
+    if i < b && ord(s.at(i)) == 46 {
+        i = i + 1
+        while i < b && ord(s.at(i)) >= 48 && ord(s.at(i)) <= 57 { i = i + 1  digits = digits + 1 }
+    }
+    if digits == 0 { return false }
+    if i < b && (ord(s.at(i)) == 101 || ord(s.at(i)) == 69) {
+        i = i + 1
+        if i < b && (ord(s.at(i)) == 45 || ord(s.at(i)) == 43) { i = i + 1 }
+        var ed = 0
+        while i < b && ord(s.at(i)) >= 48 && ord(s.at(i)) <= 57 { i = i + 1  ed = ed + 1 }
+        if ed == 0 { return false }
+    }
+    return i == b
+}
+/// `is_number_sub` over a whole string.
+pub fn is_number(s: Str) -> Bool { return is_number_sub(s, 0, s.len()) }
+/// parse a number (Float) at the cursor.
+pub fn dp_number(s: Str, inout pos: Vec<Int>) -> Float {
+    dp_ws(s, pos)
+    var start = pos[0]
+    var go = true
+    while go {
+        var c = dp_peek(s, pos)
+        if (c >= 48 && c <= 57) || c == 45 || c == 43 || c == 46 || c == 101 || c == 69 { dp_adv(pos) } else { go = false }
+    }
+    return parse_float_sub(s, start, pos[0])
+}
+/// parse a `true`/`false` literal at the cursor.
+pub fn dp_bool(s: Str, inout pos: Vec<Int>) -> Bool {
+    dp_ws(s, pos)
+    if dp_peek(s, pos) == 116 { var k = 0  while k < 4 { dp_adv(pos)  k = k + 1 }  return true }
+    var k2 = 0
+    while k2 < 5 { dp_adv(pos)  k2 = k2 + 1 }
+    return false
+}
+/// set both collapse flags on a split node.
+pub fn dock_set_collapsed(n: Node, fc: Bool, sc: Bool) {
+    match n {
+        Node::NSplit(s) => { if fc { sd_set_first_collapsed(s, true) }  if sc { sd_set_second_collapsed(s, true) } }
+        Node::NLeaf(l) => {}
+        Node::NEmpty => {}
+    }
+}
+/// rebuild a dock tree from the mini-JSON at the cursor (inverse of dock_tree_to_json).
+pub fn dock_tree_parse(s: Str, inout pos: Vec<Int>) -> Tree {
+    dp_eat(s, pos, 123)
+    var key = dp_string(s, pos)
+    dp_eat(s, pos, 58)
+    if (key == "empty") { dp_bool(s, pos)  dp_eat(s, pos, 125)  return tree_empty() }
+    if (key == "leaf") {
+        dp_eat(s, pos, 123)
+        dp_string(s, pos)  dp_eat(s, pos, 58)  dp_eat(s, pos, 91)
+        var tabs: Vec<Str> = vec()
+        dp_ws(s, pos)
+        if dp_peek(s, pos) != 93 {
+            var go = true
+            while go { tabs.push(dp_string(s, pos))  dp_ws(s, pos)  if dp_peek(s, pos) == 44 { dp_adv(pos) } else { go = false } }
+        }
+        dp_eat(s, pos, 93)  dp_eat(s, pos, 44)
+        dp_string(s, pos)  dp_eat(s, pos, 58)
+        var active = to_int(dp_number(s, pos))
+        dp_eat(s, pos, 125)  dp_eat(s, pos, 125)
+        return tree_leaf(tabs, active)
+    }
+    dp_eat(s, pos, 123)
+    dp_string(s, pos)  dp_eat(s, pos, 58)
+    var dir_s = dp_string(s, pos)
+    var dir = SplitDirection::DirHorizontal
+    if (dir_s == "v") { dir = SplitDirection::DirVertical }
+    dp_eat(s, pos, 44)
+    dp_string(s, pos)  dp_eat(s, pos, 58)
+    var ratio = dp_number(s, pos)
+    dp_eat(s, pos, 44)
+    dp_string(s, pos)  dp_eat(s, pos, 58)
+    var fc = dp_bool(s, pos)
+    dp_eat(s, pos, 44)
+    dp_string(s, pos)  dp_eat(s, pos, 58)
+    var sc = dp_bool(s, pos)
+    dp_eat(s, pos, 44)
+    dp_string(s, pos)  dp_eat(s, pos, 58)
+    var first = dock_tree_parse(s, pos)
+    dp_eat(s, pos, 44)
+    dp_string(s, pos)  dp_eat(s, pos, 58)
+    var second = dock_tree_parse(s, pos)
+    dp_eat(s, pos, 125)  dp_eat(s, pos, 125)
+    var tr = tree_split(dir, ratio, first, second)
+    if node_is_split(tr.node) { dock_set_collapsed(tr.node, fc, sc) }
+    return tr
+}
+/// parse a DockState from a string produced by serialize_dock_state.
+pub fn deserialize_dock_state(str: Str) -> DockState {
+    var pos: Vec<Int> = vec()  pos.push(0)
+    var surfaces: Vec<Surface> = vec()
+    dp_eat(str, pos, 123)
+    dp_string(str, pos)  dp_eat(str, pos, 58)  dp_eat(str, pos, 91)
+    dp_ws(str, pos)
+    if dp_peek(str, pos) != 93 {
+        var go = true
+        while go {
+            dp_eat(str, pos, 123)
+            dp_string(str, pos)  dp_eat(str, pos, 58)
+            surfaces.push(Surface { tree: dock_tree_parse(str, pos) })
+            dp_eat(str, pos, 125)
+            dp_ws(str, pos)
+            if dp_peek(str, pos) == 44 { dp_adv(pos) } else { go = false }
+        }
+    }
+    if surfaces.len() == 0 { var empty_ids: Vec<Str> = vec()  return dock_state_new(empty_ids) }
+    var fp: Vec<Int> = vec()
+    var ti: Vec<Str> = vec()
+    var tt: Vec<Str> = vec()
+    return DockState { surfaces: surfaces, has_focus_surface: true, focused_surface_index: 0, has_focus_leaf: false, focused_leaf_path: fp, title_ids: ti, title_texts: tt }
+}
+// ===========================================================================
+// WindowManager <-> JSON (floating-window layout save/restore). Mirrors the
+// dock serializer; behavior/constraints/style keep their defaults on restore.
+// ===========================================================================
+
+/// serialize a WindowManager's windows (id/title/rect/visible/minimized/z) to compact JSON.
+pub fn serialize_window_manager(wm: WindowManager) -> Str {
+    var q = "" + chr(34)
+    var out = "{" + q + "windows" + q + ":["
+    var i = 0
+    while i < wm.windows.len() {
+        if i > 0 { out = out + "," }
+        var w = wm.windows[i]
+        var vis = "false"
+        if w.visible { vis = "true" }
+        var mini = "false"
+        if w.minimized { mini = "true" }
+        out = out + "{" + q + "id" + q + ":" + to_str(w.id)
+        out = out + "," + q + "title" + q + ":" + q + json_escape(w.title) + q
+        out = out + "," + q + "x" + q + ":" + float_to_str(w.rect.min.x)
+        out = out + "," + q + "y" + q + ":" + float_to_str(w.rect.min.y)
+        out = out + "," + q + "w" + q + ":" + float_to_str(w.rect.width())
+        out = out + "," + q + "h" + q + ":" + float_to_str(w.rect.height())
+        out = out + "," + q + "vis" + q + ":" + vis
+        out = out + "," + q + "min" + q + ":" + mini
+        out = out + "," + q + "z" + q + ":" + to_str(w.z_index) + "}"
+        i = i + 1
+    }
+    out = out + "]}"
+    return out
+}
+
+/// parse a WindowManager from a string produced by serialize_window_manager.
+pub fn deserialize_window_manager(str: Str) -> WindowManager {
+    var pos: Vec<Int> = vec()  pos.push(0)
+    var wm = window_manager_new()
+    dp_eat(str, pos, 123)
+    dp_string(str, pos)  dp_eat(str, pos, 58)  dp_eat(str, pos, 91)
+    dp_ws(str, pos)
+    if dp_peek(str, pos) != 93 {
+        var go = true
+        while go {
+            dp_eat(str, pos, 123)
+            dp_string(str, pos)  dp_eat(str, pos, 58)
+            var id = to_int(dp_number(str, pos))
+            dp_eat(str, pos, 44)
+            dp_string(str, pos)  dp_eat(str, pos, 58)
+            var title = dp_string(str, pos)
+            dp_eat(str, pos, 44)
+            dp_string(str, pos)  dp_eat(str, pos, 58)
+            var x = dp_number(str, pos)
+            dp_eat(str, pos, 44)
+            dp_string(str, pos)  dp_eat(str, pos, 58)
+            var y = dp_number(str, pos)
+            dp_eat(str, pos, 44)
+            dp_string(str, pos)  dp_eat(str, pos, 58)
+            var w = dp_number(str, pos)
+            dp_eat(str, pos, 44)
+            dp_string(str, pos)  dp_eat(str, pos, 58)
+            var h = dp_number(str, pos)
+            dp_eat(str, pos, 44)
+            dp_string(str, pos)  dp_eat(str, pos, 58)
+            var vis = dp_bool(str, pos)
+            dp_eat(str, pos, 44)
+            dp_string(str, pos)  dp_eat(str, pos, 58)
+            var mini = dp_bool(str, pos)
+            dp_eat(str, pos, 44)
+            dp_string(str, pos)  dp_eat(str, pos, 58)
+            var z = to_int(dp_number(str, pos))
+            dp_eat(str, pos, 125)
+            var ws = window_state_new(id, title, rect_min_size(vec2(x, y), vec2(w, h)))
+            ws.visible = vis
+            ws.minimized = mini
+            ws.z_index = z
+            wm.windows.push(ws)                          // push directly (upsert would reassign z)
+            if z > wm.max_z { wm.max_z = z }
+            dp_ws(str, pos)
+            if dp_peek(str, pos) == 44 { dp_adv(pos) } else { go = false }
+        }
+    }
+    wm.sort_by_z()
+    return wm
+}

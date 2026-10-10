@@ -1,0 +1,173 @@
+// Native .nori tests for the MP3 and Ogg Vorbis decoders. Run from the repo root with
+//   noric --test std/audio/decode_test.nori compiler/runtime.nori --import-root .
+//
+// The fixtures. std/audio/testdata holds one 0.3 s 44.1 kHz stereo
+// two-tone signal in five files, all produced by ffmpeg:
+//   tone.wav          the signal itself, 16-bit PCM
+//   tone.mp3          it encoded by libmp3lame at 128 kbps
+//   tone.ogg          it encoded by libvorbis at q5
+//   tone_mp3_ref.wav  ffmpeg's own decode of tone.mp3   <- the oracle for mp3.nori
+//   tone_ogg_ref.wav  ffmpeg's own decode of tone.ogg   <- the oracle for vorbis.nori
+// So what is asserted here is agreement with an independent decoder (libavcodec), not
+// self-consistency. The committed copies let the check run on a machine without ffmpeg.
+//
+// Why the tolerance is 1. Both codecs are lossy and both decoders are floating point. libavcodec and
+// minimp3/stb_vorbis round the final float->int16 conversion at slightly different points, so
+// individual samples can differ by one least-significant bit (1/32768 of full scale). They must not
+// differ by more: a real porting bug (a wrong table entry, a dropped sample, a sign error, a
+// mis-scaled window) shows up as hundreds or thousands, never as one.
+//
+// Why MP3 has a 2257-frame offset. An MP3 encoder emits a priming frame: the first samples out of
+// any MP3 decoder are the encoder's delay, not the signal. ffmpeg reads LAME's gapless tag and trims
+// them; minimp3 has no such layer and returns every frame it decodes. The constant below is that
+// difference for this fixture, measured once. Vorbis carries its granule positions in the stream, so
+// no offset is needed there.
+import "std/audio" as audio
+
+global MP3_SKIP_FRAMES: Int = 2257
+
+fn load(p: Str) -> audio::Sound {
+    var r = audio::wav_decode(read_file(p))
+    assert_streq(r.error, "")
+    return sink r.sound
+}
+
+// Compare `got` against `ref` from `skip` frames in, allowing each sample to differ by at most
+// `tol`. Reports the worst difference and where, because "they differ" is not a useful failure.
+fn compare(got: audio::Sound, ref: audio::Sound, skip: Int, tol: Int) {
+    assert_eq(got.rate, ref.rate)
+    assert_eq(got.channels, ref.channels)
+    let nref = audio::frames(ref)
+    let ngot = audio::frames(got)
+    assert_true(ngot >= nref + skip)
+    var worst = 0
+    var worst_at = 0
+    var f = 0
+    while f < nref {
+        var c = 0
+        while c < ref.channels {
+            var d = audio::sample_at(got, f + skip, c) - audio::sample_at(ref, f, c)
+            if d < 0 { d = 0 - d }
+            if d > worst { worst = d  worst_at = f }
+            c = c + 1
+        }
+        f = f + 1
+    }
+    if worst > tol { printl("  worst |diff| = " + to_str(worst) + " at frame " + to_str(worst_at) + " of " + to_str(nref)) }
+    assert_true(worst <= tol)
+}
+
+// The signal is not silence: a decoder that returned a buffer of zeros the right length would pass
+// a lax comparison, so every fixture check is paired with this.
+fn assert_is_real_audio(s: audio::Sound) {
+    var peak = 0
+    var f = 0
+    let n = audio::frames(s)
+    while f < n {
+        var v = audio::sample_at(s, f, 0)
+        if v < 0 { v = 0 - v }
+        if v > peak { peak = v }
+        f = f + 1
+    }
+    assert_true(peak > 8000)
+}
+
+fn test_mp3_matches_ffmpeg() {
+    let got = audio::mp3_decode(read_file("std/audio/testdata/tone.mp3"))
+    assert_eq(got.rate, 44100)
+    assert_eq(got.channels, 2)
+    assert_is_real_audio(got)
+    compare(got, load("std/audio/testdata/tone_mp3_ref.wav"), MP3_SKIP_FRAMES, 1)
+}
+
+fn test_mp3_reports_its_stream() {
+    let b = read_file("std/audio/testdata/tone.mp3")
+    let i = audio::mp3_decode_info(b)
+    assert_streq(i.error, "")
+    assert_eq(i.rate, 44100)
+    assert_eq(i.channels, 2)
+    assert_eq(i.layer, 3)
+    assert_eq(i.bitrate_kbps, 128)
+    assert_true(i.frames > 10)
+    // probe reads the first header only and must agree with the full decode
+    let p = audio::mp3_probe(b)
+    assert_eq(p.rate, 44100)
+    assert_eq(p.channels, 2)
+    assert_eq(p.layer, 3)
+    assert_eq(p.bitrate_kbps, 128)
+}
+
+fn test_mp3_refuses_junk() {
+    assert_eq(audio::mp3_decode("").rate, 0)
+    assert_eq(audio::mp3_decode("no").rate, 0)
+    // a WAV is not an MP3, and 52 KB of it must not be mistaken for one
+    let wav = read_file("std/audio/testdata/tone.wav")
+    assert_eq(audio::mp3_decode(wav).rate, 0)
+    let i = audio::mp3_decode_info(wav)
+    assert_true(i.error.len() > 0)
+    // a truncated MP3 decodes the frames it has rather than failing or reading off the end
+    let b = read_file("std/audio/testdata/tone.mp3")
+    let half = audio::mp3_decode(b.slice(0, b.len() / 2))
+    assert_eq(half.rate, 44100)
+    assert_true(audio::frames(half) > 1000)
+    assert_true(audio::frames(half) < audio::frames(audio::mp3_decode(b)))
+}
+
+fn test_mp3_is_deterministic() {
+    // The decoder carries global tables initialised on first use. Decoding twice must give the same
+    // bytes — a table built twice, or state left over from the previous call, would show here.
+    let b = read_file("std/audio/testdata/tone.mp3")
+    let a1 = audio::mp3_decode(b)
+    let a2 = audio::mp3_decode(b)
+    assert_eq(a1.data.len(), a2.data.len())
+    assert_streq(a1.data, a2.data)
+}
+
+fn test_ogg_matches_ffmpeg() {
+    let got = audio::ogg_decode(read_file("std/audio/testdata/tone.ogg"))
+    assert_eq(got.rate, 44100)
+    assert_eq(got.channels, 2)
+    assert_is_real_audio(got)
+    compare(got, load("std/audio/testdata/tone_ogg_ref.wav"), 0, 1)
+}
+
+fn test_ogg_refuses_junk() {
+    assert_eq(audio::ogg_decode("").rate, 0)
+    assert_eq(audio::ogg_decode("OggS").rate, 0)
+    assert_eq(audio::ogg_decode(read_file("std/audio/testdata/tone.wav")).rate, 0)
+    let b = read_file("std/audio/testdata/tone.ogg")
+    assert_eq(audio::ogg_decode(b.slice(0, 200)).rate, 0)      // header only, no audio
+}
+
+fn test_ogg_is_deterministic() {
+    let b = read_file("std/audio/testdata/tone.ogg")
+    let a1 = audio::ogg_decode(b)
+    let a2 = audio::ogg_decode(b)
+    assert_streq(a1.data, a2.data)
+    let p = audio::ogg_probe(b)
+    assert_eq(p.rate, 44100)
+    assert_eq(p.channels, 2)
+    assert_eq(p.data.len(), 0)
+}
+
+fn test_decoders_feed_the_mixer_and_the_wav_writer() {
+    // A decoded Sound is the same type the mixer and the device take, with no conversion step
+    // in between.
+    let m3 = audio::mp3_decode(read_file("std/audio/testdata/tone.mp3"))
+    let og = audio::ogg_decode(read_file("std/audio/testdata/tone.ogg"))
+    var mx = audio::mixer_new(m3.rate, m3.channels)
+    let a = audio::mix_play(mx, m3, 1000, false)
+    let b = audio::mix_play(mx, og, 1000, false)
+    assert_true(a > 0)
+    assert_true(b > 0)
+    assert_eq(audio::mix_active(mx), 2)
+    // 4096 frames in, the MP3 voice is still inside its encoder-delay priming and contributes
+    // almost nothing; the Ogg voice is what has to be audible here.
+    let pcm = audio::mix_render(mx, 4096)
+    assert_eq(pcm.len(), 4096 * 2 * 2)
+    assert_is_real_audio(audio::sound(44100, 2, pcm))
+    // and it round-trips out through the WAV writer unchanged
+    let w = audio::wav_decode(audio::wav_write(m3))
+    assert_streq(w.error, "")
+    assert_streq(w.sound.data, m3.data)
+}

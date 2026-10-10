@@ -1,0 +1,395 @@
+//! std/manifest: what a `nori.manifest` is allowed to say, and whether one says it.
+//!
+//! The schema is the point. Code that only branches on keys (`if section_get(mf, sect, "lto") ==
+//! "thin"`) can act on the keys but cannot list them, tell you `auto-loop` is not `auto-order`, or
+//! say that `opt = thin` is a level that does not exist.
+//!
+//! So the keys live here, as data, and the things that want to know ask. An editor highlighting a
+//! manifest, a `roll` subcommand explaining one, a formatter or a completion should not retype this
+//! table, because a copy goes stale the first time somebody adds a profile flag.
+//!
+//! ## Scope
+//!
+//! This is the schema plus a validator. It is not a replacement for `roll`'s own reader, which also
+//! rewrites a manifest in place while preserving comments.
+//!
+//! ## The format
+//!
+//! It is not TOML, and the difference is not cosmetic: `name = roll` is an unquoted string and
+//! `version = 0.1.0` is not a TOML value, so a TOML parser rejects a manifest at line 1. Values are
+//! bare text to the end of the line, `#` starts a comment, `[section]` opens one, and a list is
+//! `[a, b]`.
+
+use core::*
+
+/// what a key's value may be.
+pub fn MF_BOOL() -> Int { return 1 }
+/// a bare word from a fixed set, e.g. `lto = thin`
+pub fn MF_ENUM() -> Int { return 2 }
+/// a level: `opt = 0|1|2|3|s|z`
+pub fn MF_OPT() -> Int { return 3 }
+/// free text: a name, a path, a version
+pub fn MF_TEXT() -> Int { return 4 }
+/// a bracketed list, e.g. `cfg = [devtools, wide]`
+pub fn MF_LIST() -> Int { return 5 }
+/// a key this schema does not know
+pub fn MF_UNKNOWN() -> Int { return 0 }
+
+/// one key the schema knows about.
+pub struct MfKey { section: Str, key: Str, kind: Int, values: Vec<Str>, note: Str }
+
+fn mfk(section: Str, key: Str, kind: Int, values: Str, note: Str) -> MfKey {
+    var vs: Vec<Str> = vec()
+    var cur = ""
+    var i = 0
+    while i <= values.len() {
+        var end = i == values.len()
+        var bar = false
+        if !end { bar = ord(values.at(i)) == 124 }
+        if end || bar { if cur.len() > 0 { vs.push(cur) }  cur = "" } else { cur = cur + values.at(i) }
+        i = i + 1
+    }
+    return MfKey { section: copy section, key: copy key, kind: kind, values: vs, note: copy note }
+}
+
+/// The table. Sections are matched by name, with `profile.*` standing for every profile; a project
+/// may declare as many as it likes and they all take the same keys.
+///
+/// Every entry here is a key `roll` reads.
+pub fn manifest_schema() -> Vec<MfKey> {
+    var v: Vec<MfKey> = vec()
+    // ---- the project itself ----
+    v.push(mfk("", "name", MF_TEXT(), "", "the project's name; the artifact is named after it"))
+    v.push(mfk("", "kind", MF_ENUM(), "bin|lib|plugin", "what to build"))
+    v.push(mfk("", "version", MF_TEXT(), "", "semantic version"))
+    v.push(mfk("", "entry", MF_TEXT(), "", "the source file the build starts from"))
+    // ---- a build profile ----
+    v.push(mfk("profile.*", "auto-order", MF_BOOL(), "", "reorder fields to close padding holes"))
+    v.push(mfk("profile.*", "auto-parallel", MF_BOOL(), "", "parallelise loops the compiler can prove independent"))
+    v.push(mfk("profile.*", "simd", MF_ENUM(), "true|false|force", "vectorise; `force` even where it is a guess"))
+    v.push(mfk("profile.*", "opt", MF_OPT(), "0|1|2|3|s|z", "clang -O level"))
+    v.push(mfk("profile.*", "lto", MF_ENUM(), "true|false|thin", "link-time optimisation; `thin` is the parallel one"))
+    v.push(mfk("profile.*", "incremental", MF_BOOL(), "", "cache per module; no LTO"))
+    v.push(mfk("profile.*", "overflow-checks", MF_BOOL(), "", "signed + - * trap instead of wrapping"))
+    v.push(mfk("profile.*", "debug", MF_BOOL(), "", "source locations and backtraces for traps"))
+    v.push(mfk("profile.*", "dwarf", MF_BOOL(), "", "DWARF line tables only"))
+    v.push(mfk("profile.*", "memprof", MF_BOOL(), "", "per-allocation-site profiling; implies debug"))
+    v.push(mfk("profile.*", "erasure", MF_BOOL(), "", "generic erasure; `false` to monomorphise"))
+    v.push(mfk("profile.*", "cfg", MF_LIST(), "", "conditional compilation flags for this profile"))
+    // ---- linking and the platform ----
+    v.push(mfk("native", "clink", MF_TEXT(), "", "libraries to link, space separated"))
+    v.push(mfk("native", "cflags", MF_TEXT(), "", "extra flags for the C parts"))
+    v.push(mfk("freestanding", "asm", MF_TEXT(), "", "assembly to assemble in"))
+    v.push(mfk("freestanding", "linker", MF_TEXT(), "", "linker script"))
+    return v
+}
+
+/// does `section` match a schema entry's section pattern? `profile.*` matches any profile.
+pub fn manifest_section_matches(pattern: Str, section: Str) -> Bool {
+    if pattern == section { return true }
+    if pattern == "profile.*" {
+        if section.len() > 8 { return section.slice(0, 8) == "profile." }
+        return false
+    }
+    return false
+}
+
+/// the schema entry for `key` in `section`, or one with `kind` MF_UNKNOWN.
+pub fn manifest_key(section: Str, key: Str) -> MfKey {
+    let sch = manifest_schema()
+    var i = 0
+    while i < sch.len() {
+        if sch[i].key == key && manifest_section_matches(sch[i].section, section) { return copy sch[i] }
+        i = i + 1
+    }
+    var none: Vec<Str> = vec()
+    return MfKey { section: "", key: copy key, kind: MF_UNKNOWN(), values: none, note: "" }
+}
+
+/// every key valid in `section`.
+pub fn manifest_keys_for(section: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let sch = manifest_schema()
+    var i = 0
+    while i < sch.len() {
+        if manifest_section_matches(sch[i].section, section) { out.push("" + sch[i].key) }
+        i = i + 1
+    }
+    return out
+}
+
+/// is `section` one this schema knows? `deps` takes arbitrary keys (they are dependency names), so
+/// it is known and never validated against a key list.
+pub fn manifest_section_known(section: Str) -> Bool {
+    if section == "" || section == "deps" || section == "native" || section == "freestanding" { return true }
+    if section.len() > 8 { if section.slice(0, 8) == "profile." { return true } }
+    if section.len() > 7 { if section.slice(0, 7) == "native." { return true } }
+    return false
+}
+
+/// true when a section's keys are its own business: `[deps]` holds dependency names, and a
+/// dependency called `auto-loop` is a project, not a typo.
+pub fn manifest_section_freeform(section: Str) -> Bool {
+    if section == "deps" { return true }
+    if section.len() > 7 { if section.slice(0, 7) == "native." { return true } }
+    return false
+}
+
+/// the known key in `section` closest to `key`, or "" when nothing is close.
+///
+/// Two passes, and the first is the one that matters here. These keys come in families
+/// (`auto-order`, `auto-parallel`) and the usual mistake is reaching for the right family and the
+/// wrong member. `auto-loop` is five edits from `auto-order`, which no reasonable distance cap
+/// will accept, yet it is clearly a misremembered `auto-` key. So a shared first segment is
+/// checked before distance is consulted at all.
+///
+/// The fallback is edit distance capped at a third of the length, because "did you mean" is only
+/// worth having when it is nearly always right: one that fires on anything vaguely similar teaches
+/// you to stop reading it.
+pub fn manifest_suggest(section: Str, key: Str) -> Str {
+    let keys = manifest_keys_for(section)
+    let fam = mf_family(key)
+    if fam.len() > 0 {
+        var best = ""
+        var bestd = 99
+        var i = 0
+        while i < keys.len() {
+            if mf_family(keys[i]) == fam {
+                let d = mf_distance(keys[i], key)
+                if d < bestd { bestd = d  best = keys[i] }
+            }
+            i = i + 1
+        }
+        if best.len() > 0 { return copy best }
+    }
+    var best2 = ""
+    var bestd2 = 99
+    var j = 0
+    while j < keys.len() {
+        let d = mf_distance(keys[j], key)
+        if d < bestd2 { bestd2 = d  best2 = keys[j] }
+        j = j + 1
+    }
+    var cap = key.len() / 3
+    if cap < 1 { cap = 1 }
+    if bestd2 > cap { return "" }
+    return copy best2
+}
+
+/// the part of a hyphenated key before its first hyphen, or "" when there is none.
+fn mf_family(key: Str) -> Str {
+    var i = 0
+    while i < key.len() { if ord(key.at(i)) == 45 { return key.slice(0, i) }  i = i + 1 }
+    return ""
+}
+
+/// Levenshtein distance, iterative over one row.
+fn mf_distance(a: Str, b: Str) -> Int {
+    var prev: Vec<Int> = vec()
+    var j = 0
+    while j <= b.len() { prev.push(j)  j = j + 1 }
+    var i = 0
+    while i < a.len() {
+        var cur: Vec<Int> = vec()
+        cur.push(i + 1)
+        var k = 0
+        while k < b.len() {
+            var cost = 1
+            if a.at(i) == b.at(k) { cost = 0 }
+            var m = prev[k] + cost
+            let del = prev[k + 1] + 1
+            let ins = cur[k] + 1
+            if del < m { m = del }
+            if ins < m { m = ins }
+            cur.push(m)
+            k = k + 1
+        }
+        prev = copy cur
+        i = i + 1
+    }
+    return prev[b.len()]
+}
+
+// ---- reading one ---------------------------------------------------------------------------
+
+/// what a line of a manifest is.
+pub fn MF_LINE_BLANK() -> Int { return 0 }
+pub fn MF_LINE_COMMENT() -> Int { return 1 }
+pub fn MF_LINE_SECTION() -> Int { return 2 }
+pub fn MF_LINE_PAIR() -> Int { return 3 }
+/// a line that is none of those, which is the only syntax error this format has.
+pub fn MF_LINE_BAD() -> Int { return 4 }
+
+/// one line, read. `col` is where the interesting part starts, 1-based, for pointing at it.
+pub struct MfLine { no: Int, kind: Int, section: Str, key: Str, value: Str, col: Int }
+
+/// split `src` into lines and say what each one is.
+///
+/// Every line comes back, including blanks and comments, because the callers that want this are a
+/// highlighter and a formatter and both need the ones that say nothing.
+pub fn manifest_read(src: Str) -> Vec<MfLine> {
+    var out: Vec<MfLine> = vec()
+    var section = ""
+    var line = ""
+    var no = 1
+    var i = 0
+    while i <= src.len() {
+        var end = i == src.len()
+        var nl = false
+        if !end { nl = ord(src.at(i)) == 10 }
+        if end || nl {
+            // a trailing newline is not a line
+            if !(end && line.len() == 0 && no > 1) {
+                out.push(mf_line(line, no, section))
+                if out[out.len() - 1].kind == MF_LINE_SECTION() { section = out[out.len() - 1].section }
+            }
+            line = ""
+            no = no + 1
+        } else { line = line + src.at(i) }
+        i = i + 1
+    }
+    return out
+}
+
+/// read one line, given the section it falls in.
+fn mf_line(raw: Str, no: Int, section: Str) -> MfLine {
+    var a = 0
+    while a < raw.len() && ord(raw.at(a)) == 32 { a = a + 1 }
+    if a >= raw.len() { return MfLine { no: no, kind: MF_LINE_BLANK(), section: copy section, key: "", value: "", col: 1 } }
+    let c = ord(raw.at(a))
+    if c == 35 { return MfLine { no: no, kind: MF_LINE_COMMENT(), section: copy section, key: "", value: "", col: a + 1 } }
+    if c == 91 {
+        // `[name]`, with anything after the bracket ignored (a comment may follow one)
+        var close = 0 - 1
+        var k = a + 1
+        while k < raw.len() { if ord(raw.at(k)) == 93 && close < 0 { close = k }  k = k + 1 }
+        if close < 0 { return MfLine { no: no, kind: MF_LINE_BAD(), section: copy section, key: "", value: copy raw, col: a + 1 } }
+        return MfLine { no: no, kind: MF_LINE_SECTION(), section: raw.slice(a + 1, close), key: "", value: "", col: a + 2 }
+    }
+    var eq = 0 - 1
+    var j = a
+    while j < raw.len() { if ord(raw.at(j)) == 61 && eq < 0 { eq = j }  j = j + 1 }
+    if eq < 0 { return MfLine { no: no, kind: MF_LINE_BAD(), section: copy section, key: "", value: copy raw, col: a + 1 } }
+    let key = mf_trim(raw.slice(a, eq))
+    // The value runs to a `#` or to the end. Unquoted to the end of the line is the whole of this
+    // format's value syntax, which is why a TOML parser cannot read it.
+    var vend = raw.len()
+    var h = eq + 1
+    while h < raw.len() { if ord(raw.at(h)) == 35 && vend == raw.len() { vend = h }  h = h + 1 }
+    let value = mf_trim(raw.slice(eq + 1, vend))
+    return MfLine { no: no, kind: MF_LINE_PAIR(), section: copy section, key: key, value: value, col: a + 1 }
+}
+
+fn mf_trim(s: Str) -> Str {
+    var a = 0
+    while a < s.len() && ord(s.at(a)) == 32 { a = a + 1 }
+    var b = s.len()
+    while b > a && ord(s.at(b - 1)) == 32 { b = b - 1 }
+    return s.slice(a, b)
+}
+
+// ---- checking one --------------------------------------------------------------------------
+
+pub fn MF_ERROR() -> Int { return 1 }
+pub fn MF_WARN() -> Int { return 2 }
+
+/// something wrong with a manifest, where and how bad.
+pub struct MfDiag { line: Int, col: Int, sev: Int, msg: Str }
+
+/// every complaint this schema has about `src`.
+///
+/// Errors are things `roll` will refuse or ignore; warnings are things it will accept and you
+/// probably did not mean. A key that does not exist is a warning rather than an error because it is
+/// harmless (`roll` skips it), and calling it fatal would make a stale schema break somebody's
+/// build. It is a common mistake, so the message says what you probably meant.
+pub fn manifest_diagnostics(src: Str) -> Vec<MfDiag> {
+    var out: Vec<MfDiag> = vec()
+    let lines = manifest_read(src)
+    var seen_name = false
+    var seen_kind = false
+    var seen_entry = false
+    var i = 0
+    while i < lines.len() {
+        let l = lines[i]
+        if l.kind == MF_LINE_BAD() {
+            out.push(MfDiag { line: l.no, col: l.col, sev: MF_ERROR(), msg: "not a section, a comment or a `key = value`" })
+        }
+        else if l.kind == MF_LINE_SECTION() {
+            if !manifest_section_known(l.section) {
+                out.push(MfDiag { line: l.no, col: l.col, sev: MF_WARN(), msg: ("unknown section [" + (l.section + "] — nothing reads it")) })
+            }
+        }
+        else if l.kind == MF_LINE_PAIR() {
+            if l.key.len() == 0 {
+                out.push(MfDiag { line: l.no, col: l.col, sev: MF_ERROR(), msg: "a value with no key" })
+            } else {
+                if l.section == "" {
+                    if l.key == "name" { seen_name = true }
+                    if l.key == "kind" { seen_kind = true }
+                    if l.key == "entry" { seen_entry = true }
+                }
+                if !manifest_section_freeform(l.section) && manifest_section_known(l.section) {
+                    let sk = manifest_key(l.section, l.key)
+                    if sk.kind == MF_UNKNOWN() {
+                        var msg = "unknown key `" + (l.key + "`")
+                        let did = manifest_suggest(l.section, l.key)
+                        if did.len() > 0 { msg = msg + (" — did you mean `" + (did + "`?")) }
+                        out.push(MfDiag { line: l.no, col: l.col, sev: MF_WARN(), msg: msg })
+                    } else {
+                        let bad = mf_value_problem(sk, l.value)
+                        if bad.len() > 0 { out.push(MfDiag { line: l.no, col: l.col, sev: MF_ERROR(), msg: bad }) }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    // What is missing is reported on line 1, because that is where a reader starts looking and the
+    // absence of a thing has no line of its own.
+    //
+    // Only `name` is required. `roll` reads `kind` and `entry` too, but a project with either key
+    // removed still builds; only removing `name` fails. A schema that calls a working project
+    // broken is worse than no schema.
+    if !seen_name { out.push(MfDiag { line: 1, col: 1, sev: MF_ERROR(), msg: "no `name` — the artifact is named after it" }) }
+    let _k = seen_kind
+    let _e = seen_entry
+    return out
+}
+
+/// what is wrong with `value` for `k`, or "".
+fn mf_value_problem(k: MfKey, value: Str) -> Str {
+    if value.len() == 0 { return ("`" + (k.key + "` has no value")) }
+    if k.kind == MF_BOOL() {
+        if value == "true" || value == "false" { return "" }
+        return ("`" + (k.key + ("` is true or false, not `" + (value + "`"))))
+    }
+    if k.kind == MF_ENUM() {
+        var i = 0
+        while i < k.values.len() { if k.values[i] == value { return "" }  i = i + 1 }
+        return ("`" + (k.key + ("` is " + (mf_join(k.values, " or ") + (", not `" + (value + "`"))))))
+    }
+    if k.kind == MF_OPT() {
+        if value == "0" || value == "1" || value == "2" || value == "3" || value == "s" || value == "z" { return "" }
+        return ("`opt` is 0, 1, 2, 3, s or z, not `" + (value + "`"))
+    }
+    if k.kind == MF_LIST() {
+        if value.len() >= 2 { if ord(value.at(0)) == 91 && ord(value.at(value.len() - 1)) == 93 { return "" } }
+        return ("`" + (k.key + ("` is a list: [a, b] — not `" + (value + "`"))))
+    }
+    return ""
+}
+
+/// "a, b or c": commas between, `sep` before the last. Reads as a sentence because it appears in
+/// one: "`lto` is true, false or thin, not `maybe`".
+fn mf_join(v: Vec<Str>, sep: Str) -> Str {
+    var o = ""
+    var i = 0
+    while i < v.len() {
+        if i > 0 {
+            if i == v.len() - 1 { o = o + sep } else { o = o + ", " }
+        }
+        o = o + v[i]
+        i = i + 1
+    }
+    return o
+}

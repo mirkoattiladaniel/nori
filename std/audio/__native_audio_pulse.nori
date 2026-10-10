@@ -1,0 +1,547 @@
+// std/audio/__native_audio_pulse.nori: the sound-server backend of __native_audio.nori: a playback
+// client of the PulseAudio native protocol, which PulseAudio and pipewire-pulse both serve on a Unix
+// socket ($PULSE_SERVER in its unix:PATH form, else $XDG_RUNTIME_DIR/pulse/native).
+//
+// The wire. Every packet is a 20-byte descriptor of big-endian 32-bit words — payload length, channel,
+// seek offset (high, low) and flags — followed by the payload. Channel 0xFFFFFFFF carries a command,
+// whose payload is a tagstruct: a run of values each led by a one-byte tag ('L' u32, 't' string with
+// its NUL, 'N' null string, 'a' sample spec, 'm' channel map, 'v' volume per channel, 'P' property
+// list, '1'/'0' booleans, 'B' u8, 'x' length-prefixed bytes), all big-endian. A command starts with
+// its number and a tag the reply echoes. Any other channel number is a stream, and the payload is
+// raw audio for it.
+//
+// Flow control. The server says how many bytes a stream may send: the `missing` count in the reply
+// that created it, then a REQUEST command each time it has room for more. `npa_write` sends no more
+// than that and waits on the socket for the next REQUEST when the allowance runs out, which is what
+// makes a write block for as long as the audio takes to play.
+
+// what the connection is waiting for (NpaConn.wstate): nothing yet, a reply, an error
+fn NPA_WAITING() -> Int { return 0 }
+fn NPA_GOT_REPLY() -> Int { return 1 }
+fn NPA_GOT_ERROR() -> Int { return 2 }
+
+// the command numbers this client sends or reads
+fn NPA_CMD_ERROR() -> Int { return 0 }
+fn NPA_CMD_REPLY() -> Int { return 2 }
+fn NPA_CMD_CREATE_PLAYBACK_STREAM() -> Int { return 3 }
+fn NPA_CMD_DELETE_PLAYBACK_STREAM() -> Int { return 4 }
+fn NPA_CMD_AUTH() -> Int { return 8 }
+fn NPA_CMD_SET_CLIENT_NAME() -> Int { return 9 }
+fn NPA_CMD_DRAIN_PLAYBACK_STREAM() -> Int { return 12 }
+fn NPA_CMD_FLUSH_PLAYBACK_STREAM() -> Int { return 42 }
+fn NPA_CMD_REQUEST() -> Int { return 61 }
+fn NPA_CMD_PLAYBACK_STREAM_KILLED() -> Int { return 64 }
+
+fn NPA_VERSION() -> Int { return 35 }
+fn NPA_COMMAND_CHANNEL() -> Int { return 4294967295 }
+fn NPA_INVALID() -> Int { return 4294967295 }
+
+// The connection: the socket, the bytes received and not yet parsed, the reply being waited for (its
+// payload after the tag is copied to `rep`), and the one playback stream: its channel, the bytes the
+// server currently allows, and the size of a frame.
+cstruct NpaConn {
+    fd: Int, dead: Int, version: Int, nexttag: Int,
+    inb: Int, ilen: Int, icap: Int,
+    wtag: Int, wstate: Int, werr: Int, rep: Int, replen: Int,
+    chan: Int, req: Int, fs: Int
+}
+
+// A growing tagstruct under construction.
+cstruct NpaBuf { p: Int, len: Int, cap: Int }
+
+// A cursor over a received tagstruct; `bad` is set by the first read that finds the wrong tag or
+// runs off the end.
+cstruct NpaRd { p: Int, n: Int, at: Int, bad: Int }
+
+// ---- tagstruct writing -----------------------------------------------------------------------------
+
+fn npa_buf_new() -> Int {
+    let b: NpaBuf = calloc(1, sizeof(NpaBuf))
+    b.cap = 512
+    b.p = malloc(512)
+    return b
+}
+fn npa_buf_free(b: NpaBuf) { free(b.p)  free(b) }
+fn npa_grow(b: NpaBuf, n: Int) {
+    if b.len + n <= b.cap { return }
+    var c = b.cap * 2
+    while c < b.len + n { c = c * 2 }
+    b.p = realloc(b.p, c)
+    b.cap = c
+}
+fn npa_byte(b: NpaBuf, v: Int) {
+    npa_grow(b, 1)
+    poke8(b.p + b.len, v & 255)
+    b.len = b.len + 1
+}
+fn npa_be32(b: NpaBuf, v: Int) {
+    npa_byte(b, v >> 24)  npa_byte(b, v >> 16)  npa_byte(b, v >> 8)  npa_byte(b, v)
+}
+fn npa_bytes(b: NpaBuf, p: Int, n: Int) {
+    npa_grow(b, n)
+    if n > 0 { memcpy(b.p + b.len, p, n) }
+    b.len = b.len + n
+}
+fn npa_put_u32(b: NpaBuf, v: Int) { npa_byte(b, 76)  npa_be32(b, v) }                // 'L'
+fn npa_put_u8(b: NpaBuf, v: Int) { npa_byte(b, 66)  npa_byte(b, v) }                 // 'B'
+fn npa_put_bool(b: NpaBuf, v: Int) { if v != 0 { npa_byte(b, 49) } else { npa_byte(b, 48) } }
+fn npa_put_null(b: NpaBuf) { npa_byte(b, 78) }                                       // 'N'
+fn npa_put_str(b: NpaBuf, s: Str) {                                                  // 't'
+    npa_byte(b, 116)
+    npa_bytes(b, nori_str_ptr(s), s.len())
+    npa_byte(b, 0)
+}
+fn npa_put_arb(b: NpaBuf, p: Int, n: Int) { npa_byte(b, 120)  npa_be32(b, n)  npa_bytes(b, p, n) }   // 'x'
+// sample spec: format, channels, rate
+fn npa_put_ss(b: NpaBuf, fmt: Int, ch: Int, rate: Int) {
+    npa_byte(b, 97)  npa_byte(b, fmt)  npa_byte(b, ch)  npa_be32(b, rate)
+}
+// The channel positions libasound gives these counts (front left/right, rear, center, LFE, sides);
+// any other count is auxiliary channels.
+fn npa_put_map(b: NpaBuf, ch: Int) {
+    npa_byte(b, 109)
+    npa_byte(b, ch)
+    var i = 0
+    while i < ch { npa_byte(b, npa_pos(ch, i))  i = i + 1 }
+}
+fn npa_pos(ch: Int, i: Int) -> Int {
+    if ch == 1 { return 0 }                                                          // mono
+    if ch == 3 && i == 2 { return 7 }                                                // LFE
+    if ch == 2 || ch == 3 { return 1 + i }                                           // front left, right
+    if ch == 4 || ch == 5 || ch == 6 || ch == 8 {
+        if i < 2 { return 1 + i }
+        if i < 4 { return 3 + i }                                                    // rear left, right
+        if i == 4 { return 3 }                                                       // front center
+        if i == 5 { return 7 }                                                       // LFE
+        return 4 + i                                                                 // side left, right
+    }
+    return 12 + i                                                                    // AUX0..
+}
+fn npa_put_cvol(b: NpaBuf, ch: Int) {
+    npa_byte(b, 118)
+    npa_byte(b, ch)
+    var i = 0
+    while i < ch { npa_be32(b, 65536)  i = i + 1 }                                   // PA_VOLUME_NORM
+}
+// a property list holding one string property (the value is stored with its NUL)
+fn npa_put_prop1(b: NpaBuf, key: Str, val: Str) {
+    npa_byte(b, 80)                                                                  // 'P'
+    npa_put_str(b, key)
+    npa_put_u32(b, val.len() + 1)
+    npa_byte(b, 120)
+    npa_be32(b, val.len() + 1)
+    npa_bytes(b, nori_str_ptr(val), val.len())
+    npa_byte(b, 0)
+    npa_put_null(b)
+}
+// a command tagstruct: its number and a fresh tag, which is returned
+fn npa_cmd(c: NpaConn, b: NpaBuf, cmd: Int) -> Int {
+    let tag = c.nexttag
+    c.nexttag = c.nexttag + 1
+    npa_put_u32(b, cmd)
+    npa_put_u32(b, tag)
+    return tag
+}
+
+// ---- tagstruct reading -----------------------------------------------------------------------------
+
+fn npa_rd32(p: Int) -> Int {
+    return (peek8(p) << 24) | (peek8(p + 1) << 16) | (peek8(p + 2) << 8) | peek8(p + 3)
+}
+fn npa_get_u32(r: NpaRd) -> Int {
+    if r.bad == 1 || r.at + 5 > r.n || peek8(r.p + r.at) != 76 { r.bad = 1  return 0 }
+    let v = npa_rd32(r.p + r.at + 1)
+    r.at = r.at + 5
+    return v
+}
+
+// ---- the socket ------------------------------------------------------------------------------------
+
+// send all `n` bytes, waiting while the socket is full; a failed send marks the connection dead
+fn npa_send_all(c: NpaConn, p: Int, n: Int) -> Int {
+    var off = 0
+    while off < n {
+        if c.dead == 1 { return 0 - 32 }
+        let k = send(c.fd, p + off, n - off, 16384)             // MSG_NOSIGNAL
+        if k > 0 { off = off + k } else {
+            if k == 0 - 11 || k == 0 - 4 { nau_wait(c.fd, 4, 1000) }   // EAGAIN / EINTR: wait for POLLOUT
+            else { c.dead = 1  return 0 - 32 }
+        }
+    }
+    return 0
+}
+
+fn npa_send_packet(c: NpaConn, chan: Int, p: Int, n: Int) -> Int {
+    let hdr = calloc(1, 20)
+    poke8(hdr, n >> 24)  poke8(hdr + 1, n >> 16)  poke8(hdr + 2, n >> 8)  poke8(hdr + 3, n)
+    poke8(hdr + 4, chan >> 24)  poke8(hdr + 5, chan >> 16)  poke8(hdr + 6, chan >> 8)  poke8(hdr + 7, chan)
+    var r = npa_send_all(c, hdr, 20)
+    free(hdr)
+    if r == 0 { r = npa_send_all(c, p, n) }
+    return r
+}
+
+// Act on one command packet. A reply or error for the awaited tag is recorded; a REQUEST for the
+// stream adds to its allowance; a killed stream kills the connection; every other event (underflow,
+// overflow, started, subscription, suspend, move, attribute change) needs nothing from a client that
+// only writes.
+fn npa_dispatch(c: NpaConn, p: Int, n: Int) {
+    let r: NpaRd = calloc(1, sizeof(NpaRd))
+    r.p = p
+    r.n = n
+    let cmd = npa_get_u32(r)
+    let tag = npa_get_u32(r)
+    if r.bad == 0 {
+        if cmd == NPA_CMD_REPLY() || cmd == NPA_CMD_ERROR() {
+            if tag == c.wtag && c.wstate == NPA_WAITING() {
+                if cmd == NPA_CMD_ERROR() {
+                    c.werr = npa_get_u32(r)
+                    c.wstate = NPA_GOT_ERROR()
+                } else {
+                    c.replen = n - r.at
+                    c.rep = malloc(c.replen + 1)
+                    memcpy(c.rep, p + r.at, c.replen)
+                    c.wstate = NPA_GOT_REPLY()
+                }
+            }
+        } else {
+            if cmd == NPA_CMD_REQUEST() {
+                let ch = npa_get_u32(r)
+                let bytes = npa_get_u32(r)
+                if r.bad == 0 && ch == c.chan { c.req = c.req + bytes }
+            }
+            if cmd == NPA_CMD_PLAYBACK_STREAM_KILLED() {
+                let kch = npa_get_u32(r)
+                if r.bad == 0 && kch == c.chan { c.dead = 1 }
+            }
+        }
+    }
+    free(r)
+}
+
+// Dispatch the complete packets already received, stopping after one that answers the awaited tag so
+// the caller sees the reply before anything that follows it. Returns how many were dispatched.
+fn npa_parse(c: NpaConn) -> Int {
+    var off = 0
+    var count = 0
+    var going = 1
+    while going == 1 && c.ilen - off >= 20 {
+        let len = npa_rd32(c.inb + off)
+        if c.ilen - off < 20 + len { going = 0 } else {
+            let chan = npa_rd32(c.inb + off + 4)
+            let before = c.wstate
+            if chan == NPA_COMMAND_CHANNEL() { npa_dispatch(c, c.inb + off + 20, len) }
+            off = off + 20 + len
+            count = count + 1
+            if before == NPA_WAITING() && c.wstate != NPA_WAITING() { going = 0 }
+        }
+    }
+    if off > 0 {
+        memmove(c.inb, c.inb + off, c.ilen - off)
+        c.ilen = c.ilen - off
+    }
+    return count
+}
+
+// Handle what has arrived: parse what is buffered, else wait up to `ms` (-1 = forever) for more and
+// parse that. 1 = something was handled, 0 = nothing came, < 0 = the connection is gone.
+fn npa_pump(c: NpaConn, ms: Int) -> Int {
+    if npa_parse(c) > 0 { return 1 }
+    if c.dead == 1 { return 0 - 32 }
+    if nau_wait(c.fd, 1, ms) == 0 { return 0 }                  // POLLIN
+    if c.icap - c.ilen < 65536 {
+        c.icap = c.icap * 2
+        c.inb = realloc(c.inb, c.icap)
+    }
+    let k = recv(c.fd, c.inb + c.ilen, c.icap - c.ilen, 64)     // MSG_DONTWAIT
+    if k == 0 { c.dead = 1  return 0 - 32 }
+    if k < 0 {
+        if k == 0 - 11 || k == 0 - 4 { return 0 }
+        c.dead = 1
+        return 0 - 32
+    }
+    c.ilen = c.ilen + k
+    npa_parse(c)
+    return 1
+}
+
+// PulseAudio error codes as errno values
+fn npa_errno(e: Int) -> Int {
+    if e == 1 || e == 9 { return 0 - 13 }                      // access, auth key: EACCES
+    if e == 3 || e == 13 { return 0 - 22 }                     // invalid: EINVAL
+    if e == 4 { return 0 - 17 }                                // exists
+    if e == 5 { return 0 - 2 }                                 // no such entity: ENOENT
+    if e == 6 { return 0 - 111 }                               // connection refused
+    if e == 7 || e == 17 { return 0 - 71 }                     // protocol, version: EPROTO
+    if e == 8 { return 0 - 110 }                               // timeout
+    if e == 11 || e == 12 { return 0 - 32 }                    // terminated, killed: EPIPE
+    if e == 15 { return 0 - 77 }                               // bad state: EBADFD
+    if e == 16 { return 0 - 61 }                               // no data
+    if e == 18 { return 0 - 7 }                                // too large
+    if e == 19 || e == 21 || e == 22 { return 0 - 95 }         // not supported
+    if e == 23 { return 0 - 38 }                               // not implemented
+    if e == 26 { return 0 - 16 }                               // busy
+    return 0 - 5                                               // EIO
+}
+
+// Send the command in `b` (whose tag is `tag`) and wait up to `ms` (-1 = forever) for its answer:
+// 0 with the reply's payload in c.rep, or a negated errno.
+fn npa_call(c: NpaConn, b: NpaBuf, tag: Int, ms: Int) -> Int {
+    if c.rep != 0 { free(c.rep)  c.rep = 0  c.replen = 0 }
+    c.wtag = tag
+    c.wstate = NPA_WAITING()
+    let s = npa_send_packet(c, NPA_COMMAND_CHANNEL(), b.p, b.len)
+    npa_buf_free(b)
+    if s < 0 { return s }
+    let deadline = nau_now_ms() + ms
+    while c.wstate == NPA_WAITING() {
+        var slice = 1000
+        if ms >= 0 {
+            slice = deadline - nau_now_ms()
+            if slice <= 0 { c.wtag = 0 - 1  return 0 - 110 }
+        }
+        let k = npa_pump(c, slice)
+        if k < 0 && c.wstate == NPA_WAITING() { return k }
+    }
+    c.wtag = 0 - 1
+    if c.wstate == NPA_GOT_ERROR() { return npa_errno(c.werr) }
+    return 0
+}
+
+// a cursor over the last reply's payload (the caller frees it)
+fn npa_reply(c: NpaConn) -> Int {
+    let r: NpaRd = calloc(1, sizeof(NpaRd))
+    r.p = c.rep
+    r.n = c.replen
+    return r
+}
+
+// ---- connecting ------------------------------------------------------------------------------------
+
+// The socket path as a malloc'd C string: $PULSE_SERVER's first `unix:` (or absolute path) entry,
+// else $XDG_RUNTIME_DIR/pulse/native. 0 when neither names one.
+fn npa_socket_path() -> Int {
+    let ps = nau_getenv("PULSE_SERVER")
+    if ps != 0 {
+        var i = 0
+        let n = strlen(ps)
+        while i < n {
+            while i < n && peek8(ps + i) == 32 { i = i + 1 }
+            var j = i
+            while j < n && peek8(ps + j) != 32 { j = j + 1 }
+            var st = i
+            if j - i > 5 && nau_starts(ps + i, "unix:") == 1 { st = i + 5 }
+            if st < j && peek8(ps + st) == 47 {
+                let out = malloc(j - st + 1)
+                memcpy(out, ps + st, j - st)
+                poke8(out + j - st, 0)
+                return out
+            }
+            i = j
+        }
+    }
+    let xdg = nau_getenv("XDG_RUNTIME_DIR")
+    if xdg == 0 || peek8(xdg) == 0 { return 0 }
+    let tail = "/pulse/native"
+    let xn = strlen(xdg)
+    let out = malloc(xn + tail.len() + 1)
+    memcpy(out, xdg, xn)
+    memcpy(out + xn, nori_str_ptr(tail), tail.len())
+    poke8(out + xn + tail.len(), 0)
+    return out
+}
+
+// The 256-byte authentication cookie from $PULSE_COOKIE or ~/.config/pulse/cookie; zeros when there is
+// none, which a server that does not check cookies (pipewire-pulse) accepts.
+fn npa_cookie(out: Int) {
+    memset(out, 0, 256)
+    var path = 0
+    let pc = nau_getenv("PULSE_COOKIE")
+    if pc != 0 && peek8(pc) != 0 {
+        path = malloc(strlen(pc) + 1)
+        memcpy(path, pc, strlen(pc) + 1)
+    } else {
+        let home = nau_getenv("HOME")
+        if home == 0 { return }
+        let tail = "/.config/pulse/cookie"
+        let hn = strlen(home)
+        path = malloc(hn + tail.len() + 1)
+        memcpy(path, home, hn)
+        memcpy(path + hn, nori_str_ptr(tail), tail.len())
+        poke8(path + hn + tail.len(), 0)
+    }
+    let fd = open(path, 524288)                                 // O_RDONLY | O_CLOEXEC
+    free(path)
+    if fd < 0 { return }
+    var got = 0
+    var going = 1
+    while going == 1 && got < 256 {
+        let k = read(fd, out + got, 256 - got)
+        if k <= 0 { going = 0 } else { got = got + k }
+    }
+    close(fd)
+}
+
+fn npa_conn_free(c: NpaConn) {
+    if c.fd >= 0 { close(c.fd) }
+    if c.rep != 0 { free(c.rep) }
+    free(c.inb)
+    free(c)
+}
+
+// Connect, authenticate, name the client and create a playback stream on the default sink. `fmt` is
+// 0 for s16le and 1 for float32le. Returns the connection, or a negated errno.
+fn npa_open(rate: Int, ch: Int, fmt: Int, latency_us: Int) -> Int {
+    if ch > 32 || rate > 384000 { return 0 - 22 }              // PA_CHANNELS_MAX, PA_RATE_MAX
+    let path = npa_socket_path()
+    if path == 0 { return 0 - 2 }
+    let pn = strlen(path)
+    if pn > 107 { free(path)  return 0 - 36 }
+    let fd = socket(1, 524289, 0)                               // AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC
+    if fd < 0 { free(path)  return fd }
+    let sa = calloc(1, 112)
+    poke16(sa, 1)
+    memcpy(sa + 2, path, pn)
+    let cr = connect(fd, sa, 2 + pn + 1)
+    free(sa)
+    free(path)
+    if cr < 0 { close(fd)  return cr }
+
+    let c: NpaConn = calloc(1, sizeof(NpaConn))
+    c.fd = fd
+    c.icap = 131072
+    c.inb = malloc(c.icap)
+    c.chan = 0 - 1
+    c.wtag = 0 - 1
+    var sbytes = 2
+    if fmt == 1 { sbytes = 4 }
+    c.fs = ch * sbytes
+
+    // Auth: our protocol version (no shared-memory flags: audio travels in the packets) and the cookie
+    var b: NpaBuf = npa_buf_new()
+    var tag = npa_cmd(c, b, NPA_CMD_AUTH())
+    npa_put_u32(b, NPA_VERSION())
+    let cookie = malloc(256)
+    npa_cookie(cookie)
+    npa_put_arb(b, cookie, 256)
+    free(cookie)
+    var r = npa_call(c, b, tag, 5000)
+    if r < 0 { npa_conn_free(c)  return r }
+    var rd: NpaRd = npa_reply(c)
+    let sv = npa_get_u32(rd) & 65535
+    free(rd)
+    c.version = NPA_VERSION()
+    if sv < c.version { c.version = sv }
+    if c.version < 13 { npa_conn_free(c)  return 0 - 71 }
+
+    b = npa_buf_new()
+    tag = npa_cmd(c, b, NPA_CMD_SET_CLIENT_NAME())
+    npa_put_prop1(b, "application.name", "nori")
+    r = npa_call(c, b, tag, 5000)
+    if r < 0 { npa_conn_free(c)  return r }
+
+    // CREATE_PLAYBACK_STREAM, field by field in the order the protocol version defines. The target
+    // length is the requested latency in bytes; the server picks prebuffer, minimum request and
+    // maximum length.
+    var tl = latency_us * rate / 1000000 * c.fs
+    if tl < c.fs { tl = c.fs }
+    b = npa_buf_new()
+    tag = npa_cmd(c, b, NPA_CMD_CREATE_PLAYBACK_STREAM())
+    var pafmt = 3                                               // PA_SAMPLE_S16LE
+    if fmt == 1 { pafmt = 5 }                                   // PA_SAMPLE_FLOAT32LE
+    npa_put_ss(b, pafmt, ch, rate)
+    npa_put_map(b, ch)
+    npa_put_u32(b, NPA_INVALID())                               // sink index
+    npa_put_null(b)                                             // sink name: the default sink
+    npa_put_u32(b, NPA_INVALID())                               // maxlength
+    npa_put_bool(b, 0)                                          // start corked
+    npa_put_u32(b, tl)                                          // tlength
+    npa_put_u32(b, NPA_INVALID())                               // prebuf
+    npa_put_u32(b, NPA_INVALID())                               // minreq
+    npa_put_u32(b, 0)                                           // sync id
+    npa_put_cvol(b, ch)
+    var k = 0
+    while k < 7 { npa_put_bool(b, 0)  k = k + 1 }               // no remap/remix, fix format/rate/channels, don't move, variable rate
+    npa_put_bool(b, 0)                                          // start muted
+    npa_put_bool(b, 0)                                          // adjust latency
+    npa_put_prop1(b, "media.name", "Nori audio")
+    if c.version >= 14 { npa_put_bool(b, 0)  npa_put_bool(b, 0) }                      // volume set, early requests
+    if c.version >= 15 { npa_put_bool(b, 0)  npa_put_bool(b, 0)  npa_put_bool(b, 0) }  // muted set, don't inhibit suspend, fail on suspend
+    if c.version >= 17 { npa_put_bool(b, 0) }                                          // relative volume
+    if c.version >= 18 { npa_put_bool(b, 0) }                                          // passthrough
+    if c.version >= 21 { npa_put_u8(b, 0) }                                            // no format list: the sample spec stands
+    r = npa_call(c, b, tag, 5000)
+    if r < 0 { npa_conn_free(c)  return r }
+    rd = npa_reply(c)
+    let chan = npa_get_u32(rd)
+    npa_get_u32(rd)                                             // sink input index
+    let missing = npa_get_u32(rd)
+    let bad = rd.bad
+    free(rd)
+    if bad == 1 { npa_conn_free(c)  return 0 - 71 }
+    c.chan = chan
+    c.req = missing
+    return c
+}
+
+// ---- the stream ------------------------------------------------------------------------------------
+
+// take in every event already waiting, without blocking
+fn npa_settle(c: NpaConn) {
+    var k = npa_pump(c, 0)
+    while k > 0 { k = npa_pump(c, 0) }
+}
+
+fn npa_write(h: Int, buf: Int, frames: Int) -> Int {
+    let c: NpaConn = h
+    let total = frames * c.fs
+    let maxchunk = 65536 - 65536 % c.fs
+    var off = 0
+    while off < total {
+        if c.dead == 1 { return 0 - 32 }
+        npa_settle(c)
+        let allowed = c.req - c.req % c.fs
+        if allowed <= 0 {
+            let k = npa_pump(c, 0 - 1)
+            if k < 0 { return k }
+        } else {
+            var n = total - off
+            if n > allowed { n = allowed }
+            if n > maxchunk { n = maxchunk }
+            let s = npa_send_packet(c, c.chan, buf + off, n)
+            if s < 0 { return s }
+            c.req = c.req - n
+            off = off + n
+        }
+    }
+    return frames
+}
+
+fn npa_avail(h: Int) -> Int {
+    let c: NpaConn = h
+    npa_settle(c)
+    if c.dead == 1 { return 0 - 32 }
+    return c.req / c.fs
+}
+
+fn npa_stream_cmd(c: NpaConn, cmd: Int, ms: Int) -> Int {
+    if c.dead == 1 { return 0 - 32 }
+    let b: NpaBuf = npa_buf_new()
+    let tag = npa_cmd(c, b, cmd)
+    npa_put_u32(b, c.chan)
+    return npa_call(c, b, tag, ms)
+}
+
+// the server answers a drain once the stream has played out, however long that takes
+fn npa_drain(h: Int) -> Int { return npa_stream_cmd(h, NPA_CMD_DRAIN_PLAYBACK_STREAM(), 0 - 1) }
+
+fn npa_drop(h: Int) -> Int { return npa_stream_cmd(h, NPA_CMD_FLUSH_PLAYBACK_STREAM(), 5000) }
+
+fn npa_close(h: Int) -> Int {
+    let c: NpaConn = h
+    var r = 0
+    if c.dead == 0 { r = npa_stream_cmd(c, NPA_CMD_DELETE_PLAYBACK_STREAM(), 2000) }
+    npa_conn_free(c)
+    if r == 0 - 32 { r = 0 }
+    return r
+}

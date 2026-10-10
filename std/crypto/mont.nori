@@ -1,0 +1,199 @@
+// Montgomery modular arithmetic: the multiply-and-reduce that needs no division.
+//
+// Shared by RSA verification and by the elliptic curves, which is why it is its own file. Both
+// need arithmetic modulo a large odd number with no exploitable shape: an RSA modulus has none by
+// construction, and writing a second reduction per curve prime is how a subtle difference gets
+// into one of them and not the other.
+//
+// std/bigint is not used here. Its limbs are base 10^9 and its reduction is long division;
+// one 4096-bit RSA verification through it allocated 232 MB. Working with numbers scaled by
+// R = 2^(32*len) turns a modular multiply into a multiply and a shift, and the only setup is
+// R^2 mod n, which is reached by doubling rather than dividing.
+//
+// Limbs are 32 bits held in i64, little-endian. The widest intermediate is
+// (2^32-1)^2 + 2*(2^32-1), which is exactly 2^64-1: it fits a 64-bit word with nothing to spare,
+// and that is why the limbs are 32 bits and not more. Nori's `>>` is logical and `+`/`*` wrap, so
+// these words behave as unsigned throughout; nothing here compares or divides one as a signed
+// value.
+//
+// None of this is constant-time, and every caller uses it on public values only: a
+// signature, a public key, a published exponent.
+
+/// A big-endian byte string as little-endian 32-bit limbs.
+pub fn mont_limbs_of(be: Str) -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    var i = be.len()
+    while i > 0 {
+        var w = 0
+        var k = 0
+        while k < 4 {
+            let idx = (i - 1 - k)
+            if idx >= 0 { w = (w | (ord(be.at(idx)) << (8 * k))) }
+            k = k + 1
+        }
+        v.push(w)
+        i = i - 4
+    }
+    return v
+}
+/// Limbs back to exactly `n` big-endian bytes.
+pub fn mont_bytes_of(v: Vec<Int>, n: Int) -> Str {
+    var out = ""
+    var i = n - 1
+    while i >= 0 {
+        let w = (i / 4)
+        var b = 0
+        if w < v.len() { b = ((v[w] >> (8 * (i % 4))) & 0xff) }
+        out = (out + chr(b))
+        i = i - 1
+    }
+    return out
+}
+/// `n` zero limbs.
+pub fn mont_zeros(n: Int) -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    var i = 0
+    while i < n { v.push(0)  i = i + 1 }
+    return v
+}
+// a >= b, as unsigned little-endian limb vectors of the same length
+/// a >= b, as unsigned little-endian limb vectors of equal length.
+pub fn mont_ge(a: Vec<Int>, b: Vec<Int>) -> Bool {
+    var i = a.len() - 1
+    while i >= 0 {
+        if a[i] != b[i] {
+            // compare as unsigned 32-bit; both are masked, so a plain comparison is correct
+            return a[i] > b[i]
+        }
+        i = i - 1
+    }
+    return true
+}
+/// a -= b, wrapping.
+pub fn mont_sub_in_place(inout a: Vec<Int>, b: Vec<Int>) {
+    var borrow = 0
+    var i = 0
+    while i < a.len() {
+        let v = ((a[i] - b[i]) - borrow)
+        if v < 0 { a[i] = (v + 4294967296)  borrow = 1 } else { a[i] = v  borrow = 0 }
+        i = i + 1
+    }
+}
+
+// -n^-1 mod 2^32, by Newton's iteration: each step doubles the number of correct bits, so five
+// steps take 1 bit to 32. Requires n to be odd, which every RSA modulus is.
+//
+// The products below are of two full 32-bit limbs, and (2^32-1)^2 does not fit a signed 64-bit
+// Int, so they are written `wrapping_mul`. That is not a workaround but the operation this
+// algorithm asks for: every intermediate here is defined modulo 2^32, and the low bits
+// a wrap keeps are the ones the mask goes on to read. Plain `*` would give
+// identical results in a release build (where the check is off) and trap in a checked one, which is a
+// difference between build modes in code that has no business having one.
+/// -n^-1 mod 2^32, for an odd n.
+pub fn mont_n0inv(n0: Int) -> Int {
+    var x = n0
+    var i = 0
+    while i < 5 {
+        x = (wrapping_mul(x, (2 - (wrapping_mul(n0, x) & 0xffffffff))) & 0xffffffff)
+        i = i + 1
+    }
+    return ((4294967296 - x) & 0xffffffff)
+}
+
+// (a * b * R^-1) mod n, the CIOS form. All three vectors have `len` limbs.
+/// (a * b * R^-1) mod n: a Montgomery product, CIOS form.
+pub fn mont_mul(a: Vec<Int>, b: Vec<Int>, n: Vec<Int>, n0inv: Int) -> Vec<Int> {
+    let len = n.len()
+    var t = mont_zeros(len + 2)
+    var i = 0
+    while i < len {
+        var c = 0
+        var j = 0
+        while j < len {
+            let v = wrapping_add(wrapping_add(t[j], wrapping_mul(a[j], b[i])), c)
+            t[j] = (v & 0xffffffff)
+            c = ((v >> 32) & 0xffffffff)
+            j = j + 1
+        }
+        let v1 = (t[len] + c)
+        t[len] = (v1 & 0xffffffff)
+        t[len + 1] = ((v1 >> 32) & 0xffffffff)
+
+        let m = (wrapping_mul(t[0], n0inv) & 0xffffffff)
+        let v2 = wrapping_add(t[0], wrapping_mul(m, n[0]))
+        c = ((v2 >> 32) & 0xffffffff)
+        j = 1
+        while j < len {
+            let v = wrapping_add(wrapping_add(t[j], wrapping_mul(m, n[j])), c)
+            t[j - 1] = (v & 0xffffffff)
+            c = ((v >> 32) & 0xffffffff)
+            j = j + 1
+        }
+        let v3 = (t[len] + c)
+        t[len - 1] = (v3 & 0xffffffff)
+        t[len] = (t[len + 1] + ((v3 >> 32) & 0xffffffff))
+        i = i + 1
+    }
+    var r = mont_zeros(len)
+    i = 0
+    while i < len { r[i] = t[i]  i = i + 1 }
+    if t[len] != 0 { mont_sub_in_place(r, n)  return r }
+    if mont_ge(r, n) { mont_sub_in_place(r, n) }
+    return r
+}
+
+// R^2 mod n, by doubling. 2^k mod n is reached from 1 by k conditional doublings, and no division
+// is needed anywhere, which is the whole reason for this representation.
+/// R^2 mod n, so a value can be scaled into Montgomery form.
+pub fn mont_r_squared(n: Vec<Int>) -> Vec<Int> {
+    let len = n.len()
+    var r = mont_zeros(len)
+    r[0] = 1
+    var i = 0
+    let total = (2 * (32 * len))
+    while i < total {
+        var carry = 0
+        var j = 0
+        while j < len {
+            let v = ((r[j] << 1) | carry)
+            r[j] = (v & 0xffffffff)
+            carry = ((v >> 32) & 1)
+            j = j + 1
+        }
+        if carry != 0 { mont_sub_in_place(r, n) }
+        else { if mont_ge(r, n) { mont_sub_in_place(r, n) } }
+        i = i + 1
+    }
+    return r
+}
+
+// base^exp mod n, with everything little-endian and `n` odd.
+/// base^exp mod n, for an odd n. Inputs and output are ordinary (not Montgomery) values.
+pub fn mont_modexp(base: Vec<Int>, exp: Vec<Int>, n: Vec<Int>) -> Vec<Int> {
+    let len = n.len()
+    let n0inv = mont_n0inv(n[0])
+    let rr = mont_r_squared(n)
+    var result = mont_mul(mont_one(len), rr, n, n0inv)      // R mod n, i.e. Montgomery 1
+    var b = mont_mul(base, rr, n, n0inv)
+    // highest set bit of the exponent
+    var top = ((exp.len() * 32) - 1)
+    while top >= 0 {
+        if ((exp[(top / 32)] >> (top % 32)) & 1) == 1 { top = 0 - 2 - top }
+        else { top = top - 1 }
+    }
+    if top >= 0 - 1 { return mont_one(len) }                     // a zero exponent
+    var bit = (0 - 2 - top)
+    while bit >= 0 {
+        result = mont_mul(result, result, n, n0inv)
+        if ((exp[(bit / 32)] >> (bit % 32)) & 1) == 1 { result = mont_mul(result, b, n, n0inv) }
+        bit = bit - 1
+    }
+    return mont_mul(result, mont_one(len), n, n0inv)         // back out of Montgomery form
+}
+
+/// the value 1 in `len` limbs.
+pub fn mont_one(len: Int) -> Vec<Int> {
+    var v = mont_zeros(len)
+    v[0] = 1
+    return v
+}

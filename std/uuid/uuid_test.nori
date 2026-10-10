@@ -1,0 +1,31 @@
+// Tests for std/uuid. Run with
+//   noric --test std/uuid/uuid_test.nori compiler/runtime.nori --import-root .
+import "std/uuid" as uuid
+import "std/rand" as rand
+
+fn test_v4_format() {
+    var r = rand::seeded(12345)
+    let u = uuid::v4(r)
+    assert_eq(u.len(), 36)
+    assert_eq(ord(u.at(8)), 45)                    // '-'
+    assert_eq(ord(u.at(13)), 45)
+    assert_eq(ord(u.at(18)), 45)
+    assert_eq(ord(u.at(23)), 45)
+    assert_eq(ord(u.at(14)), 52)                   // version nibble '4'
+    let vc = ord(u.at(19))                          // variant char in {8,9,a,b}
+    assert_true(vc == 56 || vc == 57 || vc == 97 || vc == 98)
+}
+
+fn test_unique() {
+    var r = rand::seeded(7)
+    let a = uuid::v4(r)
+    let b = uuid::v4(r)
+    assert_false((a == b))
+}
+
+fn test_v7_format() {
+    var r = rand::seeded(99)
+    let u = uuid::v7(r)
+    assert_eq(u.len(), 36)
+    assert_eq(ord(u.at(14)), 55)                   // version nibble '7'
+}

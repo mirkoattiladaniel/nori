@@ -1,0 +1,32 @@
+import "std/heap" as heap
+fn test_order() {
+    var h = heap::new()
+    var vals: Vec<Int> = vec()  vals.push(5)  vals.push(1)  vals.push(8)  vals.push(3)  vals.push(2)
+    var i = 0  while i < vals.len() { h.insert(vals[i])  i = i + 1 }
+    assert_eq(h.size(), 5)
+    assert_eq(h.peek_min(), 1)
+    assert_eq(h.pop_min(), 1)
+    assert_eq(h.pop_min(), 2)
+    assert_eq(h.pop_min(), 3)
+    assert_eq(h.pop_min(), 5)
+    assert_eq(h.pop_min(), 8)
+    assert_true(h.is_empty())
+}
+
+// ---- laws: min-heap invariants (fuzzed by `noric --fuzz-laws` / `roll law`) ----
+law heap_pops_in_sorted_order(v: Vec<Int>) {
+    var h = heap::new()
+    var i = 0
+    while i < v.len() { h.insert(v[i])  i = i + 1 }
+    var prev = 0
+    var first = true
+    var popped = 0
+    while h.size() > 0 {
+        let x = h.pop_min()
+        if !first { assert(prev <= x) }
+        prev = x
+        first = false
+        popped = popped + 1
+    }
+    assert(popped == v.len())                      // every inserted element comes back out
+}

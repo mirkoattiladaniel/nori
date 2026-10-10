@@ -1,0 +1,1268 @@
+// roll: the everyday verbs (init, build, check, run, clean) and the reports that read a build (xray, db,
+// todo, shadow).
+//
+// One directory module of roll (see src/main.nori for the layout). It reaches the others through
+// their aliases below, and only what another module uses is `pub`. The modules import each other
+// freely (`cmds` and `deps` call in both directions); cycles between directory modules are fine.
+
+import "std/io" as io
+import "std/os" as os
+import "std/time" as time
+import "../android" as android
+import "../caps" as caps
+import "../deps" as deps
+import "../law" as law
+import "../manifest" as manifest
+import "../ui" as ui
+import "../util" as util
+
+use caps::*
+use deps::*
+use law::*
+use manifest::*
+use ui::*
+use util::*
+
+// ---------- commands ----------
+pub fn init() {
+    var name = ""
+    var is_lib = false
+    var k = 1
+    while k < argc() {
+        let a = arg(k)
+        if(a == "--lib") {
+            is_lib = true
+        }
+        else if ord(a.at(0)) != 45 {
+            if(name == "") {
+                name = copy a
+            }
+        }
+        // first non-flag arg = the name
+        k = k + 1
+    }
+    var dir = "."
+    if(name == "") {
+        name = basename(os::cwd())
+    }
+    // no NAME: scaffold here, name = cwd's basename
+    else {
+        dir = copy name // NAME (maybe a path): create there
+        if os::path_exists(dir) {
+            printl(("roll: `" + (dir + "` already exists")))
+            return
+        }
+        name = basename(name) // project name = the last path component
+    }
+    var kind = "bin"
+    var entry = "src/main.nori"
+    if is_lib {
+        kind = "lib"
+        entry = "src/lib.nori"
+    }
+    os::make_dir_p((dir + "/src"))
+
+    // manifest, including default dev + release profiles (edit freely; add your own [profile.NAME])
+    var m = ("name = " + name)
+    m = nl(m, ("kind = " + kind))
+    m = nl(m, "version = 0.1.0") // this project's own version (semver)
+    m = nl(m, ("entry = " + entry))
+    m = nl(m, "# nori = 1.0.0     # optional: minimum noric version this project needs")
+    m = nl(m, "# auto-type = true # set false to require an explicit type on every let/var (`var a: i64 = 1`)")
+    m = nl(m, "")
+    m = nl(m, "# build profiles: `roll build` -> [profile.dev], `--release` -> [profile.release],")
+    m = nl(m, "# `--profile NAME` -> [profile.NAME]. Override these or add as many as you like.")
+    m = nl(m, "[profile.dev]")
+    m = nl(m, "overflow-checks = true") // trap on Int overflow in dev (release wraps; say wrapping_*/saturating_* to be explicit)
+    m = nl(m, "auto-order = false") // skip loop-interchange analysis: smaller MLIR, faster compile
+    m = nl(m, "auto-parallel = true") // auto-run provably-independent foreach loops in parallel (bit-identical to serial)
+    m = nl(m, "simd = true")
+    // The dev profile has no `opt` line on purpose. `debug = true` below asks for DWARF, and a DWARF
+    // build with no explicit opt level compiles at -O0, which keeps every local in memory where a
+    // debugger can read it. An explicit `opt = 1` would make the first `roll build` warn:
+    // "--debug with --opt 1: the line table survives, the variables do not".
+    m = nl(m, "# opt = 1          # uncomment for faster dev RUNS; costs the variables in a debugger (backtraces stay)")
+    m = nl(m, "lto = false") // skip link-time optimisation for a faster link (a debug build declines LTO anyway)
+    m = nl(m, "incremental = true") // per-module cached + parallel backend: fast rebuilds (full LTO is skipped on this path; `lto = thin` still applies)
+    m = nl(m, "debug = true") // backtraces on trap/fail() (`at file:line` + call chain); DWARF line tables; implies dwarf, selects opt 0
+    m = nl(m, "")
+    m = nl(m, "[profile.release]")
+    m = nl(m, "auto-order = true") // automatic unit-stride loop interchange where provably legal
+    m = nl(m, "auto-parallel = true") // auto-run provably-independent foreach loops in parallel (bit-identical to serial)
+    m = nl(m, "simd = true")
+    m = nl(m, "opt = 3") // maximum clang optimisation
+    m = nl(m, "lto = thin") // ThinLTO: cross-module inlining, parallel + fast link
+    m = nl(m, "incremental = true") // per-module cached + parallel backend; `thin` is the only lto value it combines with
+    m = nl(m, "")
+    m = nl(m, "# dependencies — referenced by name in code (no paths/extensions). Examples:")
+    m = nl(m, "# [deps]")
+    m = nl(m, "# mathx = path ../mathx                          # a local project")
+    m = nl(m, "# json  = git https://github.com/x/json@v1.0     # fetched + pinned in nori.lock")
+    m = nl(m, "# (or add them with:  roll add json https://github.com/x/json   /   roll add mathx --path ../mathx)")
+    m = nl(m, "# then in code:  import \"mathx\" as m")
+    m = (m + "\n")
+    write_file((dir + "/nori.manifest"), m)
+
+    if is_lib {
+        write_file((dir + "/src/lib.nori"), ("// " + (name + " — (describe your library)\nfn example(n: Int) -> Int {\n    return n + 1\n}\n")))
+    } else {
+        write_file((dir + "/src/main.nori"), "fn main() -> Int {\n    printl(\"Roll the Nori!\")\n    return 0\n}\n")
+    }
+    printl(("created " + (name + (" (" + (kind + ") with profiles: dev, release")))))
+    if(dir == ".") {
+        printl("  roll run")
+    }
+    else {
+        printl(("  cd " + (dir + " && roll run")))
+    }
+}
+
+// Compile all of a project's own .nori files together, with no manual `import` for your own modules.
+// We generate build/_root.nori importing every .nori under the source dir (the dir of the
+// manifest's `entry`); noric inlines and dedups them. `import` is then only for external/std deps, and
+// any explicit imports a file already has still work (deduped). Returns the root's path.
+// Which subdirectories of the source tree does the project import as a module (`import "codegen"`,
+// with or without `as`)? Those are dir-modules: their files share one scope and must be pulled in as a
+// unit. Everything else is listed file by file, which is what makes roll's Go-style "a helper nobody
+// imports still compiles" work.
+//
+// Getting this wrong breaks in one direction or the other. Listing a dir-module's files individually
+// gives each its own scope, so names declared one file over are not found ("cannot find `x` in this
+// scope") even though `noric --build` on the same source works. Importing only the source directory
+// instead makes every sub-folder a namespace, and then a Go-style helper in `src/lib/` is no longer
+// visible unqualified. The project's own imports say which it wants.
+fn dirmod_imports(dir: Str, files: Vec<Str>) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var i = 0
+    while i < files.len() {
+        let f = files[i]
+        if ends_with(f, ".nori") {
+            let txt = read_file(f)
+            var j = 0
+            let n = txt.len()
+            while j < n {
+                if(txt.at(j) == 'i') {
+                    // scan for `import "`
+                    if j + 8 <= n {
+                        if(txt.slice(j, j + 8) == "import \"") {
+                            var k = j + 8
+                            var t = ""
+                            while k < n && !(ord(txt.at(k)) == 34) {
+                                t = (t + txt.slice(k, k + 1))
+                                k = k + 1
+                            }
+                            // a directory import: no `.nori` suffix, and it resolves under the source dir
+                            if !ends_with(t, ".nori") {
+                                if !starts_with(t, "std/") {
+                                    let cand = (dir + ("/" + t))
+                                    if os::is_dir(cand) {
+                                        out.push(t)
+                                    }
+                            } }
+                            j = k
+                    } }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+pub fn gen_root(entry: Str) -> Str {
+    os::make_dir("build")
+    let dir = dirname(entry) // e.g. "src"
+    let root = "build/_root.nori" // build/ is one level down -> import "../<path>"
+    var scan = dir
+    if(scan == "") {
+        scan = "."
+    }
+    let files = os::list_tree(scan)
+    let mods = dirmod_imports(scan, files)
+    // The project's own imports decide the shape, and it is either/or: mixing a directory import
+    // with individual file imports gives neither scoping.
+    //
+    //   * A project that imports a subdirectory as a module (`import "codegen"`) is saying its tree
+    //     has structure. Import the source directory and let the dir-module rules apply: root files
+    //     share one scope, sub-folders are namespaces.
+    //   * A project with no directory imports is Go-style: every file compiles together in one flat
+    //     scope, including a helper in a sub-folder that nobody imports. Those are listed
+    //     individually, which makes such a helper visible unqualified.
+    var imp = ""
+    if mods.len() > 0 {
+        write_file(root, ("import \"../" + (scan + "\"\n")))
+        return root
+    }
+    var i = 0
+    while i < files.len() {
+        let f = files[i] // e.g. "src/util/math.nori" (relative to here)
+        if ends_with(f, ".nori") {
+            imp = (imp + ("import \"../" + (f + "\"\n")))
+        }
+        i = i + 1
+    }
+    write_file(root, imp)
+    return root
+}
+
+// the cross-compile target triple: `roll build --target <triple>` (CLI) or a manifest top-level
+// `target = <triple>`; "" = native. noric derives the cfg OS from it and passes --target to clang.
+// The profile's flags onto a noric command. `opt`, `lto`, `incremental` and `unit_host` describe
+// LLVM's optimizer and its per-unit path; the native back end has one pipeline and refuses them, so
+// off LLVM they are dropped (the manifest reference says so beside each key).
+fn push_profile_flags(inout cmd: Vec<Str>, pf: Vec<Str>, usellvm: Bool, bare: Bool) {
+    var fi = 0
+    while fi < pf.len() {
+        let f = pf[fi]
+        var drop = false
+        if bare && (f == "--incremental") { drop = true }   // freestanding lowers via do_build, not the incremental path
+        if !usellvm {
+            if (f == "--incremental") { drop = true }
+            if (f == "--thin-lto") { drop = true }
+            if (f == "--no-lto") { drop = true }
+            if (f == "--unit-host") { drop = true }
+            if (f == "--opt") { drop = true  fi = fi + 1 }   // …and its level
+        }
+        if !drop { cmd.push(copy f) }
+        fi = fi + 1
+    }
+}
+fn build_target(mf: Str) -> Str {
+    var k = 1
+    while k < argc() {
+        if(arg(k) == "--target") {
+            if k + 1 < argc() {
+                return arg(k + 1)
+            }
+        }
+        k = k + 1
+    }
+    return section_get(mf, "", "target")
+}
+// `roll verify`: show the proof-carrying evidence embedded in the built binary (needs `roll build --evidence`).
+pub fn verify_cmd() -> Int {
+    let mf = load_manifest()
+    let name = section_get(mf, "", "name")
+    let bin = ("build/" + (selected_profile() + ("/" + name)))
+    if !is_file(bin) {
+        printl("roll verify: no built binary — run `roll build --evidence` first")
+        return 1
+    }
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--verify") cmd.push(bin)
+    return os::run(cmd)
+}
+// ---------- an optional PATH argument to `build` / `check` ----------
+// `roll check std/html`, `roll build ../other-project`. The argument names one of two things, decided
+// by whether a `nori.manifest` sits in it:
+//
+//   * Another project: a directory holding its own manifest. Nothing changes but the working
+//     directory; the ordinary manifest flow runs from there, profiles, deps and all.
+//   * A loose target: a `.nori` file, or a module directory with no manifest of its own. There is no
+//     manifest to read, so it goes straight to noric. This is what makes one std module inspectable on
+//     its own: the compiler's directory-module rules apply, which keeps `*_test.nori` out of the scope,
+//     whereas the generated root a manifest project compiles through lists every file in the folder,
+//     and a flat module's tests then collide with each other over shared helper names.
+//
+// A loose build carries no profile flags: profiles are a manifest's, so the compiler's own defaults
+// stand in for them.
+fn path_arg() -> Str {
+    var k = 1
+    while k < argc() {
+        let a = arg(k)
+        if(a == "--") {
+            return ""
+        }
+        // everything past `--` belongs to the program
+        if(a == "--profile") || (a == "--target") || (a == "--diag") || (a == "--state-from") {
+            k = k + 1
+        }
+        // that flag's value is not a path
+        else if !starts_with(a, "-") {
+            return a
+        }
+        k = k + 1
+    }
+    return ""
+}
+// 1 = a project directory (now the working directory), 0 = a loose target, -1 = nothing at that path.
+fn enter_path(p: Str) -> Int {
+    if os::is_dir(p) {
+        if !os::path_exists((p + "/nori.manifest")) {
+            return 0
+        }
+        if os::set_cwd(p) != 0 {
+            return 0 - 1
+        }
+        return 1
+    }
+    if os::path_exists(p) {
+        return 0
+    }
+    return 0 - 1
+}
+// the name a loose target answers to: its file or folder name, without the extension.
+fn loose_name(p: Str) -> Str {
+    let b = basename(p)
+    if ends_with(b, ".nori") {
+        return b.slice(0, b.len() - 5)
+    }
+    return b
+}
+// does a loose target define `main`? A directory module is its `.nori` files (its tests are not part
+// of it), so a program is one that says `fn main` in any of them. Anything else can only be checked.
+fn loose_has_main(p: Str) -> Bool {
+    if !os::is_dir(p) {
+        return find_substr(read_file(p), "fn main") >= 0
+    }
+    let files = os::list_tree(p)
+    var i = 0
+    while i < files.len() {
+        let f = files[i]
+        if ends_with(f, ".nori") && !ends_with(f, "_test.nori") {
+            if find_substr(read_file(f), "fn main") >= 0 {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+// `roll check PATH` on a loose target: the compiler's diagnostics, and nothing else.
+fn check_loose(p: Str) -> Int {
+    eprintl((verb("Checking", "1;36") + (" " + proj_label(loose_name(p), "", "no manifest"))))
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--check") cmd.push(copy p) cmd.push("--quiet")
+    let t0 = time::now_ms()
+    let rc = os::run(cmd)
+    let dt = time::now_ms() - t0
+    if rc == 0 {
+        eprintl((verb("Finished", "1;32") + (" " + (dim("no errors") + dim(("  in " + fmt_ms(dt)))))))
+    }
+    return rc
+}
+// `roll build PATH` on a loose target: a binary if it has a `main`, otherwise the same type-check a
+// `kind = lib` project gets, since there is nothing to link a program out of.
+/// `[assets] copy = a, b`: files that ship beside the library, copied there after it builds.
+///
+/// A plugin that draws itself from a `.ui` and a `.style` needs those files at run time, and the
+/// only directory it can be told about is the one its `.so` was loaded from (`plugin.dir`). In a
+/// checkout the loader also looks two levels up in `src/`, so editing a `.ui` shows up without a
+/// rebuild, but a plugin copied somewhere else has no src/ above it. Copying the assets makes it
+/// self-contained.
+///
+/// Paths are relative to the project root; only the basename survives the copy, so `src/panel.ui`
+/// lands as `panel.ui` next to the library. A file that is not there is named and skipped rather
+/// than failing the build: a missing asset is a panel that says so at run time, not a build that
+/// stops after the code was fine.
+fn copy_assets(mf: Str, so: Str) {
+    let spec = manifest::section_get(mf, "assets", "copy")
+    if spec.len() == 0 { return }
+    var dir = ""
+    var cut = 0 - 1
+    var k = 0
+    while k < so.len() { if ord(so.at(k)) == 47 { cut = k }  k = k + 1 }
+    if cut > 0 { dir = so.slice(0, cut) }
+    if dir.len() == 0 { return }
+    var cur = ""
+    var i = 0
+    while i <= spec.len() {
+        var end = i == spec.len()
+        var comma = false
+        if !end { comma = ord(spec.at(i)) == 44 }
+        if end || comma {
+            let one = util::trim(cur)
+            cur = ""
+            if one.len() > 0 {
+                var base = one
+                var bc = 0 - 1
+                var b = 0
+                while b < one.len() { if ord(one.at(b)) == 47 { bc = b }  b = b + 1 }
+                if bc >= 0 { base = one.slice(bc + 1, one.len()) }
+                if os::path_exists(one) {
+                    if !io::copy_file(one, dir + ("/" + base)) {
+                        eprintl((verb("Warning", "1;33") + (" " + dim(("could not copy asset " + one)))))
+                    }
+                } else {
+                    eprintl((verb("Warning", "1;33") + (" " + dim(("no asset at " + one)))))
+                }
+            }
+        } else { cur = cur + spec.at(i) }
+        i = i + 1
+    }
+}
+
+fn build_loose(p: Str) -> Int {
+    if !loose_has_main(p) {
+        return check_loose(p)
+    }
+    let prof = selected_profile()
+    let name = loose_name(p)
+    eprintl((verb("Compiling", "1;36") + (" " + proj_label(name, "", ("no manifest, " + prof)))))
+    os::make_dir_p(("build/" + prof))
+    let out = ("build/" + (prof + ("/" + name)))
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--build") cmd.push(copy p) cmd.push(copy out) cmd.push("--quiet")
+    let t0 = time::now_ms()
+    let rc = os::run(cmd)
+    let dt = time::now_ms() - t0
+    if rc == 0 {
+        eprintl((verb("Finished", "1;32") + (" " + (out + dim(("  in " + fmt_ms(dt)))))))
+    }
+    return rc
+}
+pub fn build() -> Int {
+    if(arg(0) == "build") {
+        let pa = path_arg() // `roll run` reaches build() too, and its own arguments are not paths
+        if !(pa == "") {
+            let k = enter_path(pa)
+            if k < 0 {
+                fail(("roll build: no such file or directory: " + pa))
+                return 1
+            }
+            if k == 0 {
+                return build_loose(pa)
+            }
+        }
+    }
+    let mf = load_manifest()
+    let name = section_get(mf, "", "name")
+    let kind = section_get(mf, "", "kind")
+    let entry = section_get(mf, "", "entry")
+    let ver = section_get(mf, "", "version")
+    let prof = selected_profile()
+    let target = gen_root(entry) // all src/*.nori, compiled together
+    if caps_enforce(mf) != 0 {
+        return 1
+    }
+    // [caps] deny lists: fail before compiling
+
+    if(kind == "lib") {
+        // a library: type-check only
+        eprintl((verb("Checking", "1;36") + (" " + proj_label(name, ver, kind))))
+        var cc: Vec<Str> = vec()
+        cc.push(noric_path()) cc.push("--check") cc.push(target) cc.push("--quiet")
+        add_import_flags(cc, mf)
+        add_never_flags(cc, mf)
+        let t0 = time::now_ms()
+        let rc = os::run(cc)
+        let dt = time::now_ms() - t0
+        if rc == 0 {
+            eprintl((verb("Finished", "1;32") + (" " + (dim("type-checks; no errors") + dim(("  in " + fmt_ms(dt)))))))
+        }
+        return rc
+    }
+
+    if(kind == "plugin") {
+        // a plugin: a loadable shared library, not a program
+        eprintl((verb("Compiling", "1;36") + (" " + proj_label(name, ver, (kind + (", " + prof))))))
+        os::make_dir_p(("build/" + prof))
+        // Use the target's extension, not this machine's. `plugin_ext()` answers from the host's own
+        // `cfg(windows)`, which is right only for a native build. A cross build must also pass
+        // `--target`, or it would quietly produce a host artifact and report success.
+        let ptgt = build_target(mf)
+        let so = ("build/" + (prof + ("/" + (name + ("." + plugin_ext_for(deps::native_platform_of(ptgt)))))))
+        var pc: Vec<Str> = vec()
+        pc.push(noric_path()) pc.push("--build-lib") pc.push(target) pc.push(copy so) pc.push("--shared") pc.push("--quiet")
+        if !(ptgt == "") { pc.push("--target")  pc.push(copy ptgt) }
+        // The back end is chosen the way a program's is (below): native unless the manifest, the flags
+        // or what it links say LLVM. Passing neither would leave noric's --build-lib on its LLVM
+        // default, so every plugin would need mlir-opt. The native back end writes x86-64 shared
+        // objects only; another target stays on LLVM.
+        var pllvm = has_flag("--llvm") || (section_get(mf, "build", "backend") == "llvm")
+        if deps::needs_llvm(mf, deps::native_platform_of(ptgt), false) { pllvm = true }
+        if !(ptgt == "") && !(ptgt.len() >= 6 && ptgt.slice(0, 6) == "x86_64") { pllvm = true }
+        if has_flag("--native") { pllvm = false }
+        if pllvm { pc.push("--llvm") } else { pc.push("--native") }
+        // --incremental and --sep-std are program-link strategies; the shared link has its own path.
+        var ppf: Vec<Str> = vec()
+        let pf0 = profile_flags(mf, prof)
+        var pi = 0
+        while pi < pf0.len() {
+            if !((pf0[pi] == "--incremental") || (pf0[pi] == "--sep-std")) { ppf.push(copy pf0[pi]) }
+            pi = pi + 1
+        }
+        push_profile_flags(pc, ppf, pllvm, false)
+        // `exports = a, b, c` in the manifest: extra symbol names the .so must keep in its dynamic
+        // table. A plugin needs none (`nori_plugin_*` is exported automatically), but a module built
+        // against a foreign ABI (a native game with its own host ABI, say) has to export that ABI's names.
+        let exv = section_get(mf, "", "exports")
+        if exv.len() > 0 {
+            var st = 0
+            var ci = 0
+            while ci <= exv.len() {
+                if ci == exv.len() || ord(exv.at(ci)) == 44 {
+                    let sym = trim(exv.slice(st, ci))
+                    if sym.len() > 0 { pc.push("--export-symbol")  pc.push(sym) }
+                    st = ci + 1
+                }
+                ci = ci + 1
+            }
+        }
+        add_import_flags(pc, mf)
+        let pt0 = time::now_ms()
+        let prc = os::run(pc)
+        let pdt = time::now_ms() - pt0
+        if prc == 0 {
+            copy_assets(mf, so)
+            eprintl((verb("Finished", "1;32") + (" " + (so + dim(("  in " + fmt_ms(pdt)))))))
+        }
+        else {
+            eprintl((verb("Failed", "1;31") + (" " + dim("the plugin did not build"))))
+        }
+        return prc
+    }
+
+    // An Android target makes the same project an app rather than a program: a shared library with
+    // the activity glue, packaged and signed below. The manifest says nothing about it; the target
+    // is the whole difference, so one project builds for a desktop and a phone unchanged.
+    //
+    // `--exe` asks for the other Android artifact: a plain static executable for the phone rather
+    // than an app. A Nori binary makes raw syscalls and links no libc, so one runs unchanged from
+    // /data/local/tmp over adb, which suits a command-line tool or a benchmark. It is also the only
+    // Android artifact the native backend can produce (it has no aarch64 shared object writer).
+    // `roll run --device` then pushes and runs it.
+    let andro = android::is_android(build_target(mf)) && !has_flag("--exe")
+    eprintl((verb("Compiling", "1;36") + (" " + proj_label(name, ver, (kind + (", " + prof))))))
+    os::make_dir_p(("build/" + prof)) // build/<profile>/: dev/release/<custom> kept apart
+    var out = ("build/" + (prof + ("/" + name)))
+    if andro { out = ("build/" + (prof + "/libnoriapp.so")) }
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--build") cmd.push(target) cmd.push(copy out) cmd.push("--quiet")
+    if andro {
+        android::add_app_flags(cmd, util::nori_home())
+        // The ABI, for the manifest to name. A project shipping a prebuilt library has one copy
+        // per architecture, so the path to it has the ABI in it, and roll is the only party that
+        // knows which one this build is. Leaving it to an environment variable would make every
+        // caller remember to set it, and a build that forgot would fail at the linker with
+        // "unable to find library".
+        let _ = os::set_env("NORI_ABI", android::abi_of(build_target(mf)))
+    }
+    // `background = true` asks to be woken when the program is not running. The backend that can
+    // do it differs per platform and the program says nothing about which: the same source builds
+    // for a phone and a desktop, and only the phone has a scheduler behind this.
+    if deps::native_of(mf, deps::native_platform_of(build_target(mf)), "background") == "true" {
+        cmd.push("--cfile")
+        if andro { cmd.push((util::nori_home() + "/std/background/background_android.c")) }
+        else { cmd.push((util::nori_home() + "/std/background/background_absent.c")) }
+    }
+    add_never_flags(cmd, mf) // [never] manifest policies, forwarded to the build
+    let bare = is_freestanding(mf) // kernel build: needs the monolithic (non-incremental) path
+    // --state-from names the manifest of the build this one takes over from: only a freestanding program that
+    // describes its state (a kernel with [freestanding] state = true) has one, and it must be there
+    let sf = flag_val("--state-from", "")
+    if !(sf == "") {
+        if !(bare && section_get(mf, "freestanding", "state") == "true") {
+            printl("roll build: --state-from needs a freestanding program with [freestanding] state = true in nori.manifest")
+            return 1
+        }
+        if !is_file(sf) {
+            printl(("roll build: --state-from " + (sf + ": no such manifest")))
+            return 1
+        }
+    }
+    let pf = profile_flags(mf, prof)
+    // The back end. noric's own code generator is the default here too; `--llvm`, a manifest
+    // `[build] backend = "llvm"`, and everything deps::needs_llvm knows the native back end cannot do
+    // select the other pipeline. roll then passes --llvm, so the choice is on the command line
+    // and in the build log rather than inferred twice.
+    var usellvm = has_flag("--llvm") || (section_get(mf, "build", "backend") == "llvm")
+    if deps::needs_llvm(mf, deps::native_platform_of(build_target(mf)), andro) { usellvm = true }
+    if has_flag("--separate") { usellvm = true }   // external objects + interfaces are the LLVM path's
+    if has_flag("--native") { usellvm = false }    // explicit: let noric refuse if it must
+    if usellvm && !has_flag("--native") { cmd.push("--llvm") }
+    // `opt`, `lto`, `incremental` and `unit_host` describe LLVM's optimizer and its per-unit path.
+    // The default back end has one optimization pipeline and compiles whole programs, so on that path
+    // they name nothing, so they are dropped here rather than handed to a compiler that would refuse
+    // them (the manifest reference says so beside each key). `backend = "llvm"` (or `--llvm`)
+    // is how a project that means them gets them.
+    push_profile_flags(cmd, pf, usellvm, bare)
+    if has_flag("--memprof") {
+        cmd.push("--memprof")
+    }
+    // `roll build --memprof` / `roll run --memprof`: per-site allocation profile, dumped to stderr at exit
+    if has_flag("--debug") {
+        cmd.push("--debug")
+    }
+    // `roll build --debug`: source locations + a backtrace when a trap or fail() fires
+    if has_flag("--dwarf") {
+        cmd.push("--dwarf")
+    }
+    // `roll build --dwarf`: line tables, so gdb/perf and a core dump report file:line (no LTO)
+    if has_flag("--shadow") {
+        cmd.push("--shadow")
+    }
+    // `roll build --shadow` / `roll run --shadow`: run each `shadows` pair, log divergences to stderr
+    if has_flag("--evidence") {
+        cmd.push("--evidence")
+    }
+    // `roll build --evidence`: embed a proof-carrying evidence section (see `roll verify`)
+    if has_flag("--native") {
+        cmd.push("--native")
+    }
+    // `roll build --llvm`: the MLIR -> clang pipeline, for a second opinion or for what the
+    // native back end cannot build. The default is the native one, noric's and roll's.
+    // `roll build --native`: the whole program through the native x86-64 backend, no LLVM or clang
+    //
+    // An Android executable (`--exe`, the artifact that runs from /data/local/tmp rather than an
+    // APK) is static and libc-free, which takes two settings here. `--nolibc`, because roll
+    // otherwise asks for a bionic-hosted link and there is no NDK sysroot on this path to link
+    // against. And the whole-program route, because the sep-std branch below adds the platform's
+    // absent C seams, which are compiled against the host's /usr/include on a cross build (an
+    // aarch64 compile of the host's stdlib.h fails with `__float128 is not supported on this
+    // target`). The native backend replaces those seams with Nori modules and needs none of them.
+    let andexe = android::is_android(build_target(mf)) && has_flag("--exe")
+    if andexe { cmd.push("--nolibc") }
+    if bare {
+        add_freestanding_flags(cmd, mf, out)
+        // `--state-from OLD.state`: this build takes over from the one whose manifest OLD is (a kernel's live
+        // update: the new image is checked against the old one's state and carries its migrations)
+        let sfrom = flag_val("--state-from", "")
+        if !(sfrom == "") {
+            cmd.push("--state-from")
+            cmd.push(sfrom)
+        }
+        add_import_flags(cmd, mf)
+    } else if has_flag("--separate") { // separate compilation: deps as cached objects + interfaces
+        cmd.push("--incremental") // external objects need the no-LTO backend
+        add_separate_flags(cmd, mf)
+        if has_flag("--dev") {
+            cmd.push("--sep-std")
+            deps::add_absent_seams(cmd, mf, deps::native_platform_of(build_target(mf)), util::nori_home())
+        }
+        // dev profile: std as a once-compiled lib DAG too
+    } else if usellvm && (prof == "dev") && !has_flag("--whole") && !andexe && (section_keys(mf, "never").len() == 0)
+              && (section_keys(mf, "deps").len() == 0) {
+        // [never] policies are whole-program call-graph analyses, and a sep-std build cuts the graph
+        // at lib boundaries, so a manifest carrying them keeps the whole-program path.
+        //
+        // A project with dependencies keeps it too, as a limitation: --sep-std compiles the std
+        // modules in the root's import closure, and a dependency's sources are not in it. A std
+        // function only a dependency calls is therefore never compiled, and the build fails at the
+        // linker naming it. Until dependency sources are walked when collecting the closure, a dev
+        // build of such a project takes the whole-program path, which is slower but correct.
+        //
+        // The default: the dev profile compiles std imports once into the content-addressed
+        // ~/.nori/sepstd lib DAG (noric --sep-std), so a project rebuild pays for its own code and
+        // linking, not the std closure. Release keeps whole-program + LTO for maximum optimization;
+        // `roll build --whole` opts a dev build out.
+        cmd.push("--sep-std")
+        // a sep-std build compiles each std module whole, so every C seam in the closure must link
+        deps::add_absent_seams(cmd, mf, deps::native_platform_of(build_target(mf)), util::nori_home())
+        add_import_flags(cmd, mf)
+    } else if !usellvm && (prof == "dev") && !has_flag("--whole") && !andexe && !andro && (build_target(mf) == "")
+              && (deps::host_os() == "linux")
+              && (section_keys(mf, "never").len() == 0) && (section_keys(mf, "deps").len() == 0) {
+        // The same default applies on the default back end. A dev build keeps every std module in the import
+        // closure as its MLIR behind an interface (noric --sep-std --native): the front end then
+        // checks and emits the project alone, and the back end (which still compiles program and
+        // std together, so nothing is lost across the boundary) takes unchanged functions from its
+        // cache. A rebuild pays for what was edited. Release stays whole-program: it is the same
+        // code within a percent, and it is the build that has to be trustworthy. `--whole` opts out.
+        // A cross build, [never] policies and dependencies keep the whole-program path for the
+        // reasons given above for the other back end.
+        cmd.push("--sep-std")
+        if !has_flag("--native") { cmd.push("--native") }
+        add_import_flags(cmd, mf)
+    } else { add_import_flags(cmd, mf) }
+    let tgt = build_target(mf) // cross-compile: --target <triple> (CLI) or manifest `target`
+    if !(tgt == "") {
+        cmd.push("--target")
+        cmd.push(tgt)
+    }
+    // the native back end answers the window and GPU glue itself: what the manifest names of it
+    // stays off its command line (std/native_seams)
+    if !usellvm { cmd = deps::strip_answered(cmd) }
+    let t0 = time::now_ms()
+    var rc = os::run(cmd)
+    var dt = time::now_ms() - t0
+    // Package it. The .so alone is not runnable on a phone (an APK is the deliverable), so the
+    // build is not finished until this is, and a packaging failure is a build failure.
+    if andro { if rc == 0 {
+        let apk = ("build/" + (prof + ("/" + (name + ".apk"))))
+        let abi = android::abi_of(build_target(mf))
+        let aplat = deps::native_platform_of(build_target(mf))
+        rc = android::package_apk(copy out, apk, ("dev.nori." + name), name, abi, ("build/" + (prof + "/apk")),
+                                  deps::native_of(mf, aplat, "java"),
+                                  deps::native_of(mf, aplat, "manifest_application"),
+                                  deps::native_of(mf, aplat, "background") == "true",
+                                  util::nori_home(),
+                                  deps::native_of(mf, aplat, "jni"))
+        dt = time::now_ms() - t0
+        if rc == 0 { out = (apk + dim(("  (" + (abi + ")")))) }
+        else { eprintl((verb("Failed", "1;31") + (" " + dim("the APK could not be packaged")))) }
+    } }
+    if rc == 0 {
+        var summ = profile_summary(mf, prof)
+        // what the line says was applied has to be what was: on the native back end the keys that
+        // tune LLVM's optimizer and its per-unit path were dropped above, so they are dropped here
+        if !usellvm { summ = native_summary(summ, cmd) }
+        var det = copy out
+        if !(summ == "") {
+            det = (out + dim(("  (" + (summ + ")"))))
+        }
+        det = (det + dim(("  in " + fmt_ms(dt))))
+        eprintl((verb("Finished", "1;32") + (" " + det)))
+    } else {
+        eprintl((verb("Failed", "1;31") + (" " + dim("the build did not complete"))))
+    }
+    stale_reminder() // nag about cache deps unused for 90+ days (quiet if none)
+    return rc
+}
+
+pub fn check() -> Int {
+    let pa = path_arg()
+    if !(pa == "") {
+        let k = enter_path(pa)
+        if k < 0 {
+            fail(("roll check: no such file or directory: " + pa))
+            return 1
+        }
+        if k == 0 {
+            return check_loose(pa)
+        }
+    }
+    // `--all`: every package under here, not just this one. A checkout is often a tree of them
+    // (several plugins side by side, a compiler beside its tools), and this answers "what is wrong
+    // with my project" in one command instead of one directory at a time.
+    if has_flag("--all") {
+        return check_all()
+    }
+    return check_here()
+}
+
+/// `--diag FILE`: the diagnostics, in the machine-readable form, to FILE.
+///
+/// `--check` prints its report and nothing else, which suits a person but not an editor: to show
+/// a clickable list, something has to know where each diagnostic is. `--emit-checked` already
+/// writes that when handed `--diag`, so this asks for it that way and discards the MLIR. It costs
+/// the same, since the checking is the work and the emission is not.
+fn check_cmd_for(mf: Str, diag: Str, inout cmd: Vec<Str>) {
+    cmd.push(noric_path())
+    if(diag == "") {
+        cmd.push("--check") cmd.push(gen_root(section_get(mf, "", "entry"))) cmd.push("--quiet")
+    } else {
+        cmd.push("--emit-checked") cmd.push(gen_root(section_get(mf, "", "entry")))
+        cmd.push("--diag") cmd.push(copy diag)
+        cmd.push("--out") cmd.push("build/check.mlir")
+    }
+    add_import_flags(cmd, mf)
+    // a kernel is checked as it is built: freestanding (the floor's hooks it overrides are used by the
+    // floor, and the checker knows the bare target)
+    if is_freestanding(mf) { cmd.push("--freestanding") }
+}
+
+fn check_here() -> Int {
+    let mf = load_manifest()
+    let name = section_get(mf, "", "name")
+    let ver = section_get(mf, "", "version")
+    eprintl((verb("Checking", "1;36") + (" " + proj_label(name, ver, section_get(mf, "", "kind")))))
+    if caps_enforce(mf) != 0 {
+        return 1
+    }
+    // [caps] deny lists checked first
+    var cmd: Vec<Str> = vec()
+    check_cmd_for(mf, flag_val("--diag", ""), cmd)
+    let t0 = time::now_ms()
+    let rc = os::run(cmd)
+    let dt = time::now_ms() - t0
+    if rc == 0 {
+        eprintl((verb("Finished", "1;32") + (" " + (dim("no errors") + dim(("  in " + fmt_ms(dt)))))))
+    }
+    todo_summary(mf) // append "warning: N TODOs, M FIXMEs" (quiet if none)
+    stale_reminder() // nag about cache deps unused for 90+ days (quiet if none)
+    return rc
+}
+
+/// every directory under `root` holding a `nori.manifest`, nearest first.
+///
+/// `build/` is skipped and so is anything beginning with a dot: a vendored dependency under
+/// `build/` is not this project's to report on, and neither is whatever a tool left in `.cache`.
+/// The root itself counts if it is a package (a repository is often one package with others
+/// beneath it).
+pub fn packages_under(root: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    if os::path_exists((root + "/nori.manifest")) {
+        out.push(copy root)
+    }
+    let files = os::list_tree(root)
+    var i = 0
+    while i < files.len() {
+        let f = files[i]
+        // Test only the part below the root. `list_tree` answers with absolute paths, so testing the
+        // whole path would search the project's own ancestors for a dot, and a checkout under
+        // `~/.cache`, `~/.local/src` or any dotted parent would have every package skipped.
+        var rel = f
+        if f.len() > root.len() + 1 && f.slice(0, root.len()) == root {
+            rel = f.slice(root.len() + 1, f.len())
+        }
+        if ends_with(f, "/nori.manifest") && !skip_pkg_path(rel) {
+            let d = dirname(f)
+            if !(d == root) {
+                out.push(d)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// a path with a `build/` or a dot-directory in it, which is not the project's own source.
+///
+/// Takes a path relative to the project root (see the caller).
+fn skip_pkg_path(p: Str) -> Bool {
+    var seg = ""
+    var i = 0
+    while i <= p.len() {
+        if i == p.len() || ord(p.at(i)) == 47 {
+            if(seg == "build") {
+                return true
+            }
+            if seg.len() > 1 && ord(seg.at(0)) == 46 {
+                return true
+            }
+            seg = ""
+        } else {
+            seg = seg + p.at(i)
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// check every package under the working directory.
+///
+/// The diagnostics of all of them go into one `--diag` file, each package's run introduced by a
+/// `== package <dir>` line. The paths inside a run stay as the compiler wrote them, relative to
+/// the package it was checked from, so a reader joins the two and gets a path it can open.
+/// Rewriting them here would mean parsing the report, which the `--diag` form exists to avoid.
+fn check_all() -> Int {
+    let root = os::cwd()
+    let pkgs = packages_under(root)
+    if pkgs.len() == 0 {
+        fail("roll check --all: no nori.manifest anywhere under here")
+        return 1
+    }
+    let diag = flag_val("--diag", "")
+    var report = ""
+    var worst = 0
+    var i = 0
+    while i < pkgs.len() {
+        let d = pkgs[i]
+        if os::set_cwd(d) != 0 {
+            eprintl(("roll check: cannot enter " + d))
+            worst = 1
+        } else {
+            let mf = load_manifest()
+            eprintl((verb("Checking", "1;36") + (" " + (proj_label(section_get(mf, "", "name"), section_get(mf, "", "version"), section_get(mf, "", "kind")) + dim(("  " + rel_to(root, d)))))))
+            var one = ""
+            if !(diag == "") {
+                one = "build/check.diag"
+                os::make_dir("build")
+                write_file(one, "")
+            }
+            var cmd: Vec<Str> = vec()
+            check_cmd_for(mf, one, cmd)
+            let rc = os::run(cmd)
+            if rc != 0 {
+                worst = rc
+            }
+            if !(diag == "") {
+                report = report + ("== package " + (rel_to(root, d) + "\n"))
+                report = report + read_file(one)
+                if report.len() > 0 && !(ord(report.at(report.len() - 1)) == 10) {
+                    report = report + "\n"
+                }
+            }
+            let _ = os::set_cwd(root)
+        }
+        i = i + 1
+    }
+    if !(diag == "") {
+        write_file(diag, report)
+    }
+    // Warnings are part of the answer: "no errors" is true of a run that reported a dozen warnings,
+    // and next to a list that shows one it would read as a contradiction. The count is only known
+    // when `--diag` collected the report; without it the diagnostics went straight to the terminal
+    // and roll never saw them, so it says only what it knows.
+    if worst == 0 {
+        var tail = ", no errors"
+        if !(diag == "") {
+            let (_e, w) = count_diags(report)
+            if w > 0 { tail = ", no errors, " + (to_str(w) + (" " + warn_word(w))) }
+        }
+        eprintl((verb("Finished", "1;32") + (" " + dim((to_str(pkgs.len()) + (" " + (pkg_word(pkgs.len()) + tail)))))))
+    }
+    return worst
+}
+
+/// "warning" or "warnings".
+pub fn warn_word(n: Int) -> Str {
+    if n == 1 {
+        return "warning"
+    }
+    return "warnings"
+}
+
+/// how many errors and warnings a collected report holds.
+///
+/// Only numbered markers are counted. `◆` and `▲` open a diagnostic, and the compiler ends a run
+/// with a line that starts the same way ("◆ check stopped — 1 error, 1 warning"), so counting every
+/// marker would count the summary too. A real diagnostic carries its index next: `◆ [1] …`.
+pub fn count_diags(report: Str) -> (Int, Int) {
+    var errs = 0
+    var warns = 0
+    var ls = 0
+    var i = 0
+    let n = report.len()
+    while i <= n {
+        if i == n || ord(report.at(i)) == 10 {
+            let line = report.slice(ls, i)
+            if numbered_marker(line) == 1 {
+                errs = errs + 1
+            } else if numbered_marker(line) == 2 {
+                warns = warns + 1
+            }
+            ls = i + 1
+        }
+        i = i + 1
+    }
+    return (errs, warns)
+}
+
+/// 1 for `◆ [n] …`, 2 for `▲ [n] …`, 0 for anything else.
+///
+/// The glyphs are three UTF-8 bytes each and differ in the second: 0x97 for ◆, 0x96 for ▲.
+fn numbered_marker(line: Str) -> Int {
+    if line.len() < 6 {
+        return 0
+    }
+    if !(ord(line.at(0)) == 226) {
+        return 0
+    }
+    let b = ord(line.at(1))
+    if !(b == 151) && !(b == 150) {
+        return 0
+    }
+    var j = 3
+    while j < line.len() && ord(line.at(j)) == 32 {
+        j = j + 1
+    }
+    if j >= line.len() || !(ord(line.at(j)) == 91) {
+        return 0
+    }
+    var k = j + 1
+    while k < line.len() && ord(line.at(k)) >= 48 && ord(line.at(k)) <= 57 {
+        k = k + 1
+    }
+    if k == j + 1 || k >= line.len() || !(ord(line.at(k)) == 93) {
+        return 0
+    }
+    if b == 150 {
+        return 2
+    }
+    return 1
+}
+
+/// "package" or "packages", so a one-package project does not report "1 packages".
+pub fn pkg_word(n: Int) -> Str {
+    if n == 1 {
+        return "package"
+    }
+    return "packages"
+}
+
+/// `p` with `root/` taken off the front, or `.` when they are the same.
+fn rel_to(root: Str, p: Str) -> Str {
+    if(p == root) {
+        return "."
+    }
+    if p.len() > root.len() + 1 && p.slice(0, root.len()) == root {
+        return p.slice(root.len() + 1, p.len())
+    }
+    return copy p
+}
+
+// the target name inside a divergence line "shadow divergence [TARGET]: …" (or "" if not one)
+fn shadow_line_target(line: Str) -> Str {
+    let lb = find_substr(line, "[")
+    if lb < 0 {
+        return ""
+    }
+    let rb = find_substr(line, "]")
+    if rb <= lb {
+        return ""
+    }
+    return line.slice(lb + 1, rb)
+}
+// index of `name` in `names`, or -1
+pub fn shadow_idx(names: Vec<Str>, name: Str) -> Int {
+    var i = 0
+    while i < names.len() {
+        if(names[i] == name) {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+// `roll shadow [report] [--sample N] [-- ARGS]`: build the project with `--shadow`, run it capturing
+// every divergence to build/shadow/divergences.log (NORI_SHADOW_LOG), then tally them per shadowed
+// target: how often each candidate rewrite disagreed with the original, with a first example. A
+// shadow can be promoted once its count stays at zero across a representative run.
+pub fn shadow_cmd() -> Int {
+    let mf = load_manifest()
+    let kind = section_get(mf, "", "kind")
+    if(kind == "lib") {
+        printl("roll: a library has no `main` to exercise — add the `shadows` pair to an app and run `roll shadow` there")
+        return 1
+    }
+    if(kind == "plugin") {
+        printl("roll: a plugin has no `main` to exercise — run `roll shadow` in the app that loads it")
+        return 1
+    }
+    let name = section_get(mf, "", "name")
+    let target = gen_root(section_get(mf, "", "entry"))
+    if caps_enforce(mf) != 0 {
+        return 1
+    }
+    os::make_dir_p("build/shadow")
+    let out = ("build/shadow/" + name)
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--build") cmd.push(target) cmd.push(copy out) cmd.push("--quiet") cmd.push("--shadow") cmd.push("--debug") // --debug: divergence lines carry the calling frame (@caller)
+    add_import_flags(cmd, mf)
+    eprintl((verb("Compiling", "1;36") + (" " + (dim(name) + dim(" with shadows enabled")))))
+    if os::run(cmd) != 0 {
+        eprintl((verb("Failed", "1;31") + (" " + dim("the shadow build did not complete"))))
+        return 1
+    }
+    let logp = ("build/shadow/divergences.log")
+    remove_path(logp)
+    os::set_env("NORI_SHADOW_LOG", logp)
+    let sn = flag_val("--sample", "")
+    if !(sn == "") {
+        os::set_env("NORI_SHADOW_SAMPLE", sn)
+        eprintl((verb("Sampling", "1;36") + (" " + dim(("1 call in " + sn)))))
+    }
+    var rc: Vec<Str> = vec()
+    rc.push(copy out)
+    var seen = false
+    var k = 1
+    while k < argc() {
+        if seen {
+            rc.push(arg(k))
+        }
+        if(arg(k) == "--") {
+            seen = true
+        }
+        k = k + 1
+    }
+    eprintl((verb("Running", "1;36") + (" " + dim(copy out))))
+    let _ = os::run(rc)
+    // tally the divergence log per target
+    if !is_file(logp) {
+        eprintl((verb("Clean", "1;32") + " no divergences — every observed call agreed with the original"))
+        return 0
+    }
+    let lines = law_split_lines(read_file(logp))
+    var tnames: Vec<Str> = vec() var tcount: Vec<Int> = vec() var texample: Vec<Str> = vec()
+    var i = 0
+    while i < lines.len() {
+        let t = shadow_line_target(lines[i])
+        if !(t == "") {
+            let ix = shadow_idx(tnames, t)
+            if ix < 0 {
+                tnames.push(t)
+                tcount.push(1)
+                texample.push(copy lines[i])
+            }
+            else {
+                tcount[ix] = tcount[ix] + 1
+            }
+        }
+        i = i + 1
+    }
+    printl("")
+    printl(("shadow report — " + (name + ":")))
+    if tnames.len() == 0 {
+        printl("  (log present but empty)")
+        return 0
+    }
+    i = 0
+    var totd = 0
+    while i < tnames.len() {
+        totd = totd + tcount[i]
+        printl(("  " + (tnames[i] + (": " + (tcount[i] + " divergence(s)")))))
+        printl(dim(("      e.g. " + texample[i])))
+        i = i + 1
+    }
+    printl("")
+    printl(dim(("  " + (totd + (" divergence(s) across " + (tnames.len() + " shadowed function(s); log: " + logp))))))
+    return 1
+}
+
+pub fn run() -> Int {
+    let mf = load_manifest()
+    let kind = section_get(mf, "", "kind")
+    if(kind == "lib") {
+        printl("roll: a library has no `main` to run")
+        return 1
+    }
+    if(kind == "plugin") {
+        printl("roll: a plugin is loaded by an app, not run — `roll build` it, then point the app's plugin directory at build/")
+        return 1
+    }
+    let rc = build()
+    if rc != 0 {
+        return rc
+    }
+    let name = section_get(mf, "", "name")
+    if is_freestanding(mf) {
+        // a kernel isn't a host executable: hand it to an emulator, don't exec it
+        let img = ("build/" + (selected_profile() + ("/" + name)))
+        eprintl((verb("Built", "1;32") + (" " + (dim(img) + dim("  (freestanding kernel — not a host binary)")))))
+        printl(("boot it in an emulator, e.g.:  qemu-system-x86_64 -kernel " + (img + ".bin -serial stdio -display none")))
+        printl("or run ./run.sh if the project ships one")
+        return 0
+    }
+    var cmd: Vec<Str> = vec()
+    cmd.push(("build/" + (selected_profile() + ("/" + name)))) // build/<profile>/<name>, cwd-relative
+    var seen = false
+    var k = 1
+    while k < argc() {
+        if seen {
+            cmd.push(arg(k))
+        }
+        if(arg(k) == "--") {
+            seen = true
+        }
+        k = k + 1
+    }
+    // `roll run --device`: the binary was cross-built for a phone, so running it here would be
+    // running the wrong CPU's code. Push it over adb and run it on the device instead.
+    //
+    // An Android target normally packages an APK, and an APK is installed and launched rather than
+    // pushed and exec'd, so which of the two this does depends on which artifact the build
+    // produced, not on the triple. `roll build --exe` asks for a plain executable.
+    // Everything after `--` goes through as the program's arguments, as it does on the host.
+    if has_flag("--device") {
+        let apkp = ("build/" + (selected_profile() + ("/" + (name + ".apk"))))
+        if os::path_exists(apkp) {
+            eprintl((verb("Installing", "1;36") + (" " + dim(apkp))))
+            return android::install_and_launch(apkp, ("dev.nori." + name))
+        }
+        let dbin = ("build/" + (selected_profile() + ("/" + name)))
+        var dargs: Vec<Str> = vec()
+        var di = 1
+        while di < cmd.len() { dargs.push(copy cmd[di])  di = di + 1 }
+        eprintl((verb("Running", "1;36") + (" " + (dim(dbin) + dim("  (on the attached device)")))))
+        let t0d = time::now_ms()
+        let drc = android::run_on_device(dbin, name, sink dargs)
+        eprintl((verb("Finished", "1;32") + (" " + dim(("ran in " + fmt_ms(time::now_ms() - t0d))))))
+        return drc
+    }
+    // `roll last`: capture this run structured (every printl/trap, with --debug statement locations
+    // when the profile has debug=true) to build/run.log; the previous run rotates to
+    // build/run.prev.log so `roll last --diff` can compare. Zero cost inside the binary when unset.
+    if os::path_exists("build/run.log") {
+        os::move_path("build/run.log", "build/run.prev.log")
+    }
+    os::set_env("NORI_RUN_LOG", "build/run.log")
+    eprintl((verb("Running", "1;36") + (" " + dim(cmd[0]))))
+    let t0 = time::now_ms()
+    let rc = os::run(cmd)
+    let dt = time::now_ms() - t0
+    eprintl((verb("Finished", "1;32") + (" " + dim(("ran in " + fmt_ms(dt))))))
+    return rc
+}
+
+pub fn clean() {
+    if os::path_exists("build") {
+        os::remove_tree("build")
+        printl("cleaned build/")
+    }
+    else {
+        printl("nothing to clean")
+    }
+}
+
+// `roll xray`: generate an annotated report of what the compiler does to your code (heap-value
+// lifelines + safety checks) into build/xray/<name>.xray. The source is never modified.
+pub fn xray() -> Int {
+    let mf = load_manifest()
+    let name = section_get(mf, "", "name")
+    let target = gen_root(section_get(mf, "", "entry"))
+    os::make_dir_p("build/xray")
+    let outp = ("build/xray/" + (name + ".xray"))
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--xray") cmd.push(target) cmd.push("--out") cmd.push(copy outp)
+    let pf = profile_flags(mf, selected_profile()) // so SIMD/auto-order/erasure annotations match the build profile
+    var fi = 0
+    while fi < pf.len() {
+        cmd.push(copy pf[fi])
+        fi = fi + 1
+    }
+    add_import_flags(cmd, mf)
+    let rc = os::run(cmd)
+    if rc == 0 {
+        eprintl((verb("Wrote", "1;32") + (" " + (outp + dim(" — heap-value lifelines + safety; open it to see what the compiler does")))))
+    }
+    return rc
+}
+// `roll db [IMAGE]`: what the project's persisted images hold, the shape on disk against the shape
+// declared now, and whether this build loads it directly, migrates it, or refuses it. Reads headers only;
+// nothing is run. With an IMAGE argument it reports on that file instead of every `durable var`.
+pub fn db_cmd() -> Int {
+    let mf = load_manifest()
+    let target = gen_root(section_get(mf, "", "entry"))
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--db-info") cmd.push(target)
+    if argc() > 2 {
+        cmd.push(arg(2))
+    }
+    add_import_flags(cmd, mf)
+    return os::run(cmd)
+}
+// `roll todo` / `roll fixme`: list the TODO / FIXME markers the compiler found in the project's `//`
+// comments (std + dependencies are skipped by noric). `only` is the kind to list.
+pub fn todo_cmd(only: Str) -> Int {
+    let mf = load_manifest()
+    let name = section_get(mf, "", "name")
+    eprintl((verb("Scanning", "1;36") + (" " + (name + (" for " + (only + "s"))))))
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--todos") cmd.push(gen_root(section_get(mf, "", "entry")))
+    cmd.push("--only") cmd.push(copy only) cmd.push("--color")
+    add_import_flags(cmd, mf)
+    return os::run(cmd)
+}
+// the TODO/FIXME count line `roll check` appends (quiet when there are none).
+fn todo_summary(mf: Str) {
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--todos") cmd.push(gen_root(section_get(mf, "", "entry")))
+    cmd.push("--summary") cmd.push("--color")
+    add_import_flags(cmd, mf)
+    os::run(cmd)
+}
+
+/// the profile summary of a native build: "native" first, "std apart" when the std closure is compiled
+/// once behind interfaces, then the parts that still mean something there
+fn native_summary(summ: Str, cmd: Vec<Str>) -> Str {
+    var out = "native"
+    var i = 0
+    while i < cmd.len() { if cmd[i] == "--sep-std" { out = "native, std apart" }  i = i + 1 }
+    var start = 0
+    i = 0
+    let n = summ.len()
+    while i <= n {
+        if i == n || ord(summ.at(i)) == 44 {
+            var a = start
+            while a < i && ord(summ.at(a)) == 32 { a = a + 1 }
+            let part = summ.slice(a, i)
+            let llvm_only = (part == "lto") || (part == "thin-lto") || (part == "incremental") || (part.len() > 4 && part.slice(0, 4) == "opt ")
+            if !(part == "") && !llvm_only { out = (out + (", " + part)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}

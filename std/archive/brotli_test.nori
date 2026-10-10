@@ -1,0 +1,25 @@
+// End-to-end tests for the Brotli decoder (public API).
+//   noric --test std/archive/brotli_test.nori compiler/runtime.nori --import-root .
+import "std/archive" as ar
+
+fn check(brf: Str, binf: Str) {
+    let got = ar::brotli_decode(read_file(brf))
+    let want = read_file(binf)
+    assert_eq(got.len(), want.len())
+    assert_streq(got, want)
+}
+
+// A 2560-byte arithmetic ramp (period 256, ten copies): literals + UTF8 context modeling + ring-buffer copies.
+fn test_brotli_repeat() {
+    check("std/archive/testdata/t_rep.br", "std/archive/testdata/t_rep.bin")
+}
+
+// A 200-byte increasing ramp: encoded via static-dictionary word references (with transforms).
+fn test_brotli_dict_literals() {
+    check("std/archive/testdata/t_lit.br", "std/archive/testdata/t_lit.bin")
+}
+
+// Repeated English text: dictionary words + backward copies + block-6+ insert-and-copy commands.
+fn test_brotli_text() {
+    check("std/archive/testdata/t_text.br", "std/archive/testdata/t_text.bin")
+}

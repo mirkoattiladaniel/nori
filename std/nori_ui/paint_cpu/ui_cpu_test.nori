@@ -1,0 +1,1155 @@
+// Native tests for std/nori_ui/paint_cpu, run with
+//   noric --test std/nori_ui/paint_cpu/ui_cpu_test.nori compiler/runtime.nori --import-root .
+import "std/nori_ui" as ui
+import "std/font" as font
+
+fn rgb(r: Int, g: Int, b: Int) -> Int { return (((r << 16) | (g << 8)) | b) }
+fn imaxi(a: Int, b: Int) -> Int { if a > b { return a }  return b }
+fn imini(a: Int, b: Int) -> Int { if a < b { return a }  return b }
+
+fn test_clear_and_fill() {
+    var cv = ui::paint_cpu::canvas_new_nofont(40, 30)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(10, 20, 30))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 20, 15), rgb(10, 20, 30))
+    // a filled rect covers its interior, leaves the outside as background
+    var r = ui::core::rect_min_max(ui::core::vec2(5.0, 5.0), ui::core::vec2(15.0, 15.0))
+    ui::paint_cpu::fill_rect(cv, r, ui::core::color_rgb(200, 100, 50), 0.0)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 10, 10), rgb(200, 100, 50))   // inside
+    assert_eq(ui::paint_cpu::pixel_at(cv, 2, 2), rgb(10, 20, 30))       // outside stays bg
+    assert_eq(ui::paint_cpu::pixel_at(cv, 25, 25), rgb(10, 20, 30))
+    ui::paint_cpu::canvas_free(cv)
+}
+
+fn test_alpha_blend() {
+    var cv = ui::paint_cpu::canvas_new_nofont(10, 10)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    // 50% white over black -> ~127 grey
+    var r = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(10.0, 10.0))
+    ui::paint_cpu::fill_rect(cv, r, ui::core::color_rgba(255, 255, 255, 128), 0.0)
+    var p = ui::paint_cpu::pixel_at(cv, 5, 5)
+    var chan = (p & 255)
+    assert_true(chan > 120 && chan < 135)
+    ui::paint_cpu::canvas_free(cv)
+}
+
+fn test_rounded_corner_and_stroke() {
+    var cv = ui::paint_cpu::canvas_new_nofont(40, 40)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    var r = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(40.0, 40.0))
+    ui::paint_cpu::fill_rect(cv, r, ui::core::color_rgb(255, 0, 0), 12.0)
+    // the extreme corner is rounded away (stays black); the center is filled red
+    assert_eq(ui::paint_cpu::pixel_at(cv, 0, 0), rgb(0, 0, 0))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 20, 20), rgb(255, 0, 0))
+    // ui::core::stroke: an edge pixel is the ui::core::stroke color, a deep-interior pixel is not
+    var cv2 = ui::paint_cpu::canvas_new_nofont(40, 40)
+    ui::paint_cpu::clear(cv2, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::stroke(cv2, ui::core::rect_min_max(ui::core::vec2(5.0, 5.0), ui::core::vec2(35.0, 35.0)), ui::core::color_rgb(0, 255, 0), 2.0)
+    assert_eq(ui::paint_cpu::pixel_at(cv2, 5, 20), rgb(0, 255, 0))      // left edge
+    assert_eq(ui::paint_cpu::pixel_at(cv2, 20, 20), rgb(0, 0, 0))       // hollow interior
+    ui::paint_cpu::canvas_free(cv)
+    ui::paint_cpu::canvas_free(cv2)
+}
+
+fn test_text_produces_ink() {
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    assert_true(fr.ok)
+    var cv = ui::paint_cpu::canvas_new(120, 40, fr.font)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::text(cv, ui::core::vec2(4.0, 30.0), "Hi", 28.0, ui::core::color_rgb(255, 255, 255))
+    // somewhere in the text box there is bright ink
+    var ink = false
+    var y = 0
+    while y < 40 {
+        var x = 0
+        while x < 120 {
+            if (ui::paint_cpu::pixel_at(cv, x, y) & 255) > 180 { ink = true }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    assert_true(ink)
+    ui::paint_cpu::canvas_free(cv)
+}
+
+fn test_render_overlay_end_to_end() {
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    var q = "" + chr(34)
+    var src = "column { padding: 10 gap: 8 bg: [30, 34, 48, 255]"
+    src = src + " text { text: " + q + "Panel" + q + " color: [240, 240, 245, 255] size_px: 20 }"
+    src = src + " button { label: " + q + "Go" + q + " on_click: go bg: [64, 130, 226, 255] color: [255, 255, 255, 255] radius: 5 }"
+    src = src + " }"
+    var pr = ui::layout::dsl_parse_document(src)
+    assert_true(pr.ok)
+    var vp = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(200.0, 120.0))
+    var ov = ui::layout::doc_layout(pr.doc, vp)
+    assert_true(ov.prims.len() >= 3)                             // panel bg + text + button (bg + label)
+    var cv = ui::paint_cpu::canvas_new(200, 120, fr.font)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::render_overlay(cv, ov)
+    // the panel background painted the top-left area (not pure black anymore)
+    assert_true(ui::paint_cpu::pixel_at(cv, 3, 3) != rgb(0, 0, 0))
+    // the blue button bg appears somewhere (a pixel close to the button blue)
+    var found_blue = false
+    var y = 0
+    while y < 120 {
+        var x = 0
+        while x < 200 {
+            var p = ui::paint_cpu::pixel_at(cv, x, y)
+            var b = (p & 255)
+            var rr = ((p >> 16) & 255)
+            if b > 180 && rr < 120 && rr > 30 { found_blue = true }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    assert_true(found_blue)
+    ui::paint_cpu::canvas_free(cv)
+}
+
+fn test_font_metrics_injection() {
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    assert_true(fr.ok)
+    ui::paint_cpu::use_font_metrics(fr.font)
+    // real metrics give sensible, proportional widths (not the flat 0.52em heuristic)
+    var w = ui::layout::overlay_text_width("Cancel", 20.0)
+    assert_true(w > 20.0 && w < 100.0)
+    // a wide glyph advances more than a narrow one (proportional, unlike the flat heuristic)
+    var wW = ui::layout::fallback_char_advance(87, 20.0)   // 'W'
+    var wi = ui::layout::fallback_char_advance(105, 20.0)  // 'i'
+    assert_true(wW > wi)
+    // a canvas exposes its framebuffer pointer + size for presenting
+    var cv = ui::paint_cpu::canvas_new_nofont(64, 48)
+    assert_true(ui::paint_cpu::canvas_ptr(cv) != 0)
+    assert_eq(ui::paint_cpu::canvas_w(cv), 64)
+    assert_eq(ui::paint_cpu::canvas_h(cv), 48)
+    ui::paint_cpu::canvas_free(cv)
+}
+
+fn test_gradient() {
+    var cv = ui::paint_cpu::canvas_new_nofont(20, 40)
+    var r = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(20.0, 40.0))
+    ui::paint_cpu::fill_gradient(cv, r, ui::core::color_rgb(0, 0, 0), ui::core::color_rgb(0, 0, 200))
+    // top row is near the top color (dark), bottom row near the bottom color (blue)
+    assert_true((ui::paint_cpu::pixel_at(cv, 10, 0) & 255) < 20)
+    assert_true((ui::paint_cpu::pixel_at(cv, 10, 39) & 255) > 180)
+    ui::paint_cpu::canvas_free(cv)
+}
+
+fn test_shadow_and_aa() {
+    var cv = ui::paint_cpu::canvas_new_nofont(60, 60)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(200, 200, 200))
+    // a shadow darkens pixels just outside a rect
+    ui::paint_cpu::drop_shadow(cv, ui::core::rect_min_max(ui::core::vec2(20.0, 20.0), ui::core::vec2(40.0, 40.0)), 0.0, 0.0, 6.0, ui::core::color_rgb(0, 0, 0), 200)
+    assert_true((ui::paint_cpu::pixel_at(cv, 42, 30) & 255) < 200)   // just right of the rect: darkened
+    assert_eq(ui::paint_cpu::pixel_at(cv, 0, 0), rgb(200, 200, 200))    // far away: untouched
+    // A rounded box's glow must follow the rounded shape. Measured from the square border box, a
+    // `border-radius:50%` circle would glow hardest at the four corners the circle does not reach,
+    // a visible X around it. On a 40px circle, a pixel off the corner is ~9.7px clear of the edge
+    // and must stay far lighter than one the same 1px off the edge on-axis.
+    var cvr = ui::paint_cpu::canvas_new_nofont(60, 60)
+    ui::paint_cpu::clear(cvr, ui::core::color_rgb(255, 255, 255))
+    ui::paint_cpu::drop_shadow_r(cvr, ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(40.0, 40.0)), 0.0, 0.0, 10.0, ui::core::color_rgb(0, 0, 0), 255, 20.0)
+    let onaxis = ui::paint_cpu::pixel_at(cvr, 41, 20) & 255
+    let corner = ui::paint_cpu::pixel_at(cvr, 41, 41) & 255
+    assert_true(onaxis < 200)                                   // just outside the circle: shadowed
+    assert_true(corner > onaxis + 40)                           // past the corner: nearly clear
+    ui::paint_cpu::canvas_free(cvr)
+    // AA rounded corner: a pixel right on the arc is partially covered (between bg and fill)
+    var cv2 = ui::paint_cpu::canvas_new_nofont(40, 40)
+    ui::paint_cpu::clear(cv2, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::fill_rect(cv2, ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(40.0, 40.0)), ui::core::color_rgb(255, 255, 255), 10.0)
+    // somewhere along the corner arc a pixel is partially covered (anti-aliased edge)
+    var partial = false
+    var yy = 0
+    while yy < 12 {
+        var xx = 0
+        while xx < 12 {
+            var v = (ui::paint_cpu::pixel_at(cv2, xx, yy) & 255)
+            if v > 20 && v < 235 { partial = true }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    assert_true(partial)                                        // anti-aliased corner
+    ui::paint_cpu::canvas_free(cv)
+    ui::paint_cpu::canvas_free(cv2)
+}
+
+// ---------------------------------------------------------------------------
+// blit_rgba: the image path. It carries video frames, which is millions of
+// pixels a second, so it walks the source with a fixed-point step instead of a
+// division per pixel and stores opaque pixels without blending. These pin the
+// arithmetic: which source pixel each destination pixel takes,
+// the colour order (source is RGBA in bytes, canvas is 0x00RRGGBB), what
+// happens outside the rectangle, and that alpha still composites.
+// ---------------------------------------------------------------------------
+
+// a src image of iw*ih RGBA pixels, filled by a callback-free rule: p(x,y) = (x, y, x+y, a)
+fn mk_img(iw: Int, ih: Int, a: Int) -> Int {
+    var buf = 0
+    unsafe { buf = malloc(iw * ih * 4) }
+    var y = 0
+    while y < ih {
+        var x = 0
+        while x < iw {
+            let o = ((y * iw) + x) * 4
+            unsafe {
+                poke8(buf + o, x & 255)
+                poke8(buf + o + 1, y & 255)
+                poke8(buf + o + 2, (x + y) & 255)
+                poke8(buf + o + 3, a)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return buf
+}
+
+fn test_blit_one_to_one() {
+    var cv = ui::paint_cpu::canvas_new_nofont(16, 16)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    let img = mk_img(8, 8, 255)
+    ui::paint_cpu::blit_rgba(cv, ui::core::rect_min_max(ui::core::vec2(4.0, 4.0), ui::core::vec2(12.0, 12.0)), img, 8, 8)
+    // pixel-for-pixel, and in the right colour order: source (3,5) is R=3 G=5 B=8
+    assert_eq(ui::paint_cpu::pixel_at(cv, 4 + 3, 4 + 5), rgb(3, 5, 8))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 4 + 7, 4 + 7), rgb(7, 7, 14))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 4 + 0, 4 + 0), rgb(0, 0, 0))
+    // nothing outside the rectangle was touched
+    assert_eq(ui::paint_cpu::pixel_at(cv, 3, 4), rgb(0, 0, 0))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 12, 12), rgb(0, 0, 0))
+    unsafe { free(img) }
+    ui::paint_cpu::canvas_free(cv)
+}
+
+fn test_blit_scaled_up_and_down() {
+    var cv = ui::paint_cpu::canvas_new_nofont(32, 32)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    let img = mk_img(4, 4, 255)
+    // 4x4 into 16x16: each source pixel becomes a 4x4 block, sampled at pixel centres
+    ui::paint_cpu::blit_rgba(cv, ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(16.0, 16.0)), img, 4, 4)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 1, 1), rgb(0, 0, 0))       // block of source (0,0)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 5, 1), rgb(1, 0, 1))       // block of source (1,0)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 5, 9), rgb(1, 2, 3))       // block of source (1,2)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 15, 15), rgb(3, 3, 6))     // last block
+    // 8x8 into 4x4: every other pixel is dropped
+    let big = mk_img(8, 8, 255)
+    ui::paint_cpu::blit_rgba(cv, ui::core::rect_min_max(ui::core::vec2(20.0, 20.0), ui::core::vec2(24.0, 24.0)), big, 8, 8)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 21, 21), rgb(3, 3, 6))
+    unsafe { free(img)  free(big) }
+    ui::paint_cpu::canvas_free(cv)
+}
+
+fn test_blit_clipped_and_offscreen() {
+    var cv = ui::paint_cpu::canvas_new_nofont(16, 16)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(9, 9, 9))
+    let img = mk_img(8, 8, 255)
+    // half off the left/top edge: the visible half lands, nothing is written out of bounds
+    ui::paint_cpu::blit_rgba(cv, ui::core::rect_min_max(ui::core::vec2(0.0 - 4.0, 0.0 - 4.0), ui::core::vec2(4.0, 4.0)), img, 8, 8)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 0, 0), rgb(4, 4, 8))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 3, 3), rgb(7, 7, 14))
+    // clipped to a box smaller than the rectangle: outside the box keeps the background
+    ui::paint_cpu::blit_rgba_clip(cv, ui::core::rect_min_max(ui::core::vec2(8.0, 8.0), ui::core::vec2(16.0, 16.0)), img, 8, 8, 8, 8, 12, 12)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 9, 9), rgb(1, 1, 2))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 13, 13), rgb(9, 9, 9))
+    // entirely off-screen: draws nothing and does not fault
+    ui::paint_cpu::blit_rgba(cv, ui::core::rect_min_max(ui::core::vec2(100.0, 100.0), ui::core::vec2(120.0, 120.0)), img, 8, 8)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 15, 15), rgb(9, 9, 9))
+    unsafe { free(img) }
+    ui::paint_cpu::canvas_free(cv)
+}
+
+fn test_blit_alpha_still_blends() {
+    var cv = ui::paint_cpu::canvas_new_nofont(8, 8)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    let img = mk_img(4, 4, 128)                                  // half-transparent
+    ui::paint_cpu::blit_rgba(cv, ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(4.0, 4.0)), img, 4, 4)
+    // source (3,3) is R=3 G=3 B=6 at a=128 over black: about half of each
+    let p = ui::paint_cpu::pixel_at(cv, 3, 3)
+    assert_true(((p >> 16) & 255) <= 2)
+    assert_true((p & 255) >= 2 && (p & 255) <= 4)
+    // a fully transparent image changes nothing
+    let clear_img = mk_img(4, 4, 0)
+    ui::paint_cpu::blit_rgba(cv, ui::core::rect_min_max(ui::core::vec2(4.0, 4.0), ui::core::vec2(8.0, 8.0)), clear_img, 4, 4)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 6, 6), rgb(0, 0, 0))
+    unsafe { free(img)  free(clear_img) }
+    ui::paint_cpu::canvas_free(cv)
+}
+
+// =========================================================================
+// PaintPrimitive kind 3, image. Rasterises through
+// layout/dsl_media.nori's decode cache and letterbox fit, in the style of
+// test_render_overlay_end_to_end above.
+// =========================================================================
+
+fn test_render_image_prim_letterbox() {
+    // corners_rgb.png is 4x2: TL red, TR green, BL blue, BR white, and a black middle; only the
+    // four corner pixels carry colour, so column 20 of the blit is legitimately black.
+    // Panel 40x40 -> scale = min(40/4, 40/2) = 10 -> a 40x20 blit centred at y = 10..30, leaving a
+    // 10px letterbox strip above and below. The canvas is cleared to a
+    // non-black grey so the margin is distinguishable from the image's own black interior.
+    ui::layout::ui_media_set_resolve_roots("", "")
+    ui::layout::ui_media_cache_clear()
+    var q = "" + chr(34)
+    var src = "image { path: " + q + "std/image/testdata/corners_rgb.png" + q + " }"
+    var pr = ui::layout::dsl_parse_document(src)
+    assert_true(pr.ok)
+    var vp = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(40.0, 40.0))
+    var ov = ui::layout::doc_layout(pr.doc, vp)
+    // exactly one primitive, and it is the new kind, carrying the resolved path in `text`
+    assert_eq(ov.prims.len(), 1)
+    assert_eq(ov.prims[0].kind, 3)
+    assert_streq(ov.prims[0].text, "std/image/testdata/corners_rgb.png")
+
+    var cv = ui::paint_cpu::canvas_new_nofont(40, 40)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(7, 7, 7))
+    ui::paint_cpu::render_overlay(cv, ov)
+    // inside the blit: the four source corners land in the four corners of the 40x20 band
+    assert_eq(ui::paint_cpu::pixel_at(cv, 2, 12), rgb(255, 0, 0))       // TL red
+    assert_eq(ui::paint_cpu::pixel_at(cv, 38, 12), rgb(0, 255, 0))      // TR green
+    assert_eq(ui::paint_cpu::pixel_at(cv, 2, 27), rgb(0, 0, 255))       // BL blue
+    assert_eq(ui::paint_cpu::pixel_at(cv, 38, 27), rgb(255, 255, 255))  // BR white
+    // the source's own black middle really was painted, over the grey
+    assert_eq(ui::paint_cpu::pixel_at(cv, 20, 20), rgb(0, 0, 0))
+    // in the letterbox margin: untouched background, above and below the band
+    assert_eq(ui::paint_cpu::pixel_at(cv, 2, 2), rgb(7, 7, 7))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 20, 9), rgb(7, 7, 7))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 20, 30), rgb(7, 7, 7))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 38, 38), rgb(7, 7, 7))
+    // the band edges themselves are ink, so the fit really is rows 10..30 and full width
+    assert_eq(ui::paint_cpu::pixel_at(cv, 2, 10), rgb(255, 0, 0))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 2, 29), rgb(0, 0, 255))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 0, 12), rgb(255, 0, 0))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 39, 27), rgb(255, 255, 255))
+    ui::paint_cpu::canvas_free(cv)
+    // decoding went through the shared cache exactly once
+    assert_eq(ui::layout::ui_media_cache_len(), 1)
+    ui::layout::ui_media_cache_clear()
+}
+
+fn test_render_image_prim_pillarbox_and_misses() {
+    ui::layout::ui_media_set_resolve_roots("", "")
+    ui::layout::ui_media_cache_clear()
+    // a 4x2 source in a 20x40 panel: scale = min(20/4, 40/2) = 5 -> a 20x10 blit at rows 15..25
+    var noids: Vec<Str> = vec()
+    var nooffs: Vec<Float> = vec()
+    var ov = ui::layout::overlay_new(noids, nooffs)
+    ov.prims.push(ui::layout::pp_image(ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(20.0, 40.0)), "std/image/testdata/corners_rgb.png"))
+    var cv = ui::paint_cpu::canvas_new_nofont(20, 40)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(7, 7, 7))
+    ui::paint_cpu::render_overlay(cv, ov)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 1, 16), rgb(255, 0, 0))       // inside, top-left
+    assert_eq(ui::paint_cpu::pixel_at(cv, 18, 23), rgb(255, 255, 255))  // inside, bottom-right
+    assert_eq(ui::paint_cpu::pixel_at(cv, 10, 20), rgb(0, 0, 0))        // inside, the source's black middle
+    assert_eq(ui::paint_cpu::pixel_at(cv, 10, 5), rgb(7, 7, 7))         // pillarbox margin above
+    assert_eq(ui::paint_cpu::pixel_at(cv, 10, 35), rgb(7, 7, 7))        // and below
+    ui::paint_cpu::canvas_free(cv)
+
+    // an image primitive whose path does not exist paints nothing and does not fault;
+    // read_file would abort the process, so ui_media_image_load has to stat first.
+    var noids2: Vec<Str> = vec()
+    var nooffs2: Vec<Float> = vec()
+    var ov2 = ui::layout::overlay_new(noids2, nooffs2)
+    ov2.prims.push(ui::layout::pp_image(ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(20.0, 20.0)), "no/such/file.png"))
+    ov2.prims.push(ui::layout::pp_image(ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(20.0, 20.0)), ""))
+    ov2.prims.push(ui::layout::pp_image(ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(20.0, 20.0)), "std/image/testdata/quad.gif"))
+    ov2.prims.push(ui::layout::pp_image(ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(20.0, 20.0)), "std/image/testdata"))
+    var cv2 = ui::paint_cpu::canvas_new_nofont(20, 20)
+    ui::paint_cpu::clear(cv2, ui::core::color_rgb(7, 7, 7))
+    ui::paint_cpu::render_overlay(cv2, ov2)
+    assert_eq(ui::paint_cpu::pixel_at(cv2, 10, 10), rgb(7, 7, 7))
+    // the four misses added nothing to the cache; only the pillarbox image above is in it
+    assert_eq(ui::layout::ui_media_cache_len(), 1)
+    ui::paint_cpu::canvas_free(cv2)
+    ui::layout::ui_media_cache_clear()
+}
+
+// ---------------------------------------------------------------------------
+// Text effects: outline / gradient / shadow / decoration (PaintPrimitive's
+// outline_color+outline_w and has_grad+grad_*, plus the stacked-copy shadow and
+// the decoration rules layout emits). These are the CPU reference the GPU painter is
+// compared against, so they assert the pixels, not the primitive fields;
+// dsl_core_nodes_test.nori covers those.
+// ---------------------------------------------------------------------------
+
+/// a 1-primitive overlay holding just `p`.
+fn fxt_ov1(p: ui::layout::PaintPrimitive) -> ui::layout::ComputedOverlay {
+    var ids: Vec<Str> = vec()
+    var offs: Vec<Float> = vec()
+    var ov = ui::layout::overlay_new(ids, offs)
+    ov.prims.push(copy p)
+    return ov
+}
+/// how many pixels of the canvas are not pure black.
+fn fxt_ink(cv: ui::paint_cpu::CpuCanvas, w: Int, h: Int) -> Int {
+    var n = 0
+    var y = 0
+    while y < h {
+        var x = 0
+        while x < w { if ui::paint_cpu::pixel_at(cv, x, y) != 0 { n = n + 1 }  x = x + 1 }
+        y = y + 1
+    }
+    return n
+}
+fn fxt_r(p: Int) -> Int { return ((p >> 16) & 255) }
+fn fxt_b(p: Int) -> Int { return (p & 255) }
+
+fn test_text_outline_adds_ink_around_the_glyphs() {
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    assert_true(fr.ok)
+    // pp_text's `pos.y` is the text box top, not the baseline (see the contract on layout::pp_text);
+    // the painter adds the font ascent. The input is 16.50390625 so the baseline lands at 40.0:
+    // ascent(DejaVuSans, 30px) = 1604/2048 * 30 = 23.49609375, and 40.0 - 23.49609375 = 16.50390625.
+    // At 40.0 the baseline would be 63.5, off the bottom of this 80x60 canvas entirely.
+    var plain = ui::layout::pp_text(ui::core::vec2(20.0, 16.50390625), "H", ui::core::color_rgb(255, 255, 255), 30.0)
+    var outl = ui::layout::pp_text(ui::core::vec2(20.0, 16.50390625), "H", ui::core::color_rgb(255, 255, 255), 30.0)
+    outl.outline_color = ui::core::color_rgb(255, 0, 0)
+    outl.outline_w = 3.0
+    var c1 = ui::paint_cpu::canvas_new(80, 60, fr.font)
+    ui::paint_cpu::clear(c1, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::render_overlay(c1, fxt_ov1(plain))
+    var c2 = ui::paint_cpu::canvas_new(80, 60, fr.font)
+    ui::paint_cpu::clear(c2, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::render_overlay(c2, fxt_ov1(outl))
+    var n1 = fxt_ink(c1, 80, 60)
+    var n2 = fxt_ink(c2, 80, 60)
+    assert_true(n1 > 0)
+    assert_true(n2 > n1)                       // the outline strictly grows the inked area
+    // there is at least one pixel the outlined run inks and the plain one does not, and it is red
+    var found = false
+    var y = 0
+    while y < 60 {
+        var x = 0
+        while x < 80 {
+            var a = ui::paint_cpu::pixel_at(c1, x, y)
+            var b = ui::paint_cpu::pixel_at(c2, x, y)
+            if a == 0 && fxt_r(b) > 120 && fxt_b(b) < 60 { found = true }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    assert_true(found)
+    ui::paint_cpu::canvas_free(c1)
+    ui::paint_cpu::canvas_free(c2)
+}
+
+fn test_text_gradient_runs_along_its_axis() {
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    // a solid block of glyphs 4..120 wide; the ramp spans [10, 130) in x, red -> blue
+    // The input is 19.63671875 (a text box top, see layout::pp_text): the painter
+    // adds ascent(DejaVuSans, 26px) = 1604/2048 * 26 = 20.36328125, so the baseline is 40.0.
+    var p = ui::layout::pp_text(ui::core::vec2(10.0, 19.63671875), "HHHHHHHHHHHH", ui::core::color_rgb(255, 0, 0), 26.0)
+    p.has_grad = true
+    p.grad_to = ui::core::color_rgb(0, 0, 255)
+    p.grad_a = 10.0
+    p.grad_b = 120.0
+    p.grad_horizontal = true
+    var cv = ui::paint_cpu::canvas_new(140, 60, fr.font)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::render_overlay(cv, fxt_ov1(p))
+    // brightest-red column vs brightest-blue column: red must dominate on the left, blue on the right
+    var left_r = 0  var left_b = 0  var right_r = 0  var right_b = 0
+    var y = 0
+    while y < 60 {
+        var x = 0
+        while x < 140 {
+            var px = ui::paint_cpu::pixel_at(cv, x, y)
+            if px != 0 {
+                if x < 30 { if fxt_r(px) > left_r { left_r = fxt_r(px) }  if fxt_b(px) > left_b { left_b = fxt_b(px) } }
+                if x > 100 { if fxt_r(px) > right_r { right_r = fxt_r(px) }  if fxt_b(px) > right_b { right_b = fxt_b(px) } }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    assert_true(left_r > 150)
+    assert_true(left_b < 80)
+    assert_true(right_b > 150)
+    assert_true(right_r < 80)
+    ui::paint_cpu::canvas_free(cv)
+}
+
+fn test_text_shadow_darkens_outside_the_glyph_box() {
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    var q = "" + chr(34)
+    var plain_src = "text { text: " + q + "Hg" + q + " size_px: 26 color: [255, 255, 255, 255] }"
+    var shad_src = "text { text: " + q + "Hg" + q + " size_px: 26 color: [255, 255, 255, 255] shadow_color: [255, 0, 0, 255] shadow_blur: 8 shadow_offset_x: 6 shadow_offset_y: 6 }"
+    var vp = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(120.0, 60.0))
+    var d1 = ui::layout::dsl_parse_document(plain_src)
+    var d2 = ui::layout::dsl_parse_document(shad_src)
+    assert_true(d1.ok)
+    assert_true(d2.ok)
+    var o1 = ui::layout::doc_layout(d1.doc, vp)
+    var o2 = ui::layout::doc_layout(d2.doc, vp)
+    var c1 = ui::paint_cpu::canvas_new(120, 60, fr.font)
+    ui::paint_cpu::clear(c1, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::render_overlay(c1, o1)
+    var c2 = ui::paint_cpu::canvas_new(120, 60, fr.font)
+    ui::paint_cpu::clear(c2, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::render_overlay(c2, o2)
+    // the shadow is offset down and right, so it inks pixels the plain run leaves black, and those
+    // pixels carry the shadow colour (red) rather than the glyph colour (white).
+    var outside = 0
+    var y = 0
+    while y < 60 {
+        var x = 0
+        while x < 120 {
+            var a = ui::paint_cpu::pixel_at(c1, x, y)
+            var b = ui::paint_cpu::pixel_at(c2, x, y)
+            if a == 0 && b != 0 && fxt_r(b) > fxt_b(b) { outside = outside + 1 }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    assert_true(outside > 10)
+    assert_true(fxt_ink(c2, 120, 60) > fxt_ink(c1, 120, 60))
+    ui::paint_cpu::canvas_free(c1)
+    ui::paint_cpu::canvas_free(c2)
+}
+
+fn test_text_decoration_rule_lands_at_the_right_y() {
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    var q = "" + chr(34)
+    // an anchored text box so the y is predictable: anchor [0,0] puts the box at the viewport top.
+    var src = "text { text: " + q + "under" + q + " size_px: 20 anchor: [0, 0] color: [255, 255, 255, 255] text_decoration: underline decoration_color: [0, 255, 0, 255] decoration_width: 2 }"
+    var pr = ui::layout::dsl_parse_document(src)
+    assert_true(pr.ok)
+    var vp = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(120.0, 60.0))
+    var ov = ui::layout::doc_layout(pr.doc, vp)
+    var cv = ui::paint_cpu::canvas_new(120, 60, fr.font)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::render_overlay(cv, ov)
+    // the rule is the only pure green ink; find its rows
+    var top = 999
+    var bot = 0 - 1
+    var y = 0
+    while y < 60 {
+        var x = 0
+        while x < 120 {
+            var px = ui::paint_cpu::pixel_at(cv, x, y)
+            if ((px >> 8) & 255) > 150 && fxt_r(px) < 60 && fxt_b(px) < 60 {
+                if y < top { top = y }
+                if y > bot { bot = y }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    // underline y = box_top + size_px * 0.88 = 0 + 17.6, thickness 2 -> rows 17..19
+    assert_true(top >= 17)
+    assert_true(top <= 18)
+    assert_true(bot <= 20)
+    ui::paint_cpu::canvas_free(cv)
+}
+
+// ---------------------------------------------------------------------------
+// The popup layer, in pixels. layout's ComputedOverlay collects a dropdown's
+// option list and a picker's colour popup into pop_prims/pop_hits and
+// overlay_flush_popups appends them last, so the painter, which walks `prims`
+// in order, must end up drawing them over everything that came before,
+// including content an enclosing scroll viewport clipped.
+// ---------------------------------------------------------------------------
+
+/// render `src` into a fresh `w` x `h` canvas on a black ground and return it (caller frees).
+fn popt_render(src: Str, w: Int, h: Int) -> ui::paint_cpu::CpuCanvas {
+    var pr = ui::layout::dsl_parse_document(src)
+    assert_true(pr.ok)
+    var vp = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(to_float(w), to_float(h)))
+    var ov = ui::layout::doc_layout(pr.doc, vp)
+    var cv = ui::paint_cpu::canvas_new_nofont(w, h)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::render_overlay(cv, ov)
+    return cv
+}
+
+fn test_dropdown_popup_paints_over_the_content_beneath_it() {
+    // a gapless column: an open dropdown (trigger 38 tall, then a 3 x 20 option list at y 40..100)
+    // over a solid red block that starts at y = 38. Everything the list covers was red.
+    var body = " dropdown { id: d options: [Low, Mid, High] selected: 0 open: true item_height: 20 }"
+    var under = " rect { h: 200 color: [255, 0, 0, 255] } }"
+    let shut_src = "column { padding: 0 gap: 0" + (" dropdown { id: d options: [Low, Mid, High] selected: 0 item_height: 20 }" + under)
+    var shut = popt_render(shut_src, 200, 260)
+    // closed: the pixel is the red block
+    assert_eq(ui::paint_cpu::pixel_at(shut, 130, 70), rgb(255, 0, 0))
+    assert_eq(ui::paint_cpu::pixel_at(shut, 130, 50), rgb(255, 0, 0))
+    ui::paint_cpu::canvas_free(shut)
+    // open: the same pixel is now the popup panel's opaque background (30, 30, 40)
+    let open_src = "column { padding: 0 gap: 0" + (body + under)
+    var open_cv = popt_render(open_src, 200, 260)
+    assert_eq(ui::paint_cpu::pixel_at(open_cv, 130, 70), rgb(30, 30, 40))
+    // row 0 is the selected one: its highlight (70, 96, 156) is painted inside the panel
+    assert_eq(ui::paint_cpu::pixel_at(open_cv, 130, 50), rgb(70, 96, 156))
+    // ...and one pixel past the list's bottom edge the red block is untouched
+    assert_eq(ui::paint_cpu::pixel_at(open_cv, 130, 110), rgb(255, 0, 0))
+    ui::paint_cpu::canvas_free(open_cv)
+}
+
+fn test_dropdown_popup_pixels_escape_a_scroll_viewport() {
+    // the same list, but the dropdown lives in a 60px scroll viewport painted over a red block.
+    // Only y 40..60 of the list is inside the viewport; without the popup layer the rest would
+    // have been intersected away by merge_clipped_overlay and the red would show through.
+    var src = "column { padding: 0 gap: 0 scroll_column { id: sc h: 60 dropdown { id: d options: [Low, Mid, High] selected: 0 open: true item_height: 20 } } rect { h: 200 color: [255, 0, 0, 255] } }"
+    var cv = popt_render(src, 200, 260)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 130, 70), rgb(30, 30, 40))    // past the viewport's edge
+    assert_eq(ui::paint_cpu::pixel_at(cv, 130, 90), rgb(30, 30, 40))    // the last row, 30px past it
+    assert_eq(ui::paint_cpu::pixel_at(cv, 130, 110), rgb(255, 0, 0))    // and no further
+    ui::paint_cpu::canvas_free(cv)
+}
+
+fn test_picker_colour_popup_paints_its_hue_strip_over_the_content() {
+    // a focused colour picker over a red block. The hue strip's first segment is pure red by
+    // coincidence, so the assertion is made at the strip's middle, where the hue is cyan-ish, and
+    // inside the S/V square, whose top-left cell is near-white.
+    var q = "" + chr(34)
+    var src = "column { padding: 0 gap: 0 picker { id: file label: Fill h: 28 classes: [focused] value: " + (q + ("#3366cc" + (q + " } rect { h: 300 color: [255, 0, 0, 255] } }")))
+    var cv = popt_render(src, 300, 340)
+    // the popup panel background (24, 24, 30) at its top-left padding strip
+    assert_eq(ui::paint_cpu::pixel_at(cv, 113, 32), rgb(24, 24, 30))
+    // the S/V square's first cell: hue 220-ish at s ~ 0.03, v ~ 0.97 -> almost white, and not red
+    var sv = ui::paint_cpu::pixel_at(cv, 121, 39)
+    assert_true(((sv >> 16) & 255) > 230 && (sv & 255) > 230)
+    // the hue strip at its vertical middle is in the cyan/green half of the wheel: G+B >> R
+    var hu = ui::paint_cpu::pixel_at(cv, 250, 96)
+    assert_true((hu & 255) + ((hu >> 8) & 255) > ((hu >> 16) & 255) + 200)
+    // below the popup the red block is untouched
+    assert_eq(ui::paint_cpu::pixel_at(cv, 150, 200), rgb(255, 0, 0))
+    ui::paint_cpu::canvas_free(cv)
+}
+
+// ---------------------------------------------------------------------------
+// An open menu, in pixels. The bar's list rides the same popup
+// layer the dropdown does, so the painter needs no change: the flushed overlay
+// is one flat prim list whose last entries are the list, drawn over whatever
+// the host painted first.
+// ---------------------------------------------------------------------------
+
+/// the dock chrome for a `w` x `h` view with File / View / Panels across the top.
+fn mnu_dock(w: Int, h: Int) -> ui::layout::DockLayoutResult {
+    var ids: Vec<Str> = vec()
+    ids.push("scene")
+    ids.push("inspector")
+    var ds = ui::layout::dock_state_new(ids)
+    var titles: Vec<Str> = vec()
+    titles.push("File")
+    titles.push("View")
+    titles.push("Panels")
+    var nofill: Vec<Str> = vec()
+    return ui::layout::layout_dock_ui(ds, 0, w, h, ui::core::theme_default_dark(), -1, false, 0, titles, nofill)
+}
+
+/// a File menu with a disabled row and a separator in it.
+fn mnu_menus() -> Vec<ui::layout::Menu> {
+    var ms: Vec<ui::layout::Menu> = vec()
+    var file = ui::layout::menu_new("File")
+    ui::layout::menu_add(file, ui::layout::menu_item("New Scene", "file.new"))
+    ui::layout::menu_add(file, ui::layout::menu_item_disabled("Open Recent"))
+    ui::layout::menu_add(file, ui::layout::menu_separator())
+    ui::layout::menu_add(file, ui::layout::menu_item("Quit", "file.quit"))
+    ms.push(file)
+    return ms
+}
+
+fn test_an_open_menu_paints_over_the_content_beneath_it() {
+    // a red block standing in for the dock content, painted first, the order a host uses
+    // (render::dock, then every panel overlay, then the menu overlay last).
+    var cv = ui::paint_cpu::canvas_new_nofont(200, 160)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::fill_rect(cv, ui::core::rect_min_max(ui::core::vec2(0.0, 28.0), ui::core::vec2(200.0, 160.0)), ui::core::color_rgb(255, 0, 0), 0.0)
+    // closed: the menu overlay is empty and every pixel is still the red block.
+    var res = mnu_dock(200, 160)
+    var shut = ui::layout::menu_overlay(mnu_menus(), ui::layout::menu_bar_state_new(), res.menu_rects, ui::core::theme_default_dark(), 200.0, 160.0, false, ui::core::vec2_zero())
+    ui::paint_cpu::render_overlay(cv, shut)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 80, 60), rgb(255, 0, 0))
+
+    // open: File's list hangs from y = 28 (the bar's bottom) at x = 8, 150 wide, 87 tall.
+    var st = ui::layout::menu_bar_state_new()
+    ui::layout::menu_bar_open_at(st, 0)
+    var open_ov = ui::layout::menu_overlay(mnu_menus(), st, res.menu_rects, ui::core::theme_default_dark(), 200.0, 160.0, false, ui::core::vec2_zero())
+    ui::paint_cpu::render_overlay(cv, open_ov)
+    // the same pixel is now the list's opaque panel (the dark theme's dock_menu_bar_fill)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 80, 60), rgb(11, 11, 17))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 80, 40), rgb(11, 11, 17))
+    // the separator's rule is drawn inside the panel, inset from both edges
+    assert_eq(ui::paint_cpu::pixel_at(cv, 80, 83), rgb(82, 82, 94))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 10, 83), rgb(11, 11, 17))
+    // ...and just past the list, in both directions, the red block is untouched
+    assert_eq(ui::paint_cpu::pixel_at(cv, 80, 130), rgb(255, 0, 0))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 180, 60), rgb(255, 0, 0))
+    ui::paint_cpu::canvas_free(cv)
+}
+
+fn test_an_open_menu_paints_its_hover_highlight_on_the_row_under_the_pointer() {
+    var cv = ui::paint_cpu::canvas_new_nofont(200, 160)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    var res = mnu_dock(200, 160)
+    var st = ui::layout::menu_bar_state_new()
+    ui::layout::menu_bar_open_at(st, 0)
+    // the pointer on row 0 ("New Scene", y 32..56)
+    var ov = ui::layout::menu_overlay(mnu_menus(), st, res.menu_rects, ui::core::theme_default_dark(), 200.0, 160.0, true, ui::core::vec2(80.0, 44.0))
+    ui::paint_cpu::render_overlay(cv, ov)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 80, 44), rgb(56, 56, 68))     // hovered row
+    assert_eq(ui::paint_cpu::pixel_at(cv, 80, 68), rgb(11, 11, 17))     // the row below it is not
+    ui::paint_cpu::canvas_free(cv)
+}
+
+// ---- gradient fills (kind-0 has_grad/grad_*) -------------------------------------------------
+// The two-colour, one-axis ramp PaintPrimitive carries for text, applied to rects.
+// The expected bytes are the arithmetic both painters do: t is taken at the pixel centre
+// (x + 0.5) over [grad_a, grad_a + grad_b), and each channel is rounded to nearest, which is what
+// the GPU's float mix + unorm quantisation lands on, so these numbers are the cross-backend contract
+// as much as they are the CPU's.
+fn grt_overlay() -> ui::layout::ComputedOverlay {
+    var ids: Vec<Str> = vec()
+    var offs: Vec<Float> = vec()
+    return ui::layout::overlay_new(ids, offs)
+}
+fn grt_rect(x0: Float, y0: Float, x1: Float, y1: Float) -> ui::core::Rect { return ui::core::rect_min_max(ui::core::vec2(x0, y0), ui::core::vec2(x1, y1)) }
+
+fn test_gradient_rect_ramps_horizontally_from_the_base_colour_to_grad_to() {
+    var cv = ui::paint_cpu::canvas_new_nofont(64, 16)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    var ov = grt_overlay()
+    var p = ui::layout::pp_rect(grt_rect(0.0, 0.0, 64.0, 16.0), ui::core::color_rgb(255, 0, 0), 0.0)
+    p.has_grad = true
+    p.grad_to = ui::core::color_rgb(0, 0, 255)
+    p.grad_a = 0.0
+    p.grad_b = 64.0
+    p.grad_horizontal = true
+    ov.prims.push(p)
+    ui::paint_cpu::render_overlay(cv, ov)
+    // left end = the base colour (t = 0.5/64), right end = grad_to, midpoint halfway between.
+    assert_eq(ui::paint_cpu::pixel_at(cv, 0, 8), rgb(253, 0, 2))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 63, 8), rgb(2, 0, 253))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 32, 8), rgb(126, 0, 129))
+    // the ramp is along x only: every row of a column is the same colour.
+    assert_eq(ui::paint_cpu::pixel_at(cv, 32, 0), ui::paint_cpu::pixel_at(cv, 32, 15))
+    ui::paint_cpu::canvas_free(cv)
+}
+
+fn test_gradient_rect_ramps_vertically_when_grad_horizontal_is_false() {
+    var cv = ui::paint_cpu::canvas_new_nofont(16, 64)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    var ov = grt_overlay()
+    var p = ui::layout::pp_rect(grt_rect(0.0, 0.0, 16.0, 64.0), ui::core::color_rgb(255, 0, 0), 0.0)
+    p.has_grad = true
+    p.grad_to = ui::core::color_rgb(0, 0, 255)
+    p.grad_a = 0.0
+    p.grad_b = 64.0
+    p.grad_horizontal = false
+    ov.prims.push(p)
+    ui::paint_cpu::render_overlay(cv, ov)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 8, 0), rgb(253, 0, 2))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 8, 63), rgb(2, 0, 253))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 8, 32), rgb(126, 0, 129))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 0, 32), ui::paint_cpu::pixel_at(cv, 15, 32))
+    ui::paint_cpu::canvas_free(cv)
+}
+
+fn test_a_zero_span_gradient_degrades_to_a_hard_edge_and_never_divides_by_zero() {
+    var cv = ui::paint_cpu::canvas_new_nofont(64, 16)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    var ov = grt_overlay()
+    var p = ui::layout::pp_rect(grt_rect(0.0, 0.0, 64.0, 16.0), ui::core::color_rgb(255, 0, 0), 0.0)
+    p.has_grad = true
+    p.grad_to = ui::core::color_rgb(0, 0, 255)
+    p.grad_a = 32.0
+    p.grad_b = 0.0                    // grad_a == grad_b: an empty span
+    p.grad_horizontal = true
+    ov.prims.push(p)
+    ui::paint_cpu::render_overlay(cv, ov)
+    // the divisor is clamped to one pixel (the same `max(gprm.y, 1.0)` the WGSL uses), so the ramp
+    // collapses to a step at grad_a instead of producing NaN: base colour before it, grad_to after.
+    assert_eq(ui::paint_cpu::pixel_at(cv, 0, 8), rgb(255, 0, 0))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 31, 8), rgb(255, 0, 0))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 40, 8), rgb(0, 0, 255))
+    assert_eq(ui::paint_cpu::pixel_at(cv, 63, 8), rgb(0, 0, 255))
+    ui::paint_cpu::canvas_free(cv)
+}
+
+fn test_a_rect_without_has_grad_is_bit_identical_to_a_plain_fill() {
+    // The whole 40x40 canvas, including the antialiased rim of a 12px radius, compared byte for
+    // byte against fill_rect: the gradient path must not touch a primitive that did not ask for it.
+    var a = ui::paint_cpu::canvas_new_nofont(40, 40)
+    var b = ui::paint_cpu::canvas_new_nofont(40, 40)
+    ui::paint_cpu::clear(a, ui::core::color_rgb(9, 11, 13))
+    ui::paint_cpu::clear(b, ui::core::color_rgb(9, 11, 13))
+    var r = grt_rect(3.0, 4.0, 36.5, 33.25)
+    ui::paint_cpu::fill_rect(a, r, ui::core::color_rgba(200, 100, 50, 190), 12.0)
+    var ov = grt_overlay()
+    var p = ui::layout::pp_rect(r, ui::core::color_rgba(200, 100, 50, 190), 12.0)
+    p.grad_to = ui::core::color_rgb(0, 0, 255)      // set, but has_grad stays false
+    p.grad_a = 3.0
+    p.grad_b = 33.5
+    ov.prims.push(p)
+    ui::paint_cpu::render_overlay(b, ov)
+    var same = 0
+    var y = 0
+    while y < 40 {
+        var x = 0
+        while x < 40 {
+            if ui::paint_cpu::pixel_at(a, x, y) == ui::paint_cpu::pixel_at(b, x, y) { same = same + 1 }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    assert_eq(same, 1600)
+    ui::paint_cpu::canvas_free(a)
+    ui::paint_cpu::canvas_free(b)
+}
+
+// ---------------------------------------------------------------------------
+// letter_spacing / word_spacing: the glyphs really move.
+//
+// The other half of this is the measurement assertion in nori_ui_test.nori
+// (test_text_measure_letter_and_word_spacing). Both halves matter: a string measured at one width
+// and painted at another is worse than no support at all, so the painters and text_measure share
+// one offsets table (layout::text_spacing_offsets_cps) and this test pins the pixel end of it.
+// paint_gpu goes through the same table over the same codepoints.
+// ---------------------------------------------------------------------------
+
+/// the rightmost inked column of `cv` (-1 when the canvas is blank), against a black background.
+fn last_ink_x(cv: ui::paint_cpu::CpuCanvas, w: Int, h: Int) -> Int {
+    var best = 0 - 1
+    var y = 0
+    while y < h {
+        var x = 0
+        while x < w {
+            if (ui::paint_cpu::pixel_at(cv, x, y) & 255) > 40 { if x > best { best = x } }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return best
+}
+/// the leftmost inked column of `cv` (-1 when blank).
+fn first_ink_x(cv: ui::paint_cpu::CpuCanvas, w: Int, h: Int) -> Int {
+    var best = w
+    var y = 0
+    while y < h {
+        var x = 0
+        while x < w {
+            if (ui::paint_cpu::pixel_at(cv, x, y) & 255) > 40 { if x < best { best = x } }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if best == w { return 0 - 1 }
+    return best
+}
+/// render one `.ui` source into a fresh 220x40 canvas with the test font and return it.
+fn spaced_canvas(inout fnt: font::Font, src: Str) -> ui::paint_cpu::CpuCanvas {
+    var pr = ui::layout::dsl_parse_document(src)
+    assert_true(pr.ok)
+    var vp = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(220.0, 40.0))
+    var ov = ui::layout::doc_layout(pr.doc, vp)
+    var cv = ui::paint_cpu::canvas_new(220, 40, fnt)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::render_overlay(cv, ov)
+    return cv
+}
+
+fn test_letter_and_word_spacing_move_the_glyphs() {
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    assert_true(fr.ok)
+    var head = "column { gap: 0 padding: 0 text { color: [255, 255, 255, 255] size_px: 20 text: "
+    let plain_src = head + "abc }" + " }"
+    var plain = spaced_canvas(fr.font, plain_src)
+    let ls6_src = head + "abc letter_spacing: 6 }" + " }"
+    var ls6 = spaced_canvas(fr.font, ls6_src)
+    // three glyphs = two gaps of 6px, so the run ends 12px further right ...
+    assert_eq(last_ink_x(ls6, 220, 40) - last_ink_x(plain, 220, 40), 12)
+    // ... and starts in exactly the same column: the spacing is between glyphs, never before the
+    // first one (`gaps = glyphs - 1`).
+    assert_eq(first_ink_x(ls6, 220, 40), first_ink_x(plain, 220, 40))
+
+    // word spacing shifts everything after the single word gap, and only that
+    let wplain_src = head + "\"ab cd\" }" + " }"
+    var wplain = spaced_canvas(fr.font, wplain_src)
+    let ws9_src = head + "\"ab cd\" word_spacing: 9 }" + " }"
+    var ws9 = spaced_canvas(fr.font, ws9_src)
+    assert_eq(last_ink_x(ws9, 220, 40) - last_ink_x(wplain, 220, 40), 9)
+    assert_eq(first_ink_x(ws9, 220, 40), first_ink_x(wplain, 220, 40))
+    // two spaces are still one word gap (split_whitespace), not two
+    let w2plain_src = head + "\"ab  cd\" }" + " }"
+    var w2plain = spaced_canvas(fr.font, w2plain_src)
+    let w2_src = head + "\"ab  cd\" word_spacing: 9 }" + " }"
+    var w2 = spaced_canvas(fr.font, w2_src)
+    assert_eq(last_ink_x(w2, 220, 40) - last_ink_x(w2plain, 220, 40), 9)
+
+    // and the painted run ends where the measured box says it does: the box that letter_spacing
+    // widened is the box the glyphs fill, which is the point of wiring both halves.
+    var pr = ui::layout::dsl_parse_document(head + "abc letter_spacing: 6 }" + " }")
+    assert_true(pr.ok)
+    var tl = ui::layout::ui_text_layout(pr.doc.tree.children[0], 220.0)
+    var tlp = ui::layout::ui_text_layout(ui::layout::dsl_parse_document(head + "abc }" + " }").doc.tree.children[0], 220.0)
+    assert_feq(tl.width - tlp.width, 12.0, 0.001)
+
+    ui::paint_cpu::canvas_free(plain)
+    ui::paint_cpu::canvas_free(ls6)
+    ui::paint_cpu::canvas_free(wplain)
+    ui::paint_cpu::canvas_free(ws9)
+    ui::paint_cpu::canvas_free(w2plain)
+    ui::paint_cpu::canvas_free(w2)
+}
+
+// ---- a rounded rectangle is split into corners and interior --------------------------------
+//
+// fill_rect_cl does not ask corner_cov about the interior, where the answer is always 255. That is
+// only valid if the pixels come out identical to asking, so this draws the same rectangle the slow
+// way and compares every pixel of it.
+
+fn ifloor(v: Float) -> Int { var i = to_int(v)  if to_float(i) > v { i = i - 1 }  return i }
+fn iceil(v: Float) -> Int { var i = to_int(v)  if to_float(i) < v { i = i + 1 }  return i }
+
+/// the straightforward per-pixel implementation, kept here as the thing to agree with.
+///
+/// It is bounded to the rectangle: corner_cov answers 255 for a pixel that is
+/// nowhere near the shape, so a reference that walked the whole canvas would paint all of it.
+fn ref_round(cv: ui::paint_cpu::CpuCanvas, x0: Float, y0: Float, x1: Float, y1: Float,
+             col: ui::core::Color, radius: Float) {
+    let px0 = imaxi(0, ifloor(x0))
+    let py0 = imaxi(0, ifloor(y0))
+    let px1 = imini(ui::paint_cpu::canvas_w(cv), iceil(x1))
+    let py1 = imini(ui::paint_cpu::canvas_h(cv), iceil(y1))
+    var y = py0
+    while y < py1 {
+        var x = px0
+        while x < px1 {
+            let cov = ui::paint_cpu::corner_cov_at(to_float(x) + 0.5, to_float(y) + 0.5, x0, y0, x1, y1, radius)
+            if cov > 0 { ui::paint_cpu::blend_px_at(cv, x, y, col, cov) }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn same_pixels(a: ui::paint_cpu::CpuCanvas, b: ui::paint_cpu::CpuCanvas) -> Int {
+    var bad = 0
+    var y = 0
+    while y < ui::paint_cpu::canvas_h(a) {
+        var x = 0
+        while x < ui::paint_cpu::canvas_w(a) {
+            if ui::paint_cpu::pixel_at(a, x, y) != ui::paint_cpu::pixel_at(b, x, y) { bad = bad + 1 }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return bad
+}
+
+fn round_case(w: Int, h: Int, x0: Float, y0: Float, x1: Float, y1: Float, radius: Float, alpha: Int) {
+    let bg = ui::core::color_rgb(10, 20, 30)
+    let col = ui::core::color_rgba(200, 100, 50, alpha)
+    var fast = ui::paint_cpu::canvas_new_nofont(w, h)
+    var slow = ui::paint_cpu::canvas_new_nofont(w, h)
+    ui::paint_cpu::clear(fast, bg)
+    ui::paint_cpu::clear(slow, bg)
+    let r = ui::core::rect_min_max(ui::core::vec2(x0, y0), ui::core::vec2(x1, y1))
+    ui::paint_cpu::fill_rect(fast, r, col, radius)
+    ref_round(slow, x0, y0, x1, y1, col, radius)
+    assert_eq(same_pixels(fast, slow), 0)
+    ui::paint_cpu::canvas_free(fast)
+    ui::paint_cpu::canvas_free(slow)
+}
+
+fn test_rounded_fill_matches_the_per_pixel_way() {
+    // the ordinary case: an interior far larger than the corners, which is the fast path
+    round_case(64, 48, 4.0, 4.0, 60.0, 44.0, 10.0, 255)
+    // ...and translucent, where the span still has to blend
+    round_case(64, 48, 4.0, 4.0, 60.0, 44.0, 10.0, 128)
+    // a square one: no corner anywhere
+    round_case(64, 48, 4.0, 4.0, 60.0, 44.0, 0.0, 255)
+    // narrower than its own corners, where the two corner regions meet and there is no interior
+    round_case(32, 32, 8.0, 8.0, 20.0, 24.0, 9.0, 255)
+    round_case(32, 32, 10.0, 10.0, 16.0, 16.0, 12.0, 255)
+    // fractional edges, which is what a 2.625 display scale produces all day
+    round_case(64, 48, 4.3, 5.7, 59.1, 43.2, 7.5, 255)
+    round_case(64, 48, 0.5, 0.5, 63.5, 47.5, 6.25, 200)
+    // one pixel tall and one pixel wide, the degenerate ends
+    round_case(32, 32, 5.0, 5.0, 6.0, 20.0, 4.0, 255)
+    round_case(32, 32, 5.0, 5.0, 20.0, 6.0, 4.0, 255)
+    // hanging off every edge, so the clip does the work
+    round_case(32, 32, 0.0 - 8.0, 0.0 - 8.0, 40.0, 40.0, 10.0, 255)
+}
+
+// A line of text sits in the same place in two different fonts.
+//
+// If the baseline were the face's own ascender (`baseline = ascent(face)`, measured down from the
+// top of a line box that is `size + 5` and knows nothing about the face), the box would stay put and
+// the glyphs inside it would move, for every label, row of source and button caption at once, the
+// moment somebody chose a different font.
+//
+// The two faces below are real ones, in em units from their hhea tables: DejaVuSansMono
+// (ascender 0.928, descender -0.236) and JetBrainsMono Nerd Font (1.020, -0.300). Their cap
+// heights (0.729 / 0.730) and advances (0.602 / 0.600) agree to a thousandth, so the letters are
+// the same size. Only the vertical metrics differ.
+fn bl(size: Float, asc: Float, desc: Float) -> Float {
+    return ui::layout::text_baseline_in_box(size, size * asc, size * desc, 0.0)
+}
+fn test_the_baseline_barely_moves_between_two_faces() {
+    var i = 0
+    let sizes = [11.0, 13.0, 15.0, 18.0, 24.0]
+    while i < sizes.len() {
+        let s = sizes[i]
+        let dv = bl(s, 0.928, 0.0 - 0.236)
+        let jb = bl(s, 1.020, 0.0 - 0.300)
+        var d = dv - jb
+        if d < 0.0 { d = 0.0 - d }
+        // half a pixel over the whole range, against the 1.2px at 13px the raw ascent would give.
+        assert_true(d < 0.5)
+        i = i + 1
+    }
+    // and the raw ascents really are that far apart, which is what this test guards against
+    let raw = 13.0 * 1.020 - 13.0 * 0.928
+    assert_true(raw > 1.0)
+}
+fn test_the_glyphs_stay_inside_the_box_they_were_given() {
+    // the ink of a line (ascent above the baseline, descent below) fits the box at the sizes a UI
+    // uses, for both faces, and is centred in it rather than pushed to the bottom by a tall face.
+    var i = 0
+    let sizes = [11.0, 13.0, 15.0]
+    while i < sizes.len() {
+        let s = sizes[i]
+        let box = ui::layout::text_line_height(s)
+        let top = bl(s, 1.020, 0.0 - 0.300) - s * 1.020
+        let bot = bl(s, 1.020, 0.0 - 0.300) + s * 0.300
+        assert_true(top > 0.0 - 0.001)
+        assert_true(bot < box + 0.001)
+        // centred: the space above the ink equals the space below it
+        var gap = top - (box - bot)
+        if gap < 0.0 { gap = 0.0 - gap }
+        assert_true(gap < 0.001)
+        i = i + 1
+    }
+}
+
+// The CPU painter draws shaped text: Arabic in its joined forms from a fallback face, and an emoji
+// in its own colors from a color face.
+fn test_text_shaped_fallback_and_color() {
+    var latin = font::font_load(read_file("std/font/assets/NotoSans-subset.ttf"))
+    var emoji = font::font_load(read_file("std/font/assets/NotoColorEmoji-subset.ttf"))
+    assert_true(latin.ok)
+    assert_true(emoji.ok)
+    var cv0 = ui::paint_cpu::canvas_new(160, 48, latin.font)
+    var cv = ui::paint_cpu::canvas_with_fallback(cv0, emoji.font)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(255, 255, 255))
+    // "A" then 😀: the emoji's yellow must appear (black text alone could never make it)
+    ui::paint_cpu::text(cv, ui::core::vec2(4.0, 36.0), "A" + font::utf8_encode_cp(128512), 32.0, ui::core::color_rgb(0, 0, 0))
+    var yellow = 0
+    var dark = 0
+    var y = 0
+    while y < 48 {
+        var x = 0
+        while x < 160 {
+            let p = ui::paint_cpu::pixel_at(cv, x, y)
+            let r = (p >> 16) & 255
+            let g = (p >> 8) & 255
+            let b = p & 255
+            if r > 200 && g > 150 && b < 90 { yellow = yellow + 1 }
+            if r < 60 && g < 60 && b < 60 { dark = dark + 1 }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    assert_true(yellow > 50)
+    assert_true(dark > 20)
+    ui::paint_cpu::canvas_free(cv0)
+}
+
+// ---- a translucent canvas (canvas_alpha): premultiplied ARGB, for a dock over the wallpaper ----------
+
+fn px_at(cv: ui::paint_cpu::CpuCanvas, x: Int, y: Int) -> Int {
+    var p = 0
+    unsafe { p = peek32(ui::paint_cpu::canvas_ptr(cv) + (y * ui::paint_cpu::canvas_w(cv) + x) * 4) }
+    return p & 4294967295
+}
+
+fn test_alpha_canvas_is_premultiplied() {
+    var cv = ui::paint_cpu::canvas_alpha(ui::paint_cpu::canvas_new_nofont(40, 30), true)
+    ui::paint_cpu::clear(cv, ui::core::color_rgba(0, 0, 0, 0))
+    assert_eq(px_at(cv, 0, 0), 0)
+    // an opaque fill is opaque
+    ui::paint_cpu::fill_rect_cl(cv, ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(10.0, 10.0)), ui::core::color_rgba(200, 100, 50, 255), 0.0, ui::paint_cpu::clip_full(cv))
+    assert_eq(px_at(cv, 5, 5), (255 << 24) | rgb(200, 100, 50))
+    // a half-transparent fill over nothing: alpha 128, the colour premultiplied by it
+    ui::paint_cpu::fill_rect_cl(cv, ui::core::rect_min_max(ui::core::vec2(20.0, 0.0), ui::core::vec2(30.0, 10.0)), ui::core::color_rgba(200, 100, 50, 128), 0.0, ui::paint_cpu::clip_full(cv))
+    let p = px_at(cv, 25, 5)
+    assert_eq((p >> 24) & 255, 128)
+    assert_true(((p >> 16) & 255) >= 99 && ((p >> 16) & 255) <= 101)
+    // the same again over it: 128 + 127·128/255
+    ui::paint_cpu::fill_rect_cl(cv, ui::core::rect_min_max(ui::core::vec2(20.0, 0.0), ui::core::vec2(30.0, 10.0)), ui::core::color_rgba(200, 100, 50, 128), 0.0, ui::paint_cpu::clip_full(cv))
+    assert_eq((px_at(cv, 25, 5) >> 24) & 255, 192)
+    // a rounded rect leaves its corner clear
+    ui::paint_cpu::clear(cv, ui::core::color_rgba(0, 0, 0, 0))
+    ui::paint_cpu::fill_rect_cl(cv, ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(40.0, 30.0)), ui::core::color_rgba(8, 20, 14, 224), 10.0, ui::paint_cpu::clip_full(cv))
+    assert_eq(px_at(cv, 0, 0), 0)
+    assert_eq((px_at(cv, 20, 15) >> 24) & 255, 224)
+}
+
+fn test_opaque_canvas_is_unchanged() {
+    // without the alpha channel the top byte stays what it always was
+    var cv = ui::paint_cpu::canvas_new_nofont(10, 10)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(10, 20, 30))
+    assert_eq(px_at(cv, 3, 3), rgb(10, 20, 30))
+    ui::paint_cpu::fill_rect_cl(cv, ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(10.0, 10.0)), ui::core::color_rgba(200, 100, 50, 128), 0.0, ui::paint_cpu::clip_full(cv))
+    assert_eq((px_at(cv, 3, 3) >> 24) & 255, 0)
+}
+
+// a box shadow from a style: under the box (kind 4, first), drawn outside it only: darker just below it
+// where the offset puts it, nothing far away, and the box's own fill untouched inside. A text with the same
+// properties gets its text shadow instead; damage after a change of colour reaches the shadow's extent
+fn test_box_shadow_from_a_style() {
+    let sp = ui::layout::style_parse(".card { bg: #ffffff radius: 10 shadow_color: #000000c0 shadow_blur: 16 shadow_offset_y: 12 } .glow { shadow_color: #00ff00 shadow_blur: 2 }", "t.style")
+    assert_true(sp.ok)
+    var d = ui::layout::rdoc_new()
+    var r = ui::layout::dsl_parse_document("column { padding: 40 column { classes: [card] w: 100 h: 60 } }")
+    assert_true(r.ok)
+    ui::layout::rdoc_set_tree(d, sink r.doc.tree)
+    let e = ui::layout::rdoc_set_styles(d, "t", sp.styles)
+    assert_streq(e.msg, "")
+    ui::layout::rdoc_set_viewport(d, 200.0, 180.0)
+    let _f = ui::layout::rdoc_frame(d, 0.0)
+    let ov = ui::layout::rdoc_overlay(d)
+    var ks = -1
+    var kb = -1
+    var i = 0
+    while i < ov.prims.len() {
+        if ov.prims[i].kind == 4 && ks < 0 { ks = i }
+        if ov.prims[i].kind == 0 && ov.prims[i].color.r == 255 && kb < 0 { kb = i }
+        i = i + 1
+    }
+    assert_true(ks >= 0)
+    assert_true(kb > ks)                                               // under the box's fill
+    let sh = ov.prims[ks]
+    assert_feq(sh.rect.min.x, 40.0, 0.01)
+    assert_feq(sh.rect.max.y, 100.0, 0.01)
+    assert_feq(sh.outline_w, 16.0, 0.01)
+    assert_feq(sh.word_spacing, 12.0, 0.01)
+    let b = ui::layout::pp_bounds(sh)
+    assert_true(b.max.y >= 100.0 + 12.0 + 16.0)
+    var cv = ui::paint_cpu::canvas_new_nofont(200, 180)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(200, 200, 200))
+    ui::paint_cpu::render_overlay(cv, ov)
+    assert_eq(ui::paint_cpu::pixel_at(cv, 90, 70), rgb(255, 255, 255))   // inside the box: its fill
+    let below = ui::paint_cpu::pixel_at(cv, 90, 104) & 255
+    assert_true(below < 120)                                           // just under it: dark
+    assert_eq(ui::paint_cpu::pixel_at(cv, 90, 2), rgb(200, 200, 200))   // far above: nothing
+    let above = ui::paint_cpu::pixel_at(cv, 90, 38) & 255
+    assert_true(above > below)                                         // the offset: lighter above
+    ui::paint_cpu::canvas_free(cv)
+    // a text: the same properties are its text shadow (glyph copies), not a box shadow
+    var t = ui::layout::rdoc_new()
+    var rt = ui::layout::dsl_parse_document("column { padding: 4 text { text: \"Hi\" classes: [glow] } }")
+    assert_true(rt.ok)
+    ui::layout::rdoc_set_tree(t, sink rt.doc.tree)
+    let et = ui::layout::rdoc_set_styles(t, "t", sp.styles)
+    assert_streq(et.msg, "")
+    ui::layout::rdoc_set_viewport(t, 100.0, 40.0)
+    let _g = ui::layout::rdoc_frame(t, 0.0)
+    let tov = ui::layout::rdoc_overlay(t)
+    var texts = 0
+    var boxes = 0
+    foreach p in tov.prims { if p.kind == 2 { texts = texts + 1 }  if p.kind == 4 { boxes = boxes + 1 } }
+    assert_eq(boxes, 0)
+    assert_true(texts > 1)
+}

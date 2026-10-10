@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=hexed
+Exec=hexed %f
+MimeType=application/octet-stream;

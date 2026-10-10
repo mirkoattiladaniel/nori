@@ -1,0 +1,335 @@
+//! Loading a plugin `.so` and reading what it provides.
+//!
+//! A plugin is a shared library exporting the `nori_plugin_*` entry points below. It is built
+//! with `noric --build-lib IN OUT.so --shared --runtime runtime.nori`, which links the runtime
+//! inside the library and exports nothing else, so the plugin has its own heap and handle tables,
+//! and every value crossing the boundary is a scalar or a C string.
+//!
+//! Nothing here traps. A library that will not open, is missing a symbol, reports the wrong ABI, or
+//! returns an unreadable manifest yields a `LoadedPlugin` with `ok = false` and `err` set, and the
+//! caller carries on with the plugins that did load.
+//!
+//! ## One version
+//!
+//! This host speaks plugin ABI 1, and a plugin reporting any other version is refused.
+//!
+//! Beyond drawing panels and taking their events, ABI 1 is, in one line each:
+//!
+//!   * `nori_plugin_init`: the plugin is handed the address of the host's service callback, so it
+//!     can call the host.
+//!   * `nori_plugin_service`: the plugin answers service keys, rather than only calling them. The
+//!     keys it answers are the `services` array its manifest declares; declaring a key you cannot
+//!     answer is a load error.
+//!   * `nori_plugin_surface`: the plugin fills a named hole with a GPU texture, given the host's
+//!     borrowed device and queue. The holes it fills are the manifest's `surfaces` array.
+//!
+//! The last two are dispatched by name: a host walks the surfaces a document
+//! declared and the services a plugin declared, and matches strings. It never learns what any of them
+//! mean. That is what lets one `nori_ui` binary be a game editor, an image editor or a browser
+//! depending only on what is in its plugin directory.
+//!
+//! A plugin reporting another ABI is refused by version, with the reason in `err`.
+
+use core::*
+import "std/dl" as dl
+import "std/json" as json
+import "std/os" as os
+
+/// the plugin ABI this host speaks, the one version it loads.
+pub fn ABI_VERSION() -> Int { return 1 }
+
+/// `fn nori_plugin_abi() -> Int`: the ABI version the plugin was built against.
+pub fn SYM_ABI() -> Str { return "nori_plugin_abi" }
+/// `fn nori_plugin_manifest() -> cstr`: JSON describing the plugin and its panels.
+pub fn SYM_MANIFEST() -> Str { return "nori_plugin_manifest" }
+/// `fn nori_plugin_init(host_call: Int) -> Int`: optional; called once after load, 0 = ready.
+///
+/// The argument is the address of the host's `(key: cstr, arg: cstr) -> cstr` callback, which is how
+/// a plugin calls its host.
+pub fn SYM_INIT() -> Str { return "nori_plugin_init" }
+/// `fn nori_plugin_render(id: cstr, w: Float, h: Float) -> cstr`: the panel's `.ui` source.
+pub fn SYM_RENDER() -> Str { return "nori_plugin_render" }
+/// `fn nori_plugin_event(id: cstr, action: cstr) -> Int`: a click or other action on a panel.
+pub fn SYM_EVENT() -> Str { return "nori_plugin_event" }
+/// `fn nori_plugin_service(key: cstr, arg: cstr) -> cstr`: the plugin answering one of the
+/// service keys its manifest declared. Same JSON-in / JSON-out contract as every other bus call, so
+/// a caller cannot tell whether a key is answered by the host, a builtin, or a `.so`.
+///
+/// The reply belongs to the plugin and is copied on this side immediately; a block from another
+/// image's malloc cannot be freed by ours. The plugin must therefore keep its reply alive until at
+/// least its next call, the mirror of the rule `hostcall.nori` puts on the host.
+pub fn SYM_SERVICE() -> Str { return "nori_plugin_service" }
+/// `fn nori_plugin_surface(id: cstr, device: Int, queue: Int, w: Int, h: Int) -> Int`: the
+/// plugin rendering into a named hole and returning a GPU texture view handle, or 0 when it has
+/// nothing to show this frame.
+///
+/// `device` and `queue` are borrowed: one process, one `WGPUDevice`, owned by `ui_gpu`. The plugin
+/// allocates its own targets on them and must release neither. Everything crossing here is a scalar,
+/// so the C-string-only boundary is not widened: a handle is an integer like any other.
+pub fn SYM_SURFACE() -> Str { return "nori_plugin_surface" }
+
+/// a panel a plugin provides: what the dock needs to place and label a tab.
+pub struct PanelDesc {
+    id: Str, name: Str, icon: Str, position: Int,
+    default_w: Float, default_h: Float, closable: Bool, shortcut: Str,
+    /// may the dock offer "Duplicate" on this panel's tab? See `panel_from_json`.
+    duplicable: Bool
+}
+
+/// one opened plugin library, its declared panels, and the entry points already resolved.
+/// `stamp` is the file's size+mtime as of the load, so `changed` can tell when it has been rebuilt.
+pub struct LoadedPlugin {
+    path: Str, name: Str, version: Str,
+    handle: Int, f_render: Int, f_event: Int, f_init: Int, abi: Int,
+    f_service: Int, f_surface: Int,
+    panels: Vec<PanelDesc>, services: Vec<Str>, surfaces: Vec<Str>,
+    stamp: Str, ok: Bool, err: Str
+}
+
+/// a plugin file's fingerprint: size and mtime, cheap enough to poll every frame. "" if it is gone.
+pub fn stamp_of(path: Str) -> Str {
+    let st = os::stat_path(path)
+    if !st.ok { return "" }
+    return (to_str(st.size) + ("@" + to_str(st.mtime)))
+}
+
+/// a failed load, carrying why.
+fn failed(path: Str, msg: Str) -> LoadedPlugin {
+    var np: Vec<PanelDesc> = vec()
+    var ns: Vec<Str> = vec()
+    var nf: Vec<Str> = vec()
+    return LoadedPlugin { path: copy path, name: "", version: "", handle: 0,
+                          f_render: 0, f_event: 0, f_init: 0, abi: 0,
+                          f_service: 0, f_surface: 0,
+                          panels: np, services: ns, surfaces: nf, stamp: stamp_of(path), ok: false, err: copy msg }
+}
+
+/// read a panel entry from the manifest, defaulting every field the plugin left out.
+fn panel_from_json(v: json::Json) -> PanelDesc {
+    var pos = 0
+    let pj = json::field(v, "position")
+    if !json::is_null(pj) { pos = to_int(json::as_num(pj)) }
+    var dw = 280.0
+    let dwj = json::field(v, "default_w")
+    if !json::is_null(dwj) { dw = json::as_num(dwj) }
+    var dh = 320.0
+    let dhj = json::field(v, "default_h")
+    if !json::is_null(dhj) { dh = json::as_num(dhj) }
+    var cl = true
+    let clj = json::field(v, "closable")
+    if !json::is_null(clj) { cl = json::as_bool(clj) }
+    // Whether a second view of this panel means anything. A second file tree is a second picture of
+    // one directory; a second terminal is a second shell. Only the panel knows which it is, so the
+    // dock offers Duplicate on its say-so, and defaults to not offering it, because a duplicate the
+    // owner cannot tell apart is two tabs fighting over one piece of state.
+    var dup = false
+    let dupj = json::field(v, "duplicable")
+    if !json::is_null(dupj) { dup = json::as_bool(dupj) }
+    return PanelDesc {
+        id: copy json::as_str(json::field(v, "id")),
+        name: copy json::as_str(json::field(v, "name")),
+        icon: copy json::as_str(json::field(v, "icon")),
+        position: pos, default_w: dw, default_h: dh, closable: cl,
+        shortcut: copy json::as_str(json::field(v, "shortcut"))
+    , duplicable: dup}
+}
+
+/// open `path`, check its ABI, read its manifest, and resolve its entry points.
+pub fn load(path: Str) -> LoadedPlugin {
+    let h = dl::load(path)
+    if h == 0 { return failed(path, ("cannot open: " + dl::error())) }
+
+    let fabi = dl::sym(h, SYM_ABI())
+    if fabi == 0 { dl::unload(h)  return failed(path, ("not a plugin: no " + SYM_ABI())) }
+    let abi = dl::call0(fabi)
+    if abi != ABI_VERSION() {
+        dl::unload(h)
+        return failed(path, ("ABI " + (to_str(abi) + (", host speaks " + to_str(ABI_VERSION())))))
+    }
+
+    let fman = dl::sym(h, SYM_MANIFEST())
+    if fman == 0 { dl::unload(h)  return failed(path, ("no " + SYM_MANIFEST())) }
+    let msrc = dl::call0_str(fman)
+    if msrc.len() == 0 { dl::unload(h)  return failed(path, "empty manifest") }
+
+    let m = json::parse(msrc)
+    if json::is_null(json::field(m, "name")) { dl::unload(h)  return failed(path, "manifest has no name") }
+
+    var panels: Vec<PanelDesc> = vec()
+    let pj = json::field(m, "panels")
+    var i = 0
+    while i < json::jlen(pj) {
+        let d = panel_from_json(json::at(pj, i))
+        if d.id.len() > 0 { panels.push(d) }
+        i = i + 1
+    }
+
+    var services: Vec<Str> = vec()
+    let sj = json::field(m, "services")
+    var k = 0
+    while k < json::jlen(sj) {
+        let s = json::as_str(json::at(sj, k))
+        if s.len() > 0 { services.push(copy s) }
+        k = k + 1
+    }
+
+    // The holes this plugin offers to fill, by name. A document's `surface { id: … }` is
+    // matched against these, so a plugin claims a hole by declaring it rather than by being wired in.
+    var surfaces: Vec<Str> = vec()
+    let fj = json::field(m, "surfaces")
+    var q = 0
+    while q < json::jlen(fj) {
+        let f = json::as_str(json::at(fj, q))
+        if f.len() > 0 { surfaces.push(copy f) }
+        q = q + 1
+    }
+
+    // A plugin with panels has to be able to draw them; one that only publishes services does not.
+    let fren = dl::sym(h, SYM_RENDER())
+    if fren == 0 && panels.len() > 0 { dl::unload(h)  return failed(path, ("declares panels but has no " + SYM_RENDER())) }
+
+    // The same rule, twice more: declaring something you cannot deliver is a load error and not a
+    // surprise at frame time.
+    let fsvc = dl::sym(h, SYM_SERVICE())
+    if fsvc == 0 && services.len() > 0 { dl::unload(h)  return failed(path, ("declares services but has no " + SYM_SERVICE())) }
+    let fsurf = dl::sym(h, SYM_SURFACE())
+    if fsurf == 0 && surfaces.len() > 0 { dl::unload(h)  return failed(path, ("declares surfaces but has no " + SYM_SURFACE())) }
+
+    return LoadedPlugin {
+        path: copy path,
+        name: copy json::as_str(json::field(m, "name")),
+        version: copy json::as_str(json::field(m, "version")),
+        handle: h, f_render: fren,
+        f_event: dl::sym(h, SYM_EVENT()),
+        f_init: dl::sym(h, SYM_INIT()), abi: abi,
+        f_service: fsvc, f_surface: fsurf,
+        panels: panels, services: services, surfaces: surfaces, stamp: stamp_of(path), ok: true, err: ""
+    }
+}
+
+/// run the plugin's one-time setup, handing over the host callback when the plugin asked for one.
+///
+/// The plugin is given `hostcall_addr()` and can call the host bus from that moment on. A plugin
+/// exporting no `nori_plugin_init` needs nothing from its host and is already ready.
+pub fn init(p: LoadedPlugin) -> Bool {
+    if !p.ok { return false }
+    if p.f_init == 0 { return true }
+    return dl::call1(p.f_init, hostcall_addr()) == 0
+}
+
+/// true when this plugin has an init to run, and so will be handed the host callback. A plugin with
+/// no `nori_plugin_init` needs nothing from its host and is ready the moment it loads.
+pub fn calls_back(p: LoadedPlugin) -> Bool { return p.ok && p.f_init != 0 }
+
+/// a panel's `.ui` source for this frame. "" when the plugin cannot draw it.
+pub fn render(p: LoadedPlugin, id: Str, w: Float, h: Float) -> Str {
+    if !p.ok || p.f_render == 0 { return "" }
+    return dl::call_iff_str(p.f_render, id, w, h)
+}
+
+/// deliver an action (a `HitRegion.on_click` id) to the panel that owns it.
+pub fn event(p: LoadedPlugin, id: Str, action: Str) -> Int {
+    if !p.ok || p.f_event == 0 { return 0 }
+    return dl::call2_str(p.f_event, id, action)
+}
+
+/// true when this plugin answers service keys itself.
+pub fn serves(p: LoadedPlugin) -> Bool { return p.ok && p.f_service != 0 }
+
+/// ask the plugin to answer one of the keys its manifest declared. A plugin that cannot answer at
+/// all replies in the shared error shape rather than "", so a caller has one thing to parse.
+pub fn service(p: LoadedPlugin, key: Str, arg: Str) -> Str {
+    if !p.ok || p.f_service == 0 { return ("{\"ok\":false,\"error\":\"no such service: " + (json::js_escape(key) + "\"}")) }
+    var a = arg
+    if a.len() == 0 { a = "{}" }
+    let r = dl::call2_cstr(p.f_service, key, a)
+    if r.len() == 0 { return ("{\"ok\":false,\"error\":\"" + (json::js_escape(p.name) + (" returned nothing for " + (json::js_escape(key) + "\"}")))) }
+    return r
+}
+
+/// true when this plugin declares `id` as a hole it fills.
+pub fn fills_surface(p: LoadedPlugin, id: Str) -> Bool {
+    if !p.ok || p.f_surface == 0 { return false }
+    var i = 0
+    while i < p.surfaces.len() { if p.surfaces[i] == id { return true }  i = i + 1 }
+    return false
+}
+
+/// render the named hole at `w` x `h` on the host's borrowed device and queue, and hand back a GPU
+/// texture view handle. 0 means "nothing to show this frame" and is not an error: the host then
+/// leaves the hole on its placeholder colour, which is visible on purpose.
+pub fn surface(p: LoadedPlugin, id: Str, device: Int, queue: Int, w: Int, h: Int) -> Int {
+    if !p.ok || p.f_surface == 0 { return 0 }
+    if w <= 0 || h <= 0 { return 0 }
+    return dl::call_s4i(p.f_surface, id, device, queue, w, h)
+}
+
+/// close the library. The `LoadedPlugin` must not be used afterwards.
+pub fn unload(p: LoadedPlugin) -> Bool {
+    if p.handle == 0 { return false }
+    return dl::unload(p.handle)
+}
+
+/// true when the plugin file on disk is not the one that was loaded: it has been rebuilt, replaced,
+/// or removed. Cheap enough to ask every frame; the answer is a `stat`, not a read.
+pub fn changed(p: LoadedPlugin) -> Bool {
+    let now = stamp_of(p.path)
+    if now.len() == 0 { return false }              // gone for the moment: a rebuild mid-write, not a change
+    return !(now == p.stamp)
+}
+
+/// close and load the same path again, returning the fresh plugin. All state inside the old library
+/// is gone: the plugin owns its own heap, and it goes with the library.
+///
+/// The new file must be a new file. A build that writes the `.so` in place, keeping its inode, can be
+/// handed straight back by the dynamic loader; every writer worth using (including `noric`) creates a
+/// replacement and renames it, which is what makes this work.
+pub fn reload(p: LoadedPlugin) -> LoadedPlugin {
+    let path = p.path
+    if p.handle != 0 { dl::unload(p.handle) }
+    var np = load(path)
+    // A plugin whose init() fails is not loaded, whatever the dynamic loader thought; otherwise the
+    // caller would get a LoadedPlugin marked ok whose init had refused, and the first render call
+    // into it would be the first anyone heard about it.
+    if np.ok {
+        if !init(np) {
+            np.ok = false
+            np.err = "the plugin's init() failed after reload"
+        }
+    }
+    return np
+}
+
+/// reload every plugin whose file has changed, leaving the rest untouched. Returns the new list and
+/// how many were reloaded, so a caller can log it.
+pub fn reload_changed(inout ps: Vec<LoadedPlugin>) -> Int {
+    var n = 0
+    var i = 0
+    while i < ps.len() {
+        if changed(ps[i]) { ps[i] = reload(ps[i])  n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+/// the extension a loadable plugin has on this platform: `so`, `dll`, `dylib`.
+///
+/// Re-exported so a shell can ask without importing `std/dl` itself.
+pub fn plugin_ext() -> Str { return dl::ext() }
+
+/// load every plugin in `dir`, in directory order. Failures are returned too, with `ok = false`,
+/// so a caller can show what refused to load instead of silently dropping it.
+pub fn scan(dir: Str) -> Vec<LoadedPlugin> {
+    var out: Vec<LoadedPlugin> = vec()
+    let suffix = ("." + dl::ext())
+    var names = os::read_dir(dir)
+    var i = 0
+    while i < names.len() {
+        let n = names[i]
+        if n.len() > suffix.len() && n.slice(n.len() - suffix.len(), n.len()) == suffix {
+            out.push(load((dir + ("/" + n))))
+        }
+        i = i + 1
+    }
+    return out
+}

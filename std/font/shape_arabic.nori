@@ -1,0 +1,149 @@
+// std/font: the Arabic shaper (also Syriac, N'Ko, Mongolian, Adlam and the other joining
+// scripts): HarfBuzz's hb-ot-shaper-arabic.
+//
+// Each character's Joining_Type (from the Unicode data) drives a state machine that picks the
+// positional form, isolated, initial, medial, final (and Syriac's fin2/fin3/med2), as a mask bit
+// that enables exactly one of the isol/init/medi/fina features on it. Transparent characters
+// (marks) are skipped by the machine. The forms run as separate GSUB stages in the spec's order,
+// then rlig (lam-alef), then calt and the rest. Mark reordering moves the "modifier combining
+// marks" (UTR #53) ahead of other marks of the same class.
+
+// actions, in arabic_features order
+fn AR_ISOL() -> Int { return 0 }
+fn AR_FINA() -> Int { return 1 }
+fn AR_FIN2() -> Int { return 2 }
+fn AR_FIN3() -> Int { return 3 }
+fn AR_MEDI() -> Int { return 4 }
+fn AR_MED2() -> Int { return 5 }
+fn AR_INIT() -> Int { return 6 }
+fn AR_NONE() -> Int { return 7 }
+fn arabic_feature_name(i: Int) -> Str {
+    let names = "isolfinafin2fin3medimed2init"
+    return names.slice(i * 4, i * 4 + 4)
+}
+
+fn arabic_collect_features(inout fb: FB, script: Int) {
+    let is_arabic = script_code(script) == "Arab"
+    fb_enable(fb, "stch", 0)
+    fb_gsub_pause(fb, PAUSE_ARABIC_STCH())
+    fb_enable(fb, "ccmp", FF_MANUAL_ZWJ())
+    fb_enable(fb, "locl", FF_MANUAL_ZWJ())
+    fb_gsub_pause(fb, PAUSE_NONE())
+    var i = 0
+    while i < 7 {
+        let name = arabic_feature_name(i)
+        let syriac = name == "fin2" || name == "fin3" || name == "med2"
+        var fl = 0
+        if is_arabic && !syriac { fl = FF_HAS_FALLBACK() }
+        fb_add(fb, name, fl, 1)
+        fb_gsub_pause(fb, PAUSE_NONE())
+        i = i + 1
+    }
+    fb_enable(fb, "rlig", FF_MANUAL_ZWJ() | FF_HAS_FALLBACK())
+    if is_arabic { fb_gsub_pause(fb, PAUSE_ARABIC_FALLBACK()) }
+    fb_enable(fb, "rclt", FF_MANUAL_ZWJ())
+    fb_enable(fb, "calt", FF_MANUAL_ZWJ())
+    fb_gsub_pause(fb, PAUSE_NONE())
+    fb_enable(fb, "mset", 0)
+}
+
+fn arabic_plan_masks(inout p: Plan) {
+    var i = 0
+    while i < 7 { p.shaper_masks.push(plan_1_mask(p, ot_tag(arabic_feature_name(i))))  i = i + 1 }
+    p.shaper_masks.push(0)                                                // NONE
+}
+
+// joining type in the state machine's columns: U 0, L 1, R 2, D 3 (C joins as D), ALAPH 4,
+// DALATH_RISH 5; transparent 7.
+fn arabic_joining_col(cp: Int, gc: Int) -> Int {
+    if cp == 1808 { return 4 }                                            // U+0710 SYRIAC LETTER ALAPH
+    if cp == 1813 || cp == 1814 || cp == 1834 || cp == 1839 || cp == 1871 { return 5 }   // dalath/rish group
+    let jt = ucd_joining_type(cp)
+    if jt == JT_U() { return 0 }
+    if jt == JT_L() { return 1 }
+    if jt == JT_R() { return 2 }
+    if jt == JT_D() || jt == JT_C() { return 3 }
+    return 7                                                              // T
+}
+
+// the state table: per state, per column: prev_action, curr_action, next_state (HarfBuzz's;
+// 7 states x 6 columns x 3 values, NONE = 7)
+global g_ar_tab: Vec<Int>
+global g_ar_on: Int = 0
+fn arabic_state(state: Int, col: Int, which: Int) -> Int {
+    if g_ar_on == 0 {
+        g_ar_tab = [
+            7,7,0, 7,0,2, 7,0,1, 7,0,2, 7,0,1, 7,0,6,
+            7,7,0, 7,0,2, 7,0,1, 7,0,2, 7,2,5, 7,0,6,
+            7,7,0, 7,0,2, 6,1,1, 6,1,3, 6,1,4, 6,1,6,
+            7,7,0, 7,0,2, 4,1,1, 4,1,3, 4,1,4, 4,1,6,
+            7,7,0, 7,0,2, 5,0,1, 5,0,2, 5,2,5, 5,0,6,
+            7,7,0, 7,0,2, 0,0,1, 0,0,2, 0,2,5, 0,0,6,
+            7,7,0, 7,0,2, 7,0,1, 7,0,2, 7,3,5, 7,0,6 ]
+        g_ar_on = 1
+    }
+    return g_ar_tab[(state * 6 + col) * 3 + which]
+}
+
+fn arabic_joining(inout b: Buf) {
+    var prev = 0 - 1
+    var state = 0
+    var i = 0
+    while i < b.len {
+        let cp = bi(b, i, F_CP())
+        let col = arabic_joining_col(cp, up_gc(bi(b, i, F_UP())))
+        if col == 7 {
+            bset(b, i, F_SH1(), AR_NONE())
+        } else {
+            let pa = arabic_state(state, col, 0)
+            if pa != AR_NONE() && prev >= 0 { bset(b, prev, F_SH1(), pa) }
+            bset(b, i, F_SH1(), arabic_state(state, col, 1))
+            prev = i
+            state = arabic_state(state, col, 2)
+        }
+        i = i + 1
+    }
+}
+
+fn arabic_setup_masks(p: Plan, inout b: Buf) {
+    arabic_joining(b)
+    var i = 0
+    while i < b.len {
+        let a = bi(b, i, F_SH1())
+        if a >= 0 && a < p.shaper_masks.len() { bset(b, i, F_MASK(), bi(b, i, F_MASK()) | p.shaper_masks[a]) }
+        i = i + 1
+    }
+}
+
+// UTR #53 modifier combining marks: these move ahead of other marks of their class
+fn arabic_is_mcm(cp: Int) -> Bool {
+    return cp == 1620 || cp == 1621 || cp == 1624 || cp == 1756 || cp == 1763 || cp == 1767 || cp == 1768
+        || cp == 2250 || cp == 2251 || cp == 2253 || cp == 2254 || cp == 2255 || cp == 2259 || cp == 2291
+}
+fn arabic_reorder_marks(inout b: Buf, start0: Int, end: Int) {
+    var start = start0
+    var i = start
+    var cc = 220
+    while cc <= 230 {
+        while i < end && up_mcc(bi(b, i, F_UP())) < cc { i = i + 1 }
+        if i == end { return }
+        if up_mcc(bi(b, i, F_UP())) > cc { cc = cc + 10  continue }
+        var j = i
+        while j < end && up_mcc(bi(b, j, F_UP())) == cc && arabic_is_mcm(bi(b, j, F_CP())) { j = j + 1 }
+        if i == j { cc = cc + 10  continue }
+        merge_clusters(b, start, j)
+        // rotate [start, j) so that [i, j) comes first
+        var k = i
+        while k < j { buf_move_back(b, k, start + (k - i))  k = k + 1 }
+        let new_start = start + j - i
+        var new_cc = 26
+        if cc == 220 { new_cc = 25 }
+        while start < new_start {
+            let up = bi(b, start, F_UP())
+            bset(b, start, F_UP(), (up & 65535) | (new_cc << 16))
+            start = start + 1
+        }
+        i = j
+        cc = cc + 10
+    }
+}

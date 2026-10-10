@@ -1,0 +1,204 @@
+// Native .nori tests for std/math: run with
+//   noric --test std/math/math_test.nori compiler/runtime.nori --import-root .
+import "std/math" as m
+
+fn test_imax_imin() {
+    assert_eq(m::imax(3, 7), 7)
+    assert_eq(m::imax(7, 3), 7)
+    assert_eq(m::imax(-3, -7), -3)
+    assert_eq(m::imin(3, 7), 3)
+    assert_eq(m::imin(-3, -7), -7)
+    assert_eq(m::imax(5, 5), 5)
+}
+
+fn test_iabs() {
+    assert_eq(m::iabs(0), 0)
+    assert_eq(m::iabs(9), 9)
+    assert_eq(m::iabs(-9), 9)
+}
+
+fn test_imod() {
+    assert_eq(m::imod(10, 3), 1)
+    assert_eq(m::imod(9, 3), 0)
+    assert_eq(m::imod(7, 7), 0)
+}
+
+fn test_iclamp() {
+    assert_eq(m::iclamp(5, 0, 10), 5)
+    assert_eq(m::iclamp(-3, 0, 10), 0)
+    assert_eq(m::iclamp(99, 0, 10), 10)
+    assert_eq(m::iclamp(0, 0, 10), 0)
+}
+
+fn test_isign() {
+    assert_eq(m::isign(42), 1)
+    assert_eq(m::isign(-42), -1)
+    assert_eq(m::isign(0), 0)
+}
+
+fn test_gcd_lcm() {
+    assert_eq(m::gcd(12, 8), 4)
+    assert_eq(m::gcd(17, 5), 1)
+    assert_eq(m::gcd(0, 5), 5)
+    assert_eq(m::gcd(-12, 8), 4)
+    assert_eq(m::lcm(4, 6), 12)
+    assert_eq(m::lcm(0, 6), 0)
+    assert_eq(m::lcm(6, 0), 0)
+}
+
+fn test_ipow() {
+    assert_eq(m::ipow(2, 0), 1)
+    assert_eq(m::ipow(2, 10), 1024)
+    assert_eq(m::ipow(5, 3), 125)
+    assert_eq(m::ipow(10, 1), 10)
+}
+
+fn test_isqrt() {
+    assert_eq(m::isqrt(0), 0)
+    assert_eq(m::isqrt(1), 1)
+    assert_eq(m::isqrt(16), 4)
+    assert_eq(m::isqrt(17), 4)
+    assert_eq(m::isqrt(15), 3)
+    assert_eq(m::isqrt(-4), -1)
+}
+
+fn test_hex_digit() {
+    assert_eq(m::hex_digit(ord('0')), 0)
+    assert_eq(m::hex_digit(ord('9')), 9)
+    assert_eq(m::hex_digit(ord('a')), 10)
+    assert_eq(m::hex_digit(ord('f')), 15)
+    assert_eq(m::hex_digit(ord('A')), 10)
+    assert_eq(m::hex_digit(ord('F')), 15)
+    assert_eq(m::hex_digit(ord('g')), -1)
+}
+
+fn test_fabs_fsign() {
+    assert_feq(m::fabs(-2.5), 2.5, 0.0001)
+    assert_feq(m::fabs(2.5), 2.5, 0.0001)
+    assert_feq(m::fsign(3.0), 1.0, 0.0001)
+    assert_feq(m::fsign(-3.0), -1.0, 0.0001)
+    assert_feq(m::fsign(0.0), 0.0, 0.0001)
+}
+
+fn test_fmin_fmax_fclamp() {
+    assert_feq(m::fmin(1.5, 2.5), 1.5, 0.0001)
+    assert_feq(m::fmax(1.5, 2.5), 2.5, 0.0001)
+    assert_feq(m::fclamp(5.0, 0.0, 1.0), 1.0, 0.0001)
+    assert_feq(m::fclamp(-1.0, 0.0, 1.0), 0.0, 0.0001)
+    assert_feq(m::fclamp(0.5, 0.0, 1.0), 0.5, 0.0001)
+}
+
+fn test_floor_ceil_round_trunc() {
+    assert_feq(m::floor(2.7), 2.0, 0.0001)
+    assert_feq(m::floor(-2.1), -3.0, 0.0001)
+    assert_feq(m::ceil(2.1), 3.0, 0.0001)
+    assert_feq(m::ceil(-2.7), -2.0, 0.0001)
+    assert_feq(m::round(2.4), 2.0, 0.0001)
+    assert_feq(m::round(2.6), 3.0, 0.0001)
+    assert_feq(m::trunc(2.9), 2.0, 0.0001)
+    assert_feq(m::trunc(-2.9), -2.0, 0.0001)
+}
+
+fn test_trig() {
+    assert_feq(m::sin(0.0), 0.0, 0.0001)
+    assert_feq(m::cos(0.0), 1.0, 0.0001)
+    assert_feq(m::tan(0.0), 0.0, 0.0001)
+    assert_feq(m::sin(m::pi() / 2.0), 1.0, 0.0001)
+    assert_feq(m::atan2(0.0, 1.0), 0.0, 0.0001)
+    assert_feq(m::asin(1.0), m::pi() / 2.0, 0.0001)
+    assert_feq(m::acos(1.0), 0.0, 0.0001)
+    assert_feq(m::atan(0.0), 0.0, 0.0001)
+}
+
+fn test_exp_log() {
+    assert_feq(m::exp(0.0), 1.0, 0.0001)
+    assert_feq(m::log(m::e()), 1.0, 0.0001)
+    assert_feq(m::log(1.0), 0.0, 0.0001)
+    assert_feq(m::log2(8.0), 3.0, 0.0001)
+    assert_feq(m::log10(1000.0), 3.0, 0.0001)
+}
+
+fn test_pow_hypot_cbrt_fmod() {
+    assert_feq(m::pow(2.0, 10.0), 1024.0, 0.0001)
+    assert_feq(m::pow(9.0, 0.5), 3.0, 0.0001)
+    assert_feq(m::hypot(3.0, 4.0), 5.0, 0.0001)
+    assert_feq(m::cbrt(27.0), 3.0, 0.0001)
+    assert_feq(m::fmod(10.0, 3.0), 1.0, 0.0001)
+}
+
+fn test_constants() {
+    assert_feq(m::pi(), 3.141592653589793, 0.0001)
+    assert_feq(m::tau(), 2.0 * m::pi(), 0.0001)
+    assert_feq(m::e(), 2.718281828459045, 0.0001)
+}
+
+// The bottom of the double range: 2^k for k below -1022 is a subnormal, and a power built by squaring
+// a running product overflows on the way there and hands back 0 for every one of them.
+fn test_pow_subnormal() {
+    assert_true(m::pow(2.0, -1074.0) == 5e-324)
+    assert_true(m::pow(2.0, -1030.0) == 8.691694759794e-311)
+    assert_true(m::pow(2.0, -1075.0) == 0.0)
+    assert_true(m::pow(2.0, 1023.0) == 8.98846567431158e307)
+    assert_true(m::pow(2.0, 1024.0) > 1.7976931348623157e308)
+}
+
+// A power of two answers its own exponent exactly, all the way through the subnormals: reading the
+// biased exponent field straight off a subnormal reports the floor -1023 for every one of them.
+fn test_log2_exact_powers() {
+    var i = -1074
+    var bad = 0
+    while i < 1024 {
+        if m::log2(m::pow(2.0, to_float(i))) != to_float(i) { bad = bad + 1 }
+        i = i + 1
+    }
+    assert_eq(bad, 0)
+    assert_true(m::log(1e-320) > -737.0 && m::log(1e-320) < -736.0)
+}
+
+// The transcendentals are expected to land on the correctly rounded double, not merely near it.
+fn test_exp_log_last_bit() {
+    assert_true(m::exp(1.0) == 2.718281828459045)
+    assert_true(m::exp(-1.0) == 0.36787944117144233)
+    assert_true(m::exp(0.0) == 1.0)
+    assert_true(m::exp(10.0) == 22026.465794806718)
+    assert_true(m::log(2.0) == 0.6931471805599453)
+    assert_true(m::log(10.0) == 2.302585092994046)
+    assert_true(m::log2(5.0) == 2.321928094887362)
+    assert_true(m::pow(10.0, 3.0) == 1000.0)
+    assert_true(m::pow(-2.0, 3.0) == -8.0)
+    assert_true(m::pow(-2.0, 4.0) == 16.0)
+}
+
+// The last stretch below the overflow threshold: x above ~709.436 rounds its reduction constant k to
+// 1024, and 2^1024 is already infinity, so scaling by it flushed the largest finite results away.
+fn test_exp_overflow_edge() {
+    assert_true(m::exp(709.0) < 1.7976931348623157e308)
+    assert_true(m::exp(709.5209609999999) < 1.7976931348623157e308)
+    assert_true(m::exp(709.6343625) < 1.7976931348623157e308)
+    assert_true(m::exp(709.782712893383) < 1.7976931348623157e308)
+    assert_feq(m::exp(709.5209609999999) / 1.3836879440690668e308, 1.0, 0.000000000000001)
+    assert_true(m::exp(710.0) > 1.7976931348623157e308)
+}
+
+// `fbits` / `bitsf` are the only way to look at a Float: the language has no bit-cast and
+// `to_str(Float)` truncates to six significant digits. They were private until five separate places
+// had each re-derived the same malloc+poke trick, so these pin the contract that made them public.
+fn test_fbits_bitsf_round_trip() {
+    assert_true(m::bitsf(m::fbits(0.0)) == 0.0)
+    assert_true(m::bitsf(m::fbits(1.0)) == 1.0)
+    assert_true(m::bitsf(m::fbits(-1.0)) == -1.0)
+    assert_true(m::bitsf(m::fbits(0.1)) == 0.1)
+    assert_true(m::bitsf(m::fbits(3.141592653589793)) == 3.141592653589793)
+    assert_true(m::bitsf(m::fbits(1.7976931348623157e308)) == 1.7976931348623157e308)
+    assert_true(m::bitsf(m::fbits(5.0e-324)) == 5.0e-324)
+    // the known patterns, so a change of endianness or cell reuse would show
+    assert_eq(m::fbits(1.0), 4607182418800017408)          // 0x3FF0000000000000
+    assert_eq(m::fbits(2.0), 4611686018427387904)          // 0x4000000000000000
+    assert_eq(m::fbits(0.0), 0)
+    assert_true(m::bitsf(4607182418800017408) == 1.0)
+    // negative zero is distinguishable only through the bits: -0.0 == 0.0 compares true
+    let nz = m::bitsf(-9223372036854775808)                // 0x8000000000000000
+    assert_true(nz == 0.0)
+    assert_true(1.0 / nz < 0.0)
+    assert_eq(m::fbits(nz), -9223372036854775808)
+}

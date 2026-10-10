@@ -1,0 +1,64 @@
+use core::*
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// layout/parse_error: the in-panel overlay shown when `.ui`/`.style` parsing
+// fails. Consumes the strict DslParseResult from layout/dsl (src_empty = Empty,
+// otherwise Dsl{line, column, message}; there is no Json variant here, since
+// std/json is not used by this module).
+// ===========================================================================
+
+/// one-line summary suitable for logs or window titles (Display for the error).
+pub fn parse_error_summary(res: DslParseResult) -> Str {
+    return copy res.err
+}
+
+/// the multi-line body for the in-panel error overlay (title + message + source hint).
+pub fn parse_error_lines(res: DslParseResult) -> Vec<Str> {
+    var lines: Vec<Str> = vec()
+    lines.push("UI parse error")
+    lines.push(copy res.err)
+    if !res.src_empty {
+        lines.push(("Line " + (to_str(res.eline) + (", column " + to_str(res.ecol)))))
+        if res.emsg.len() > 0 { lines.push(copy res.emsg) }
+    }
+    lines.push("Fix the .ui / .style source and save - dev hot reload will refresh.")
+    return lines
+}
+
+fn pe_fmax(a: Float, b: Float) -> Float { if a > b { return a }  return b }
+fn pe_fmin(a: Float, b: Float) -> Float { if a < b { return a }  return b }
+
+/// paint a diagnostic card inside `bounds` (panel-local coordinates); geometry and
+/// palette are fixed.
+pub fn paint_parse_error(inout ctx: Context, bounds: Rect, res: DslParseResult) {
+    var lines = parse_error_lines(res)
+    if lines.len() == 0 { return }
+    var line_h = 15.0
+    var pad = 10.0
+    var inner_w = pe_fmax(bounds.width() - pad * 2.0, 120.0)
+    var panel_w = pe_fmin(inner_w, 420.0)
+    var panel_h = pe_fmin(to_float(lines.len()) * line_h + pad * 2.0, pe_fmax(bounds.height(), 80.0))
+    var panel_x = bounds.min.x + pe_fmax((bounds.width() - panel_w) * 0.5, pad)
+    var panel_y = bounds.min.y + pad
+    var panel = rect_min_size(vec2(panel_x, panel_y), vec2(panel_w, panel_h))
+
+    ctx.rect_filled(panel, color_rgba(48, 18, 22, 240), 6.0)
+    ctx.rect_stroke(panel, stroke(1.0, color_rgba(255, 90, 90, 220)), 6.0)
+
+    var i = 0
+    while i < lines.len() {
+        var y = panel.min.y + pad + to_float(i) * line_h
+        if y + line_h > panel.max.y - pad { return }
+        var lcolor = color_rgba(200, 210, 220, 230)
+        if i == 0 { lcolor = color_rgba(255, 200, 200, 255) }
+        else if i == 1 { lcolor = color_rgba(255, 240, 240, 255) }
+        var fsize = 11.0
+        if i == 0 { fsize = 13.0 }
+        var tc = text_cmd(vec2(panel.min.x + pad, y), lines[i], lcolor, fsize)
+        if i <= 1 { tc.font_bold = true }
+        ctx.push_command(dc_text(tc))
+        i = i + 1
+    }
+}

@@ -1,0 +1,317 @@
+use core::*
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// the overlay stylesheet cascade (core subset).
+//
+// NodeStyle (optional per-node visual props), OverlayStyleSheet (tag + class
+// rules), the field-level merge (apply_over / merge_over) and the tag->classes
+// cascade (resolve). NodeStyle covers the common visual + text-layout subset
+// that the paint/text code consumes. Each optional field is a `has_x: Bool`
+// flag + an `x` value (Nori has no Option<struct>); OverlayStyleSheet stores
+// rules in parallel Vecs because Map<struct> field-access is unsupported.
+// ===========================================================================
+
+/// optional per-node visual props; an unset field (has_* == false) does not override during merge.
+/// text_overflow: 0 clip / 1 ellipsis. text_transform/text_decoration use the tt_*/td_* constants.
+pub struct NodeStyle {
+    has_bg: Bool                bg: Int
+    has_text_color: Bool        text_color: Int
+    has_color: Bool             color: Int
+    has_border_color: Bool      border_color: Int
+    has_size_px: Bool           size_px: Float
+    has_radius: Bool            radius: Float
+    has_padding: Bool           padding: Float
+    has_border_w: Bool          border_w: Float
+    has_line_height_mult: Bool  line_height_mult: Float
+    has_letter_spacing: Bool    letter_spacing: Float
+    has_word_spacing: Bool      word_spacing: Float
+    has_max_width: Bool         max_width: Float
+    has_min_height: Bool        min_height: Float
+    has_font_bold: Bool         font_bold: Bool
+    has_font_italic: Bool       font_italic: Bool
+    has_wrap: Bool               wrap: Bool
+    has_wrap_hard_break: Bool   wrap_hard_break: Bool
+    has_line_clamp: Bool        line_clamp: Int
+    has_text_overflow: Bool     text_overflow: Int
+    has_text_transform: Bool    text_transform: Int
+    has_text_decoration: Bool   text_decoration: Int
+    has_overflow_x: Bool        overflow_x: Int
+    has_overflow_y: Bool        overflow_y: Int
+    has_position: Bool          position: Int
+    has_z_index: Bool           z_index: Int
+    has_top: Bool               top: Float
+    has_right: Bool             right: Float
+    has_bottom: Bool            bottom: Float
+    has_left: Bool              left: Float
+    has_hover_bg: Bool          hover_bg: Int
+    has_hover_border_color: Bool hover_border_color: Int
+    has_hover_text_color: Bool  hover_text_color: Int
+    has_active_bg: Bool         active_bg: Int
+    // ---- the customization language's additions (retained documents animate these) ----
+    has_opacity: Bool = false       opacity: Float = 1.0
+    has_translate_x: Bool = false   translate_x: Float = 0.0
+    has_translate_y: Bool = false   translate_y: Float = 0.0
+    has_scale_x: Bool = false       scale_x: Float = 1.0
+    has_scale_y: Bool = false       scale_y: Float = 1.0
+    has_w: Bool = false             w_unit: Int = 0          w_val: Float = 0.0
+    has_h: Bool = false             h_unit: Int = 0          h_val: Float = 0.0
+    has_gap: Bool = false           gap: Float = 0.0
+    // ---- text in every script ----
+    has_text_dir: Bool = false      text_dir: Int = 2
+    has_lang: Bool = false          lang: Str = ""
+    has_text_align: Bool = false    text_align: Int = 0      align_x: Float = 0.0
+    has_font_family: Bool = false   font_family: Str = ""
+    has_font_weight: Bool = false   font_weight: Int = 0
+    has_font_slant: Bool = false    font_slant: Int = 0
+    // ---- a background that is a gradient: `bg` to `bg_to`, left to right (`bg_vertical`: top to bottom) ----
+    has_bg_to: Bool = false         bg_to: Int = 0
+    has_bg_vertical: Bool = false   bg_vertical: Bool = false
+    // ---- a shadow: under a box (outside it, as CSS box-shadow), or behind a text's glyphs ----
+    has_shadow_color: Bool = false  shadow_color: Int = 0
+    has_shadow_blur: Bool = false   shadow_blur: Float = 0.0
+    has_shadow_spread: Bool = false shadow_spread: Float = 0.0
+    has_shadow_x: Bool = false      shadow_x: Float = 0.0
+    has_shadow_y: Bool = false      shadow_y: Float = 0.0
+}
+
+// position modes: 0 relative (in flow), 1 absolute (out of flow, placed against
+// the parent's padded rect via top/right/bottom/left), 2 overlay (absolute; hosts may float it above).
+pub fn pm_relative() -> Int { return 0 }
+pub fn pm_absolute() -> Int { return 1 }
+pub fn pm_overlay() -> Int { return 2 }
+
+// overflow modes (match core OverflowMode order: Visible/Hidden/Auto/Scroll), stored as Int since
+// NodeStyle is a copy struct (enums aren't copyable). Bridge to core via overflow_mode_of.
+pub fn om_visible() -> Int { return 0 }
+pub fn om_hidden() -> Int { return 1 }
+pub fn om_auto() -> Int { return 2 }
+pub fn om_scroll() -> Int { return 3 }
+/// convert a stored overflow Int to the core OverflowMode enum.
+pub fn overflow_mode_of(v: Int) -> OverflowMode {
+    if v == 1 { return OverflowMode::OvHidden }
+    if v == 2 { return OverflowMode::OvAuto }
+    if v == 3 { return OverflowMode::OvScroll }
+    return OverflowMode::OvVisible
+}
+
+/// an empty NodeStyle (every field unset).
+pub fn node_style_empty() -> NodeStyle {
+    return NodeStyle {
+        has_bg: false, bg: rgba_transparent(),
+        has_text_color: false, text_color: rgba_transparent(),
+        has_color: false, color: rgba_transparent(),
+        has_border_color: false, border_color: rgba_transparent(),
+        has_size_px: false, size_px: 0.0,
+        has_radius: false, radius: 0.0,
+        has_padding: false, padding: 0.0,
+        has_border_w: false, border_w: 0.0,
+        has_line_height_mult: false, line_height_mult: 0.0,
+        has_letter_spacing: false, letter_spacing: 0.0,
+        has_word_spacing: false, word_spacing: 0.0,
+        has_max_width: false, max_width: 0.0,
+        has_min_height: false, min_height: 0.0,
+        has_font_bold: false, font_bold: false,
+        has_font_italic: false, font_italic: false,
+        has_wrap: false, wrap: false,
+        has_wrap_hard_break: false, wrap_hard_break: false,
+        has_line_clamp: false, line_clamp: 0,
+        has_text_overflow: false, text_overflow: 0,
+        has_text_transform: false, text_transform: 0,
+        has_text_decoration: false, text_decoration: 0,
+        has_overflow_x: false, overflow_x: 0,
+        has_overflow_y: false, overflow_y: 0,
+        has_position: false, position: 0,
+        has_z_index: false, z_index: 0,
+        has_top: false, top: 0.0,
+        has_right: false, right: 0.0,
+        has_bottom: false, bottom: 0.0,
+        has_left: false, left: 0.0,
+        has_hover_bg: false, hover_bg: rgba_transparent(),
+        has_hover_border_color: false, hover_border_color: rgba_transparent(),
+        has_hover_text_color: false, hover_text_color: rgba_transparent(),
+        has_active_bg: false, active_bg: rgba_transparent()
+    }
+}
+
+/// a NodeStyle of its own: every colour a fresh record.
+pub fn node_style_dup(s: NodeStyle) -> NodeStyle {
+    return NodeStyle { has_bg: s.has_bg, bg: s.bg, has_text_color: s.has_text_color, text_color: s.text_color, has_color: s.has_color, color: s.color, has_border_color: s.has_border_color, border_color: s.border_color, has_size_px: s.has_size_px, size_px: s.size_px, has_radius: s.has_radius, radius: s.radius, has_padding: s.has_padding, padding: s.padding, has_border_w: s.has_border_w, border_w: s.border_w, has_line_height_mult: s.has_line_height_mult, line_height_mult: s.line_height_mult, has_letter_spacing: s.has_letter_spacing, letter_spacing: s.letter_spacing, has_word_spacing: s.has_word_spacing, word_spacing: s.word_spacing, has_max_width: s.has_max_width, max_width: s.max_width, has_min_height: s.has_min_height, min_height: s.min_height, has_font_bold: s.has_font_bold, font_bold: s.font_bold, has_font_italic: s.has_font_italic, font_italic: s.font_italic, has_wrap: s.has_wrap, wrap: s.wrap, has_wrap_hard_break: s.has_wrap_hard_break, wrap_hard_break: s.wrap_hard_break, has_line_clamp: s.has_line_clamp, line_clamp: s.line_clamp, has_text_overflow: s.has_text_overflow, text_overflow: s.text_overflow, has_text_transform: s.has_text_transform, text_transform: s.text_transform, has_text_decoration: s.has_text_decoration, text_decoration: s.text_decoration, has_overflow_x: s.has_overflow_x, overflow_x: s.overflow_x, has_overflow_y: s.has_overflow_y, overflow_y: s.overflow_y, has_position: s.has_position, position: s.position, has_z_index: s.has_z_index, z_index: s.z_index, has_top: s.has_top, top: s.top, has_right: s.has_right, right: s.right, has_bottom: s.has_bottom, bottom: s.bottom, has_left: s.has_left, left: s.left, has_hover_bg: s.has_hover_bg, hover_bg: s.hover_bg, has_hover_border_color: s.has_hover_border_color, hover_border_color: s.hover_border_color, has_hover_text_color: s.has_hover_text_color, hover_text_color: s.hover_text_color, has_active_bg: s.has_active_bg, active_bg: s.active_bg, has_opacity: s.has_opacity, opacity: s.opacity, has_translate_x: s.has_translate_x, translate_x: s.translate_x, has_translate_y: s.has_translate_y, translate_y: s.translate_y, has_scale_x: s.has_scale_x, scale_x: s.scale_x, has_scale_y: s.has_scale_y, scale_y: s.scale_y, has_w: s.has_w, w_unit: s.w_unit, w_val: s.w_val, has_h: s.has_h, h_unit: s.h_unit, h_val: s.h_val, has_gap: s.has_gap, gap: s.gap, has_text_dir: s.has_text_dir, text_dir: s.text_dir, has_lang: s.has_lang, lang: copy s.lang, has_text_align: s.has_text_align, text_align: s.text_align, align_x: s.align_x, has_font_family: s.has_font_family, font_family: copy s.font_family, has_font_weight: s.has_font_weight, font_weight: s.font_weight, has_font_slant: s.has_font_slant, font_slant: s.font_slant, has_bg_to: s.has_bg_to, bg_to: s.bg_to, has_bg_vertical: s.has_bg_vertical, bg_vertical: s.bg_vertical, has_shadow_color: s.has_shadow_color, shadow_color: s.shadow_color, has_shadow_blur: s.has_shadow_blur, shadow_blur: s.shadow_blur, has_shadow_spread: s.has_shadow_spread, shadow_spread: s.shadow_spread, has_shadow_x: s.has_shadow_x, shadow_x: s.shadow_x, has_shadow_y: s.has_shadow_y, shadow_y: s.shadow_y }
+}
+
+/// merge `ovr` on top of `base` with field-level precision: each set field in `ovr` overrides,
+/// unset fields leave `base` intact.
+pub fn node_style_apply_over(base: NodeStyle, ovr: NodeStyle) -> NodeStyle {
+    var acc = node_style_dup(base)
+    node_style_apply_in(acc, ovr)
+    return acc
+}
+/// node_style_apply_over in place: `ovr`'s set fields written over `acc`'s.
+pub fn node_style_apply_in(inout acc: NodeStyle, ovr: NodeStyle) {
+    if ovr.has_bg { acc.bg = ovr.bg  acc.has_bg = true }
+    if ovr.has_text_color { acc.text_color = ovr.text_color  acc.has_text_color = true }
+    if ovr.has_color { acc.color = ovr.color  acc.has_color = true }
+    if ovr.has_border_color { acc.border_color = ovr.border_color  acc.has_border_color = true }
+    if ovr.has_size_px { acc.size_px = ovr.size_px  acc.has_size_px = true }
+    if ovr.has_radius { acc.radius = ovr.radius  acc.has_radius = true }
+    if ovr.has_padding { acc.padding = ovr.padding  acc.has_padding = true }
+    if ovr.has_border_w { acc.border_w = ovr.border_w  acc.has_border_w = true }
+    if ovr.has_line_height_mult { acc.line_height_mult = ovr.line_height_mult  acc.has_line_height_mult = true }
+    if ovr.has_letter_spacing { acc.letter_spacing = ovr.letter_spacing  acc.has_letter_spacing = true }
+    if ovr.has_word_spacing { acc.word_spacing = ovr.word_spacing  acc.has_word_spacing = true }
+    if ovr.has_max_width { acc.max_width = ovr.max_width  acc.has_max_width = true }
+    if ovr.has_min_height { acc.min_height = ovr.min_height  acc.has_min_height = true }
+    if ovr.has_font_bold { acc.font_bold = ovr.font_bold  acc.has_font_bold = true }
+    if ovr.has_font_italic { acc.font_italic = ovr.font_italic  acc.has_font_italic = true }
+    if ovr.has_wrap { acc.wrap = ovr.wrap  acc.has_wrap = true }
+    if ovr.has_wrap_hard_break { acc.wrap_hard_break = ovr.wrap_hard_break  acc.has_wrap_hard_break = true }
+    if ovr.has_line_clamp { acc.line_clamp = ovr.line_clamp  acc.has_line_clamp = true }
+    if ovr.has_text_overflow { acc.text_overflow = ovr.text_overflow  acc.has_text_overflow = true }
+    if ovr.has_text_transform { acc.text_transform = ovr.text_transform  acc.has_text_transform = true }
+    if ovr.has_text_decoration { acc.text_decoration = ovr.text_decoration  acc.has_text_decoration = true }
+    if ovr.has_overflow_x { acc.overflow_x = ovr.overflow_x  acc.has_overflow_x = true }
+    if ovr.has_overflow_y { acc.overflow_y = ovr.overflow_y  acc.has_overflow_y = true }
+    if ovr.has_position { acc.position = ovr.position  acc.has_position = true }
+    if ovr.has_z_index { acc.z_index = ovr.z_index  acc.has_z_index = true }
+    if ovr.has_top { acc.top = ovr.top  acc.has_top = true }
+    if ovr.has_right { acc.right = ovr.right  acc.has_right = true }
+    if ovr.has_bottom { acc.bottom = ovr.bottom  acc.has_bottom = true }
+    if ovr.has_left { acc.left = ovr.left  acc.has_left = true }
+    if ovr.has_hover_bg { acc.hover_bg = ovr.hover_bg  acc.has_hover_bg = true }
+    if ovr.has_hover_border_color { acc.hover_border_color = ovr.hover_border_color  acc.has_hover_border_color = true }
+    if ovr.has_hover_text_color { acc.hover_text_color = ovr.hover_text_color  acc.has_hover_text_color = true }
+    if ovr.has_active_bg { acc.active_bg = ovr.active_bg  acc.has_active_bg = true }
+    if ovr.has_opacity { acc.opacity = ovr.opacity  acc.has_opacity = true }
+    if ovr.has_translate_x { acc.translate_x = ovr.translate_x  acc.has_translate_x = true }
+    if ovr.has_translate_y { acc.translate_y = ovr.translate_y  acc.has_translate_y = true }
+    if ovr.has_scale_x { acc.scale_x = ovr.scale_x  acc.has_scale_x = true }
+    if ovr.has_scale_y { acc.scale_y = ovr.scale_y  acc.has_scale_y = true }
+    if ovr.has_w { acc.w_unit = ovr.w_unit  acc.w_val = ovr.w_val  acc.has_w = true }
+    if ovr.has_h { acc.h_unit = ovr.h_unit  acc.h_val = ovr.h_val  acc.has_h = true }
+    if ovr.has_gap { acc.gap = ovr.gap  acc.has_gap = true }
+    if ovr.has_text_dir { acc.text_dir = ovr.text_dir  acc.has_text_dir = true }
+    if ovr.has_lang { acc.lang = copy ovr.lang  acc.has_lang = true }
+    if ovr.has_text_align { acc.text_align = ovr.text_align  acc.align_x = ovr.align_x  acc.has_text_align = true }
+    if ovr.has_font_family { acc.font_family = copy ovr.font_family  acc.has_font_family = true }
+    if ovr.has_font_weight { acc.font_weight = ovr.font_weight  acc.has_font_weight = true }
+    if ovr.has_font_slant { acc.font_slant = ovr.font_slant  acc.has_font_slant = true }
+    if ovr.has_bg_to { acc.bg_to = ovr.bg_to  acc.has_bg_to = true }
+    if ovr.has_bg_vertical { acc.bg_vertical = ovr.bg_vertical  acc.has_bg_vertical = true }
+    if ovr.has_shadow_color { acc.shadow_color = ovr.shadow_color  acc.has_shadow_color = true }
+    if ovr.has_shadow_blur { acc.shadow_blur = ovr.shadow_blur  acc.has_shadow_blur = true }
+    if ovr.has_shadow_spread { acc.shadow_spread = ovr.shadow_spread  acc.has_shadow_spread = true }
+    if ovr.has_shadow_x { acc.shadow_x = ovr.shadow_x  acc.has_shadow_x = true }
+    if ovr.has_shadow_y { acc.shadow_y = ovr.shadow_y  acc.has_shadow_y = true }
+}
+
+// ---- stylesheet: tag rules + class rules (parallel Vecs) ----
+
+/// tag rules (`"button"`/`"text"`/`"rect"`/`"surface"`) + class rules (any name).
+pub struct OverlayStyleSheet {
+    tag_keys: Vec<Str>
+    tag_styles: Vec<NodeStyle>
+    class_keys: Vec<Str>
+    class_styles: Vec<NodeStyle>
+}
+
+/// an empty stylesheet.
+pub fn stylesheet_new() -> OverlayStyleSheet {
+    var tk: Vec<Str> = vec()
+    var ts: Vec<NodeStyle> = vec()
+    var ck: Vec<Str> = vec()
+    var cs: Vec<NodeStyle> = vec()
+    return OverlayStyleSheet { tag_keys: tk, tag_styles: ts, class_keys: ck, class_styles: cs }
+}
+
+/// index of `k` in `keys`, or -1.
+fn sheet_find_idx(keys: Vec<Str>, k: Str) -> Int {
+    var i = 0
+    while i < keys.len() { if keys[i] == k { return i }  i = i + 1 }
+    return 0 - 1
+}
+
+/// merge `style` into the tag rule `tag` (field-level; inserts wholesale when new).
+pub fn sheet_merge_tag(inout sheet: OverlayStyleSheet, tag: Str, style: NodeStyle) {
+    var idx = sheet_find_idx(sheet.tag_keys, tag)
+    if idx >= 0 { var ts = inout sheet.tag_styles  ts[idx] = node_style_apply_over(ts[idx], style) }
+    else { sheet.tag_keys.push(copy tag)  sheet.tag_styles.push(node_style_dup(style)) }
+}
+
+/// merge `style` into the class rule `cls` (field-level; inserts wholesale when new).
+pub fn sheet_merge_class(inout sheet: OverlayStyleSheet, cls: Str, style: NodeStyle) {
+    var idx = sheet_find_idx(sheet.class_keys, cls)
+    if idx >= 0 { var cs = inout sheet.class_styles  cs[idx] = node_style_apply_over(cs[idx], style) }
+    else { sheet.class_keys.push(copy cls)  sheet.class_styles.push(node_style_dup(style)) }
+}
+
+/// true if a rule exists for tag `tag`.
+pub fn sheet_has_tag(sheet: OverlayStyleSheet, tag: Str) -> Bool { return sheet_find_idx(sheet.tag_keys, tag) >= 0 }
+/// the tag rule (or an empty NodeStyle when absent).
+pub fn sheet_tag(sheet: OverlayStyleSheet, tag: Str) -> NodeStyle {
+    var i = sheet_find_idx(sheet.tag_keys, tag)
+    if i < 0 { return node_style_empty() }
+    return node_style_dup(sheet.tag_styles[i])
+}
+/// true if a rule exists for class `cls`.
+pub fn sheet_has_class(sheet: OverlayStyleSheet, cls: Str) -> Bool { return sheet_find_idx(sheet.class_keys, cls) >= 0 }
+/// the class rule (or an empty NodeStyle when absent).
+pub fn sheet_class(sheet: OverlayStyleSheet, cls: Str) -> NodeStyle {
+    var i = sheet_find_idx(sheet.class_keys, cls)
+    if i < 0 { return node_style_empty() }
+    return node_style_dup(sheet.class_styles[i])
+}
+
+/// merge every rule of `ovr` on top of `base` (field-level).
+pub fn stylesheet_merge_over(inout base: OverlayStyleSheet, ovr: OverlayStyleSheet) {
+    var i = 0
+    while i < ovr.tag_keys.len() { sheet_merge_tag(base, ovr.tag_keys[i], ovr.tag_styles[i])  i = i + 1 }
+    var j = 0
+    while j < ovr.class_keys.len() { sheet_merge_class(base, ovr.class_keys[j], ovr.class_styles[j])  j = j + 1 }
+}
+
+/// cascade a node's style: start empty, apply the tag rule, then each class rule in order (later
+/// classes win). Overflow/text/box props all resolve through this.
+pub fn resolve_node_style(sheet: OverlayStyleSheet, tag: Str, classes: Vec<Str>) -> NodeStyle {
+    var acc = node_style_empty()
+    // the rules are read where they are (sheet_tag / sheet_class would copy each one first): this
+    // runs for every node of an immediate document on every frame
+    let ti = sheet_find_idx(sheet.tag_keys, tag)
+    if ti >= 0 { node_style_apply_in(acc, sheet.tag_styles[ti]) }
+    var i = 0
+    while i < classes.len() {
+        let ci = sheet_find_idx(sheet.class_keys, classes[i])
+        if ci >= 0 { node_style_apply_in(acc, sheet.class_styles[ci]) }
+        i = i + 1
+    }
+    return acc
+}
+
+/// resolve a text node's rendered content + box from a cascaded NodeStyle, using the given
+/// defaults for any unset size/line-height. Pulls size/wrap/hard_break/line_clamp/text_overflow/
+/// transform/max_width/min_height straight into text_render_content_and_metrics.
+pub fn text_layout_from_style(style: NodeStyle, text: Str, available_w: Float, default_size: Float, default_lh_mult: Float) -> TextLayout {
+    var size = default_size
+    if style.has_size_px { size = style.size_px }
+    var lh = default_lh_mult
+    if style.has_line_height_mult { lh = style.line_height_mult }
+    var max_w = 0.0
+    if style.has_max_width { max_w = style.max_width }
+    var min_h = 0.0
+    if style.has_min_height { min_h = style.min_height }
+    var wrap = false
+    if style.has_wrap { wrap = style.wrap }
+    var hard = false
+    if style.has_wrap_hard_break { hard = style.wrap_hard_break }
+    var clamp = 0
+    if style.has_line_clamp { clamp = style.line_clamp }
+    var ellipsis = false
+    if style.has_text_overflow { ellipsis = style.text_overflow == 1 }
+    var transform = 0
+    if style.has_text_transform { transform = style.text_transform }
+    var ls = 0.0
+    if style.has_letter_spacing { ls = style.letter_spacing }
+    var ws = 0.0
+    if style.has_word_spacing { ws = style.word_spacing }
+    return text_render_content_and_metrics_sp(text, available_w, max_w, size, wrap, hard, clamp, ellipsis, transform, lh, min_h, ls, ws)
+}

@@ -1,0 +1,568 @@
+//! std/math: scalar math and the 3D linear-algebra primitives, the module's entry file.
+//!
+//! ## Scalars (this file)
+//!
+//! Integer + floating-point math, with no libm on any target (a prerequisite for
+//! the fully libc-free `--nolibc` Linux build). Transcendentals use range reduction + series/rational
+//! cores (~1e-12 over the common range); only `sqrt`/`to_float`/`to_int` are compiler builtins. Float
+//! has no `%`, hence imod.
+//!
+//! ## Linear algebra (the sibling root files)
+//!
+//! A `glam`-equivalent: Vec2/3/4 (`vec.nori`), Mat3/Mat4 (`mat.nori`), Quat (`quat.nori`), and the
+//! `Transform` plus the projection/view matrix constructors (`xform.nori`). Vectors, matrices and
+//! quaternions are mathematical primitives, so they live here; the geometry built on them (rays,
+//! boxes, planes, spheres, frusta and their intersections) lives in `std/geometry`, which imports
+//! this module. The root files of this directory share one scope, so every name below is reachable
+//! unqualified from any of them and as `math::<name>` from a dependent.
+//!
+//! Conventions, fixed and asserted in the tests (change one and the tests must change with it):
+//!   · Mat3/Mat4 are column-major, vectors are columns, mul(a, b) applies b first, translation lives
+//!     in w_axis, and mat4_to_cols_array is memcpy-ready for a wgpu `mat4x4<f32>`.
+//!   · Projections are right-handed with a 0..1 depth range: the wgpu/WebGPU convention, not
+//!     OpenGL's -1..1.
+//!   · Quaternions are scalar-last, Hamilton product, right-handed: from_axis_angle(+Y, 90 deg)
+//!     takes +X to -Z.
+//!   · Euler order is intrinsic Y-X-Z, so yaw stays about world up.
+
+// ---------------- integer ----------------
+/// larger of two ints.
+pub fn imax(a: Int, b: Int) -> Int { if a > b { return a }  return b }
+/// smaller of two ints.
+pub fn imin(a: Int, b: Int) -> Int { if a < b { return a }  return b }
+/// absolute value of an int.
+pub fn iabs(x: Int) -> Int { if x < 0 { return -x }  return x }
+/// integer remainder a mod b (truncated, sign follows a). undefined if b == 0.
+pub fn imod(a: Int, b: Int) -> Int { return a - (a / b) * b }
+/// clamp x into [lo, hi].
+pub fn iclamp(x: Int, lo: Int, hi: Int) -> Int { return imin(imax(x, lo), hi) }
+/// sign of an int: 1 if positive, -1 if negative, 0 if zero.
+pub fn isign(x: Int) -> Int { if x > 0 { return 1 }  if x < 0 { return -1 }  return 0 }
+/// greatest common divisor (Euclid), always non-negative. gcd(0,0) == 0.
+pub fn gcd(a: Int, b: Int) -> Int {
+    var x = iabs(a)
+    var y = iabs(b)
+    while y != 0 {
+        var t = imod(x, y)
+        x = y
+        y = t
+    }
+    return x
+}
+/// least common multiple, always non-negative. 0 if either arg is 0.
+pub fn lcm(a: Int, b: Int) -> Int { if a == 0 || b == 0 { return 0 }  return iabs(a / gcd(a, b) * b) }
+/// integer power base^e by repeated multiplication. e <= 0 yields 1 (no negative-exponent support).
+pub fn ipow(base: Int, e: Int) -> Int {
+    var r = 1
+    var i = 0
+    while i < e { r = r * base  i = i + 1 }
+    return r
+}
+/// integer square root (floor), via Newton's method. -1 for negative input.
+pub fn isqrt(n: Int) -> Int {
+    if n < 0 { return -1 }
+    if n < 2 { return n }
+    var x = n
+    var y = (x + 1) / 2
+    while y < x { x = y  y = (x + n / x) / 2 }
+    return x
+}
+/// value 0..15 of an ASCII hex digit, or -1.
+pub fn hex_digit(c: Int) -> Int {
+    if c >= 48 && c <= 57 { return c - 48 }       // 0-9
+    if c >= 97 && c <= 102 { return c - 87 }      // a-f
+    if c >= 65 && c <= 70 { return c - 55 }       // A-F
+    return -1
+}
+
+// ---------------- floating point (no libm) ----------------
+// The transcendentals are implemented here (range reduction + series/rational cores) so a
+// build links no libm on any target: a prerequisite for the fully libc-free Linux build (`--nolibc`).
+// Accuracy is ~1e-12 relative over the common range (comfortably past the 1e-4 tolerance the tests use and fine for
+// rendering); huge trig arguments (|x| >~ 2^52, beyond Payne-Hanek reduction) are not supported. Only
+// `sqrt` (hardware sqrtsd), the sitofp/fptosi conversions `to_float`/`to_int` and the bit reinterpretations
+// `bits_of_f64`/`f64_of_bits` are compiler builtins.
+
+/// the IEEE-754 bit pattern of a double, as an Int.
+///
+/// `pub` because `to_str` truncates to six significant digits, so a value cannot be printed, compared
+/// bit-for-bit, or diffed without its bits. The language's `bits_of_f64` is the reinterpretation itself
+/// (one move between a float and a general register, no memory); this name is kept for the code that
+/// already calls it.
+///
+/// Round-trips exactly: `bitsf(fbits(x)) == x` for every finite `x`, and for NaN it preserves the
+/// payload rather than canonicalising it.
+pub fn fbits(x: Float) -> Int { return bits_of_f64(x) }
+/// the double with this IEEE-754 bit pattern. The inverse of `fbits` (`f64_of_bits`).
+pub fn bitsf(b: Int) -> Float { return f64_of_bits(b) }
+fn f_inf() -> Float { return bitsf(9218868437227405312) }    // 0x7FF0000000000000  (+inf)
+fn f_ninf() -> Float { return bitsf(-4503599627370496) }     // 0xFFF0000000000000  (-inf)
+fn f_nan() -> Float { return bitsf(9221120237041090560) }    // 0x7FF8000000000000  (quiet NaN)
+
+/// truncate toward zero.
+pub fn trunc(x: Float) -> Float {
+    if fabs(x) >= 4503599627370496.0 { return x }            // |x| >= 2^52: already integral
+    return to_float(to_int(x))
+}
+/// largest integer <= x.
+pub fn floor(x: Float) -> Float { let t = trunc(x)  if t > x { return t - 1.0 }  return t }
+/// smallest integer >= x.
+pub fn ceil(x: Float) -> Float { let t = trunc(x)  if t < x { return t + 1.0 }  return t }
+/// round to nearest, halves away from zero (matches C round()).
+pub fn round(x: Float) -> Float { if x >= 0.0 { return floor(x + 0.5) }  return ceil(x - 0.5) }
+/// floating remainder a - trunc(a/b)*b (sign follows a); NaN if b == 0.
+pub fn fmod(a: Float, b: Float) -> Float { if b == 0.0 { return f_nan() }  return a - trunc(a / b) * b }
+
+// 2^k for integer k, via exponentiation-by-squaring (no libm ldexp; handles negative k).
+fn exp2i(k: Int) -> Float {
+    // straight out of the exponent field, so every power of two is exact and the subnormals are
+    // reachable: squaring up to 2^1074 and taking the reciprocal overflowed to infinity first, and
+    // 1/infinity is the zero that made exp() flush everything below 2^-1022 away
+    if k > 1023 { return f_inf() }
+    if k >= -1022 { return bitsf((k + 1023) << 52) }
+    if k >= -1074 { return bitsf(1 << (k + 1074)) }
+    return 0.0
+}
+
+// fdlibm's ln2, split so that k·ln2 is exact to well past a double, and its log polynomial. A
+// single-rounded ln2 multiplied by an exponent as large as 1023 is already worth half an ulp of
+// the answer, and the series below is the one that keeps the rest.
+fn ln2_hi_c() -> Float { return 0.6931471803691238 }
+fn ln2_lo_c() -> Float { return 1.9082149292705877e-10 }
+
+/// natural logarithm; -inf at 0, NaN for x < 0.
+pub fn log(x: Float) -> Float {
+    if x != x { return f_nan() }                             // every comparison below is false for a NaN
+    if x <= 0.0 { if x == 0.0 { return f_ninf() }  return f_nan() }
+    if x == f_inf() { return f_inf() }
+    var b = fbits(x)
+    var k = 0
+    // a subnormal carries a zero exponent field, so it is scaled into the normals first and the
+    // scaling taken back out of `k`
+    if ((b >> 52) & 2047) == 0 { k = 0 - 54  b = fbits(x * 18014398509481984.0) }
+    k = k + (((b >> 52) & 2047) - 1023)
+    let hx = b & 4503599627370495                            // the 52 mantissa bits
+    // pick the half of [1,2) the mantissa lands in, so |f| stays below ~0.18 either way
+    let i = (hx + 2638157891764224) & 4503599627370496
+    let xn = bitsf(hx | (i ^ (1023 << 52)))
+    k = k + (i >> 52)
+    let f = xn - 1.0
+    let dk = to_float(k)
+    let hi20 = hx >> 32
+    if ((hi20 + 2) & 1048575) < 3 {                          // |f| < 2^-20: the cubic is enough
+        if f == 0.0 {
+            if k == 0 { return 0.0 }
+            return dk * ln2_hi_c() + dk * ln2_lo_c()
+        }
+        let rr = f * f * (0.5 - 0.3333333333333333 * f)
+        if k == 0 { return f - rr }
+        return dk * ln2_hi_c() - ((rr - dk * ln2_lo_c()) - f)
+    }
+    let s = f / (2.0 + f)
+    let z = s * s
+    let w = z * z
+    let t1 = w * (0.3999999999940942 + w * (0.22222198432149784 + w * 0.15313837699209373))
+    let t2 = z * (0.6666666666666735 + w * (0.2857142874366239 + w * (0.1818357216161805 + w * 0.14798198605116586)))
+    let rr = t2 + t1
+    // f well away from zero: carrying f²/2 separately is what keeps the cancellation out
+    if ((hi20 - 398458) | (440401 - hi20)) > 0 {
+        let hfsq = 0.5 * f * f
+        if k == 0 { return f - (hfsq - s * (hfsq + rr)) }
+        return dk * ln2_hi_c() - ((hfsq - (s * (hfsq + rr) + dk * ln2_lo_c())) - f)
+    }
+    if k == 0 { return f - s * (f - rr) }
+    return dk * ln2_hi_c() - ((s * (f - rr) - dk * ln2_lo_c()) - f)
+}
+
+/// log(1+x), accurate for a tiny x where `log(1.0 + x)` has already lost every digit of the answer
+pub fn log1p(x: Float) -> Float {
+    if x != x { return f_nan() }
+    if x < 0.0 - 1.0 { return f_nan() }
+    if x == 0.0 - 1.0 { return f_ninf() }
+    if x == f_inf() { return f_inf() }
+    let hx = fbits(x)
+    let ax = hx & 9223372036854775807
+    var k = 1
+    var f = 0.0
+    var hu = 0
+    var c = 0.0
+    if ax < 4601133429810003968 {                            // |x| < 0.41422
+        if ax < 4476578029606273024 {                        // |x| < 2^-29
+            if ax < 4363988038922010624 { return x }         // |x| < 2^-54: log(1+x) is x
+            return x - x * x * 0.5
+        }
+        // -0.2929 < x < 0.41422: 1+x is exact enough to skip the correction term entirely
+        if hx > 0 || hx <= 0 - 4624424122628177920 { k = 0  f = x  hu = 1 }
+    }
+    if k != 0 {
+        var u = 0.0
+        var ub = 0
+        if ax < 4845873199050653696 {                        // |x| < 2^53: the sum still carries x
+            u = 1.0 + x
+            ub = fbits(u)
+            k = ((ub >> 52) & 2047) - 1023
+            // the part of x that `1+x` rounded away, recovered exactly and carried along
+            if k > 0 { c = 1.0 - (u - x) } else { c = x - (u - 1.0) }
+            c = c / u
+        } else {
+            u = x
+            ub = fbits(u)
+            k = ((ub >> 52) & 2047) - 1023
+            c = 0.0
+        }
+        let hu52 = ub & 4503599627370495
+        hu = hu52 >> 32                                      // the top twenty mantissa bits
+        if hu < 434334 { u = bitsf(hu52 | (1023 << 52)) }     // 0x6a09e: u still below sqrt(2)
+        else { k = k + 1  u = bitsf(hu52 | (1022 << 52))  hu = (1048576 - hu) >> 2 }
+        f = u - 1.0
+    }
+    let hfsq = 0.5 * f * f
+    let dk = to_float(k)
+    if hu == 0 {                                             // |f| < 2^-20
+        if f == 0.0 {
+            if k == 0 { return 0.0 }
+            return dk * ln2_hi_c() + (dk * ln2_lo_c() + c)
+        }
+        let rr = hfsq * (1.0 - 0.6666666666666666 * f)
+        if k == 0 { return f - rr }
+        return dk * ln2_hi_c() - ((rr - (dk * ln2_lo_c() + c)) - f)
+    }
+    let s = f / (2.0 + f)
+    let z = s * s
+    let rr = z * (0.6666666666666735 + z * (0.3999999999940942 + z * (0.2857142874366239
+        + z * (0.22222198432149784 + z * (0.1818357216161805 + z * (0.15313837699209373
+        + z * 0.14798198605116586))))))
+    if k == 0 { return f - (hfsq - s * (hfsq + rr)) }
+    return dk * ln2_hi_c() - ((hfsq - (s * (hfsq + rr) + (dk * ln2_lo_c() + c))) - f)
+}
+
+/// exp(x)-1, accurate for a tiny x where `exp(x) - 1.0` has cancelled the answer away
+pub fn expm1(x: Float) -> Float {
+    if x != x { return f_nan() }
+    if x == f_inf() { return f_inf() }
+    if x == f_ninf() { return 0.0 - 1.0 }
+    if x > 709.782712893383973096 { return f_inf() }
+    if x < 0.0 - 56.0 * 0.6931471805599453 { return 0.0 - 1.0 }
+    var k = 0
+    var xr = x
+    var c = 0.0
+    if fabs(x) > 0.34657359027997264 {                       // |x| > ln2/2: reduce
+        var hi = 0.0
+        var lo = 0.0
+        if fabs(x) < 1.0397207708399179 {                    // |x| < 1.5 ln2
+            if x > 0.0 { hi = x - ln2_hi_c()  lo = ln2_lo_c()  k = 1 }
+            else { hi = x + ln2_hi_c()  lo = 0.0 - ln2_lo_c()  k = 0 - 1 }
+        } else {
+            var kf = 0.0
+            if x > 0.0 { kf = trunc(1.4426950408889634 * x + 0.5) }
+            else { kf = trunc(1.4426950408889634 * x - 0.5) }
+            k = to_int(kf)
+            hi = x - kf * ln2_hi_c()
+            lo = kf * ln2_lo_c()
+        }
+        xr = hi - lo
+        c = (hi - xr) - lo
+    } else if fabs(x) < 0.00000000000000005551115123125783 { // |x| < 2^-54
+        return x
+    }
+    let hfx = 0.5 * xr
+    let hxs = xr * hfx
+    let r1 = 1.0 + hxs * (0.0 - 0.03333333333333313 + hxs * (0.0015873015872548146
+        + hxs * (0.0 - 0.0000793650757867488 + hxs * (0.000004008217827329362
+        + hxs * (0.0 - 0.00000020109921818362437)))))
+    let t0 = 3.0 - r1 * hfx
+    var e = hxs * ((r1 - t0) / (6.0 - xr * t0))
+    if k == 0 { return xr - (xr * e - hxs) }
+    e = xr * (e - c) - c
+    e = e - hxs
+    if k == 0 - 1 { return 0.5 * (xr - e) - 0.5 }
+    if k == 1 {
+        if xr < 0.0 - 0.25 { return 0.0 - 2.0 * (e - (xr + 0.5)) }
+        return 1.0 + 2.0 * (xr - e)
+    }
+    if k <= 0 - 2 || k > 56 {
+        let y0 = 1.0 - (e - xr)
+        if k == 1024 { return (y0 * 2.0) * exp2i(1023) - 1.0 }
+        return y0 * exp2i(k) - 1.0
+    }
+    var y = 0.0
+    if k < 20 {
+        let t = bitsf((1023 << 52) - (9007199254740992 >> k))   // 1 - 2^-k
+        y = (t - (e - xr)) * exp2i(k)
+    } else {
+        let t = bitsf((1023 - k) << 52)                         // 2^-k
+        y = ((xr - (e + t)) + 1.0) * exp2i(k)
+    }
+    return y
+}
+
+/// base-2 logarithm.
+pub fn log2(x: Float) -> Float {
+    if x != x { return f_nan() }
+    if x <= 0.0 { if x == 0.0 { return f_ninf() }  return f_nan() }
+    if x == f_inf() { return f_inf() }
+    // the exponent is exact, so a power of two answers its own exponent and nothing else. Scaling
+    // log(x) by log2(e) instead rounds twice and misses by an ulp for hundreds of them.
+    let m = frexp2(x)
+    let e = g_frexp_e
+    if m == 1.0 { return to_float(e) }
+    return to_float(e) + log(m) * 1.4426950408889634
+}
+/// base-10 logarithm.
+pub fn log10(x: Float) -> Float {
+    if x != x { return f_nan() }
+    if x <= 0.0 { if x == 0.0 { return f_ninf() }  return f_nan() }
+    if x == f_inf() { return f_inf() }
+    // log10(2) split the same way ln2 is: e times the head is exact, and the tail joins the
+    // mantissa's own term rather than rounding into the integer part
+    let m = frexp2(x)
+    let de = to_float(g_frexp_e)
+    return de * 0.30102992057800293 + (de * 7.508597826832997e-08 + log(m) * 0.4342944819032518)
+}
+
+// x split into its unbiased exponent and a mantissa in [1,2), with a subnormal scaled into range
+// first: its biased exponent field reads 0 whatever its real exponent is. The exponent comes back
+// through the cell, so the caller gets both halves of the decomposition.
+threadlocal global g_frexp_e: Int = 0
+fn frexp2(x: Float) -> Float {
+    var xr = x
+    var e = 0
+    if xr < 2.2250738585072014e-308 { xr = xr * 1.8014398509481984e16  e = -54 }
+    let b = fbits(xr)
+    g_frexp_e = e + (((b >> 52) & 2047) - 1023)
+    return bitsf((b & 4503599627370495) | 4607182418800017408)
+}
+// true when |x| is an exact power of two: a clear mantissa over a live exponent field
+fn is_pow2(x: Float) -> Bool {
+    let b = fbits(fabs(x))
+    if (b & 4503599627370495) != 0 { return false }
+    let be = (b >> 52) & 2047
+    return be != 0 && be != 2047
+}
+// base^n for n >= 0 by squaring. Each step rounds once, where exp(n*log(base)) carries log's whole
+// error multiplied by n: `10 ** 3` is 1000 only this way.
+fn ipowf(base: Float, n: Int) -> Float {
+    var r = 1.0
+    var b = base
+    var m = n
+    while m > 0 {
+        if imod(m, 2) == 1 { r = r * b }
+        m = m / 2
+        if m > 0 { b = b * b }
+    }
+    return r
+}
+
+/// e^x.
+pub fn exp(x: Float) -> Float {
+    // NaN first: every comparison below is false for one, and the argument reduction then feeds
+    // `to_int` a NaN, whose result is garbage
+    if x != x { return f_nan() }
+    if x > 709.782712893384 { return f_inf() }
+    if x < -745.1332191019411 { return 0.0 }
+    // ln2 is split HI/LO so that k·ln2 is subtracted without rounding: a single rounded ln2 leaves
+    // the reduced argument short by ~k·1e-17, which is the whole error budget for a 1-ulp answer.
+    // The remainder is then evaluated through the even rational fdlibm uses rather than a plain
+    // Taylor sum, whose term-by-term accumulation was itself worth an ulp.
+    var k = 0
+    var hi = x
+    var lo = 0.0
+    if fabs(x) > 0.34657359027997264 {                       // |x| > ln2/2: reduce
+        let kf = round(x * 1.4426950408889634)
+        k = to_int(kf)
+        hi = x - kf * 0.6931471803691238
+        lo = kf * 1.9082149292705877e-10
+    }
+    let r = hi - lo
+    if fabs(r) < 1.0e-300 { return 1.0 + x }                 // nothing left to expand
+    let t = r * r
+    let c = r - t * (0.16666666666666602
+        + t * (0.0 - 0.0027777777777015593
+        + t * (0.00006613756321437934
+        + t * (0.0 - 0.0000016533902205465252
+        + t * 0.00000004138136797057238))))
+    if k == 0 { return 1.0 - ((r * c) / (c - 2.0) - r) }
+    // 1 + hi - lo + q added with the rounding error of each step carried along: chaining the four
+    // additions plainly threw away half an ulp at a time, which is what left exp(1) one ulp above
+    // Math.E even with an exactly reduced argument
+    let q = (r * c) / (2.0 - c)
+    let s1 = 1.0 + hi
+    let e1 = hi - (s1 - 1.0)
+    let u = q - lo
+    let s2 = s1 + u
+    let e2 = u - (s2 - s1)
+    let y = s2 + (e1 + e2)
+    // the top of the range rounds k to 1024, whose 2^k is already infinity: halving y first keeps
+    // the largest finite results (x up to 709.78) finite instead of flushing them to inf
+    if k > 1023 { return (y * 2.0) * exp2i(1023) }
+    // a result below the normals is scaled in two steps, so the intermediate never underflows
+    if k >= -1021 { return y * exp2i(k) }
+    return (y * exp2i(k + 1000)) * exp2i(0 - 1000)
+}
+/// base^exp. Real for base > 0; for base < 0 only integer exponents (else NaN).
+pub fn pow(base: Float, ex: Float) -> Float {
+    if ex == 0.0 { return 1.0 }
+    if base == 0.0 { if ex > 0.0 { return 0.0 }  return f_inf() }
+    if fabs(ex) < 4503599627370496.0 {
+        let ep = to_int(ex)
+        if to_float(ep) == ex && is_pow2(base) {
+            // a power-of-two base with an integer exponent is exact, and exp(ex*log(base)) is not:
+            // the subnormal end of `2 ** k` has no slack at all, and log2 reads k back off it
+            let eb = (((fbits(fabs(base)) >> 52) & 2047) - 1023) * ep
+            var mg = 0.0
+            if eb > 1100 { mg = f_inf() } else if eb < -1200 { mg = 0.0 } else { mg = exp2i(eb) }
+            if base < 0.0 && imod(ep, 2) != 0 { return -mg }
+            return mg
+        }
+        if to_float(ep) == ex && iabs(ep) <= 1024 {
+            // a modest integer exponent costs one rounding per squaring; the fallback below costs
+            // log's error multiplied by the exponent
+            var mg = ipowf(fabs(base), iabs(ep))
+            if ep < 0 { mg = 1.0 / mg }
+            if mg != 0.0 && mg == mg && mg < 1.7976931348623157e308 && mg > 2.2250738585072014e-308 {
+                if base < 0.0 && imod(ep, 2) != 0 { return -mg }
+                return mg
+            }
+        }
+    }
+    if base > 0.0 { return exp(ex * log(base)) }
+    if fabs(ex) >= 4503599627370496.0 { return f_nan() }
+    let ei = to_int(ex)
+    if to_float(ei) == ex {
+        let mag = exp(ex * log(-base))
+        if imod(ei, 2) == 0 { return mag }
+        return -mag
+    }
+    return f_nan()
+}
+/// sqrt(x*x + y*y) without spurious overflow/underflow.
+pub fn hypot(x: Float, y: Float) -> Float {
+    var a = fabs(x)
+    var b = fabs(y)
+    if a < b { let t = a  a = b  b = t }
+    if a == 0.0 { return 0.0 }
+    let r = b / a
+    return a * sqrt(1.0 + r * r)
+}
+/// cube root (real, handles negatives).
+pub fn cbrt(x: Float) -> Float {
+    if x == 0.0 { return 0.0 }
+    var s = 1.0
+    var a = x
+    if x < 0.0 { s = -1.0  a = -x }
+    var y = exp(log(a) / 3.0)
+    y = y - (y * y * y - a) / (3.0 * y * y)                  // one Newton step -> ~machine precision
+    return s * y
+}
+
+// sin/cos on the reduced argument r in [-pi/4, pi/4] via Taylor (alternating, ~1e-16 there).
+fn sin_poly(r: Float) -> Float {
+    let r2 = r * r
+    var term = r
+    var sum = r
+    var n = 2.0
+    var i = 0
+    while i < 8 { term = -term * r2 / (n * (n + 1.0))  sum = sum + term  n = n + 2.0  i = i + 1 }
+    return sum
+}
+fn cos_poly(r: Float) -> Float {
+    let r2 = r * r
+    var term = 1.0
+    var sum = 1.0
+    var n = 1.0
+    var i = 0
+    while i < 8 { term = -term * r2 / (n * (n + 1.0))  sum = sum + term  n = n + 2.0  i = i + 1 }
+    return sum
+}
+/// sine (radians).
+pub fn sin(x: Float) -> Float {
+    let kf = round(x * 0.6366197723675814)                   // k = round(x / (pi/2))
+    let k = to_int(kf)
+    let r = x - kf * 1.5707963267948966                      // r = x - k*(pi/2), in [-pi/4, pi/4]
+    var q = imod(k, 4)
+    if q < 0 { q = q + 4 }
+    if q == 0 { return sin_poly(r) }
+    if q == 1 { return cos_poly(r) }
+    if q == 2 { return -sin_poly(r) }
+    return -cos_poly(r)
+}
+/// cosine (radians).
+pub fn cos(x: Float) -> Float { return sin(x + 1.5707963267948966) }
+/// tangent (radians).
+pub fn tan(x: Float) -> Float { return sin(x) / cos(x) }
+
+// atan on |x| <= 2-sqrt(3) via the arctan series (fast there).
+fn atan_poly(x: Float) -> Float {
+    let x2 = x * x
+    var term = x
+    var sum = x
+    var k = 3.0
+    var i = 0
+    while i < 16 { term = -term * x2  sum = sum + term / k  k = k + 2.0  i = i + 1 }
+    return sum
+}
+/// arctangent, result in (-pi/2, pi/2).
+pub fn atan(x: Float) -> Float {
+    var sign = 1.0
+    var t = x
+    if t < 0.0 { sign = -1.0  t = -t }
+    var inv = false
+    if t > 1.0 { t = 1.0 / t  inv = true }                   // atan(t) = pi/2 - atan(1/t)
+    var comp = 0.0
+    if t > 0.2679491924311227 {                              // reduce with pi/6: t' = (t-k)/(1+k t), k=1/sqrt3
+        t = (t - 0.5773502691896257) / (1.0 + 0.5773502691896257 * t)
+        comp = 0.5235987755982988                            // pi/6
+    }
+    var a = atan_poly(t) + comp
+    if inv { a = 1.5707963267948966 - a }
+    return sign * a
+}
+/// two-argument arctangent, result in (-pi, pi].
+pub fn atan2(y: Float, x: Float) -> Float {
+    if x > 0.0 { return atan(y / x) }
+    if x < 0.0 { if y >= 0.0 { return atan(y / x) + 3.141592653589793 }  return atan(y / x) - 3.141592653589793 }
+    if y > 0.0 { return 1.5707963267948966 }
+    if y < 0.0 { return -1.5707963267948966 }
+    return 0.0
+}
+/// arcsine, result in [-pi/2, pi/2]; NaN outside the domain [-1, 1].
+///
+/// `x > 1` is not pi/2. Clamping to the endpoint answers an undefined question with a number in the
+/// expected range, which a caller cannot tell from a real result: asin(2) and asin(1) came back
+/// identical. NaN is the IEEE answer and the one that propagates.
+pub fn asin(x: Float) -> Float {
+    if x != x { return f_nan() }                             // NaN in, NaN out
+    if x > 1.0 { return f_nan() }
+    if x < -1.0 { return f_nan() }
+    if x == 1.0 { return 1.5707963267948966 }
+    if x == -1.0 { return -1.5707963267948966 }
+    return atan(x / sqrt(1.0 - x * x))
+}
+/// arccosine, result in [0, pi]; NaN outside the domain [-1, 1] (see `asin`).
+pub fn acos(x: Float) -> Float {
+    if x != x { return f_nan() }
+    if x > 1.0 { return f_nan() }
+    if x < -1.0 { return f_nan() }
+    if x == 1.0 { return 0.0 }
+    if x == -1.0 { return 3.141592653589793 }
+    return 1.5707963267948966 - asin(x)
+}
+/// sqrt is a compiler builtin (lowered to math.sqrt), so it is not declared here.
+/// absolute value of a float.
+pub fn fabs(x: Float) -> Float { if x < 0.0 { return -x }  return x }
+/// smaller of two floats.
+pub fn fmin(a: Float, b: Float) -> Float { if a < b { return a }  return b }
+/// larger of two floats.
+pub fn fmax(a: Float, b: Float) -> Float { if a > b { return a }  return b }
+/// clamp x into [lo, hi].
+pub fn fclamp(x: Float, lo: Float, hi: Float) -> Float { return fmin(fmax(x, lo), hi) }
+/// sign of a float: 1.0 if positive, -1.0 if negative, 0.0 if zero.
+pub fn fsign(x: Float) -> Float { if x > 0.0 { return 1.0 }  if x < 0.0 { return -1.0 }  return 0.0 }
+
+// ---------------- constants ----------------
+/// the constant pi.
+pub fn pi() -> Float { return 3.141592653589793 }
+/// the constant tau (2*pi).
+pub fn tau() -> Float { return 6.283185307179586 }
+/// Euler's number e.
+pub fn e() -> Float { return 2.718281828459045 }

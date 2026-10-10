@@ -1,0 +1,2151 @@
+//! std/font: a text engine that takes fonts in and gives shaped, rasterized text out.
+//!
+//!   import "std/font" as font
+//!   var fr = font::font_load(read_file("DejaVuSans.ttf"))
+//!   if fr.ok {
+//!     var gid = font::font_glyph_index(fr.font, ord("A"))
+//!     var gb  = font::rasterize(fr.font, gid, 32.0)     // 8-bit coverage bitmap at 32px
+//!     let gs  = font::shape(fr.font, "office", "Latn", font::DIR_LTR(), "en", "")   // HarfBuzz-model shaping
+//!   }
+//!
+//! Loading: TrueType (`glyf`) and OpenType/CFF outlines (Type 2 charstrings, CID-keyed too),
+//! `.ttc` collections (font_load_index), WOFF and WOFF2. Outlines rasterize to grayscale coverage
+//! via a signed-area accumulator, with light vertical autohinting; color glyphs (CBDT/CBLC PNG
+//! strikes, COLR/CPAL v0 layers) rasterize to premultiplied RGBA (color.nori).
+//!
+//! Text: shape.nori is HarfBuzz's OpenType pipeline (GSUB/GPOS in otl_apply.nori, the plan in
+//! shape_plan.nori; default, Arabic, Hebrew, Hangul and Indic shapers), bidi.nori is UAX #9,
+//! linebreak.nori UAX #14, textrun.nori itemizes a line into bidi/script/font runs over a FontSet and
+//! lays them out (layout_run and measure_run are thin wrappers over it), fontdb.nori discovers the
+//! system's fonts without fontconfig.
+//! Out of scope: variable fonts beyond the default instance, vertical text, hinting bytecode.
+//!
+//! Bytes: the font is held as a `Str` (length-prefixed in the runtime, so embedded NULs are fine)
+//! and read big-endian via ord(char_at) + band/bor/shl; reads past the end are zero, so a malformed
+//! font draws nothing rather than trapping.
+
+import "std/archive" as ar
+
+extern fn malloc(Int) -> Int
+extern fn free(Int)
+
+// ============================================================================
+// big-endian byte cursor + fixed-point helpers
+// ============================================================================
+
+// Past the end reads as zero. Every offset these readers are given came out of the font file, and a
+// font is input: a table that says it is longer than the file, a loca entry past glyf, a cmap offset
+// into nothing. A zero is what the rest of the parser already treats as absent: no glyph, no
+// segment, no more components.
+/// unsigned byte at `p` (0..255).
+pub fn rd_u8(d: Str, p: Int) -> Int { if p < 0 || p >= d.len() { return 0 }  return ord(d.at(p)) }
+/// big-endian u16 at `p`.
+pub fn rd_u16(d: Str, p: Int) -> Int { return ((rd_u8(d, p) << 8) | rd_u8(d, p + 1)) }
+/// big-endian i16 at `p` (two's complement).
+pub fn rd_i16(d: Str, p: Int) -> Int {
+    var v = rd_u16(d, p)
+    if v >= 32768 { return v - 65536 }
+    return v
+}
+/// big-endian u32 at `p`.
+pub fn rd_u32(d: Str, p: Int) -> Int { return ((rd_u16(d, p) << 16) | rd_u16(d, p + 2)) }
+/// a 4-byte table tag as a Str.
+pub fn rd_tag(d: Str, p: Int) -> Str { return d.slice(p, p + 4) }
+/// F2Dot14 (signed 2.14 fixed point) at `p` -> Float (composite-glyph transforms).
+pub fn rd_f2dot14(d: Str, p: Int) -> Float {
+    var v = rd_i16(d, p)
+    return to_float(v) / 16384.0
+}
+
+// a sequential cursor (glyf parsing is heavily sequential). Cur is a reference handle, so `c.p = ...`
+// mutates the shared object: the std/archive `Bits` idiom.
+struct Cur { d: view Str, p: Int }
+fn cur_at(d: Str, p: Int) -> Cur { return Cur { d: d, p: p } }
+fn cu8(inout c: Cur) -> Int { var b = rd_u8(c.d, c.p)  c.p = c.p + 1  return b }
+fn cu16(inout c: Cur) -> Int { var b = rd_u16(c.d, c.p)  c.p = c.p + 2  return b }
+fn ci16(inout c: Cur) -> Int { var b = rd_i16(c.d, c.p)  c.p = c.p + 2  return b }
+fn cu32(inout c: Cur) -> Int { var b = rd_u32(c.d, c.p)  c.p = c.p + 4  return b }
+
+// ============================================================================
+// sfnt container + required tables
+// ============================================================================
+
+/// a loaded font face: the raw bytes + parsed header values + table offsets (-1 = absent).
+/// cmap is pre-resolved to the best Unicode subtable (`cmap_sub` offset + `cmap_fmt` 4 or 12).
+/// Offsets are into `d`, the whole file: for a face of a `.ttc` collection too, whose tables are
+/// shared between faces and addressed from the start of the file.
+pub struct Font {
+    d: Str,
+    units_per_em: Int,
+    index_to_loc: Int,        // 0 = short (u16 offsets *2), 1 = long (u32)
+    num_glyphs: Int,
+    num_h_metrics: Int,
+    ascender: Int, descender: Int, line_gap: Int,
+    head_off: Int, maxp_off: Int, hhea_off: Int, hmtx_off: Int,
+    cmap_off: Int, loca_off: Int, glyf_off: Int, kern_off: Int,
+    cmap_sub: Int, cmap_fmt: Int,
+    face_off: Int,            // where this face's table directory starts (0 unless a .ttc face)
+    face_index: Int,
+    cmap_uvs: Int,            // the format-14 variation-sequence subtable, or -1
+    gsub_off: Int, gpos_off: Int, gdef_off: Int,
+    os2_off: Int, name_off: Int, post_off: Int,
+    cff_off: Int, cff2_off: Int,
+    cbdt_off: Int, cblc_off: Int, sbix_off: Int, colr_off: Int, cpal_off: Int,
+    // GDEF sub-tables, resolved once (absolute offsets, -1 when absent)
+    gdef_gcd: Int,            // glyph class definition
+    gdef_macd: Int,           // mark attachment class definition
+    gdef_mgs: Int,            // mark glyph sets
+    // CFF: resolved at load (absolute offsets of the INDEXes, -1 when absent); see cff.nori
+    cff_cs: Int,              // CharStrings INDEX
+    cff_gsubrs: Int,          // global subroutine INDEX
+    cff_lsubrs: Int,          // local subroutine INDEX of a non-CID font
+    cff_fdarray: Int,         // CID-keyed: Font DICT INDEX
+    cff_fdselect: Int,        // CID-keyed: FDSelect
+    cff_cid: Int              // 1 if CID-keyed
+}
+/// the load outcome: `ok=false` + `err` on a malformed or unsupported font.
+pub struct FontResult { ok: Bool, err: Str, font: Font }
+
+fn font_blank(d: Str) -> Font {
+    return Font {
+        d: d.slice(0, d.len()), units_per_em: 0, index_to_loc: 0, num_glyphs: 0, num_h_metrics: 0,
+        ascender: 0, descender: 0, line_gap: 0,
+        head_off: 0 - 1, maxp_off: 0 - 1, hhea_off: 0 - 1, hmtx_off: 0 - 1,
+        cmap_off: 0 - 1, loca_off: 0 - 1, glyf_off: 0 - 1, kern_off: 0 - 1,
+        cmap_sub: 0 - 1, cmap_fmt: 0,
+        face_off: 0, face_index: 0, cmap_uvs: 0 - 1,
+        gsub_off: 0 - 1, gpos_off: 0 - 1, gdef_off: 0 - 1,
+        os2_off: 0 - 1, name_off: 0 - 1, post_off: 0 - 1,
+        cff_off: 0 - 1, cff2_off: 0 - 1,
+        cbdt_off: 0 - 1, cblc_off: 0 - 1, sbix_off: 0 - 1, colr_off: 0 - 1, cpal_off: 0 - 1,
+        gdef_gcd: 0 - 1, gdef_macd: 0 - 1, gdef_mgs: 0 - 1,
+        cff_cs: 0 - 1, cff_gsubrs: 0 - 1, cff_lsubrs: 0 - 1, cff_fdarray: 0 - 1, cff_fdselect: 0 - 1, cff_cid: 0
+    }
+}
+fn font_err(d: Str, sink msg: Str) -> FontResult { return FontResult { ok: false, err: msg, font: font_blank(d) } }
+/// an empty placeholder Font (no glyphs): for holding a Font-typed field before a real load.
+pub fn font_empty() -> Font { return font_blank("") }
+
+/// pick the best Unicode cmap subtable: prefer platform 3/enc 10 or 0/enc 4/6 (format 12, full
+/// Unicode), then platform 3/enc 1 or 0/* (format 4, BMP). Sets font.cmap_sub + font.cmap_fmt.
+fn resolve_cmap(inout f: Font) {
+    var d = f.d
+    var base = f.cmap_off
+    if base < 0 { return }
+    var n = rd_u16(d, base + 2)
+    var best_off = 0 - 1
+    var best_fmt = 0
+    var best_score = 0 - 1
+    var i = 0
+    while i < n {
+        var rec = base + 4 + i * 8
+        var plat = rd_u16(d, rec)
+        var enc = rd_u16(d, rec + 2)
+        var off = rd_u32(d, rec + 4)
+        var sub = base + off
+        var fmt = rd_u16(d, sub)
+        // score: full-Unicode format-12 subtables beat BMP format-4; Windows beats Unicode-platform.
+        var score = 0 - 1
+        if fmt == 12 {
+            if plat == 3 && enc == 10 { score = 5 }
+            else if plat == 0 { score = 4 }
+        } else if fmt == 4 {
+            if plat == 3 && enc == 1 { score = 3 }
+            else if plat == 0 { score = 2 }
+            else if plat == 3 && enc == 0 { score = 1 }
+        }
+        if score > best_score { best_score = score  best_off = sub  best_fmt = fmt }
+        if fmt == 14 && plat == 0 && enc == 5 { f.cmap_uvs = sub }
+        i = i + 1
+    }
+    f.cmap_sub = best_off
+    f.cmap_fmt = best_fmt
+}
+
+// big-endian writers into a raw malloc'd buffer (for reconstructing an SFNT from WOFF).
+fn wr_u16(buf: Int, off: Int, v: Int) { unsafe { poke8(buf + off, ((v >> 8) & 255))  poke8(buf + off + 1, (v & 255)) } }
+fn wr_u32(buf: Int, off: Int, v: Int) { unsafe { poke8(buf + off, ((v >> 24) & 255))  poke8(buf + off + 1, ((v >> 16) & 255))  poke8(buf + off + 2, ((v >> 8) & 255))  poke8(buf + off + 3, (v & 255)) } }
+fn is_woff(d: Str) -> Bool { return d.len() >= 4 && rd_u8(d, 0) == 119 && rd_u8(d, 1) == 79 && rd_u8(d, 2) == 70 && rd_u8(d, 3) == 70 }   // 'wOFF'
+
+/// reconstruct a plain SFNT (ttf/otf) byte string from a WOFF 1.0 container, inflating any zlib-
+/// compressed tables. Returns "" if the input isn't a WOFF or is malformed.
+pub fn woff_to_sfnt(d: Str) -> Str {
+    if d.len() < 44 || !is_woff(d) { return "" }
+    let flavor = rd_u32(d, 4)
+    let numTables = rd_u16(d, 12)
+    if numTables == 0 { return "" }
+    // sfnt search params
+    var maxPow = 1
+    var es = 0
+    while maxPow * 2 <= numTables { maxPow = maxPow * 2  es = es + 1 }
+    let searchRange = maxPow * 16
+    let rangeShift = numTables * 16 - searchRange
+    // read the WOFF table directory (20-byte records at offset 44)
+    var tags: Vec<Str> = vec()
+    var offs: Vec<Int> = vec()
+    var comps: Vec<Int> = vec()
+    var origs: Vec<Int> = vec()
+    var checks: Vec<Int> = vec()
+    var i = 0
+    while i < numTables {
+        let e = 44 + i * 20
+        if e + 20 > d.len() { return "" }
+        tags.push(rd_tag(d, e))
+        offs.push(rd_u32(d, e + 4))  comps.push(rd_u32(d, e + 8))  origs.push(rd_u32(d, e + 12))  checks.push(rd_u32(d, e + 16))
+        i = i + 1
+    }
+    // compute each table's offset in the reconstructed sfnt (tables 4-byte aligned)
+    var sfntOff: Vec<Int> = vec()
+    var cursor = 12 + numTables * 16
+    i = 0
+    while i < numTables {
+        if origs[i] < 0 || origs[i] > 134217728 { return "" }                   // a table over 128 MB is not a font
+        sfntOff.push(cursor)  cursor = cursor + (origs[i] + 3) / 4 * 4  i = i + 1
+    }
+    let total = cursor
+    var buf = 0
+    unsafe { buf = malloc(total) }
+    wr_u32(buf, 0, flavor)  wr_u16(buf, 4, numTables)  wr_u16(buf, 6, searchRange)  wr_u16(buf, 8, es)  wr_u16(buf, 10, rangeShift)
+    i = 0
+    while i < numTables {
+        let de = 12 + i * 16
+        unsafe {
+            poke8(buf + de, rd_u8(tags[i], 0))  poke8(buf + de + 1, rd_u8(tags[i], 1))  poke8(buf + de + 2, rd_u8(tags[i], 2))  poke8(buf + de + 3, rd_u8(tags[i], 3))
+        }
+        wr_u32(buf, de + 4, checks[i])  wr_u32(buf, de + 8, sfntOff[i])  wr_u32(buf, de + 12, origs[i])
+        let dst = sfntOff[i]
+        if comps[i] >= origs[i] {                                             // stored uncompressed
+            var k = 0
+            unsafe { while k < origs[i] { poke8(buf + dst + k, rd_u8(d, offs[i] + k))  k = k + 1 } }
+        } else {                                                             // zlib-compressed table
+            // checked, and to exactly the table's length (WOFF 1.0 §5): a damaged table makes the
+            // font malformed rather than a table of zeros, or a crash
+            if offs[i] + comps[i] > d.len() { unsafe { free(buf) }  return "" }
+            let ir = ar::inflate_zlib_checked(d.slice(offs[i], offs[i] + comps[i]), origs[i])
+            let inf = ir.data
+            let ip = ar::inflated_ptr(inf)
+            let il = ar::inflated_len(inf)
+            if !ir.ok || il != origs[i] { ar::inflated_free(inf)  unsafe { free(buf) }  return "" }
+            var k = 0
+            unsafe { while k < origs[i] && k < il { poke8(buf + dst + k, peek8(ip + k))  k = k + 1 } }
+            ar::inflated_free(inf)
+        }
+        var pad = (origs[i] + 3) / 4 * 4 - origs[i]                           // zero the alignment padding
+        var pj = 0
+        unsafe { while pj < pad { poke8(buf + dst + origs[i] + pj, 0)  pj = pj + 1 } }
+        i = i + 1
+    }
+    var s = ""
+    unsafe { s = str_from_buf(buf, total)  free(buf) }
+    return s
+}
+
+// ── WOFF2 (W3C): Brotli-compressed SFNT + glyf/loca transform ────────────────────────────────────────
+fn is_woff2(d: Str) -> Bool { return d.len() >= 4 && rd_u8(d, 0) == 119 && rd_u8(d, 1) == 79 && rd_u8(d, 2) == 70 && rd_u8(d, 3) == 50 }   // 'wOF2'
+fn woff2_tag(idx: Int) -> Str { let t = "cmapheadhheahmtxmaxpnameOS/2postcvt fpgmglyflocaprepCFF VORGEBDTEBLCgasphdmxkernLTSHPCLTVDMXvheavmtxBASEGDEFGPOSGSUBEBSCJSTFMATHCBDTCBLCCOLRCPALSVG sbixacntavarbdatblocbslncvarfdscfeatfmtxfvargvarhstyjustlcarmortmorxopbdproptrakZapfSilfGlatGlocFeatSill"  return t.slice(idx * 4, idx * 4 + 4) }
+fn read_base128(inout c: Cur) -> Int { var v = 0  var i = 0  while i < 5 { let b = cu8(c)  v = ((v << 7) | (b & 127))  if (b & 128) == 0 { return v }  i = i + 1 }  return v }
+fn read_255ushort(inout c: Cur) -> Int {
+    let code = cu8(c)
+    if code == 253 { return cu16(c) }
+    if code == 255 { return cu8(c) + 253 }
+    if code == 254 { return cu8(c) + 506 }
+    return code
+}
+fn withsign(flag: Int, base: Int) -> Int { if (flag & 1) != 0 { return base }  return 0 - base }
+
+// growable big-endian byte buffer
+struct WBuf { p: Int, len: Int, cap: Int }
+fn wbuf_new(cap0: Int) -> WBuf { var b = WBuf { p: 0, len: 0, cap: cap0 }  unsafe { b.p = malloc(cap0) }  return b }
+fn wbuf_grow(inout b: WBuf, extra: Int) {
+    if b.len + extra > b.cap {
+        var nc = b.cap * 2
+        while nc < b.len + extra { nc = nc * 2 }
+        var np = 0
+        unsafe { np = malloc(nc)  var i = 0  while i < b.len { poke8(np + i, peek8(b.p + i))  i = i + 1 }  free(b.p) }
+        b.p = np  b.cap = nc
+    }
+}
+fn wb1(inout b: WBuf, v: Int) { wbuf_grow(b, 1)  unsafe { poke8(b.p + b.len, (v & 255)) }  b.len = b.len + 1 }
+fn wb2(inout b: WBuf, v: Int) { wb1(b, ((v >> 8) & 255))  wb1(b, (v & 255)) }
+fn wb4(inout b: WBuf, v: Int) { wb2(b, ((v >> 16) & 65535))  wb2(b, (v & 65535)) }
+fn wb_bytes(inout b: WBuf, src: Str, off: Int, n: Int) { var i = 0  while i < n { wb1(b, rd_u8(src, off + i))  i = i + 1 } }
+fn wb_at(b: WBuf, i: Int) -> Int { var v = 0  unsafe { v = peek8(b.p + i) }  return v }
+fn wb_or(b: WBuf, i: Int, v: Int) { unsafe { poke8(b.p + i, (peek8(b.p + i) | v)) } }
+
+// rebuild the standard glyf + loca tables from the WOFF2 glyf transform. Returns the glyf bytes; loca
+// offsets are appended to `loca_out`, and the loca index format to `fmt_out` (via 1-elem vecs).
+fn woff2_reconstruct_glyf(td: Str, goff: Int, inout loca_out: Vec<Int>, inout fmt_out: Vec<Int>) -> Str {
+    let gflags = rd_u16(td, goff + 2)
+    let has_overlap = (gflags & 1) != 0
+    let num_glyphs = rd_u16(td, goff + 4)
+    let index_format = rd_u16(td, goff + 6)
+    fmt_out.push(index_format)
+    var soff: Vec<Int> = vec()
+    var off = 36                                                            // (2 + 7) * 4
+    var i = 0
+    while i < 7 { soff.push(goff + off)  off = off + rd_u32(td, goff + 8 + i * 4)  i = i + 1 }
+    let nc_base = soff[0]                                                   // nContourStream (int16/glyph)
+    var np_c = Cur { d: td, p: soff[1] }                                    // nPointsStream (255ushort)
+    var flag_ptr = soff[2]                                                  // flagStream (1 byte/point)
+    var g_c = Cur { d: td, p: soff[3] }                                     // glyphStream (triplets + 255ushort)
+    var comp_c = Cur { d: td, p: soff[4] }                                  // compositeStream
+    let bbox_bitmap = soff[5]
+    var bbox_data = soff[5] + ((num_glyphs + 31 >> 5) * 4)                 // bbox values follow the bitmap
+    var instr_c = Cur { d: td, p: soff[6] }                                 // instructionStream
+    var overlap_ptr = goff + off
+    var out = wbuf_new(65536)
+    var gi = 0
+    while gi < num_glyphs {
+        let nc = rd_i16(td, nc_base + gi * 2)
+        loca_out.push(out.len)
+        let have_bbox = (rd_u8(td, bbox_bitmap + (gi >> 3)) & (128 >> (gi & 7))) != 0
+        var glyph_ovl = false
+        if has_overlap { glyph_ovl = (rd_u8(td, overlap_ptr + (gi >> 3)) & (128 >> (gi & 7))) != 0 }
+        if nc == 0 { }                                                      // empty glyph: no data
+        else if nc == 0 - 1 {                                              // composite (0xffff)
+            let cstart = comp_c.p
+            var have_instr = false
+            var flags = 32
+            while (flags & 32) != 0 {                                    // FLAG_MORE_COMPONENTS = 1<<5
+                flags = cu16(comp_c)
+                if (flags & 256) != 0 { have_instr = true }              // WE_HAVE_INSTRUCTIONS = 1<<8
+                var arg = 2 + 2
+                if (flags & 1) != 0 { arg = 2 + 4 }                      // ARG_1_AND_2_ARE_WORDS = 1<<0
+                if (flags & 8) != 0 { arg = arg + 2 }                    // WE_HAVE_A_SCALE = 1<<3
+                else if (flags & 64) != 0 { arg = arg + 4 }             // X_AND_Y_SCALE = 1<<6
+                else if (flags & 128) != 0 { arg = arg + 8 }            // TWO_BY_TWO = 1<<7
+                comp_c.p = comp_c.p + arg
+            }
+            let csize = comp_c.p - cstart
+            wb2(out, 65535)                                                 // numberOfContours = -1
+            wb_bytes(out, td, bbox_data, 8)  bbox_data = bbox_data + 8
+            wb_bytes(out, td, cstart, csize)
+            if have_instr { let isz = read_255ushort(g_c)  wb2(out, isz)  wb_bytes(out, td, instr_c.p, isz)  instr_c.p = instr_c.p + isz }
+        } else {                                                           // simple glyph
+            var npts: Vec<Int> = vec()  var total = 0
+            var c = 0
+            while c < nc { let np = read_255ushort(np_c)  npts.push(np)  total = total + np  c = c + 1 }
+            var xs: Vec<Int> = vec()  var ys: Vec<Int> = vec()  var ons: Vec<Int> = vec()
+            var px = 0  var py = 0  var tp = g_c.p
+            var pi = 0
+            while pi < total {
+                let raw = rd_u8(td, flag_ptr + pi)
+                let on = ((raw >> 7) & 1) == 0
+                let f = (raw & 127)
+                var dx = 0  var dy = 0  var ndb = 1
+                if f < 10 { dy = withsign(f, ((f & 14) << 7) + rd_u8(td, tp)) }
+                else if f < 20 { dx = withsign(f, ((f - 10 & 14) << 7) + rd_u8(td, tp)) }
+                else if f < 84 { let b0 = f - 20  let b1 = rd_u8(td, tp)  dx = withsign(f, 1 + (b0 & 48) + (b1 >> 4))  dy = withsign((f >> 1), 1 + ((b0 & 12) << 2) + (b1 & 15)) }
+                else if f < 120 { ndb = 2  let b0 = f - 84  dx = withsign(f, 1 + (b0 / 12 << 8) + rd_u8(td, tp))  dy = withsign((f >> 1), 1 + ((b0 - (b0 / 12) * 12 >> 2) << 8) + rd_u8(td, tp + 1)) }
+                else if f < 124 { ndb = 3  let b1 = rd_u8(td, tp)  let b2 = rd_u8(td, tp + 1)  let b3 = rd_u8(td, tp + 2)  dx = withsign(f, (b1 << 4) + (b2 >> 4))  dy = withsign((f >> 1), ((b2 & 15) << 8) + b3) }
+                else { ndb = 4  let b1 = rd_u8(td, tp)  let b2 = rd_u8(td, tp + 1)  let b3 = rd_u8(td, tp + 2)  let b4 = rd_u8(td, tp + 3)  dx = withsign(f, (b1 << 8) + b2)  dy = withsign((f >> 1), (b3 << 8) + b4) }
+                tp = tp + ndb
+                px = px + dx  py = py + dy
+                xs.push(px)  ys.push(py)  if on { ons.push(1) } else { ons.push(0) }
+                pi = pi + 1
+            }
+            g_c.p = tp
+            flag_ptr = flag_ptr + total
+            let instr_size = read_255ushort(g_c)
+            // write standard simple glyph: header + endPts + instr + flags + x + y
+            wb2(out, nc)
+            if have_bbox { wb_bytes(out, td, bbox_data, 8)  bbox_data = bbox_data + 8 }
+            else {
+                var xmin = 0  var ymin = 0  var xmax = 0  var ymax = 0
+                if total > 0 { xmin = xs[0]  xmax = xs[0]  ymin = ys[0]  ymax = ys[0] }
+                var k = 1
+                while k < total { if xs[k] < xmin { xmin = xs[k] }  if xs[k] > xmax { xmax = xs[k] }  if ys[k] < ymin { ymin = ys[k] }  if ys[k] > ymax { ymax = ys[k] }  k = k + 1 }
+                wb2(out, (xmin & 65535))  wb2(out, (ymin & 65535))  wb2(out, (xmax & 65535))  wb2(out, (ymax & 65535))
+            }
+            var ep = 0 - 1
+            c = 0  while c < nc { ep = ep + npts[c]  wb2(out, ep)  c = c + 1 }
+            wb2(out, instr_size)
+            wb_bytes(out, td, instr_c.p, instr_size)  instr_c.p = instr_c.p + instr_size
+            // flags with repeat compression
+            var last_flag = 0 - 1  var repeat_count = 0  var repeat_pos = 0 - 1
+            var lx = 0  var ly = 0
+            pi = 0
+            while pi < total {
+                var flg = 0
+                if ons[pi] == 1 { flg = 1 }                                 // ON_CURVE
+                if glyph_ovl && pi == 0 { flg = (flg | 64) }              // OVERLAP_SIMPLE
+                let dx = xs[pi] - lx
+                if dx == 0 { flg = (flg | 16) }                          // X_IS_SAME
+                else if dx > 0 - 256 && dx < 256 { flg = (flg | 2)  if dx > 0 { flg = (flg | 16) } }   // X_SHORT (+ positive)
+                let dy = ys[pi] - ly
+                if dy == 0 { flg = (flg | 32) }                          // Y_IS_SAME
+                else if dy > 0 - 256 && dy < 256 { flg = (flg | 4)  if dy > 0 { flg = (flg | 32) } }   // Y_SHORT (+ positive)
+                if flg == last_flag && repeat_count != 255 { wb_or(out, repeat_pos, 8)  repeat_count = repeat_count + 1 }   // set REPEAT on prev flag byte
+                else {
+                    if repeat_count != 0 { wb1(out, repeat_count)  repeat_count = 0 }
+                    repeat_pos = out.len
+                    wb1(out, flg)
+                }
+                lx = xs[pi]  ly = ys[pi]  last_flag = flg
+                pi = pi + 1
+            }
+            if repeat_count != 0 { wb1(out, repeat_count) }
+            // x coords
+            lx = 0  pi = 0
+            while pi < total { let dx = xs[pi] - lx  if dx != 0 { if dx > 0 - 256 && dx < 256 { var a = dx  if a < 0 { a = 0 - a }  wb1(out, a) } else { wb2(out, (dx & 65535)) } }  lx = xs[pi]  pi = pi + 1 }
+            // y coords
+            ly = 0  pi = 0
+            while pi < total { let dy = ys[pi] - ly  if dy != 0 { if dy > 0 - 256 && dy < 256 { var a = dy  if a < 0 { a = 0 - a }  wb1(out, a) } else { wb2(out, (dy & 65535)) } }  ly = ys[pi]  pi = pi + 1 }
+        }
+        while (out.len & 3) != 0 { wb1(out, 0) }                        // Pad4: glyphs 4-byte aligned
+        gi = gi + 1
+    }
+    loca_out.push(out.len)                                                 // final loca entry
+    var s = ""
+    unsafe { s = str_from_buf(out.p, out.len)  free(out.p) }
+    return s
+}
+
+/// reconstruct a plain SFNT from a WOFF2 container (Brotli decompress + glyf/loca transform reversal).
+/// Returns "" on malformed input or unsupported features (CFF, TTC, hmtx transform).
+pub fn woff2_to_sfnt(d: Str) -> Str {
+    if d.len() < 48 || !is_woff2(d) { return "" }
+    let flavor = rd_u32(d, 4)
+    let numTables = rd_u16(d, 12)
+    let totalCompressed = rd_u32(d, 20)
+    if numTables == 0 { return "" }
+    // ── table directory ──
+    var tags: Vec<Str> = vec()  var transformed: Vec<Int> = vec()  var srclen: Vec<Int> = vec()  var srcoff: Vec<Int> = vec()  var dstlen: Vec<Int> = vec()
+    var dc = Cur { d: d, p: 48 }
+    var i = 0
+    var cum = 0
+    while i < numTables {
+        let flags = cu8(dc)
+        let tidx = (flags & 63)
+        let tv = ((flags >> 6) & 3)
+        var tag = ""
+        if tidx == 63 { tag = rd_tag(d, dc.p)  dc.p = dc.p + 4 } else { tag = woff2_tag(tidx) }
+        let orig = read_base128(dc)
+        var isxf = 0
+        if ((tag == "glyf") || (tag == "loca")) && tv == 0 { isxf = 1 }
+        else if (tag == "hmtx") && tv == 1 { isxf = 1 }
+        else if !(tag == "glyf") && !(tag == "loca") && !(tag == "hmtx") && tv != 0 { isxf = 1 }
+        var sl = orig
+        if isxf == 1 { sl = read_base128(dc) }
+        tags.push(tag)  transformed.push(isxf)  dstlen.push(orig)  srclen.push(sl)  srcoff.push(cum)  cum = cum + sl
+        i = i + 1
+    }
+    // ── Brotli-decompress the table data block ──
+    let comp = d.slice(dc.p, dc.p + totalCompressed)
+    let td = ar::brotli_decode(comp)
+    if td.len() == 0 { return "" }
+    // ── reconstruct glyf + loca (if the glyf transform is present) ──
+    var glyf_bytes = ""  var loca_vals: Vec<Int> = vec()  var locafmt: Vec<Int> = vec()
+    var gidx = 0 - 1
+    i = 0  while i < numTables { if (tags[i] == "glyf") { gidx = i }  i = i + 1 }
+    if gidx >= 0 && transformed[gidx] == 1 { glyf_bytes = woff2_reconstruct_glyf(td, srcoff[gidx], loca_vals, locafmt) }
+    // build each table's final bytes
+    var finals: Vec<Str> = vec()
+    i = 0
+    while i < numTables {
+        // handed over, then cleared: the push sits in a loop, so without the redefinition the same
+        // handle could be pushed twice as far as anything here can tell, and `finals` falls back to a
+        // shallow free with every reconstructed table stranded. At most one table is a transformed
+        // glyf, and nothing reads `glyf_bytes` after this.
+        if (tags[i] == "glyf") && transformed[i] == 1 { finals.push(glyf_bytes)  glyf_bytes = "" }
+        else if (tags[i] == "loca") && transformed[i] == 1 {
+            var lb = wbuf_new(loca_vals.len() * 4 + 8)
+            let sf = locafmt[0]
+            var k = 0
+            while k < loca_vals.len() { if sf == 0 { wb2(lb, loca_vals[k] / 2) } else { wb4(lb, loca_vals[k]) }  k = k + 1 }
+            var ls = ""
+            unsafe { ls = str_from_buf(lb.p, lb.len)  free(lb.p) }
+            finals.push(ls)
+        }
+        else { finals.push(td.slice(srcoff[i], srcoff[i] + srclen[i])) }
+        i = i + 1
+    }
+    // ── assemble the SFNT: header + directory (sorted by tag) + 4-aligned table data ──
+    var order: Vec<Int> = vec()
+    i = 0  while i < numTables { order.push(i)  i = i + 1 }
+    var a = 0
+    while a < numTables { var b = a + 1  while b < numTables { if str_gt(tags[order[a]], tags[order[b]]) { let t = order[a]  order[a] = order[b]  order[b] = t }  b = b + 1 }  a = a + 1 }
+    var maxPow = 1  var es = 0
+    while maxPow * 2 <= numTables { maxPow = maxPow * 2  es = es + 1 }
+    let searchRange = maxPow * 16
+    var out = wbuf_new((1 << 20))
+    wb4(out, flavor)  wb2(out, numTables)  wb2(out, searchRange)  wb2(out, es)  wb2(out, numTables * 16 - searchRange)
+    // data laid out in the original woff2 order; the directory is sorted by tag.
+    var origoff: Vec<Int> = vec()
+    var dataoff = 12 + numTables * 16
+    i = 0  while i < numTables { origoff.push(dataoff)  dataoff = dataoff + (finals[i].len() + 3) / 4 * 4  i = i + 1 }
+    var dirpos: Vec<Int> = vec()
+    i = 0
+    while i < numTables {
+        let ti = order[i]
+        wb_bytes(out, tags[ti], 0, 4)
+        dirpos.push(out.len)  wb4(out, 0)                                  // checksum (filled below)
+        wb4(out, origoff[ti])  wb4(out, finals[ti].len())
+        i = i + 1
+    }
+    i = 0
+    while i < numTables {                                                   // table data in original order
+        wb_bytes(out, finals[i], 0, finals[i].len())
+        var pad = (finals[i].len() + 3) / 4 * 4 - finals[i].len()
+        while pad > 0 { wb1(out, 0)  pad = pad - 1 }
+        i = i + 1
+    }
+    // ── SFNT checksums: per-table checkSum, then head.checkSumAdjustment ──
+    var head_off = 0 - 1
+    i = 0  while i < numTables { if (tags[i] == "head") { head_off = origoff[i] }  i = i + 1 }
+    if head_off >= 0 { unsafe { poke8(out.p + head_off + 8, 0)  poke8(out.p + head_off + 9, 0)  poke8(out.p + head_off + 10, 0)  poke8(out.p + head_off + 11, 0) } }
+    i = 0
+    while i < numTables { let ti = order[i]  wb_put4(out, dirpos[i], buf_checksum(out, origoff[ti], finals[ti].len()))  i = i + 1 }
+    if head_off >= 0 { wb_put4(out, head_off + 8, (2981146554 - buf_checksum(out, 0, out.len) & 4294967295)) }   // 0xB1B0AFBA
+    var s = ""
+    unsafe { s = str_from_buf(out.p, out.len)  free(out.p) }
+    return s
+}
+fn wb_put4(b: WBuf, pos: Int, v: Int) { unsafe { poke8(b.p + pos, ((v >> 24) & 255))  poke8(b.p + pos + 1, ((v >> 16) & 255))  poke8(b.p + pos + 2, ((v >> 8) & 255))  poke8(b.p + pos + 3, (v & 255)) } }
+fn buf_checksum(b: WBuf, off: Int, ln: Int) -> Int {
+    var sum = 0  var i = 0
+    let end = (ln + 3) / 4 * 4
+    while i < end { sum = (sum + (((wb_at(b, off + i) << 24) | (wb_at(b, off + i + 1) << 16)) | ((wb_at(b, off + i + 2) << 8) | wb_at(b, off + i + 3))) & 4294967295)  i = i + 4 }
+    return sum
+}
+
+fn str_gt(a: Str, b: Str) -> Bool {
+    var i = 0
+    while i < a.len() && i < b.len() { let x = rd_u8(a, i)  let y = rd_u8(b, i)  if x != y { return x > y }  i = i + 1 }
+    return a.len() > b.len()
+}
+
+/// how many leading bytes of an sfnt file cover the whole `name` table (for partial reads);
+/// 0 if the header is malformed / not sfnt.
+pub fn sfnt_name_extent(d: Str) -> Int {
+    if d.len() < 12 { return 0 }
+    let ver = rd_u32(d, 0)
+    if ver != 0x00010000 && ver != 0x4F54544F { return 0 }
+    let ntab = rd_u16(d, 4)
+    var i = 0
+    while i < ntab {
+        let rec = 12 + i * 16
+        if rec + 16 > d.len() { return 0 }
+        if rd_tag(d, rec) == "name" { return rd_u32(d, rec + 8) + rd_u32(d, rec + 12) }
+        i = i + 1
+    }
+    return 0
+}
+/// read one string from an SFNT `name` table: nameId 1 is the family, 2 the subfamily
+/// ("Regular", "Bold Italic"), 4 the full name, 6 the PostScript name. Reads the table directly
+/// from the bytes, with no full parse, so it works on a face you have not loaded.
+///
+/// A Windows (3,1) record wins, then any Windows record, then Mac Roman (1,0). UTF-16BE is read
+/// by taking the low byte of each BMP unit, which is exact for the ASCII that family names are in
+/// practice. "" if the id is absent or the data is not an SFNT.
+pub fn sfnt_name(d: Str, nameId: Int) -> Str {
+    if d.len() < 12 { return "" }
+    let ver = rd_u32(d, 0)
+    if ver != 0x00010000 && ver != 0x4F54544F { return "" }              // TrueType / 'OTTO'
+    let ntab = rd_u16(d, 4)
+    var toff = 0 - 1
+    var i = 0
+    while i < ntab {
+        let rec = 12 + i * 16
+        if rec + 16 > d.len() { return "" }
+        if rd_tag(d, rec) == "name" { toff = rd_u32(d, rec + 8) }
+        i = i + 1
+    }
+    if toff < 0 || toff + 6 > d.len() { return "" }
+    let cnt = rd_u16(d, toff + 2)
+    let strBase = toff + rd_u16(d, toff + 4)
+    var best = ""
+    var bestScore = 0
+    var r = 0
+    while r < cnt {
+        let rp = toff + 6 + r * 12
+        if rp + 12 > d.len() { return best }
+        let plat = rd_u16(d, rp)
+        let enc = rd_u16(d, rp + 2)
+        let nid = rd_u16(d, rp + 6)
+        let ln = rd_u16(d, rp + 8)
+        let so = strBase + rd_u16(d, rp + 10)
+        if nid == nameId && so + ln <= d.len() {
+            var score = 0
+            if plat == 3 && enc == 1 { score = 3 }
+            else if plat == 3 { score = 2 }
+            else if plat == 1 && enc == 0 { score = 1 }
+            if score > bestScore {
+                var out = ""
+                if plat == 3 {                                          // UTF-16BE: take low bytes of BMP ASCII
+                    var k = 0
+                    while k + 1 < ln { let hi = rd_u8(d, so + k)  let lo = rd_u8(d, so + k + 1)  if hi == 0 && lo >= 32 { out = out + chr(lo) }  k = k + 2 }
+                } else {
+                    var k = 0
+                    while k < ln { let c = rd_u8(d, so + k)  if c >= 32 { out = out + chr(c) }  k = k + 1 }
+                }
+                if out.len() > 0 { best = sink out  bestScore = score }
+            }
+        }
+        r = r + 1
+    }
+    return best
+}
+
+/// load a face from its bytes: TrueType/OpenType (glyf or CFF outlines), the first face of a
+/// `.ttc` collection, or WOFF/WOFF2, which are decompressed to SFNT first. The result carries `ok`
+/// and, when it is false, an `err` naming what was wrong: a font is data from elsewhere, so
+/// failing to parse is an ordinary outcome rather than a trap.
+pub fn font_load(d: Str) -> FontResult { return font_load_index(d, 0) }
+
+/// how many faces the file holds: the count of a `.ttc` collection, 1 for a single font, 0 for
+/// something that is not a font.
+pub fn font_face_count(d: Str) -> Int {
+    if d.len() < 12 { return 0 }
+    let ver = rd_u32(d, 0)
+    if ver == 1953784678 { return rd_u32(d, 8) }                         // 'ttcf'
+    if ver == 65536 || ver == 1330926671 || ver == 1953658213 { return 1 }
+    if is_woff(d) || is_woff2(d) { return 1 }
+    return 0
+}
+
+/// load face `index` of a font file: of a `.ttc`/`.otc` collection, or 0 for a single font.
+pub fn font_load_index(d: Str, index: Int) -> FontResult {
+    if is_woff2(d) {
+        let sfnt = woff2_to_sfnt(d)
+        if sfnt.len() == 0 { return font_err(d, "WOFF2 decode failed (malformed, CFF, or unsupported transform)") }
+        return font_load_index(sfnt, index)
+    }
+    if is_woff(d) {
+        let sfnt = woff_to_sfnt(d)
+        if sfnt.len() == 0 { return font_err(d, "WOFF decode failed (malformed or WOFF2/Brotli)") }
+        return font_load_index(sfnt, index)
+    }
+    if d.len() < 12 { return font_err(d, "not a font: too small") }
+    var face = 0
+    if rd_u32(d, 0) == 1953784678 {                                      // 'ttcf': a collection
+        let nfaces = rd_u32(d, 8)
+        if index < 0 || index >= nfaces { return font_err(d, "no face " + to_str(index) + " in this collection") }
+        face = rd_u32(d, 12 + index * 4)
+    } else if index != 0 {
+        return font_err(d, "a single font has only face 0")
+    }
+    var ver = rd_u32(d, face)
+    // 0x00010000 = TrueType, 0x74727565 = 'true', 0x4F54544F = 'OTTO' (CFF outlines).
+    if ver != 65536 && ver != 1953658213 && ver != 1330926671 {
+        return font_err(d, "unrecognized sfnt version (not TrueType/OpenType)")
+    }
+    var num_tables = rd_u16(d, face + 4)
+    var f = font_blank(d)
+    f.face_off = face
+    f.face_index = index
+    // table directory: numTables records of 16 bytes after the 12-byte header
+    var i = 0
+    while i < num_tables {
+        var rec = face + 12 + i * 16
+        if rec + 16 > d.len() { return font_err(d, "truncated table directory") }
+        var tag = rd_tag(d, rec)
+        var off = rd_u32(d, rec + 8)
+        if off >= d.len() { off = 0 - 1 }                                // a table past the end is absent
+        if (tag == "head") { f.head_off = off }
+        else if (tag == "maxp") { f.maxp_off = off }
+        else if (tag == "hhea") { f.hhea_off = off }
+        else if (tag == "hmtx") { f.hmtx_off = off }
+        else if (tag == "cmap") { f.cmap_off = off }
+        else if (tag == "loca") { f.loca_off = off }
+        else if (tag == "glyf") { f.glyf_off = off }
+        else if (tag == "kern") { f.kern_off = off }
+        else if (tag == "GSUB") { f.gsub_off = off }
+        else if (tag == "GPOS") { f.gpos_off = off }
+        else if (tag == "GDEF") { f.gdef_off = off }
+        else if (tag == "OS/2") { f.os2_off = off }
+        else if (tag == "name") { f.name_off = off }
+        else if (tag == "post") { f.post_off = off }
+        else if (tag == "CFF ") { f.cff_off = off }
+        else if (tag == "CFF2") { f.cff2_off = off }
+        else if (tag == "CBDT") { f.cbdt_off = off }
+        else if (tag == "CBLC") { f.cblc_off = off }
+        else if (tag == "sbix") { f.sbix_off = off }
+        else if (tag == "COLR") { f.colr_off = off }
+        else if (tag == "CPAL") { f.cpal_off = off }
+        i = i + 1
+    }
+    if f.head_off < 0 { return font_err(d, "missing head table") }
+    if f.maxp_off < 0 { return font_err(d, "missing maxp table") }
+    let has_glyf = f.glyf_off >= 0 && f.loca_off >= 0
+    let has_bitmaps = f.cbdt_off >= 0 && f.cblc_off >= 0
+    if !has_glyf && f.cff_off < 0 && !has_bitmaps && f.sbix_off < 0 {
+        if f.cff2_off >= 0 { return font_err(d, "CFF2 (variable CFF) outlines are unsupported") }
+        return font_err(d, "no outlines: no glyf/loca, CFF or color bitmap tables")
+    }
+    // head: unitsPerEm @18, indexToLocFormat @50
+    f.units_per_em = rd_u16(d, f.head_off + 18)
+    f.index_to_loc = rd_i16(d, f.head_off + 50)
+    if f.units_per_em == 0 { return font_err(d, "invalid unitsPerEm = 0") }
+    // maxp: numGlyphs @4
+    f.num_glyphs = rd_u16(d, f.maxp_off + 4)
+    // hhea: ascender @4, descender @6, lineGap @8, numberOfHMetrics @34
+    if f.hhea_off >= 0 {
+        f.ascender = rd_i16(d, f.hhea_off + 4)
+        f.descender = rd_i16(d, f.hhea_off + 6)
+        f.line_gap = rd_i16(d, f.hhea_off + 8)
+        f.num_h_metrics = rd_u16(d, f.hhea_off + 34)
+    }
+    resolve_cmap(f)
+    if f.cmap_sub < 0 { return font_err(d, "no usable Unicode cmap subtable (need format 4 or 12)") }
+    resolve_gdef(f)
+    if !has_glyf && f.cff_off >= 0 { cff_resolve(f) }
+    return FontResult { ok: true, err: "", font: f }
+}
+
+// GDEF header: version u32, glyphClassDef @4, attachList @6, ligCaretList @8, markAttachClassDef
+// @10, and from version 1.2 markGlyphSetsDef @12. Offsets are from the start of GDEF; 0 = absent.
+fn resolve_gdef(inout f: Font) {
+    let g = f.gdef_off
+    if g < 0 { return }
+    let d = f.d
+    let gcd = rd_u16(d, g + 4)
+    let macd = rd_u16(d, g + 10)
+    if gcd != 0 { f.gdef_gcd = g + gcd }
+    if macd != 0 { f.gdef_macd = g + macd }
+    if rd_u16(d, g) == 1 && rd_u16(d, g + 2) >= 2 {
+        let mgs = rd_u16(d, g + 12)
+        if mgs != 0 { f.gdef_mgs = g + mgs }
+    }
+}
+
+/// units per em (the font's coordinate grid; scale = px / units_per_em).
+pub fn font_units_per_em(f: Font) -> Float { return to_float(f.units_per_em) }
+/// number of glyphs in the font.
+pub fn font_num_glyphs(f: Font) -> Int { return f.num_glyphs }
+
+/// vertical metrics in font units (scale by px/units_per_em for pixels).
+pub struct VMetrics { ascent: Float, descent: Float, line_gap: Float }
+/// the font's vertical metrics (font units).
+pub fn font_v_metrics(f: Font) -> VMetrics {
+    return VMetrics { ascent: to_float(f.ascender), descent: to_float(f.descender), line_gap: to_float(f.line_gap) }
+}
+
+/// map a Unicode codepoint to a glyph id (0 = .notdef / not found). cmap format 4 (BMP) + 12 (full).
+pub fn font_glyph_index(f: Font, cp: Int) -> Int {
+    if f.cmap_fmt == 4 { return cmap4_lookup(f.d, f.cmap_sub, cp) }
+    if f.cmap_fmt == 12 { return cmap12_lookup(f.d, f.cmap_sub, cp) }
+    return 0
+}
+// cmap format 4: segment mapping to delta values (BMP). Layout: format@0, length@2, language@4,
+// segCountX2@6, then searchRange/entrySelector/rangeShift, endCode[segCount]@14, reservedPad,
+// startCode[], idDelta[], idRangeOffset[].
+fn cmap4_lookup(d: Str, sub: Int, cp: Int) -> Int {
+    if cp > 65535 || cp < 0 { return 0 }
+    var segx2 = rd_u16(d, sub + 6)
+    var segc = segx2 / 2
+    var end_base = sub + 14
+    var start_base = end_base + segx2 + 2
+    var delta_base = start_base + segx2
+    var range_base = delta_base + segx2
+    // endCode[] rises: the segment is the first whose end is >= cp
+    var lo = 0
+    var hi = segc - 1
+    var i = 0 - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        if rd_u16(d, end_base + mid * 2) >= cp { i = mid  hi = mid - 1 } else { lo = mid + 1 }
+    }
+    if i < 0 { return 0 }
+    var startc = rd_u16(d, start_base + i * 2)
+    if cp < startc { return 0 }
+    var idr = rd_u16(d, range_base + i * 2)
+    if idr == 0 {
+        var delta = rd_u16(d, delta_base + i * 2)
+        return (cp + delta & 65535)
+    }
+    // glyph index via idRangeOffset indirection into the glyphIdArray
+    var gaddr = range_base + i * 2 + idr + (cp - startc) * 2
+    var g = rd_u16(d, gaddr)
+    if g == 0 { return 0 }
+    var delta = rd_u16(d, delta_base + i * 2)
+    return (g + delta & 65535)
+}
+// cmap format 12: segmented coverage (full Unicode). Layout: format@0, reserved@2, length@4,
+// language@8, numGroups@12, then groups[12 bytes each]: startChar, endChar, startGlyph.
+fn cmap12_lookup(d: Str, sub: Int, cp: Int) -> Int {
+    var ngroups = rd_u32(d, sub + 12)
+    var lo = 0
+    var hi = ngroups - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        var rec = sub + 16 + mid * 12
+        var startc = rd_u32(d, rec)
+        var endc = rd_u32(d, rec + 4)
+        if cp < startc { hi = mid - 1 }
+        else if cp > endc { lo = mid + 1 }
+        else { return rd_u32(d, rec + 8) + (cp - startc) }
+    }
+    return 0
+}
+
+/// the glyph for code point `cp` under variation selector `vs` (cmap format 14), or -1 when the
+/// font has no such variation sequence (a default sequence answers with the ordinary glyph).
+pub fn font_variation_glyph(f: Font, cp: Int, vs: Int) -> Int {
+    let d = f.d
+    let t = f.cmap_uvs
+    if t < 0 { return 0 - 1 }
+    let n = rd_u32(d, t + 6)
+    var lo = 0
+    var hi = n - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        let r = t + 10 + mid * 11
+        let sel = (rd_u16(d, r) << 8) | rd_u8(d, r + 2)
+        if vs < sel { hi = mid - 1 }
+        else if vs > sel { lo = mid + 1 }
+        else {
+            let dflt = rd_u32(d, r + 3)
+            let ndflt = rd_u32(d, r + 7)
+            if dflt != 0 {
+                let p = t + dflt
+                let nr = rd_u32(d, p)
+                var k = 0
+                while k < nr {
+                    let a = (rd_u16(d, p + 4 + k * 4) << 8) | rd_u8(d, p + 6 + k * 4)
+                    let cnt = rd_u8(d, p + 7 + k * 4)
+                    if cp >= a && cp <= a + cnt { return font_glyph_index(f, cp) }
+                    k = k + 1
+                }
+            }
+            if ndflt != 0 {
+                let p = t + ndflt
+                let nm = rd_u32(d, p)
+                var a = 0
+                var bnd = nm - 1
+                while a <= bnd {
+                    let m = (a + bnd) / 2
+                    let q = p + 4 + m * 5
+                    let u = (rd_u16(d, q) << 8) | rd_u8(d, q + 2)
+                    if cp < u { bnd = m - 1 } else if cp > u { a = m + 1 } else { return rd_u16(d, q + 3) }
+                }
+            }
+            return 0 - 1
+        }
+    }
+    return 0 - 1
+}
+
+/// horizontal advance width of glyph `gid` in font units. hmtx: numberOfHMetrics longHorMetric
+/// records (advanceWidth u16, lsb i16), then leftSideBearing[] for the remaining glyphs (all sharing
+/// the last advance width).
+pub fn font_h_advance(f: Font, gid: Int) -> Float {
+    if f.hmtx_off < 0 || f.num_h_metrics == 0 { return 0.0 }
+    var idx = gid
+    if idx >= f.num_h_metrics { idx = f.num_h_metrics - 1 }
+    return to_float(rd_u16(f.d, f.hmtx_off + idx * 4))
+}
+/// left side bearing of glyph `gid` in font units.
+pub fn font_lsb(f: Font, gid: Int) -> Float {
+    if f.hmtx_off < 0 { return 0.0 }
+    if gid < f.num_h_metrics { return to_float(rd_i16(f.d, f.hmtx_off + gid * 4 + 2)) }
+    var tail = f.hmtx_off + f.num_h_metrics * 4 + (gid - f.num_h_metrics) * 2
+    return to_float(rd_i16(f.d, tail))
+}
+
+// the byte range of glyph `gid`'s outline data in the glyf table, via loca. Returns [start, end);
+// start == end means an empty glyph (e.g. space). res[0]=start, res[1]=end (both glyf-relative), or
+// res[0] = -1 when out of range.
+fn glyf_range(f: Font, gid: Int, inout res: Vec<Int>) {
+    if gid < 0 || gid >= f.num_glyphs { res[0] = 0 - 1  return }
+    var d = f.d
+    var lo = 0
+    var hi = 0
+    if f.index_to_loc == 0 {
+        lo = rd_u16(d, f.loca_off + gid * 2) * 2
+        hi = rd_u16(d, f.loca_off + (gid + 1) * 2) * 2
+    } else {
+        lo = rd_u32(d, f.loca_off + gid * 4)
+        hi = rd_u32(d, f.loca_off + (gid + 1) * 4)
+    }
+    res[0] = f.glyf_off + lo
+    res[1] = f.glyf_off + hi
+    if lo == hi { res[0] = f.glyf_off + lo  res[1] = f.glyf_off + lo }
+}
+
+// cursor helpers for signed 8-bit + F2Dot14 (composite glyphs)
+fn ci8(inout c: Cur) -> Int { var b = cu8(c)  if b >= 128 { return b - 256 }  return b }
+fn cf2dot14(inout c: Cur) -> Float { var v = ci16(c)  return to_float(v) / 16384.0 }
+
+// ============================================================================
+// glyf outline extraction (simple + composite glyphs)
+// ============================================================================
+
+/// one path segment inside a contour: kind 0 = line to (x,y); kind 1 = quadratic to (x,y) with
+/// control (cx,cy); kind 2 = cubic to (x,y) with controls (cx,cy) and (c2x,c2y); CFF outlines.
+/// Coordinates are in font units.
+pub struct FSeg { kind: Int, cx: Float, cy: Float, x: Float, y: Float, c2x: Float = 0.0, c2y: Float = 0.0 }
+/// a closed contour: a start point (sx,sy) followed by segments back around to it.
+pub struct Contour { sx: Float, sy: Float, segs: Vec<FSeg> }
+/// a glyph outline: contours + the glyph bounding box (font units).
+pub struct Outline { contours: Vec<Contour>, xmin: Float, ymin: Float, xmax: Float, ymax: Float }
+
+// a small builder that turns moveto/lineto/curveto calls into Contour records.
+struct OB { contours: Vec<Contour>, cur: Vec<FSeg>, sx: Float, sy: Float, has: Bool }
+fn ob_new() -> OB { var cs: Vec<Contour> = vec()  var cu: Vec<FSeg> = vec()  return OB { contours: cs, cur: cu, sx: 0.0, sy: 0.0, has: false } }
+fn ob_flush(inout ob: OB) {
+    if ob.has { ob.contours.push(Contour { sx: ob.sx, sy: ob.sy, segs: sink ob.cur }) }
+    ob.has = false
+}
+fn ob_moveto(inout ob: OB, x: Float, y: Float) {
+    // a flush that pushed handed `cur` to the Contour (`sink ob.cur`) and left a fresh empty vector
+    // in its place; one that did not leaves the still-empty `cur` where it was
+    ob_flush(ob)
+    ob.sx = x
+    ob.sy = y
+    ob.has = true
+}
+fn ob_lineto(inout ob: OB, x: Float, y: Float) { ob.cur.push(FSeg { kind: 0, cx: 0.0, cy: 0.0, x: x, y: y }) }
+fn ob_curveto(inout ob: OB, cx: Float, cy: Float, x: Float, y: Float) { ob.cur.push(FSeg { kind: 1, cx: cx, cy: cy, x: x, y: y }) }
+fn ob_cubicto(inout ob: OB, c1x: Float, c1y: Float, c2x: Float, c2y: Float, x: Float, y: Float) { ob.cur.push(FSeg { kind: 2, cx: c1x, cy: c1y, x: x, y: y, c2x: c2x, c2y: c2y }) }
+
+// close the current contour, honoring the start-off-curve / trailing-off-curve cases (ports
+// stb_truetype's close_shape: sx/sy = contour start, scx/scy = start off-curve control, cx/cy =
+// last off-curve control).
+fn close_contour(inout ob: OB, was_off: Bool, start_off: Bool, sx: Float, sy: Float, scx: Float, scy: Float, cx: Float, cy: Float) {
+    if start_off {
+        if was_off { ob_curveto(ob, cx, cy, (cx + scx) / 2.0, (cy + scy) / 2.0) }
+        ob_curveto(ob, scx, scy, sx, sy)
+    } else {
+        if was_off { ob_curveto(ob, cx, cy, sx, sy) }
+        else { ob_lineto(ob, sx, sy) }
+    }
+}
+
+// decode a simple glyph's points into an OB. `start` points at numberOfContours.
+fn decode_simple(f: Font, start: Int, ncont: Int, inout ob: OB) {
+    var d = f.d
+    var c = cur_at(d, start)
+    ci16(c)                                   // numberOfContours (already known)
+    ci16(c)  ci16(c)  ci16(c)  ci16(c)        // xMin/yMin/xMax/yMax (bbox taken from header)
+    // endPtsOfContours
+    var endpts: Vec<Int> = vec()
+    var ci = 0
+    while ci < ncont { endpts.push(cu16(c))  ci = ci + 1 }
+    var npts = 0
+    if ncont > 0 { npts = endpts[ncont - 1] + 1 }
+    // endPtsOfContours must rise. When it does not, the contour walk below would look past the points
+    // it has, so a glyph that says otherwise draws nothing rather than read what is not there.
+    ci = 1
+    while ci < ncont { if endpts[ci] <= endpts[ci - 1] { return }  ci = ci + 1 }
+    // skip instructions
+    var ins_len = cu16(c)
+    c.p = c.p + ins_len
+    // flags (run-length via REPEAT bit 0x08)
+    var flags: Vec<Int> = vec()
+    while flags.len() < npts {
+        var fl = cu8(c)
+        flags.push(fl)
+        if (fl & 8) != 0 {
+            var rep = cu8(c)
+            var k = 0
+            while k < rep { flags.push(fl)  k = k + 1 }
+        }
+    }
+    // x coordinates (delta-encoded; bit 0x02 = short, bit 0x10 = same-or-positive)
+    var xs: Vec<Float> = vec()
+    var xacc = 0
+    var i = 0
+    while i < npts {
+        var fl = flags[i]
+        if (fl & 2) != 0 {
+            var dx = cu8(c)
+            if (fl & 16) == 0 { dx = 0 - dx }
+            xacc = xacc + dx
+        } else {
+            if (fl & 16) == 0 { xacc = xacc + ci16(c) }
+        }
+        xs.push(to_float(xacc))
+        i = i + 1
+    }
+    // y coordinates (bit 0x04 = short, bit 0x20 = same-or-positive)
+    var ys: Vec<Float> = vec()
+    var yacc = 0
+    i = 0
+    while i < npts {
+        var fl = flags[i]
+        if (fl & 4) != 0 {
+            var dy = cu8(c)
+            if (fl & 32) == 0 { dy = 0 - dy }
+            yacc = yacc + dy
+        } else {
+            if (fl & 32) == 0 { yacc = yacc + ci16(c) }
+        }
+        ys.push(to_float(yacc))
+        i = i + 1
+    }
+    // assemble contours (ports stb_truetype's vertex walk)
+    var oncurve: Vec<Int> = vec()
+    i = 0
+    while i < npts { oncurve.push((flags[i] & 1))  i = i + 1 }
+    var next_move = 0
+    var j = 0                                   // contour index
+    var was_off = false
+    var start_off = false
+    var sx = 0.0
+    var sy = 0.0
+    var scx = 0.0
+    var scy = 0.0
+    var cx = 0.0
+    var cy = 0.0
+    i = 0
+    while i < npts {
+        var on = oncurve[i] == 1
+        var px = xs[i]
+        var py = ys[i]
+        if next_move == i {
+            if i != 0 { close_contour(ob, was_off, start_off, sx, sy, scx, scy, cx, cy) }
+            start_off = !on
+            // The next point is only usable if it is in this contour. A contour of one off-curve point
+            // is legal and hinted fonts carry them (Calibri among them); reading `i + 1` for it took the
+            // next contour's first point, or, for the glyph's last contour, a point that does not
+            // exist, and trapped. A lone point starts and ends where it is.
+            if start_off && i + 1 > endpts[j] {
+                scx = px
+                scy = py
+                sx = px
+                sy = py
+            } else if start_off {
+                scx = px
+                scy = py
+                var nxt_on = oncurve[i + 1] == 1
+                if !nxt_on {
+                    sx = (px + xs[i + 1]) / 2.0
+                    sy = (py + ys[i + 1]) / 2.0
+                } else {
+                    sx = xs[i + 1]
+                    sy = ys[i + 1]
+                    i = i + 1                   // consume the next point as the start
+                }
+            } else {
+                sx = px
+                sy = py
+            }
+            ob_moveto(ob, sx, sy)
+            was_off = false
+            next_move = 1 + endpts[j]
+            j = j + 1
+        } else {
+            if !on {
+                if was_off { ob_curveto(ob, cx, cy, (cx + px) / 2.0, (cy + py) / 2.0) }
+                cx = px
+                cy = py
+                was_off = true
+            } else {
+                if was_off { ob_curveto(ob, cx, cy, px, py) }
+                else { ob_lineto(ob, px, py) }
+                was_off = false
+            }
+        }
+        i = i + 1
+    }
+    if ob.has { close_contour(ob, was_off, start_off, sx, sy, scx, scy, cx, cy) }
+}
+
+// transform every contour of `src` by the 2x2 [a,b,c,d] + translate (dx,dy) and append to `ob`.
+fn append_transformed(inout ob: OB, src: Outline, a: Float, b: Float, cc: Float, dd: Float, dx: Float, dy: Float) {
+    var ci = 0
+    while ci < src.contours.len() {
+        var ct = src.contours[ci]
+        var nsx = a * ct.sx + cc * ct.sy + dx
+        var nsy = b * ct.sx + dd * ct.sy + dy
+        ob_moveto(ob, nsx, nsy)
+        var si = 0
+        while si < ct.segs.len() {
+            var sg = ct.segs[si]
+            var nx = a * sg.x + cc * sg.y + dx
+            var ny = b * sg.x + dd * sg.y + dy
+            if sg.kind == 1 {
+                var ncx = a * sg.cx + cc * sg.cy + dx
+                var ncy = b * sg.cx + dd * sg.cy + dy
+                ob_curveto(ob, ncx, ncy, nx, ny)
+            } else if sg.kind == 2 {
+                ob_cubicto(ob, a * sg.cx + cc * sg.cy + dx, b * sg.cx + dd * sg.cy + dy,
+                    a * sg.c2x + cc * sg.c2y + dx, b * sg.c2x + dd * sg.c2y + dy, nx, ny)
+            } else {
+                ob_lineto(ob, nx, ny)
+            }
+            si = si + 1
+        }
+        ci = ci + 1
+    }
+}
+
+// decode a composite glyph (numberOfContours == -1): recurse into components, transform, append.
+fn decode_composite(f: Font, start: Int, depth: Int, inout ob: OB) {
+    var d = f.d
+    var c = cur_at(d, start)
+    ci16(c)                                   // -1
+    ci16(c)  ci16(c)  ci16(c)  ci16(c)        // bbox
+    var more = true
+    while more {
+        var flags = cu16(c)
+        var cgid = cu16(c)
+        var arg1 = 0
+        var arg2 = 0
+        if (flags & 1) != 0 { arg1 = ci16(c)  arg2 = ci16(c) }     // ARG_1_AND_2_ARE_WORDS
+        else { arg1 = ci8(c)  arg2 = ci8(c) }
+        var a = 1.0
+        var b = 0.0
+        var cc = 0.0
+        var dd = 1.0
+        if (flags & 8) != 0 { a = cf2dot14(c)  dd = a }            // WE_HAVE_A_SCALE
+        else if (flags & 64) != 0 { a = cf2dot14(c)  dd = cf2dot14(c) }   // X_AND_Y_SCALE
+        else if (flags & 128) != 0 { a = cf2dot14(c)  b = cf2dot14(c)  cc = cf2dot14(c)  dd = cf2dot14(c) }   // 2x2
+        var dx = 0.0
+        var dy = 0.0
+        if (flags & 2) != 0 { dx = to_float(arg1)  dy = to_float(arg2) }   // ARGS_ARE_XY_VALUES
+        var sub = glyph_outline_depth(f, cgid, depth + 1)
+        append_transformed(ob, sub, a, b, cc, dd, dx, dy)
+        more = (flags & 32) != 0                                   // MORE_COMPONENTS
+    }
+}
+
+fn glyph_outline_depth(f: Font, gid: Int, depth: Int) -> Outline {
+    var empty: Vec<Contour> = vec()
+    var out = Outline { contours: empty, xmin: 0.0, ymin: 0.0, xmax: 0.0, ymax: 0.0 }
+    if depth > 8 { return out }
+    if f.glyf_off < 0 || f.loca_off < 0 {
+        if f.cff_cs >= 0 { return cff_outline(f, gid) }
+        return out
+    }
+    var res: Vec<Int> = vec()
+    res.push(0)
+    res.push(0)
+    glyf_range(f, gid, res)
+    if res[0] < 0 { return out }
+    if res[0] == res[1] { return out }        // empty glyph (e.g. space)
+    var start = res[0]
+    var ncont = rd_i16(f.d, start)
+    out.xmin = to_float(rd_i16(f.d, start + 2))
+    out.ymin = to_float(rd_i16(f.d, start + 4))
+    out.xmax = to_float(rd_i16(f.d, start + 6))
+    out.ymax = to_float(rd_i16(f.d, start + 8))
+    var ob = ob_new()
+    if ncont >= 0 { decode_simple(f, start, ncont, ob) }
+    else { decode_composite(f, start, depth, ob) }
+    ob_flush(ob)
+    out.contours = sink ob.contours
+    return out
+}
+
+/// extract glyph `gid`'s outline (contours of line/quad segments, font units). Empty glyphs
+/// (space, or out-of-range) return an outline with no contours.
+pub fn font_outline(f: Font, gid: Int) -> Outline { return glyph_outline_depth(f, gid, 0) }
+/// number of contours in an outline.
+pub fn outline_num_contours(o: Outline) -> Int { return o.contours.len() }
+
+// ============================================================================
+// coverage rasterizer
+// ============================================================================
+
+fn fabs(x: Float) -> Float { if x < 0.0 { return 0.0 - x }  return x }
+fn fmin(a: Float, b: Float) -> Float { if a < b { return a }  return b }
+fn fmax(a: Float, b: Float) -> Float { if a > b { return a }  return b }
+fn floor_int(x: Float) -> Int { var t = to_int(x)  if x < 0.0 && to_float(t) != x { return t - 1 }  return t }
+fn ceil_int(x: Float) -> Int { var t = to_int(x)  if x > 0.0 && to_float(t) != x { return t + 1 }  return t }
+fn ffloor(x: Float) -> Float { return to_float(floor_int(x)) }
+fn fceil(x: Float) -> Float { return to_float(ceil_int(x)) }
+
+// the signed-area accumulation grid: a[i] holds coverage deltas; the running sum over a row gives
+// per-pixel coverage. Sized w*h+4 (the trailing slack absorbs edge writes, like ab_glyph).
+pub struct Rast { w: Int, h: Int, a: Vec<Float> }
+fn rast_new(w: Int, h: Int) -> Rast {
+    var a: Vec<Float> = vec()
+    var n = w * h + 4
+    var i = 0
+    while i < n { a.push(0.0)  i = i + 1 }
+    return Rast { w: w, h: h, a: a }
+}
+// a[idx] += val, returning false when idx is out of bounds (the caller skips that sample).
+fn r_add(inout r: Rast, idx: Int, val: Float) -> Bool {
+    if idx < 0 { return false }
+    if idx >= r.a.len() { return false }
+    r.a[idx] = r.a[idx] + val
+    return true
+}
+// add a straight edge p0->p1 to the accumulation grid (draw_line_scalar, including the
+// continue-skips-x-advance behavior on an out-of-bounds write).
+fn draw_line(inout r: Rast, p0x: Float, p0y: Float, p1x: Float, p1y: Float) {
+    if fabs(p0y - p1y) <= 0.000001 { return }
+    var dir = 1.0
+    var ax = p0x
+    var ay = p0y
+    var bx = p1x
+    var by = p1y
+    if p0y >= p1y { dir = 0.0 - 1.0  ax = p1x  ay = p1y  bx = p0x  by = p0y }
+    var dxdy = (bx - ax) / (by - ay)
+    var x = ax
+    var y0 = to_int(ay)                       // f32 as usize: truncate-toward-zero, saturate <0 to 0
+    if y0 < 0 { y0 = 0 }
+    if ay < 0.0 { x = x - ay * dxdy }
+    var hi = r.h
+    var pc = ceil_int(by)
+    if pc < hi { hi = pc }
+    var y = y0
+    while y < hi {
+        var linestart = y * r.w
+        var dy = fmin(to_float(y + 1), by) - fmax(to_float(y), ay)
+        var xnext = x + dxdy * dy
+        var d = dy * dir
+        var x0v = x
+        var x1v = xnext
+        if x >= xnext { x0v = xnext  x1v = x }
+        var x0floor = ffloor(x0v)
+        var x0i = to_int(x0floor)
+        var x1ceil = fceil(x1v)
+        var x1i = to_int(x1ceil)
+        var ls = linestart + x0i
+        if ls >= 0 {
+            var ok = true
+            if x1i <= x0i + 1 {
+                var xmf = 0.5 * (x + xnext) - x0floor
+                ok = r_add(r, ls, d - d * xmf)
+                if ok { ok = r_add(r, ls + 1, d * xmf) }
+            } else {
+                var s = 1.0 / (x1v - x0v)
+                var x0f = x0v - x0floor
+                var a0 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f)
+                var x1f = x1v - x1ceil + 1.0
+                var am = 0.5 * s * x1f * x1f
+                ok = r_add(r, ls, d * a0)
+                if ok {
+                    if x1i == x0i + 2 {
+                        ok = r_add(r, ls + 1, d * (1.0 - a0 - am))
+                    } else {
+                        var a1 = s * (1.5 - x0f)
+                        ok = r_add(r, ls + 1, d * (a1 - a0))
+                        var xi = x0i + 2
+                        while ok && xi < x1i - 1 {
+                            ok = r_add(r, linestart + xi, d * s)
+                            xi = xi + 1
+                        }
+                        if ok {
+                            var a2 = a1 + to_float(x1i - x0i - 3) * s
+                            ok = r_add(r, linestart + (x1i - 1), d * (1.0 - a2 - am))
+                        }
+                    }
+                }
+                if ok { ok = r_add(r, linestart + x1i, d * am) }
+            }
+            if ok { x = xnext }               // ab_glyph advances x only if no add hit `continue`
+        }
+        y = y + 1
+    }
+}
+// add a quadratic p0->p2 (control p1) by adaptive line subdivision (draw_quad).
+fn draw_quad(inout r: Rast, p0x: Float, p0y: Float, p1x: Float, p1y: Float, p2x: Float, p2y: Float) {
+    var devx = p0x - 2.0 * p1x + p2x
+    var devy = p0y - 2.0 * p1y + p2y
+    var devsq = devx * devx + devy * devy
+    if devsq < 0.333 { draw_line(r, p0x, p0y, p2x, p2y)  return }
+    var n = 1 + floor_int(sqrt(sqrt(3.0 * devsq)))
+    var px = p0x
+    var py = p0y
+    var nrecip = 1.0 / to_float(n)
+    var t = 0.0
+    var i = 0
+    while i < n - 1 {
+        t = t + nrecip
+        var ax = p0x + t * (p1x - p0x)
+        var ay = p0y + t * (p1y - p0y)
+        var bx = p1x + t * (p2x - p1x)
+        var by = p1y + t * (p2y - p1y)
+        var qx = ax + t * (bx - ax)
+        var qy = ay + t * (by - ay)
+        draw_line(r, px, py, qx, qy)
+        px = qx
+        py = qy
+        i = i + 1
+    }
+    draw_line(r, px, py, p2x, p2y)
+}
+
+/// a rasterized glyph: an `w`x`h` 8-bit coverage bitmap (`cov`, row-major, 0..255) plus placement
+/// offsets: `left` = pixels right of the pen origin, `top` = pixels above the baseline. Place at
+/// screen (pen_x + left, baseline_y - top).
+pub struct GlyphBitmap { w: Int, h: Int, left: Int, top: Int, cov: Vec<Int> }
+fn glyph_bitmap_empty() -> GlyphBitmap { var c: Vec<Int> = vec()  return GlyphBitmap { w: 0, h: 0, left: 0, top: 0, cov: c } }
+
+// ── light autohinting (vertical only) ───────────────────────────────────────────────────────────
+//
+// Why a glyph looks soft: an outline is a continuous shape, but a pixel row is not. At 16px the top
+// of a lowercase letter lands at, say, y = 8.45, so its edge is split across two rows at partial
+// coverage and reads as a grey smear rather than an edge. Every letter lands on a different
+// fraction, so a line of text has no shared horizontal rhythm at all.
+//
+// The fix is to move the outline, not the pixels: find the few y positions a Latin face aligns its
+// horizontals to (baseline, x-height, cap height, ascender, descender), round those to whole pixels,
+// and warp everything in between to follow. Vertically only: horizontal positions stay exactly
+// where the metrics put them, so advances and therefore line breaking are untouched. That is the
+// same trade FreeType's `hintslight` makes, and what the reference Chromium renders with here.
+//
+// The zones are measured off the face's own glyphs rather than read from OS/2, because OS/2's
+// sxHeight/sCapHeight are optional and routinely wrong; the outlines never are.
+/// the y values (font units) a face aligns its horizontal edges to. `xr`/`cr`/`rb` are the round
+/// zones: `o` and `O` are drawn slightly taller than `x` and `H`, and dip slightly below the
+/// baseline, so the curve does not read as short or as floating. That overshoot is worth keeping at
+/// display sizes and worth suppressing when it is a fraction of a pixel.
+pub struct Blues { ok: Bool, desc: Float, xf: Float, xr: Float, cf: Float, cr: Float, asc: Float, rb: Float }
+fn blues_none() -> Blues { return Blues { ok: false, desc: 0.0, xf: 0.0, xr: 0.0, cf: 0.0, cr: 0.0, asc: 0.0, rb: 0.0 } }
+// The two zone roundings. Which zone gets which is measured against the reference, and the two
+// disagree, so neither one alone would do.
+//
+// The x-height and cap round away from the baseline: at 12/14/16px Liberation Sans's x-height scales
+// to 6.34/7.40/8.45px and the reference Chromium renders it 7/8/9 pixels tall: ceil, not round,
+// which would have given 6/7/8. Rounding those to nearest left every other size a pixel short and
+// alternately compressed and stretched the glyph as the size changed, which shows up as text weight
+// visibly wobbling between adjacent font sizes; expanding outward is monotone in size, so it does
+// not.
+//
+// The ascender and descender round to nearest. Rounding those outward instead renders `b` one and
+// sometimes two rows taller than the reference across 12..24px, where nearest matches it at six
+// sizes out of eight. The two primary zones carry the text's rhythm and get pushed out; the outer
+// two are minor and do not.
+fn zone_near(v: Float) -> Float { return to_float(floor_int(v + 0.5)) }
+fn zone_out(v: Float) -> Float {
+    if v > 0.0 { return to_float(ceil_int(v)) }
+    if v < 0.0 { return to_float(floor_int(v)) }
+    return 0.0
+}
+// the median ymax (top=true) or ymin (top=false) over the reference characters that the face has;
+// median, not max, so one atypical glyph in the set cannot drag a zone off on its own.
+fn blue_edge(f: Font, chars: Vec<Int>, top: Bool) -> Float {
+    var vs: Vec<Float> = vec()
+    var i = 0
+    while i < chars.len() {
+        let gid = font_glyph_index(f, chars[i])
+        if gid != 0 {
+            let o = font_outline(f, gid)
+            if o.contours.len() > 0 { if top { vs.push(o.ymax) } else { vs.push(o.ymin) } }
+        }
+        i = i + 1
+    }
+    if vs.len() == 0 { return 0.0 }
+    var a = 0                                                     // insertion sort: the set is ~6 long
+    while a < vs.len() {
+        var b = a + 1
+        while b < vs.len() { if vs[b] < vs[a] { let t = vs[a]  vs[a] = vs[b]  vs[b] = t }  b = b + 1 }
+        a = a + 1
+    }
+    return vs[vs.len() / 2]
+}
+fn blue_chars(s: Str) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    var i = 0
+    while i < s.len() { out.push(ord(s.at(i)))  i = i + 1 }
+    return out
+}
+/// measure a face's Latin blue zones. Cached per font, this outlines ~25 glyphs.
+pub fn font_blues(f: Font) -> Blues {
+    let desc = blue_edge(f, blue_chars("pqgyj"), false)
+    let xf = blue_edge(f, blue_chars("xzvw"), true)
+    let xr = blue_edge(f, blue_chars("oesc"), true)
+    let cf = blue_edge(f, blue_chars("HEZLFT"), true)
+    let cr = blue_edge(f, blue_chars("OCGSQ"), true)
+    let asc = blue_edge(f, blue_chars("bdfhkl"), true)
+    // Round letters dip below the baseline as well as rising above the x-height: `o` and `b` are
+    // drawn a few units low so the curve does not read as floating. At text sizes that dip is
+    // hundredths of a pixel, and without a zone for it the bitmap gains a whole extra row to hold a
+    // 3%-coverage sliver nobody can see.
+    let rb = blue_edge(f, blue_chars("oescbdgpq"), false)
+    // A face we could not read a lowercase height off is not a Latin text face (icon fonts, a
+    // symbol subset); leave it alone rather than warp it against zones that mean nothing.
+    if xf <= 0.0 || cf <= 0.0 { return blues_none() }
+    return Blues { ok: true, desc: desc, xf: xf, xr: xr, cf: cf, cr: cr, asc: asc, rb: rb }
+}
+global g_blu_on: Int = 0
+global g_blu_key: Vec<Int>
+global g_blu_ok: Vec<Int>
+global g_blu_v: Vec<Float>                                        // 7 floats per entry
+// a per-face discriminator for the caches: two faces collide only if they agree on every table
+// offset this mixes, the glyph count and the file length.
+fn font_disc(f: Font) -> Int {
+    var h = f.d.len() * 31 + f.face_off
+    h = h * 131 + f.glyf_off
+    h = h * 131 + f.cff_off
+    h = h * 131 + f.cmap_off
+    h = h * 131 + f.gsub_off
+    h = h * 17 + f.num_glyphs
+    return (h & 0x3FFFFFF)
+}
+/// a number that identifies a face for caching: two loads (or copies) of the same face agree on it,
+/// and two different faces agree only by an improbable accident of their table layout.
+pub fn font_identity(f: Font) -> Int { return font_disc(f) }
+fn font_blues_cached(f: Font) -> Blues {
+    if g_blu_on == 0 { g_blu_key = vec()  g_blu_ok = vec()  g_blu_v = vec()  g_blu_on = 1 }
+    let k = font_disc(f)
+    var i = 0
+    while i < g_blu_key.len() {
+        if g_blu_key[i] == k {
+            if g_blu_ok[i] == 0 { return blues_none() }
+            let o = i * 7
+            return Blues { ok: true, desc: g_blu_v[o], xf: g_blu_v[o + 1], xr: g_blu_v[o + 2], cf: g_blu_v[o + 3], cr: g_blu_v[o + 4], asc: g_blu_v[o + 5], rb: g_blu_v[o + 6] }
+        }
+        i = i + 1
+    }
+    let b = font_blues(f)
+    g_blu_key.push(k)
+    var okf = 0  if b.ok { okf = 1 }
+    g_blu_ok.push(okf)
+    g_blu_v.push(b.desc)  g_blu_v.push(b.xf)  g_blu_v.push(b.xr)  g_blu_v.push(b.cf)  g_blu_v.push(b.cr)  g_blu_v.push(b.asc)  g_blu_v.push(b.rb)
+    return b
+}
+// ── horizontal edges and stems ──────────────────────────────────────────────────────────────────
+//
+// Snapping the blue zones fixes where a glyph starts and stops, but not the strokes inside it. The
+// crossbar of an H, the bar of an e, the top and bottom of an o are each a horizontal stroke whose
+// thickness lands on some fraction of a pixel, so each is drawn as two half-lit rows instead of one
+// solid one, and its weight drifts with size as the fraction wanders. Rounding stroke widths to
+// whole pixels is what stops that, and it is the half of FreeType's autofit that zone snapping alone
+// leaves out.
+//
+// The work is done entirely in the y remap: an edge contributes a control point, so the outline is
+// never rebuilt and the map stays one monotonic function.
+fn flat_seg(inout ys: Vec<Float>, inout ws: Vec<Float>, inout ds: Vec<Float>, x0: Float, y0: Float, x1: Float, y1: Float) {
+    var ax = x1 - x0  if ax < 0.0 { ax = 0.0 - ax }
+    var ay = y1 - y0  if ay < 0.0 { ay = 0.0 - ay }
+    if ax < 0.35 { return }                                       // too short to have a direction
+    if ay > ax * 0.2 { return }                                   // not flat enough to be an edge
+    ys.push((y0 + y1) * 0.5)
+    ws.push(ax)
+    // Which way the contour runs along the edge separates a stroke's underside from its top, which
+    // is what lets two edges be recognised as the two sides of one stroke.
+    if x1 > x0 { ds.push(1.0) } else { ds.push(0.0 - 1.0) }
+}
+// walk the outline in pixel space collecting flat runs; quadratics are subdivided, because the top of
+// a round stroke is an edge too and only shows up once the curve is in pieces.
+fn glyph_flats(o: Outline, scale: Float, inout ys: Vec<Float>, inout ws: Vec<Float>, inout ds: Vec<Float>) {
+    var ci = 0
+    while ci < o.contours.len() {
+        let ct = o.contours[ci]
+        var cx = ct.sx * scale
+        var cy = ct.sy * scale
+        var si = 0
+        while si < ct.segs.len() {
+            let sg = ct.segs[si]
+            let ex = sg.x * scale
+            let ey = sg.y * scale
+            if sg.kind == 1 {
+                let qx = sg.cx * scale
+                let qy = sg.cy * scale
+                var px = cx  var py = cy
+                var k = 1
+                while k <= 4 {
+                    let t = to_float(k) / 4.0
+                    let u = 1.0 - t
+                    let nx = u * u * cx + 2.0 * u * t * qx + t * t * ex
+                    let ny = u * u * cy + 2.0 * u * t * qy + t * t * ey
+                    flat_seg(ys, ws, ds, px, py, nx, ny)
+                    px = nx  py = ny
+                    k = k + 1
+                }
+            } else if sg.kind == 2 {
+                let ax = sg.cx * scale  let ay = sg.cy * scale
+                let bx = sg.c2x * scale  let by = sg.c2y * scale
+                var px = cx  var py = cy
+                var k = 1
+                while k <= 6 {
+                    let t = to_float(k) / 6.0
+                    let u = 1.0 - t
+                    let nx = u * u * u * cx + 3.0 * u * u * t * ax + 3.0 * u * t * t * bx + t * t * t * ex
+                    let ny = u * u * u * cy + 3.0 * u * u * t * ay + 3.0 * u * t * t * by + t * t * t * ey
+                    flat_seg(ys, ws, ds, px, py, nx, ny)
+                    px = nx  py = ny
+                    k = k + 1
+                }
+            } else { flat_seg(ys, ws, ds, cx, cy, ex, ey) }
+            cx = ex  cy = ey
+            si = si + 1
+        }
+        ci = ci + 1
+    }
+}
+// merge flat runs that sit at the same height into one edge, weighted by how much of the glyph each
+// spans. Runs closer together than this are the same stroke boundary seen in pieces.
+fn EDGE_MERGE_PX() -> Float { return 0.35 }
+// an edge carrying less than this much horizontal extent is a nick, not a stroke boundary; snapping
+// to it would move real geometry to satisfy something invisible.
+fn EDGE_MIN_W() -> Float { return 0.9 }
+fn build_edges(inout ys: Vec<Float>, inout ws: Vec<Float>, inout ds: Vec<Float>, inout ey: Vec<Float>, inout ew: Vec<Float>, inout ed: Vec<Float>) {
+    let n = ys.len()
+    var i = 0
+    while i < n {                                                 // sort by y (insertion; n is small)
+        var j = i + 1
+        while j < n {
+            if ys[j] < ys[i] {
+                let ty = ys[i]  ys[i] = ys[j]  ys[j] = ty
+                let tw = ws[i]  ws[i] = ws[j]  ws[j] = tw
+                let td = ds[i]  ds[i] = ds[j]  ds[j] = td
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    var k = 0
+    while k < n {
+        var sumW = ws[k]
+        var sumY = ys[k] * ws[k]
+        var sumD = ds[k] * ws[k]
+        var m = k + 1
+        while m < n && ys[m] - ys[k] <= EDGE_MERGE_PX() {
+            sumW = sumW + ws[m]
+            sumY = sumY + ys[m] * ws[m]
+            sumD = sumD + ds[m] * ws[m]
+            m = m + 1
+        }
+        if sumW >= EDGE_MIN_W() {
+            ey.push(sumY / sumW)
+            ew.push(sumW)
+            if sumD >= 0.0 { ed.push(1.0) } else { ed.push(0.0 - 1.0) }
+        }
+        k = m
+    }
+}
+// a monotonic piecewise-linear remap of scaled y, in pixels, baseline at 0 and y UP.
+struct YMap { on: Bool, src: Vec<Float>, dst: Vec<Float> }
+fn ymap_off() -> YMap { var a: Vec<Float> = vec()  var b: Vec<Float> = vec()  return YMap { on: false, src: a, dst: b } }
+// an overshoot smaller than this is invisible as shape and merely blurs the edge, so the round zone
+// snaps onto the flat one instead of claiming a row of its own.
+fn OVERSHOOT_PX() -> Float { return 0.6 }
+// A stroke wider than this gains nothing from rounding, the error is a small fraction of it, and
+// snapping it would move more geometry than it is worth.
+fn STEM_MAX_PX() -> Float { return 4.0 }
+// how far an edge may be from a blue zone and still be considered the same boundary
+fn BLUE_NEAR_PX() -> Float { return 0.5 }
+// Pair each edge with the nearest edge of opposite direction, the two sides of one stroke, and add
+// a control point for each, so the stroke lands on whole pixels and keeps a whole-pixel width. Only
+// Mutual nearest pairs count: that is what stops an edge being dragged toward something that is not
+// its own stroke. An edge already fixed by a blue zone anchors its stroke rather than moving.
+fn add_stem_points(o: Outline, scale: Float, bsrc: Vec<Float>, bdst: Vec<Float>, inout src: Vec<Float>, inout dst: Vec<Float>) {
+    var fy: Vec<Float> = vec()  var fw: Vec<Float> = vec()  var fd: Vec<Float> = vec()
+    glyph_flats(o, scale, fy, fw, fd)
+    // Sorting and pairing are quadratic in the number of flat runs, which is fine for a Latin letter
+    // (a few dozen) and not for a dense ideograph. Those have no Latin stems to find anyway, so the
+    // cap costs nothing real, it only stops one pathological glyph from dominating a page's paint.
+    if fy.len() > 256 { return }
+    var ey: Vec<Float> = vec()  var ew: Vec<Float> = vec()  var ed: Vec<Float> = vec()
+    build_edges(fy, fw, fd, ey, ew, ed)
+    let n = ey.len()
+    if n < 2 { return }
+    // nearest opposite-direction edge for each
+    var near: Vec<Int> = vec()
+    var i = 0
+    while i < n {
+        var best = 0 - 1
+        var bestD = STEM_MAX_PX()
+        var j = 0
+        while j < n {
+            if j != i && ed[j] != ed[i] {
+                var d = ey[j] - ey[i]  if d < 0.0 { d = 0.0 - d }
+                if d < bestD { bestD = d  best = j }
+            }
+            j = j + 1
+        }
+        near.push(best)
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        let j = near[i]
+        if j > i && near[j] == i {                                // a mutual pair, taken once
+            var lo = i  var hi = j
+            if ey[hi] < ey[lo] { lo = j  hi = i }
+            let w = ey[hi] - ey[lo]
+            if w >= 0.05 {
+                // Positions snap; widths do not. Rounding the width too was the obvious reading of
+                // "stem snapping", and it is wrong for this target: measured, Chromium renders the
+                // H crossbar of Liberation Sans at 16px as one full row plus a 25% row: 1.25px, the
+                // natural width, neither rounded down to 1 nor up to 2. Light hinting moves a stroke
+                // onto the grid and leaves its weight alone; rounding widths as well quantises stroke
+                // weight in ~25% steps and makes it lurch between adjacent sizes.
+                var wr = w
+                if wr < 1.0 { wr = 1.0 }                          // but a stroke never disappears
+                // anchor on a blue zone if either edge is one; else on whichever edge moves least
+                var loD = 0.0 - 1000000.0
+                var b = 0
+                while b < bsrc.len() {
+                    var d1 = bsrc[b] - ey[lo]  if d1 < 0.0 { d1 = 0.0 - d1 }
+                    var d2 = bsrc[b] - ey[hi]  if d2 < 0.0 { d2 = 0.0 - d2 }
+                    if d1 <= BLUE_NEAR_PX() { loD = bdst[b] }
+                    else if d2 <= BLUE_NEAR_PX() { loD = bdst[b] - wr }
+                    b = b + 1
+                }
+                if loD < 0.0 - 999999.0 {
+                    let ca = to_float(floor_int(ey[lo] + 0.5))            // round the lower edge
+                    let cb = to_float(floor_int(ey[hi] + 0.5)) - wr       // round the upper edge
+                    var ma = ca - ey[lo]  if ma < 0.0 { ma = 0.0 - ma }
+                    var mb = cb - ey[lo]  if mb < 0.0 { mb = 0.0 - mb }
+                    if ma <= mb { loD = ca } else { loD = cb }
+                }
+                src.push(ey[lo])  dst.push(loD)
+                src.push(ey[hi])  dst.push(loD + wr)
+            }
+        }
+        i = i + 1
+    }
+}
+fn ymap_build(b: Blues, o: Outline, scale: Float) -> YMap {
+    if !b.ok { return ymap_off() }
+    var src: Vec<Float> = vec()
+    var dst: Vec<Float> = vec()
+    let xfp = b.xf * scale   let cfp = b.cf * scale
+    let xfd = zone_out(xfp)     let cfd = zone_out(cfp)
+    // descender, baseline, x-height (flat then round), cap (flat then round), ascender
+    // zone_near for the outer two, zone_out for the x-height and cap: see the note on those.
+    if b.desc < 0.0 { src.push(b.desc * scale)  dst.push(zone_near(b.desc * scale)) }
+    // A round bottom that dips less than a pixel below the baseline lands on it.
+    if b.rb < 0.0 {
+        let rbp = b.rb * scale
+        var rbd = zone_out(rbp)
+        if 0.0 - rbp < OVERSHOOT_PX() { rbd = 0.0 }
+        src.push(rbp)  dst.push(rbd)
+    }
+    src.push(0.0)  dst.push(0.0)                                  // the baseline is already whole
+    src.push(xfp)  dst.push(xfd)
+    if b.xr > b.xf {
+        let xrp = b.xr * scale
+        var xrd = zone_out(xrp)
+        if xrp - xfp < OVERSHOOT_PX() { xrd = xfd }
+        src.push(xrp)  dst.push(xrd)
+    }
+    src.push(cfp)  dst.push(cfd)
+    if b.cr > b.cf {
+        let crp = b.cr * scale
+        var crd = zone_out(crp)
+        if crp - cfp < OVERSHOOT_PX() { crd = cfd }
+        src.push(crp)  dst.push(crd)
+    }
+    if b.asc > b.cf { src.push(b.asc * scale)  dst.push(zone_near(b.asc * scale)) }
+    // The zones so far are this glyph's fixed points; the strokes inside it snap around them.
+    var bsrc: Vec<Float> = vec()
+    var bdst: Vec<Float> = vec()
+    var z = 0
+    while z < src.len() { bsrc.push(src[z])  bdst.push(dst[z])  z = z + 1 }
+    add_stem_points(o, scale, bsrc, bdst, src, dst)
+    // Stem points arrive in glyph order, not height order, so sort before anything reads them as a
+    // piecewise map.
+    var a = 0
+    while a < src.len() {
+        var c = a + 1
+        while c < src.len() {
+            if src[c] < src[a] {
+                let ts = src[a]  src[a] = src[c]  src[c] = ts
+                let td = dst[a]  dst[a] = dst[c]  dst[c] = td
+            }
+            c = c + 1
+        }
+        a = a + 1
+    }
+    // Keep the map a function and keep it monotonic: two zones that round onto the same pixel, or
+    // land out of order once rounded, would otherwise fold the outline back on itself.
+    var s2: Vec<Float> = vec()
+    var d2: Vec<Float> = vec()
+    var i = 0
+    while i < src.len() {
+        if s2.len() == 0 { s2.push(src[i])  d2.push(dst[i]) }
+        else {
+            let last = s2.len() - 1
+            if src[i] > s2[last] + 0.001 {
+                var dv = dst[i]
+                if dv < d2[last] { dv = d2[last] }
+                s2.push(src[i])  d2.push(dv)
+            }
+        }
+        i = i + 1
+    }
+    if s2.len() < 2 { return ymap_off() }
+    return YMap { on: true, src: s2, dst: d2 }
+}
+fn ymap_at(m: YMap, y: Float) -> Float {
+    if !m.on { return y }
+    let n = m.src.len()
+    if y <= m.src[0] { return y + (m.dst[0] - m.src[0]) }         // below the lowest zone: shift, don't scale
+    if y >= m.src[n - 1] { return y + (m.dst[n - 1] - m.src[n - 1]) }
+    var i = 0
+    while i < n - 1 {
+        if y >= m.src[i] && y <= m.src[i + 1] {
+            let sw = m.src[i + 1] - m.src[i]
+            if sw <= 0.0 { return m.dst[i] }
+            let t = (y - m.src[i]) / sw
+            return m.dst[i] + t * (m.dst[i + 1] - m.dst[i])
+        }
+        i = i + 1
+    }
+    return y
+}
+global g_hint_off: Int = 0
+/// turn light autohinting off (or back on) for subsequent rasterization. On by default; off gives
+/// the raw outline, which is what a transformed or very large render wants.
+pub fn set_hinting(on: Bool) { if on { g_hint_off = 0 } else { g_hint_off = 1 } }
+/// is light autohinting on?
+pub fn hinting() -> Bool { return g_hint_off == 0 }
+
+/// rasterize glyph `gid` at `px_size` pixels/em into a grayscale coverage bitmap. Empty glyphs
+/// (space, out-of-range) return a 0x0 bitmap.
+pub fn rasterize(f: Font, gid: Int, px_size: Float) -> GlyphBitmap {
+    var o = font_outline(f, gid)
+    if o.contours.len() == 0 { return glyph_bitmap_empty() }
+    var scale = px_size / to_float(f.units_per_em)
+    // Light autohinting: the y axis goes through a warp that puts this face's baseline, x-height,
+    // cap height and ascender on whole pixels. x is untouched, so advances and every layout
+    // decision above this stay as they were.
+    var ym = ymap_off()
+    if g_hint_off == 0 { ym = ymap_build(font_blues_cached(f), o, scale) }
+    var ix0 = floor_int(o.xmin * scale)
+    var iy0 = floor_int(ymap_at(ym, o.ymin * scale))
+    var ix1 = ceil_int(o.xmax * scale)
+    var iy1 = ceil_int(ymap_at(ym, o.ymax * scale))
+    var w = ix1 - ix0
+    var h = iy1 - iy0
+    if w <= 0 || h <= 0 { return glyph_bitmap_empty() }
+    var fx0 = to_float(ix0)
+    var fy1 = to_float(iy1)
+    var r = rast_new(w, h)
+    var ci = 0
+    while ci < o.contours.len() {
+        var ct = o.contours[ci]
+        var cx = ct.sx * scale - fx0
+        var cy = fy1 - ymap_at(ym, ct.sy * scale)
+        var si = 0
+        while si < ct.segs.len() {
+            var sg = ct.segs[si]
+            var ex = sg.x * scale - fx0
+            var ey = fy1 - ymap_at(ym, sg.y * scale)
+            if sg.kind == 1 {
+                var qcx = sg.cx * scale - fx0
+                var qcy = fy1 - ymap_at(ym, sg.cy * scale)
+                draw_quad(r, cx, cy, qcx, qcy, ex, ey)
+            } else if sg.kind == 2 {
+                raster_cubic(r, cx, cy, sg.cx * scale - fx0, fy1 - ymap_at(ym, sg.cy * scale),
+                    sg.c2x * scale - fx0, fy1 - ymap_at(ym, sg.c2y * scale), ex, ey)
+            } else {
+                draw_line(r, cx, cy, ex, ey)
+            }
+            cx = ex
+            cy = ey
+            si = si + 1
+        }
+        ci = ci + 1
+    }
+    // running-sum accumulation -> per-pixel coverage (0..255)
+    var cov: Vec<Int> = vec()
+    var acc = 0.0
+    var total = w * h
+    var i = 0
+    while i < total {
+        acc = acc + r.a[i]
+        var a = fabs(acc)
+        var v = to_int(a * 255.0 + 0.5)
+        if v > 255 { v = 255 }
+        cov.push(v)
+        i = i + 1
+    }
+    return GlyphBitmap { w: w, h: h, left: ix0, top: iy1, cov: cov }
+}
+// per-(font,gid,size) rasterized-glyph cache. The CPU text path re-rasterizes every visible glyph
+// from outlines on every repaint (each scroll frame repaints the page), which dominates scroll cost.
+// Memoizing collapses that to one rasterization per distinct glyph. Key packs gid | size*4 | a font
+// discriminator so the primary and fallback faces (and different sizes) don't collide.
+// Master glyph store in flat global Vecs (globals are never auto-freed, so the cache survives);
+// avoids caching a Vec-holding struct in a Map, where the caller's auto-free would reclaim the shared
+// coverage buffer and corrupt the cache. Each call returns a fresh GlyphBitmap the caller owns freely.
+global g_grc_on: Int = 0
+global g_grc_idx: Map<Int, Int>      // packed key -> slot
+global g_grc_w: Vec<Int>
+global g_grc_h: Vec<Int>
+global g_grc_left: Vec<Int>
+global g_grc_top: Vec<Int>
+global g_grc_off: Vec<Int>            // slot -> start offset into g_grc_cov
+global g_grc_cov: Vec<Int>           // all coverage bytes concatenated (grows, never freed)
+/// A cached glyph addressed rather than copied: `off` is where its coverage starts in the cache's own
+/// store, read back through `glyph_span_cov`. Every field is a scalar, so a span costs no allocation.
+///
+/// The offset stays valid because the cache only ever appends: a later miss can move the underlying
+/// buffer, but never the position of what is already in it, and every read goes through the global.
+pub struct GlyphSpan { w: Int, h: Int, left: Int, top: Int, off: Int }
+// (face, glyph, size) packed into one Int: gid in the low 16 bits, quarter-pixel size in the next 16,
+// the face discriminator above that. Building a Str key here allocated one string per glyph drawn:
+// tens of thousands a frame, on the hit path, purely to look something up.
+fn grc_key(f: Font, gid: Int, px_size: Float) -> Int {
+    let si = to_int(px_size * 4.0 + 0.5)
+    let disc = font_disc(f)
+    return (gid & 0xFFFF) + (si & 0xFFFF) * 65536 + disc * 4294967296
+}
+fn grc_init() {
+    if g_grc_on == 0 {
+        var m: Map<Int, Int> = map()
+        g_grc_idx = m
+        g_grc_w = vec()  g_grc_h = vec()  g_grc_left = vec()
+        g_grc_top = vec()  g_grc_off = vec()  g_grc_cov = vec()  g_grc_on = 1
+    }
+}
+/// `rasterize`, memoized per (face, glyph, size), handed back as a span into the cache: no copy.
+/// Text repaint rasterizes every visible glyph from outlines on every frame, which is what dominates
+/// scroll cost; this collapses that to one rasterization per distinct glyph, and unlike
+/// `rasterize_cached` it does not rebuild the coverage buffer for the caller each time.
+pub fn rasterize_span(f: Font, gid: Int, px_size: Float) -> GlyphSpan {
+    grc_init()
+    let key = grc_key(f, gid, px_size)
+    if g_grc_idx.has(key) {
+        let idx = g_grc_idx.get(key)
+        if idx >= 0 && idx < g_grc_w.len() {
+            let off = g_grc_off[idx]
+            let n = g_grc_w[idx] * g_grc_h[idx]
+            if off >= 0 && off + n <= g_grc_cov.len() {
+                return GlyphSpan { w: g_grc_w[idx], h: g_grc_h[idx], left: g_grc_left[idx], top: g_grc_top[idx], off: off }
+            }
+        }
+    }
+    let g = rasterize(f, gid, px_size)
+    let slot = g_grc_w.len()
+    let off = g_grc_cov.len()
+    g_grc_w.push(g.w)  g_grc_h.push(g.h)  g_grc_left.push(g.left)  g_grc_top.push(g.top)
+    g_grc_off.push(off)
+    let n = g.w * g.h
+    var k = 0
+    while k < n { g_grc_cov.push(g.cov[k])  k = k + 1 }
+    g_grc_idx.put(key, slot)
+    return GlyphSpan { w: g.w, h: g.h, left: g.left, top: g.top, off: off }
+}
+/// coverage byte `i` (row-major, i = y * w + x) of a cached glyph.
+pub fn glyph_span_cov(s: GlyphSpan, i: Int) -> Int {
+    let at = s.off + i
+    if at < 0 || at >= g_grc_cov.len() { return 0 }
+    return g_grc_cov[at]
+}
+/// `rasterize`, memoized, as an owned `GlyphBitmap`: the copying form, for callers that want a
+/// bitmap they can keep. The paint path uses `rasterize_span` instead, which does not rebuild the
+/// coverage buffer on every call.
+pub fn rasterize_cached(f: Font, gid: Int, px_size: Float) -> GlyphBitmap {
+    let sp = rasterize_span(f, gid, px_size)
+    var cov: Vec<Int> = vec()
+    let n = sp.w * sp.h
+    var k = 0
+    while k < n { cov.push(glyph_span_cov(sp, k))  k = k + 1 }
+    return GlyphBitmap { w: sp.w, h: sp.h, left: sp.left, top: sp.top, cov: cov }
+}
+/// coverage at pixel (x,y) in a glyph bitmap (0 if out of range).
+pub fn glyph_cov_at(g: GlyphBitmap, x: Int, y: Int) -> Int {
+    if x < 0 || y < 0 || x >= g.w || y >= g.h { return 0 }
+    return g.cov[y * g.w + x]
+}
+
+// ── general path-fill rasterizer (the same signed-area engine, exposed for std/svg) ─────────────────
+// Build a coverage grid, add straight/quadratic/cubic edges in pixel space, then resolve to per-pixel
+// coverage (0..255, nonzero winding). Coordinates are already in the target pixel grid (y down).
+/// a fresh w*h coverage accumulation grid.
+pub fn raster_new(w: Int, h: Int) -> Rast { return rast_new(w, h) }
+/// add a straight edge p0->p1 (pixel coords).
+pub fn raster_line(inout r: Rast, x0: Float, y0: Float, x1: Float, y1: Float) { draw_line(r, x0, y0, x1, y1) }
+/// add a quadratic bezier p0->p2 with control p1.
+pub fn raster_quad(inout r: Rast, x0: Float, y0: Float, cx: Float, cy: Float, x1: Float, y1: Float) { draw_quad(r, x0, y0, cx, cy, x1, y1) }
+/// add a cubic bezier p0->p3 with controls p1,p2 (flattened by adaptive subdivision).
+pub fn raster_cubic(inout r: Rast, x0: Float, y0: Float, c1x: Float, c1y: Float, c2x: Float, c2y: Float, x1: Float, y1: Float) {
+    let dev = fabs(c1x - x0) + fabs(c1y - y0) + fabs(c2x - c1x) + fabs(c2y - c1y) + fabs(x1 - c2x) + fabs(y1 - c2y)
+    var n = to_int(dev / 3.0) + 2
+    if n > 96 { n = 96 }
+    var px = x0  var py = y0
+    var i = 1
+    while i <= n {
+        let t = to_float(i) / to_float(n)
+        let mt = 1.0 - t
+        let a = mt * mt * mt
+        let b = 3.0 * mt * mt * t
+        let c = 3.0 * mt * t * t
+        let e = t * t * t
+        let qx = a * x0 + b * c1x + c * c2x + e * x1
+        let qy = a * y0 + b * c1y + c * c2y + e * y1
+        draw_line(r, px, py, qx, qy)
+        px = qx  py = qy
+        i = i + 1
+    }
+}
+/// resolve the grid to per-pixel coverage (row-major w*h, 0..255).
+pub fn raster_cover(r: Rast) -> Vec<Int> {
+    var cov: Vec<Int> = vec()
+    var acc = 0.0
+    let total = r.w * r.h
+    var i = 0
+    while i < total { acc = acc + r.a[i]  var a = fabs(acc)  var v = to_int(a * 255.0 + 0.5)  if v > 255 { v = 255 }  cov.push(v)  i = i + 1 }
+    return cov
+}
+
+// ============================================================================
+// scale, kerning, run layout, glyph atlas
+// ============================================================================
+
+/// pixels-per-font-unit for a target em size (multiply font-unit values by this to get pixels).
+pub fn font_scale(f: Font, px_size: Float) -> Float { return px_size / to_float(f.units_per_em) }
+
+/// vertical metrics scaled to pixels for `px_size`.
+pub fn font_v_metrics_px(f: Font, px_size: Float) -> VMetrics {
+    var s = font_scale(f, px_size)
+    return VMetrics { ascent: to_float(f.ascender) * s, descent: to_float(f.descender) * s, line_gap: to_float(f.line_gap) * s }
+}
+/// recommended line advance in pixels (ascent - descent + line_gap).
+pub fn font_line_height_px(f: Font, px_size: Float) -> Float {
+    var s = font_scale(f, px_size)
+    return (to_float(f.ascender) - to_float(f.descender) + to_float(f.line_gap)) * s
+}
+/// the height that `line-height: normal` resolves to in a browser: the hhea ascender minus the
+/// descender, without the line gap: Chromium lays a 16px Liberation Sans line 18px tall because it
+/// uses (1854 + 434)/2048 em, and a +line_gap line (18.4) or a flat 1.2x em line (19.2) both differ.
+pub fn font_asc_desc_px(f: Font, px_size: Float) -> Float {
+    var s = font_scale(f, px_size)
+    return (to_float(f.ascender) - to_float(f.descender)) * s
+}
+
+// kern table (format 0, horizontal) pair kerning in font units; 0 if no kern table or no such pair.
+// Layout: version u16, nTables u16; per subtable: version u16, length u16, coverage u16; if the
+// coverage low byte's format is 0 and it is horizontal: nPairs u16 + 3 u16, then nPairs of
+// (left u16, right u16, value i16), sorted by (left<<16 | right): binary searched.
+/// kerning adjustment between two glyphs in font units (0 when absent).
+pub fn font_kern(f: Font, left: Int, right: Int) -> Float {
+    if f.kern_off < 0 { return 0.0 }
+    var d = f.d
+    var ntables = rd_u16(d, f.kern_off + 2)
+    var kver = rd_u16(d, f.kern_off)                     // tables version 0 have the legacy layout: a subtable is
+    var p = f.kern_off + 4                               // nPairs/searchRange/entrySelector/rangeShift/pairs directly
+    var t = 0                                            // after its header, with no format field; version 1+ (Apple)
+    while t < ntables {                                  // prefaces a format word (0 = same pair layout after it)
+        var length = rd_u16(d, p + 2)
+        var coverage = rd_u16(d, p + 4)
+        // Coverage bit 15 set = vertical kerns (to be skipped), bit 7 set = cross-stream. The low byte is
+        // not the format: real fonts (Liberation, DejaVu) write 0x0001, so testing `(coverage&255)==0`
+        // would reject every table they have and no kerning would run; words would come out up to 5% wider
+        // than in the reference (`AV` in Liberation Sans is 152 units of kerning). Chromium's AV advance
+        // at 100px is 125.984, which is this advance minus 152/2048*100.
+        var vert = (coverage & 32768) != 0
+        var cross = (coverage & 128) != 0
+        var fmt = 0
+        var npairs = rd_u16(d, p + 6)
+        var pairs = p + 14
+        if kver != 0 {
+            fmt = rd_u16(d, p + 6)                       // Apple subtable prefixes format + its own header
+            npairs = rd_u16(d, p + 8)
+            pairs = p + 16
+        }
+        if !vert && !cross && fmt == 0 && npairs > 0 {
+            var key = ((left << 16) | right)
+            var lo = 0
+            var hivar = npairs - 1
+            while lo <= hivar {
+                var mid = (lo + hivar) / 2
+                var rec = pairs + mid * 6
+                var k = ((rd_u16(d, rec) << 16) | rd_u16(d, rec + 2))
+                if k == key { return to_float(rd_i16(d, rec + 4)) }
+                if k < key { lo = mid + 1 } else { hivar = mid - 1 }
+            }
+        }
+        p = p + length
+        t = t + 1
+    }
+    return 0.0
+}
+
+/// decode a UTF-8 `Str` to Unicode codepoints (malformed trailing bytes are skipped).
+pub fn utf8_codepoints(s: Str) -> Vec<Int> {
+    var cps: Vec<Int> = vec()
+    var i = 0
+    var n = s.len()
+    while i < n {
+        var b0 = ord(s.at(i))
+        if b0 < 128 { cps.push(b0)  i = i + 1 }
+        else if b0 < 224 {
+            if i + 1 >= n { return cps }
+            var b1 = ord(s.at(i + 1))
+            cps.push((((b0 & 31) << 6) | (b1 & 63)))
+            i = i + 2
+        } else if b0 < 240 {
+            if i + 2 >= n { return cps }
+            var b1 = ord(s.at(i + 1))
+            var b2 = ord(s.at(i + 2))
+            cps.push(((((b0 & 15) << 12) | ((b1 & 63) << 6)) | (b2 & 63)))
+            i = i + 3
+        } else {
+            if i + 3 >= n { return cps }
+            var b1 = ord(s.at(i + 1))
+            var b2 = ord(s.at(i + 2))
+            var b3 = ord(s.at(i + 3))
+            cps.push((((((b0 & 7) << 18) | ((b1 & 63) << 12)) | ((b2 & 63) << 6)) | (b3 & 63)))
+            i = i + 4
+        }
+    }
+    return cps
+}
+
+/// a glyph positioned along a text run: `gid`, the pen position `x` (baseline-relative, pixels,
+/// left to right), the pen `advance` to the next glyph, and the offset to draw the glyph at relative
+/// to the pen (`x_off`, `y_off`, y up: non-zero for marks and kerned or attached glyphs). Place the
+/// glyph bitmap at (x + x_off + bitmap.left, baseline_y - y_off - bitmap.top). `cluster` is the UTF-8
+/// byte offset of the first character the glyph came from and `char_index` that character's index.
+pub struct PositionedGlyph { gid: Int, x: Float, advance: Float, x_off: Float = 0.0, y_off: Float = 0.0, cluster: Int = 0, char_index: Int = 0 }
+/// lay out a single line of text with one font: the text is shaped (OpenType GSUB/GPOS, or the
+/// `kern` table when there is no GPOS kerning), split into bidi and script runs, and the runs placed
+/// in visual order. Returns the positioned glyphs left to right; the total width is
+/// measure_run's. A thin wrapper over shape_line_font.
+pub fn layout_run(f: Font, text: Str, px_size: Float) -> Vec<PositionedGlyph> {
+    var out: Vec<PositionedGlyph> = vec()
+    let line = shape_line_font(f, text, px_size, BIDI_AUTO(), "", "")
+    var i = 0
+    while i < line.glyphs.len() {
+        let g = line.glyphs[i]
+        out.push(PositionedGlyph { gid: g.gid, x: g.x, advance: g.advance, x_off: g.x_off, y_off: g.y_off, cluster: g.cluster, char_index: g.char_index })
+        i = i + 1
+    }
+    return out
+}
+/// total advance width of a text run in pixels (shaped: GPOS or kern-table kerning, ligatures).
+pub fn measure_run(f: Font, text: Str, px_size: Float) -> Float {
+    if text.len() == 0 { return 0.0 }
+    return shape_line_font(f, text, px_size, BIDI_AUTO(), "", "").width
+}
+
+// ---- glyph atlas (shelf packing + a per-(gid,size) cache) ----
+
+/// a cached glyph in the atlas: its pixel rect (`ux,uy,w,h`) into the atlas + placement offsets
+/// (`left`,`top`, as in GlyphBitmap) + the scaled pen `advance`. `color` marks a color glyph (an
+/// emoji): its pixels are in the atlas's `rgba` plane, and `pix` holds its alpha as coverage.
+pub struct AtlasEntry { ux: Int, uy: Int, w: Int, h: Int, left: Int, top: Int, advance: Float, color: Bool = false }
+/// a CPU glyph atlas: a `w`x`h` coverage buffer packed by shelves, with a cache keyed by
+/// face, glyph and size. Upload `pix` to a GPU texture; `AtlasEntry.ux/uy/w/h` give each glyph's sub-rect.
+/// Color glyphs share the shelves: their premultiplied RGBA (packed 0xRRGGBBAA) goes to the `rgba`
+/// plane (made, w*h, on the first color glyph, `has_color`) and their alpha to `pix`, so a
+/// coverage-only consumer still draws their silhouette.
+pub struct Atlas {
+    w: Int, h: Int, pix: Vec<Int>,
+    shelf_x: Int, shelf_y: Int, shelf_h: Int,
+    keys: Vec<Str>, ents: Vec<AtlasEntry>, idx: Map<Str, Int>,
+    dirty_x0: Int, dirty_y0: Int, dirty_x1: Int, dirty_y1: Int,
+    full: Bool,
+    rgba: Vec<Int> = vec(),
+    has_color: Bool = false
+}
+/// a new empty atlas of the given pixel dimensions (grayscale, zero-filled).
+pub fn atlas_new(w: Int, h: Int) -> Atlas {
+    var pix: Vec<Int> = vec()
+    var n = w * h
+    var i = 0
+    while i < n { pix.push(0)  i = i + 1 }
+    var ks: Vec<Str> = vec()
+    var es: Vec<AtlasEntry> = vec()
+    var ix: Map<Str, Int> = map()
+    return Atlas { w: w, h: h, pix: pix, shelf_x: 0, shelf_y: 0, shelf_h: 0, keys: ks, ents: es, idx: ix,
+        dirty_x0: w, dirty_y0: h, dirty_x1: 0, dirty_y1: 0, full: false }
+}
+/// the entry index for `key`, or -1 when the atlas holds no such glyph. One map lookup: the keys are
+/// an append-only list, so the key -> index map mirrors it exactly for every entry ever added.
+fn atlas_find(a: Atlas, key: Str) -> Int {
+    if a.idx.has(key) { return a.idx.get(key) }
+    return 0 - 1
+}
+fn atlas_mark_dirty(inout a: Atlas, x0: Int, y0: Int, x1: Int, y1: Int) {
+    if x0 < a.dirty_x0 { a.dirty_x0 = x0 }
+    if y0 < a.dirty_y0 { a.dirty_y0 = y0 }
+    if x1 > a.dirty_x1 { a.dirty_x1 = x1 }
+    if y1 > a.dirty_y1 { a.dirty_y1 = y1 }
+}
+// blit a glyph bitmap into the atlas at (ux,uy).
+fn atlas_blit(inout a: Atlas, g: GlyphBitmap, ux: Int, uy: Int) {
+    var gy = 0
+    while gy < g.h {
+        var gx = 0
+        while gx < g.w {
+            a.pix[(uy + gy) * a.w + (ux + gx)] = g.cov[gy * g.w + gx]
+            gx = gx + 1
+        }
+        gy = gy + 1
+    }
+    atlas_mark_dirty(a, ux, uy, ux + g.w, uy + g.h)
+}
+
+/// get (or rasterize + pack) glyph `gid` at `px_size` in the atlas. On a cache hit returns the
+/// stored entry; on a miss rasterizes, shelf-packs, and blits. If the atlas is full the glyph is
+/// still returned (with ux=uy=-1) so text can lay out without it: grow the atlas or evict.
+pub fn atlas_glyph(inout a: Atlas, f: Font, gid: Int, px_size: Float) -> AtlasEntry {
+    // keyed by the face too: one atlas serves every face a UI draws with (fallbacks, font stacks)
+    var key = to_str(font_disc(f)) + "/" + to_str(gid) + (":" + to_str(to_int(px_size)))
+    var hit = atlas_find(a, key)
+    if hit >= 0 { return copy a.ents[hit] }
+    if font_has_color(f) && glyph_is_color(f, gid) { return atlas_color_glyph(a, f, gid, px_size, 255, key) }
+    var g = rasterize(f, gid, px_size)
+    var adv = font_h_advance(f, gid) * font_scale(f, px_size)
+    if g.w == 0 || g.h == 0 {                          // empty glyph (space): cache a zero-rect entry
+        var e = AtlasEntry { ux: 0, uy: 0, w: 0, h: 0, left: g.left, top: g.top, advance: adv }
+        a.keys.push(copy key)  a.ents.push(copy e)  a.idx.put(key, a.ents.len() - 1)
+        return e
+    }
+    // shelf pack (1px gutter between glyphs)
+    var gap = 1
+    if a.shelf_x + g.w > a.w { a.shelf_y = a.shelf_y + a.shelf_h + gap  a.shelf_x = 0  a.shelf_h = 0 }
+    if a.shelf_y + g.h > a.h {
+        a.full = true
+        return AtlasEntry { ux: 0 - 1, uy: 0 - 1, w: g.w, h: g.h, left: g.left, top: g.top, advance: adv }
+    }
+    var ux = a.shelf_x
+    var uy = a.shelf_y
+    atlas_blit(a, g, ux, uy)
+    a.shelf_x = a.shelf_x + g.w + gap
+    if g.h > a.shelf_h { a.shelf_h = g.h }
+    var e = AtlasEntry { ux: ux, uy: uy, w: g.w, h: g.h, left: g.left, top: g.top, advance: adv }
+    a.keys.push(copy key)
+    a.ents.push(copy e)
+    a.idx.put(key, a.ents.len() - 1)
+    return e
+}
+/// get (or draw + pack) color glyph `gid` at `px_size`, with `fg` (packed straight RGBA) for COLR's
+/// foreground layers. A glyph with no color form is packed as coverage, like atlas_glyph.
+pub fn atlas_glyph_color(inout a: Atlas, f: Font, gid: Int, px_size: Float, fg: Int) -> AtlasEntry {
+    var key = to_str(font_disc(f)) + "/" + to_str(gid) + (":" + to_str(to_int(px_size)) + ":c" + to_str(fg))
+    var hit = atlas_find(a, key)
+    if hit >= 0 { return copy a.ents[hit] }
+    if !(font_has_color(f) && glyph_is_color(f, gid)) { return atlas_glyph(a, f, gid, px_size) }
+    return atlas_color_glyph(a, f, gid, px_size, fg, key)
+}
+fn atlas_color_glyph(inout a: Atlas, f: Font, gid: Int, px_size: Float, fg: Int, key: Str) -> AtlasEntry {
+    let cb = rasterize_color(f, gid, px_size, fg)
+    let adv = font_h_advance(f, gid) * font_scale(f, px_size)
+    if cb.w == 0 || cb.h == 0 {
+        var e0 = AtlasEntry { ux: 0, uy: 0, w: 0, h: 0, left: 0, top: 0, advance: adv, color: true }
+        a.keys.push(copy key)  a.ents.push(copy e0)  a.idx.put(copy key, a.ents.len() - 1)
+        return e0
+    }
+    var gap = 1
+    if a.shelf_x + cb.w > a.w { a.shelf_y = a.shelf_y + a.shelf_h + gap  a.shelf_x = 0  a.shelf_h = 0 }
+    if a.shelf_y + cb.h > a.h {
+        a.full = true
+        return AtlasEntry { ux: 0 - 1, uy: 0 - 1, w: cb.w, h: cb.h, left: cb.left, top: cb.top, advance: adv, color: true }
+    }
+    if !a.has_color {
+        var n = a.w * a.h
+        var i = 0
+        while i < n { a.rgba.push(0)  i = i + 1 }
+        a.has_color = true
+    }
+    var ux = a.shelf_x
+    var uy = a.shelf_y
+    var gy = 0
+    while gy < cb.h {
+        var gx = 0
+        while gx < cb.w {
+            let p = cb.rgba[gy * cb.w + gx]
+            a.rgba[(uy + gy) * a.w + (ux + gx)] = p
+            a.pix[(uy + gy) * a.w + (ux + gx)] = p & 255
+            gx = gx + 1
+        }
+        gy = gy + 1
+    }
+    atlas_mark_dirty(a, ux, uy, ux + cb.w, uy + cb.h)
+    a.shelf_x = a.shelf_x + cb.w + gap
+    if cb.h > a.shelf_h { a.shelf_h = cb.h }
+    var e = AtlasEntry { ux: ux, uy: uy, w: cb.w, h: cb.h, left: cb.left, top: cb.top, advance: adv, color: true }
+    a.keys.push(copy key)
+    a.ents.push(copy e)
+    a.idx.put(copy key, a.ents.len() - 1)
+    return e
+}
+/// true if the atlas ran out of room for the last requested glyph (grow or rebuild).
+pub fn atlas_full(a: Atlas) -> Bool { return a.full }
+/// number of glyphs cached in the atlas.
+pub fn atlas_count(a: Atlas) -> Int { return a.ents.len() }

@@ -1,0 +1,243 @@
+//! std/tls: the TLS 1.3 key schedule (RFC 8446 §7.1) and the handshake transcript.
+//!
+//!   import "std/tls" as tls
+//!   var t = tls::transcript_new(32)              // 32 = SHA-256 suite, 48 = SHA-384
+//!   tls::transcript_add(t, client_hello)
+//!   tls::transcript_add(t, server_hello)
+//!   var s = tls::schedule_start(32, "")          // no PSK
+//!   tls::schedule_handshake(s, ecdhe_shared)
+//!   let shs = tls::server_handshake_traffic(s, tls::transcript_hash(t))
+//!   let k = tls::traffic_keys(32, shs, 16)       // k.key, k.iv
+//!
+//! Everything here is a pure function of its inputs (no sockets, no state beyond what a caller
+//! holds), which is what lets the whole schedule be checked against RFC 8448's published traces
+//! with no network and no server.
+//!
+//! The hash is named by its output length, 32 or 48, because that is what the construction uses.
+//! A cipher suite chooses it; nothing here guesses.
+import "std/crypto" as crypto
+
+/// the key and IV a traffic secret produces. `iv` is always 12 bytes: it is XORed with the record
+/// sequence number to make each record's AEAD nonce, so its length is the nonce's, not the key's.
+pub struct TrafficKeys { key: Str, iv: Str }
+
+/// the running handshake transcript, and the hash it is hashed with.
+pub struct Transcript { hlen: Int, data: Str }
+
+/// the three extracted secrets, in the order the schedule produces them. `handshake` and `master`
+/// are "" until the corresponding step has run; a caller that derives from them too early gets
+/// nothing rather than something plausible.
+pub struct Schedule { hlen: Int, early: Str, handshake: Str, master: Str }
+
+fn zeros(n: Int) -> Str {
+    var z = ""
+    var i = 0
+    while i < n { z = (z + chr(0))  i = i + 1 }
+    return z
+}
+fn hash_of(hlen: Int, data: Str) -> Str {
+    if hlen == 32 { return crypto::sha256_raw(data) }
+    if hlen == 48 { return crypto::sha384_raw(data) }
+    return ""
+}
+fn hmac_of(hlen: Int, key: Str, msg: Str) -> Str {
+    if hlen == 32 { return crypto::hmac_sha256_raw(key, msg) }
+    if hlen == 48 { return crypto::hmac_sha384_raw(key, msg) }
+    return ""
+}
+fn ok_hlen(hlen: Int) -> Bool {
+    if hlen == 32 { return true }
+    if hlen == 48 { return true }
+    return false
+}
+
+// ---- HKDF-Expand-Label (RFC 8446 §7.1) ---------------------------------------------------------
+
+/// The `HkdfLabel` structure, serialised: the `info` that HKDF-Expand is called with.
+///
+///     uint16 length; opaque label<7..255>; opaque context<0..255>
+///
+/// The `"tls13 "` prefix is not decoration. It is what keeps a TLS 1.3 key from colliding with a
+/// key some other protocol derives from the same secret under the same name, and it is included in
+/// every label's length byte.
+///
+/// "" if the label or context is too long to describe in the single length byte each gets.
+pub fn hkdf_label(label: Str, ctx: Str, n: Int) -> Str {
+    let full = ("tls13 " + label)
+    if full.len() > 255 { return "" }
+    if ctx.len() > 255 { return "" }
+    if n < 0 { return "" }
+    if n > 65535 { return "" }
+    var out = ""
+    out = (out + chr(((n >> 8) & 0xff)))
+    out = (out + chr((n & 0xff)))
+    out = (out + chr(full.len()))
+    out = (out + full)
+    out = (out + chr(ctx.len()))
+    out = (out + ctx)
+    return out
+}
+
+/// HKDF-Expand-Label: `n` bytes from `secret`, bound to a TLS label and a context.
+pub fn expand_label(hlen: Int, secret: Str, label: Str, ctx: Str, n: Int) -> Str {
+    if !ok_hlen(hlen) { return "" }
+    let info = hkdf_label(label, ctx, n)
+    if info.len() == 0 { return "" }
+    return crypto::hkdf_expand_h(hlen, secret, info, n)
+}
+
+/// Derive-Secret: one hash-length secret from another, bound to a label and a transcript hash.
+///
+/// The context is a hash of messages, never the messages themselves, which is why a whole
+/// handshake of any length costs 32 or 48 bytes here.
+pub fn derive_secret(hlen: Int, secret: Str, label: Str, thash: Str) -> Str {
+    return expand_label(hlen, secret, label, thash, hlen)
+}
+
+// ---- the schedule ------------------------------------------------------------------------------
+//
+// Three extractions, each salted by a secret derived from the one before:
+//
+//     early     = Extract(0, PSK)
+//     handshake = Extract(Derive-Secret(early, "derived", ""), ECDHE)
+//     master    = Extract(Derive-Secret(handshake, "derived", ""), 0)
+//
+// The "derived" step between them is what stops the chain from being a plain sequence of HKDF
+// calls on one input: each stage's salt commits to everything before it, so a secret from one
+// stage cannot be substituted into another.
+
+/// Start a schedule: the early secret, from a PSK or from nothing.
+///
+/// An empty `psk` means a block of zeros, which is the ordinary case: a full handshake has no
+/// pre-shared key, and the schedule still runs with a well-defined early secret rather than a
+/// special case.
+pub fn schedule_start(hlen: Int, psk: Str) -> Schedule {
+    if !ok_hlen(hlen) { return Schedule { hlen: 0, early: "", handshake: "", master: "" } }
+    var ikm = psk
+    if ikm.len() == 0 { ikm = zeros(hlen) }
+    return Schedule { hlen: hlen, early: crypto::hkdf_extract_h(hlen, "", ikm),
+                      handshake: "", master: "" }
+}
+
+/// Mix the (EC)DHE shared secret in, producing the handshake secret.
+pub fn schedule_handshake(inout s: Schedule, ecdhe: Str) {
+    if !ok_hlen(s.hlen) { return }
+    let salt = derive_secret(s.hlen, s.early, "derived", hash_of(s.hlen, ""))
+    s.handshake = crypto::hkdf_extract_h(s.hlen, salt, ecdhe)
+}
+
+/// Close the schedule, producing the master secret. There is nothing left to mix in, so the input
+/// keying material is zeros; the entropy is already all in the salt.
+pub fn schedule_master(inout s: Schedule) {
+    if !ok_hlen(s.hlen) { return }
+    let salt = derive_secret(s.hlen, s.handshake, "derived", hash_of(s.hlen, ""))
+    s.master = crypto::hkdf_extract_h(s.hlen, salt, zeros(s.hlen))
+}
+
+/// client_handshake_traffic_secret: `thash` covers ClientHello..ServerHello.
+pub fn client_handshake_traffic(s: Schedule, thash: Str) -> Str {
+    return derive_secret(s.hlen, s.handshake, "c hs traffic", thash)
+}
+/// server_handshake_traffic_secret: `thash` covers ClientHello..ServerHello.
+pub fn server_handshake_traffic(s: Schedule, thash: Str) -> Str {
+    return derive_secret(s.hlen, s.handshake, "s hs traffic", thash)
+}
+/// client_application_traffic_secret_0: `thash` covers ClientHello..server Finished.
+pub fn client_app_traffic(s: Schedule, thash: Str) -> Str {
+    return derive_secret(s.hlen, s.master, "c ap traffic", thash)
+}
+/// server_application_traffic_secret_0: `thash` covers ClientHello..server Finished.
+pub fn server_app_traffic(s: Schedule, thash: Str) -> Str {
+    return derive_secret(s.hlen, s.master, "s ap traffic", thash)
+}
+/// exporter_master_secret: `thash` covers ClientHello..server Finished.
+pub fn exporter_master(s: Schedule, thash: Str) -> Str {
+    return derive_secret(s.hlen, s.master, "exp master", thash)
+}
+/// resumption_master_secret: `thash` covers ClientHello..client Finished, which is a different
+/// point in the transcript from every other secret above.
+pub fn resumption_master(s: Schedule, thash: Str) -> Str {
+    return derive_secret(s.hlen, s.master, "res master", thash)
+}
+
+/// The record-protection key and IV for a traffic secret. `keylen` comes from the cipher suite:
+/// 16 for AES-128-GCM, 32 for AES-256-GCM.
+pub fn traffic_keys(hlen: Int, secret: Str, keylen: Int) -> TrafficKeys {
+    return TrafficKeys { key: expand_label(hlen, secret, "key", "", keylen),
+                         iv: expand_label(hlen, secret, "iv", "", 12) }
+}
+
+/// The key a Finished message is MACed with. Derived from the traffic secret with an empty
+/// context; the transcript enters through the MAC's message, not through this derivation.
+pub fn finished_key(hlen: Int, secret: Str) -> Str {
+    return expand_label(hlen, secret, "finished", "", hlen)
+}
+
+/// The `verify_data` of a Finished message: HMAC(finished_key, transcript_hash).
+///
+/// This is what makes the handshake tamper-evident. Both sides compute it over everything said so
+/// far, so a modified message anywhere earlier changes it, which is why an implementation must
+/// compare it with a constant-time equality and refuse on any difference.
+pub fn verify_data(hlen: Int, secret: Str, thash: Str) -> Str {
+    return hmac_of(hlen, finished_key(hlen, secret), thash)
+}
+
+/// The next application traffic secret after a KeyUpdate. The old one cannot be recovered from it,
+/// which is the whole point: a key compromised later does not open records sent earlier.
+pub fn key_update(hlen: Int, secret: Str) -> Str {
+    return expand_label(hlen, secret, "traffic upd", "", hlen)
+}
+
+// ---- the transcript ----------------------------------------------------------------------------
+
+/// A fresh, empty transcript for the hash named by `hlen`.
+pub fn transcript_new(hlen: Int) -> Transcript { return Transcript { hlen: hlen, data: "" } }
+
+/// Append one complete handshake message, with its four-byte header, as it appears on the
+/// wire, and never the record framing around it.
+pub fn transcript_add(inout t: Transcript, msg: Str) { t.data = (t.data + msg) }
+
+/// The transcript hash as it stands.
+pub fn transcript_hash(t: Transcript) -> Str { return hash_of(t.hlen, t.data) }
+
+/// The special Random that marks a ServerHello as a HelloRetryRequest: the SHA-256 of the string
+/// "HelloRetryRequest", fixed by RFC 8446 §4.1.3. HelloRetryRequest reuses the ServerHello message
+/// type, so this value is the only thing distinguishing them.
+pub fn hrr_random() -> Str {
+    var v: Vec<Int> = vec()
+    v.push(0xcf) v.push(0x21) v.push(0xad) v.push(0x74) v.push(0xe5) v.push(0x9a) v.push(0x61) v.push(0x11)
+    v.push(0xbe) v.push(0x1d) v.push(0x8c) v.push(0x02) v.push(0x1e) v.push(0x65) v.push(0xb8) v.push(0x91)
+    v.push(0xc2) v.push(0xa2) v.push(0x11) v.push(0x16) v.push(0x7a) v.push(0xbb) v.push(0x8c) v.push(0x5e)
+    v.push(0x07) v.push(0x9e) v.push(0x09) v.push(0xe2) v.push(0xc8) v.push(0xa8) v.push(0x33) v.push(0x9c)
+    var out = ""
+    var i = 0
+    while i < v.len() { out = (out + chr(v[i]))  i = i + 1 }
+    return out
+}
+
+/// Is this ServerHello actually a HelloRetryRequest? The Random sits at offset 6: four bytes of
+/// handshake header, then two of legacy_version.
+pub fn is_hello_retry_request(server_hello: Str) -> Bool {
+    if server_hello.len() < 38 { return false }
+    return server_hello.slice(6, 38) == hrr_random()
+}
+
+/// Apply the HelloRetryRequest transcript substitution (RFC 8446 §4.4.1).
+///
+/// This replaces what the transcript holds rather than adding to it. Everything accumulated so far
+/// (the first ClientHello) becomes a single synthetic message:
+///
+///     message_hash(254) ‖ 00 00 Hash.length ‖ Hash(ClientHello1)
+///
+/// Call it after the first ClientHello and before adding the HelloRetryRequest itself. Getting
+/// this wrong is not a visible failure on the client's side: the handshake simply ends in a
+/// decrypt error much later, with nothing pointing back here.
+pub fn transcript_hrr(inout t: Transcript) {
+    let h = hash_of(t.hlen, t.data)
+    var syn = ""
+    syn = (syn + chr(254))              // message_hash, a handshake type that never appears on the wire
+    syn = (syn + chr(0))
+    syn = (syn + chr(0))
+    syn = (syn + chr(t.hlen))           // a 3-byte length, of which only the last byte is ever non-zero
+    t.data = (syn + h)
+}

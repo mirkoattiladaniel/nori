@@ -1,0 +1,1536 @@
+// roll: dependencies: the content-addressed cache, `nori.lock`, semver resolution over git tags, the import
+// and native flags a resolved graph contributes, `roll add/remove/list/prune`, and vendoring.
+//
+// One directory module of roll (see src/main.nori for the layout). It reaches the others through
+// their aliases below, and only what another module uses is `pub`. The modules import each other
+// freely (`cmds` and `deps` call in both directions); cycles between directory modules are fine.
+
+import "std/crypto" as crypto
+import "std/os" as os
+import "std/strutil" as strutil
+import "std/sys" as sys
+import "std/time" as time
+import "../git" as git
+import "../cmds" as cmds
+import "../last" as last
+import "../manifest" as manifest
+import "../ui" as ui
+import "../util" as util
+
+use cmds::*
+use last::*
+use manifest::*
+use ui::*
+use util::*
+
+// nori.lock: each `name = git URL commit=SHA` -> name -> commit (the exact pinned commit).
+pub fn load_lock() -> Map<Str, Str> {
+    var m: Map<Str, Str> = map()
+    if !os::path_exists("nori.lock") {
+        return m
+    }
+    let src = read_file("nori.lock")
+    let n = src.len()
+    var start = 0
+    var i = 0
+    while i <= n {
+        if i == n || ord(src.at(i)) == 10 {
+            let line = trim(src.slice(start, i))
+            if line.len() > 0 {
+                if ord(line.at(0)) != 35 {
+                    let eq = index_of(line, 61)
+                    let ci = find_substr(line, "commit=")
+                    if eq >= 0 {
+                        if ci >= 0 {
+                            m.put(trim(line.slice(0, eq)), trim(line.slice(ci + 7, line.len())))
+                        }
+                    }
+            } }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return m
+}
+// the dep's entry file (its manifest `entry`, default src/lib.nori) inside resolved dir `dir`.
+pub fn entry_in(dir: Str) -> Str {
+    var entry = "src/lib.nori"
+    let dmf = (dir + "/nori.manifest")
+    if os::path_exists(dmf) {
+        let e = section_get(read_file(dmf), "", "entry")
+        if !(e == "") {
+            entry = copy e
+        }
+    }
+    return(dir + ("/" + entry))
+}
+// The module a dependency presents to its consumers: the directory its `entry` lives in, not the
+// entry file itself.
+//
+// `entry` names one file, which is right for building the dep: it is the root roll hands to noric.
+// But a Nori module is a directory: a directory's root files share one scope and the `pub` items of
+// all of them are exported. Mapping a consumer's `import "dep"` at the entry file would export only
+// that one file's surface, so a library split across several root files (the ordinary shape for
+// anything larger than a page, and the shape std uses) could not export the rest, and the consumer
+// would get "`f` is private to module `m`" for a function that is already `pub`.
+//
+// Pointing the import map at the directory also makes a dep behave like `std/os` does.
+pub fn module_in(dir: Str) -> Str { return dirname(entry_in(dir)) }
+// fetch a git dep into the commit-addressed cache (cache_dir/name@<commit>), honouring nori.lock.
+// Locked: reuse if cached (offline, reproducible), else clone the ref + checkout the exact commit.
+// Unlocked: clone the ref, discover its commit, key the cache by it. Returns the cache dir, or "".
+fn git_cache_dir(name: Str, url: Str, ref: Str, locks: Map<Str, Str>) -> Str {
+    let locked = lookup_or(locks, name, "")
+    if !(locked == "") {
+        let dest = (cache_dir() + ("/" + (name + ("@" + locked))))
+        if os::path_exists(dest) {
+            meta_record((name + ("@" + locked)), url, false)
+            return dest
+        }
+        os::make_dir_p(cache_dir())
+        printl(("  fetching " + (name + ("  (" + (url + ")")))))
+        if git::clone(url, ref, dest) != 0 {
+            os::remove_tree(dest)
+            printl(("roll: failed to fetch `" + (name + "`")))
+            return ""
+        }
+        if git::checkout(dest, locked) != 0 {
+            printl(("roll: locked commit for `" + (name + "` is no longer available")))
+            return ""
+        }
+        meta_record((name + ("@" + locked)), url, true)
+        return dest
+    }
+    os::make_dir_p(cache_dir())
+    let tmp = (cache_dir() + ("/.fetch-" + name))
+    os::remove_tree(tmp)
+    // the scratch clone is removed on every path out of here: a failed fetch, or after it has been moved
+    // into the cache (move removes it; a remove of a path that no longer exists is a no-op)
+    defer os::remove_tree(tmp)
+    printl(("  fetching " + (name + ("  (" + (url + ")")))))
+    if git::clone(url, ref, tmp) != 0 {
+        printl(("roll: failed to fetch `" + (name + "`")))
+        return ""
+    }
+    let head = git::head(tmp)
+    let dest = (cache_dir() + ("/" + (name + ("@" + head))))
+    if os::path_exists(dest) {
+        meta_record((name + ("@" + head)), url, false)   // tmp goes with the defer above
+    }
+    else {
+        os::move_path(tmp, dest)
+        meta_record((name + ("@" + head)), url, true)
+    }
+    return dest
+}
+fn meta_dir() -> Str {
+    return(cache_dir() + "/.meta")
+}
+fn meta_file(key: Str) -> Str {
+    return(meta_dir() + ("/" + key))
+}
+// stamp an entry as used now; on a new download set downloaded + url too (else preserve them).
+fn meta_record(key: Str, url: Str, fresh: Bool) {
+    os::make_dir_p(meta_dir())
+    let now = time::unix_secs()
+    var dl = now
+    var u = url
+    if !fresh {
+        if os::path_exists(meta_file(key)) {
+            let old = read_file(meta_file(key))
+            let od = field_after(old, "downloaded=")
+            if !(od == "") {
+                dl = to_int_or(od, now)
+            }
+            let ou = field_after(old, "url=")
+            if !(ou == "") {
+                u = copy ou
+            }
+        }
+    }
+    var body = nl(("url=" + u), ("downloaded=" + to_str(dl)))
+    body = nl(body, ("used=" + to_str(now)))
+    write_file(meta_file(key), body)
+}
+fn entry_field(key: Str, f: Str) -> Str {
+    let mf = meta_file(key)
+    if !os::path_exists(mf) {
+        return ""
+    }
+    return field_after(read_file(mf), f)
+}
+fn entry_used(key: Str) -> Int {
+    return to_int_or(entry_field(key, "used="), 0)
+}
+fn entry_downloaded(key: Str) -> Int {
+    return to_int_or(entry_field(key, "downloaded="), 0)
+}
+// the installed cache entries (the <name@commit> dirs), skipping .meta / .fetch- scratch.
+fn cache_entries() -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    if !os::path_exists(cache_dir()) {
+        return out
+    }
+    let pfx = (cache_dir() + "/")
+    let files = os::list_tree(cache_dir())
+    var seen: Map<Str, Int> = map()
+    var i = 0
+    while i < files.len() {
+        let f = files[i]
+        if starts_with(f, pfx) {
+            let rest = f.slice(pfx.len(), f.len())
+            var j = 0
+            let m = rest.len()
+            while j < m && ord(rest.at(j)) != 47 {
+                j = j + 1
+            }
+            let seg = rest.slice(0, j)
+            if seg.len() > 0 && ord(seg.at(0)) != 46 && find_substr(seg, "@") >= 0 {
+                if !seen.has(seg) {
+                    seen.put(seg, 1)
+                    out.push(seg)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+fn key_name(key: Str) -> Str {
+    let p = find_substr(key, "@")
+    if p < 0 {
+        return copy key
+    }
+    return key.slice(0, p)
+}
+fn key_short(key: Str) -> Str {
+    let p = find_substr(key, "@")
+    if p < 0 {
+        return ""
+    }
+    let c = key.slice(p + 1, key.len())
+    if c.len() > 10 {
+        return c.slice(0, 10)
+    }
+    return c
+}
+// sort keys: "name" ascending; "used"/"downloaded" descending by timestamp (most recent first).
+fn sort_entries(keys: Vec<Str>, by: Str) -> Vec<Str> {
+    var usedv: Vec<Int> = vec()
+    var dlv: Vec<Int> = vec()
+    var i = 0
+    while i < keys.len() {
+        usedv.push(entry_used(keys[i]))
+        dlv.push(entry_downloaded(keys[i]))
+        i = i + 1
+    }
+    var taken: Map<Str, Int> = map()
+    var out: Vec<Str> = vec()
+    var c = 0
+    while c < keys.len() {
+        var best = 0 - 1
+        var k = 0
+        while k < keys.len() {
+            if !taken.has(to_str(k)) {
+                if best < 0 {
+                    best = k
+                }
+                else {
+                    var win = false
+                    if(by == "name") {
+                        win = str_lt(keys[k], keys[best])
+                    }
+                    else if(by == "downloaded") {
+                        win = dlv[k] > dlv[best]
+                    }
+                    else {
+                        win = usedv[k] > usedv[best]
+                    }
+                    if win {
+                        best = k
+                    }
+                }
+            }
+            k = k + 1
+        }
+        out.push(copy keys[best])
+        taken.put(to_str(best), 1)
+        c = c + 1
+    }
+    return out
+}
+// `roll list`: show the cached dependencies, sorted (--sort used|downloaded|name; default: used).
+pub fn deps_list() -> Int {
+    let by = flag_val("--sort", "used")
+    let entries = sort_entries(cache_entries(), by)
+    if entries.len() == 0 {
+        eprintl(dim("no cached dependencies"))
+        return 0
+    }
+    eprintl((verb("Installed", "1;36") + (" " + (to_str(entries.len()) + (" cached " + (dep_word(entries.len()) + (dim(("  (sorted by " + (by + ")"))))))))))
+    var i = 0
+    while i < entries.len() {
+        let k = entries[i]
+        printl(("  " + (col("1", key_name(k)) + ("  " + (dim(key_short(k)) + ("  downloaded " + (date_str(entry_downloaded(k)) + ("  used " + ago_str(entry_used(k))))))))))
+        i = i + 1
+    }
+    return 0
+}
+// count entries whose last-used is older than `days` (entries without a usage stamp are not counted).
+fn stale_count(days: Int) -> Int {
+    let now = time::unix_secs()
+    let cutoff = days * 86400
+    let entries = cache_entries()
+    var n = 0
+    var i = 0
+    while i < entries.len() {
+        let u = entry_used(entries[i])
+        if u > 0 && (now - u) > cutoff {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+// the one-line nag `roll check`/`build` print when the shared cache has gone stale (quiet if none).
+pub fn stale_reminder() {
+    let n = stale_count(90)
+    if n > 0 {
+        eprintl(col("1;33", ("warning: " + (to_str(n) + (" cached " + (dep_word(n) + " unused for 90+ days — run `roll prune`"))))))
+    }
+}
+// `roll prune`: remove dependencies unused for 90+ days (--older-than N). Asks per-entry on a TTY;
+// `--yes` removes them all non-interactively; off a TTY without --yes it only lists candidates.
+pub fn prune() -> Int {
+    let days = to_int_or(flag_val("--older-than", "90"), 90)
+    let yes = has_flag("--yes")
+    let now = time::unix_secs()
+    let cutoff = days * 86400
+    let entries = sort_entries(cache_entries(), "used")
+    var stale: Vec<Str> = vec()
+    var i = 0
+    while i < entries.len() {
+        let u = entry_used(entries[i])
+        if u > 0 && (now - u) > cutoff {
+            stale.push(copy entries[i])
+        }
+        i = i + 1
+    }
+    if stale.len() == 0 {
+        eprintl(dim(("no " + (dep_word(2) + (" unused for " + (to_str(days) + "+ days"))))))
+        return 0
+    }
+    eprintl((verb("Stale", "1;33") + (" " + (to_str(stale.len()) + (" " + (dep_word(stale.len()) + (" unused for " + (to_str(days) + "+ days"))))))))
+    var removed = 0
+    var j = 0
+    while j < stale.len() {
+        let k = stale[j]
+        let desc = (col("1", key_name(k)) + ("  " + (dim(key_short(k)) + ("  last used " + ago_str(entry_used(k))))))
+        var doit = yes
+        if !yes {
+            if !os::is_tty() {
+                printl(("  " + (desc + dim("   (use --yes to remove, or run in a terminal)"))))
+            }
+            else {
+                printl(("  remove " + (desc + "  ? [y/N]: ")))
+                let c = os::read_line()
+                if(c == "y") || (c == "Y") {
+                    doit = true
+                }
+            }
+        }
+        if doit {
+            os::remove_tree((cache_dir() + ("/" + k)))
+            if os::path_exists(meta_file(k)) {
+                os::remove_tree(meta_file(k))
+            }
+            removed = removed + 1
+            eprintl(("  " + (col("1;31", "removed") + (" " + key_name(k)))))
+        }
+        j = j + 1
+    }
+    if removed > 0 {
+        eprintl((verb("Pruned", "1;32") + (" " + (to_str(removed) + (" " + dep_word(removed))))))
+    }
+    return 0
+}
+// the highest-versioned tag (by ver_num) in `tags`, or "".
+fn highest_tag(tags: Vec<Str>) -> Str {
+    var best = ""
+    var bestn = 0 - 1
+    var i = 0
+    while i < tags.len() {
+        let t = tags[i]
+        let tn = ver_num(t)
+        if tn > bestn {
+            best = t
+            bestn = tn
+        }
+        i = i + 1
+    }
+    return copy best
+}
+// resolve the graph for the just-edited manifest, write nori.lock, and report what `name` resolved to.
+fn add_resolve(name: Str, mf: Str) -> Int {
+    let locks = load_lock()
+    var lk: Vec<Str> = vec()
+    lk.push("# nori.lock — exact commits roll resolved for git dependencies. Commit this for\n# reproducible builds; delete a line to re-resolve that dependency.\n")
+    var dirs: Map<Str, Str> = map()
+    var names: Vec<Str> = vec()
+    resolve_graph(mf, locks, lk, dirs, names, false)
+    if find_substr(lk[0], " commit=") >= 0 {
+        write_file("nori.lock", lk[0])
+    }
+    if dirs.has(name) {
+        printl(("  resolved " + (name + (" -> " + dim(dirs.get(name))))))
+    }
+    else {
+        eprintl(dim("  (could not resolve now — `roll build` will fetch it)"))
+    }
+    return 0
+}
+pub fn cmd_add() -> Int {
+    let pos = positionals_from(1)
+    if pos.len() < 1 {
+        eprintl("roll add: usage `roll add <name> <git-url>[@ref] [^x.y.z]`  |  `roll add <name> --path <dir>`")
+        return 1
+    }
+    let name = pos[0]
+    var source = ""
+    let path = flag_val("--path", "")
+    if !(path == "") {
+        source = ("path " + path)
+    }
+    else {
+        var url = flag_val("--git", "")
+        if(url == "") {
+            if pos.len() >= 2 {
+                url = pos[1]
+            }
+        }
+        if(url == "") {
+            eprintl("roll add: need a git URL, or `--path <dir>` for a local dependency")
+            return 1
+        }
+        if find_substr(url, "://") < 0 && os::path_exists(url) {
+            source = ("path " + url)
+        }
+        // a local dir, no scheme
+        else {
+            let tag = flag_val("--tag", "")
+            let branch = flag_val("--branch", "")
+            var ver = flag_val("--version", "")
+            if(ver == "") {
+                if pos.len() >= 3 {
+                    ver = pos[2]
+                }
+            }
+            // bare `^1.2.0` positional
+            if !(tag == "") {
+                source = ("git " + (url + ("@" + tag)))
+            }
+            else {
+                if !(branch == "") {
+                    source = ("git " + (url + ("@" + branch)))
+                }
+                else {
+                    if !(ver == "") {
+                        var c = ver
+                        let c0 = ord(c.at(0))
+                        if c0 >= 48 && c0 <= 57 {
+                            c = ("^" + c)
+                        }
+                        // bare number -> caret
+                        source = ("git " + (url + (" " + c)))
+                    }
+                    else {
+                        if last_index_of(url, 64) > index_of(url, 58) {
+                            source = ("git " + url)
+                        }
+                        // URL already has @ref
+                        else {
+                            // auto: caret the latest tag
+                            let hi = highest_tag(git::tags(url))
+                            if(hi == "") {
+                                source = ("git " + url)
+                                eprintl(dim("  no version tags found — tracking the default branch"))
+                            }
+                            else {
+                                source = ("git " + (url + (" ^" + strip_lead_v(hi))))
+                            }
+            } } } }
+        }
+    }
+    let mf = load_manifest()
+    let existed = dep_present(mf, name)
+    let newmf = manifest_set_dep(mf, name, source)
+    write_file("nori.manifest", newmf)
+    if existed {
+        printl((verb("Updated", "1;32") + (" " + (name + (" = " + source)))))
+    }
+    else {
+        printl((verb("Added", "1;32") + (" " + (name + (" = " + source)))))
+    }
+    return add_resolve(name, newmf)
+}
+pub fn cmd_remove() -> Int {
+    let pos = positionals_from(1)
+    if pos.len() < 1 {
+        eprintl("roll remove: usage `roll remove <name>`")
+        return 1
+    }
+    let name = pos[0]
+    let mf = load_manifest()
+    if !dep_present(mf, name) {
+        eprintl(("roll remove: `" + (name + "` is not a dependency in nori.manifest")))
+        return 1
+    }
+    write_file("nori.manifest", manifest_del_dep(mf, name))
+    printl((verb("Removed", "1;32") + (" " + name)))
+    return 0
+}
+// caret semantics: tag T satisfies constraint C iff same major and T >= C (e.g. ^1.2.0 -> >=1.2.0 <2).
+pub fn tag_sat(tag: Str, con: Str) -> Bool {
+    if ver_major(tag) != ver_major(con) {
+        return false
+    }
+    return ver_num(tag) >= ver_num(con)
+}
+// the highest of `tags` satisfying `con` (preserving the original tag string, e.g. "v1.3.0"), or "".
+pub fn best_tag(tags: Vec<Str>, con: Str) -> Str {
+    var best = ""
+    var bestn = 0
+    var i = 0
+    while i < tags.len() {
+        let t = tags[i]
+        if tag_sat(t, con) {
+            let tn = ver_num(t)
+            if(best == "") || tn > bestn {
+                best = t
+                bestn = tn
+            }
+        }
+        i = i + 1
+    }
+    return copy best
+}
+
+// ── transitive resolution: a worklist over the whole dependency graph (root + every dep's manifest) ──
+// register a `name = source` dep into the resolver state. Sources:
+//   git URL ^1.2.0   semver constraint  -> kind "git", unified across the graph (max floor)
+//   git URL@ref      exact branch/tag   -> kind "ref" (pinned, first writer wins)
+//   git URL          default branch     -> kind "ref" with empty ref
+//   path DIR / DIR   local directory    -> kind "path"
+// A tightened git constraint (higher floor, same major) re-enqueues the name for re-resolution.
+fn reg_dep(name: Str, source: Str, inout urls: Map<Str, Str>, inout cons: Map<Str, Str>, inout kinds: Map<Str, Str>, inout refx: Map<Str, Str>, inout names: Vec<Str>, inout queue: Vec<Str>) {
+    if starts_with(source, "git ") {
+        let spec = trim(source.slice(4, source.len()))
+        let sp = index_of(spec, 32) // ' ' separates URL from a version constraint
+        if sp >= 0 {
+            let url = trim(spec.slice(0, sp))
+            let con = trim(spec.slice(sp + 1, spec.len()))
+            if !kinds.has(name) {
+                names.push(copy name)
+                kinds.put(name, "git")
+                urls.put(name, url)
+                cons.put(name, con)
+                queue.push(copy name)
+                return
+            }
+            if(kinds.get(name) == "git") {
+                let old = cons.get(name)
+                if ver_major(con) != ver_major(old) {
+                    printl(("roll: version conflict for `" + (name + ("`: " + (old + (" vs " + con))))))
+                }
+                else {
+                    if ver_num(con) > ver_num(old) {
+                        cons.put(name, con)
+                        queue.push(copy name)
+                    }
+                }
+                // tighten -> re-resolve
+            }
+            return
+        }
+        let at = last_index_of(spec, 64) // '@' (must follow the scheme's "://")
+        var url = spec
+        var ref = ""
+        if at > index_of(spec, 58) {
+            url = spec.slice(0, at)
+            ref = spec.slice(at + 1, spec.len())
+        }
+        if !kinds.has(name) {
+            names.push(copy name)
+            kinds.put(name, "ref")
+            urls.put(name, copy url)
+            refx.put(name, ref)
+            queue.push(copy name)
+        }
+        return
+    }
+    var dir = source
+    if starts_with(source, "path ") {
+        dir = trim(source.slice(5, source.len()))
+    }
+    if !kinds.has(name) {
+        names.push(copy name)
+        kinds.put(name, "path")
+        refx.put(name, copy dir)
+        queue.push(copy name)
+    }
+}
+// scan a manifest's [deps] section, registering each dependency into the resolver state.
+fn scan_deps(mf: Str, inout urls: Map<Str, Str>, inout cons: Map<Str, Str>, inout kinds: Map<Str, Str>, inout refx: Map<Str, Str>, inout names: Vec<Str>, inout queue: Vec<Str>) {
+    let n = mf.len()
+    var cur = ""
+    var start = 0
+    var i = 0
+    while i <= n {
+        if i == n || ord(mf.at(i)) == 10 {
+            let line = trim(mf.slice(start, i))
+            if line.len() > 0 {
+                if ord(line.at(0)) == 91 {
+                    let rb = index_of(line, 93)
+                    if rb > 1 {
+                        cur = trim(line.slice(1, rb))
+                    }
+                }
+                else {
+                    if ord(line.at(0)) != 35 {
+                        if(cur == "deps") {
+                            let eq = index_of(line, 61)
+                            if eq >= 0 {
+                                reg_dep(trim(line.slice(0, eq)), trim(line.slice(eq + 1, line.len())), urls, cons, kinds, refx, names, queue)
+                            }
+                } } }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+// resolve the full dependency graph rooted at manifest `mf`. Fills `dirs` (name -> on-disk source dir)
+// and `names` (every dep, direct + transitive, in discovery order). Git constraints are resolved to
+// the highest satisfying tag (re-resolving when a transitive dep tightens the floor); locked deps reuse
+// their pinned commit. `use_vendor` short-circuits to vendor/<name> when present (offline). Lock lines
+// for every git-origin dep are accumulated into `lk` (a one-element Str cell).
+pub fn resolve_graph(mf: Str, locks: Map<Str, Str>, inout lk: Vec<Str>, inout dirs: Map<Str, Str>, inout names: Vec<Str>, use_vendor: Bool) {
+    var urls: Map<Str, Str> = map()
+    var cons: Map<Str, Str> = map()
+    var kinds: Map<Str, Str> = map()
+    var refx: Map<Str, Str> = map()
+    var tagv: Map<Str, Str> = map() // name -> the tag it currently resolves to
+    var queue: Vec<Str> = vec()
+    scan_deps(mf, urls, cons, kinds, refx, names, queue)
+    var qi = 0
+    var guard = 0
+    while qi < queue.len() {
+        guard = guard + 1
+        if guard > 5000 {
+            break
+        }
+        // backstop against a pathological graph
+        let name = queue[qi]
+        qi = qi + 1
+        let k = kinds.get(name)
+        var dir = ""
+        var skip = false
+        if use_vendor {
+            let vd = ("vendor/" + name)
+            if os::path_exists(vd) {
+                dir = copy vd
+            }
+        }
+        if(dir == "") {
+            if(k == "path") {
+                dir = refx.get(name)
+            }
+            else {
+                if(k == "ref") {
+                    dir = git_cache_dir(name, urls.get(name), refx.get(name), locks)
+                }
+                else {
+                    let url = urls.get(name)
+                    if locks.has(name) {
+                        dir = git_cache_dir(name, url, "", locks)
+                    }
+                    // pinned: skip tag listing
+                    else {
+                        let tag = best_tag(git::tags(url), cons.get(name))
+                        if(tag == "") {
+                            printl(("roll: no published version of `" + (name + ("` satisfies " + cons.get(name)))))
+                            skip = true
+                        }
+                        else {
+                            if tagv.has(name) && (tagv.get(name) == tag) {
+                                skip = true
+                            }
+                            // unchanged since last visit
+                            else {
+                                tagv.put(name, copy tag)
+                                dir = git_cache_dir(name, url, copy tag, locks)
+                            }
+                        }
+                    }
+            } }
+        }
+        if skip {
+            qi = qi
+        } else {
+            if !(dir == "") {
+                dirs.put(name, copy dir)
+                let dmf = (dir + "/nori.manifest")
+                if os::path_exists(dmf) {
+                    scan_deps(read_file(dmf), urls, cons, kinds, refx, names, queue)
+                }
+            }
+        }
+    }
+    var j = 0 // lock lines: every git-origin dep with a real .git
+    while j < names.len() {
+        let nm = names[j]
+        if dirs.has(nm) {
+            if !(kinds.get(nm) == "path") {
+                let head = git::head(dirs.get(nm))
+                if !(head == "") {
+                    lk[0] = (lk[0] + (nm + (" = git " + (urls.get(nm) + (" commit=" + (head + "\n"))))))
+                }
+        } }
+        j = j + 1
+    }
+}
+// import resolution: tell noric where std + dependencies live.
+// --import-root NORI_HOME resolves `import "std/..."`; each [deps] entry -> --import-map NAME=<entry>.
+// git deps are fetched (honouring nori.lock) and their exact commits written back to nori.lock.
+// a [native] cfile is resolved cwd-relative, else under NORI_HOME (so a project shipping one finds it).
+fn resolve_native(p: Str) -> Str {
+    if os::path_exists(p) {
+        return copy p
+    }
+    let h = (nori_home() + ("/" + p))
+    if os::path_exists(h) {
+        return h
+    }
+    return copy p
+}
+// A dependency's native path is relative to the dependency, not to whoever is building. `cfile = cb.c`
+// in a library means that library's own cb.c; resolving it cwd-relative would find nothing (or a
+// same-named file in the root project), so the base directory has to come along.
+fn resolve_native_in(p: Str, base: Str) -> Str {
+    if os::path_exists(p) { return copy p }                      // absolute, or already relative to cwd
+    let d = (base + ("/" + p))
+    if os::path_exists(d) { return d }
+    return resolve_native(p)                                // last resort: NORI_HOME (a std seam)
+}
+// An absolute, `.`/`..`-free spelling of `p`, for comparing two paths (not for passing along).
+// Dedup has to survive the same file written two ways: a root saying `cfile = ../lib/cb.c` and the
+// library itself saying `cb.c` are one C file, and handing clang both compiles it twice. Symlinks
+// are not chased; this is a string comparison, and a false miss only means the file is passed twice.
+fn norm_abs(p: Str) -> Str {
+    var full = p
+    if !(p.len() > 0 && ord(p.at(0)) == 47) { full = (os::cwd() + ("/" + p)) }
+    var parts: Vec<Str> = vec()
+    var start = 0
+    var i = 0
+    let n = full.len()
+    while i <= n {
+        if i == n || ord(full.at(i)) == 47 {
+            let seg = full.slice(start, i)
+            if (seg == "") || (seg == ".") { }
+            else if (seg == "..") { if parts.len() > 0 { let junk_p = parts.pop() } }
+            else { parts.push(seg) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    var out = ""
+    var k = 0
+    while k < parts.len() { out = (out + ("/" + parts[k]))  k = k + 1 }
+    if (out == "") { return "/" }
+    return out
+}
+// `flag item` per comma-separated item, resolved against `base`, skipping anything already pushed.
+// The dedup matters: the root and a dep can name the same C file, and two `--cfile` for one
+// path compiles the unit twice and the link fails on duplicate symbols.
+fn add_list_flags_in(inout cmd: Vec<Str>, flag: Str, val: Str, resolve: Bool, base: Str, inout seen: Map<Str, Int>) {
+    if(val == "") { return }
+    let n = val.len()
+    var start = 0
+    var i = 0
+    while i <= n {
+        if i == n || ord(val.at(i)) == 44 {
+            let item = trim(val.slice(start, i))
+            if !(item == "") {
+                var out = item
+                if resolve { out = resolve_native_in(item, base) }
+                var kp = out
+                if resolve { kp = norm_abs(out) }          // paths compare canonically; -lNAME as written
+                let k = (flag + (" " + kp))
+                if seen.has(k) { } else {
+                    seen.put(k, 1)
+                    cmd.push(copy flag)  cmd.push(copy out)
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+// Every `[native]` a dependency declares, for the whole resolved graph (direct + transitive).
+//
+// This lets a library own the C it binds to. If only the root manifest's `[native]` were read, a lib
+// declaring `cfile = cb.c` would type-check and build, then fail at the link of every program that
+// used it (`undefined symbol: cb_run`), and the C file would have to be copied into the root
+// project. That would make a self-contained Nori library impossible for the case bindgen serves.
+//
+// cfile / clink / ldir only. sysroot, ccflag and ldflag describe the build (which machine, which
+// toolchain, which target) and belong to whoever invoked it; a dependency does not get to set those
+// for the program linking it.
+pub fn add_dep_native_flags(inout cmd: Vec<Str>, mf: Str, names: Vec<Str>, dirs: Map<Str, Str>, plat: Str) {
+    var seen: Map<Str, Int> = map()
+    // Seed with what the root already put on the command line, into a throwaway vec, so these are
+    // recorded as seen without being emitted a second time.
+    var dropped: Vec<Str> = vec()
+    add_list_flags_in(dropped, "--cfile", expand_env(native_key(mf, plat, "cfile")), true, ".", seen)
+    add_list_flags_in(dropped, "--clink", expand_env(native_key(mf, plat, "clink")), false, ".", seen)
+    add_list_flags_in(dropped, "--ldir", expand_env(native_key(mf, plat, "ldir")), true, ".", seen)
+    var i = 0
+    while i < names.len() {
+        let nm = names[i]
+        if dirs.has(nm) {
+            let dir = dirs.get(nm)
+            let dmf = (dir + "/nori.manifest")
+            if os::path_exists(dmf) {
+                let dm = read_file(dmf)
+                add_list_flags_in(cmd, "--cfile", expand_env(native_key(dm, plat, "cfile")), true, dir, seen)
+                add_list_flags_in(cmd, "--clink", expand_env(native_key(dm, plat, "clink")), false, dir, seen)
+                add_list_flags_in(cmd, "--ldir", expand_env(native_key(dm, plat, "ldir")), true, dir, seen)
+            }
+        }
+        i = i + 1
+    }
+}
+// every `cfile` the graph declares, root included; add_absent_seams tests against it.
+pub fn graph_cfiles(mf: Str, names: Vec<Str>, dirs: Map<Str, Str>, plat: Str) -> Str {
+    var out = native_key(mf, plat, "cfile")
+    var i = 0
+    while i < names.len() {
+        if dirs.has(names[i]) {
+            let dmf = (dirs.get(names[i]) + "/nori.manifest")
+            if os::path_exists(dmf) { out = (out + ("," + native_key(read_file(dmf), plat, "cfile"))) }
+        }
+        i = i + 1
+    }
+    return out
+}
+// push `flag item` for each comma-separated item in `val` (resolving cfile paths when `resolve`).
+fn add_list_flags(inout cmd: Vec<Str>, flag: Str, val: Str, resolve: Bool) {
+    if(val == "") {
+        return
+    }
+    let n = val.len()
+    var start = 0
+    var i = 0
+    while i <= n {
+        if i == n || ord(val.at(i)) == 44 {
+            // ','
+            let item = trim(val.slice(start, i))
+            if !(item == "") {
+                cmd.push(copy flag)
+                if resolve {
+                    cmd.push(resolve_native(item))
+                } else {
+                    cmd.push(item)
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+// [native]: a project's native C dependencies. cfile = a C shim to compile+link; clink = a -lLIB;
+// ldir = a directory to search for those libs. roll forwards them as noric --cfile/--clink/--ldir, so
+// These are trusted, build-time native links.
+//
+// `ldir` makes a lib in a non-standard directory work without the caller exporting
+// LIBRARY_PATH/LD_LIBRARY_PATH by hand: noric turns it into both `-L<dir>` and `-Wl,-rpath,<dir>`, so
+// the link finds it and so does the finished binary. Like cfile, an ldir that is not a path from the
+// project resolves against NORI_HOME.
+pub fn add_native_flags(inout cmd: Vec<Str>, mf: Str) {
+    add_native_flags_for(cmd, mf, native_platform_of(native_target_triple(mf)))
+}
+// The cross-compile triple, read the same way `roll build --target` reads it: CLI first, then the
+// manifest's top-level `target`. Derived here rather than passed through add_import_flags, so its
+// callers need not know about targets.
+fn native_target_triple(mf: Str) -> Str {
+    var k = 1
+    while k < argc() {
+        if(arg(k) == "--target") { if k + 1 < argc() { return arg(k + 1) } }
+        k = k + 1
+    }
+    return section_get(mf, "", "target")
+}
+// The platform name a triple selects a `[native.<name>]` section with. It is the same answer
+// noric's cfg gives, so the manifest and the code agree about what "android" means: an android triple
+// is both Linux and android, and picks the android section.
+pub fn native_platform_of(triple: Str) -> Str {
+    // No triple means this machine, and on Windows this machine has a section of its own. Answering ""
+    // would read only the base [native] keys, so a native Windows build would ignore [native.windows]
+    // entirely: window_win32.c would not be compiled and the neutral window shim would be linked in
+    // its place. (Elsewhere "" stays "": the base keys are the host's, and a Linux build has no section.)
+    if(triple == "") {
+        cfg(windows) { return "windows" }
+        return ""
+    }
+    if strutil::contains(triple, "android") { return "android" }
+    if strutil::contains(triple, "windows") || strutil::contains(triple, "mingw") { return "windows" }
+    if strutil::contains(triple, "darwin") || strutil::contains(triple, "apple") { return "macos" }
+    return "linux"
+}
+// One key of [native], letting a `[native.<platform>]` section replace it. It replaces rather than
+// appends, because the case this exists for is a swap: a window shim may be
+// std/window/window_wayland.c on a desktop and std/window/window_android.c on Android, and compiling
+// both would be a duplicate-symbol error. A platform that says nothing about a key
+// inherits it, so `clink = curl` written once still applies everywhere.
+fn native_key(mf: Str, plat: Str, key: Str) -> Str {
+    if !(plat == "") {
+        // Test whether the key is mentioned, not whether it is non-empty. A platform that says nothing
+        // about a key inherits it; one that names the key overrides it, including naming it with
+        // nothing, which is how a platform says "not here". Testing the value would make the two
+        // indistinguishable, so a library the base section links could not be dropped for one target
+        // (a library the base section links, such as a Unix-only one, must not be inherited under
+        // `[native.windows]`).
+        var ks = manifest::section_keys(mf, ("native." + plat))
+        var i = 0
+        while i < ks.len() {
+            if ks[i] == key { return section_get(mf, ("native." + plat), key) }
+            i = i + 1
+        }
+    }
+    return section_get(mf, "native", key)
+}
+/// One key of [native] / [native.<platform>], by name, with $VARs expanded, for a caller that
+/// needs a key this module has no opinion about (the APK packager's `java` and
+/// `manifest_application`, say). Same inheritance as everything else here: the platform section
+/// replaces the shared one, and saying nothing inherits.
+pub fn native_of(mf: Str, plat: Str, key: Str) -> Str { return expand_env(native_key(mf, plat, key)) }
+
+// Expand $VAR and ${VAR} from the environment. A cross toolchain lives at a path that differs per
+// machine, so a committed manifest cannot name it, but it can name the variable that holds it
+// (`sysroot = $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot`), which makes
+// `roll build --target aarch64-linux-android24` work for anyone who has an NDK, without editing the
+// manifest.
+fn expand_env(v: Str) -> Str {
+    let n = v.len()
+    var out = ""
+    var i = 0
+    while i < n {
+        if ord(v.at(i)) == 36 {                                  // '$'
+            var j = i + 1
+            var braced = false
+            if j < n { if ord(v.at(j)) == 123 { braced = true  j = j + 1 } }   // '{'
+            let st = j
+            var scanning = true
+            while scanning {
+                if j >= n { scanning = false } else {
+                    let c = ord(v.at(j))
+                    if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 { j = j + 1 }
+                    else { scanning = false }
+                }
+            }
+            let name = v.slice(st, j)
+            if braced { if j < n { if ord(v.at(j)) == 125 { j = j + 1 } } }    // '}'
+            // An unset variable drops the whole key rather than expanding to nothing. A path built
+            // from an empty variable is not a smaller path, it is "/include", a real directory on
+            // the wrong machine. It also gives a manifest a way to say "these flags apply only where
+            // this toolchain is installed": a build on a machine without that tree wants the
+            // section to be absent, not half-applied.
+            if(name == "") { out = (out + "$") } else {
+                let val = os::env_or(name, "")
+                if (val == "") { return "" }
+                out = (out + val)
+            }
+            i = j
+        } else { out = (out + v.at(i))  i = i + 1 }
+    }
+    return out
+}
+// substring test; roll's index_of takes a character, and these are path fragments.
+fn has_sub(s: Str, sub: Str) -> Bool {
+    let n = sub.len()
+    if n > s.len() { return false }
+    var i = 0
+    while i + n <= s.len() {
+        if (s.slice(i, i + n) == sub) { return true }
+        i = i + 1
+    }
+    return false
+}
+// Under --sep-std a std module is compiled whole, including the functions a whole-program build drops
+// as unreachable, so the module's C seam has to link even when the program never calls through it.
+// For example, `import "std/nori_ui"` reaches the GPU painter, and a project that never asked for a
+// GPU would otherwise fail with "undefined reference to ui_gpu_begin". Each seam ships an absent
+// shim answering it with neutral defaults, so fill in the ones this manifest does not already
+// implement: a project naming its own window backend keeps that backend, and only the seams it left
+// empty get the neutral one. Adding a seam the program never reaches is harmless, since nothing
+// references those symbols and --gc-sections drops them.
+pub fn add_absent_seams(inout cmd: Vec<Str>, mf: Str, plat: Str, home: Str) {
+    // The whole graph's cfiles, not just the root's. Since a dependency's [native] reaches the
+    // link, a dep supplying one of these backends would otherwise get the neutral shim linked
+    // alongside it and the build would fail on duplicate symbols. (With no deps this walk finds
+    // nothing and costs a manifest read.)
+    let locks = load_lock()
+    var lk: Vec<Str> = vec()
+    var dirs: Map<Str, Str> = map()
+    var names: Vec<Str> = vec()
+    resolve_graph(mf, locks, lk, dirs, names, true)
+    let have = graph_cfiles(mf, names, dirs, plat)
+    if !has_sub(have, "std/window/") {
+        cmd.push("--cfile")  cmd.push((home + "/std/window/window_absent.c"))
+    }
+    if !has_sub(have, "std/nori_ui/paint_gpu/") {
+        cmd.push("--cfile")  cmd.push((home + "/std/nori_ui/paint_gpu/ui_gpu_absent.c"))
+    }
+    if !has_sub(have, "std/notify/") {
+        cmd.push("--cfile")  cmd.push((home + "/std/notify/notify_absent.c"))
+    }
+    // background picks its own backend from the `background` key, so only fill that seam when the
+    // manifest did not ask for one; otherwise both shims define it and the link fails on duplicates.
+    if !has_sub(have, "std/background/") {
+        if !(native_of(mf, plat, "background") == "true") {
+            cmd.push("--cfile")  cmd.push((home + "/std/background/background_absent.c"))
+        }
+    }
+}
+// ==================== which back end builds this project ====================
+// noric's own code generator and linker are the default. The LLVM pipeline builds what that back end
+// cannot, and roll says so on the command line rather than leaving noric to guess: a project that
+// links C (a [native] section anywhere in its graph), an Android APK's arm64 shared object, a macOS
+// target, and any profile that tunes LLVM's optimizer or asks for its per-unit path.
+pub fn needs_llvm(mf: Str, plat: Str, andro: Bool) -> Bool {
+    if andro { return true }
+    if (plat == "macos") { return true }
+    var probe: Vec<Str> = vec()
+    add_native_flags_for(probe, mf, plat)
+    // …unless all of it is glue the native back end answers with a module of its own (the window
+    // shims, the GPU glue) and the libraries that glue alone needed: std/native_seams lists those
+    if (plat == "" || plat == "linux") && native_answers_all(probe) { return false }
+    if probe.len() > 0 { return true }
+    // The optimizer keys do not count. `opt`, `lto` and `incremental` are what a manifest says about
+    // LLVM's optimizer and its per-unit path; a project setting them is not asking for that pipeline,
+    // and `roll init` writes `incremental = true` into every scaffolded manifest. cmds drops them on
+    // the native path instead.
+    return false
+}
+// ---- the C a native build does without (std/native_seams: `=cfile`, `=clink`, `=ccflag`) ----
+fn seam_list(kind: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let f = (nori_home() + "/std/native_seams")
+    if !os::is_file(f) { return out }
+    let txt = read_file(f)
+    var start = 0
+    var i = 0
+    let n = txt.len()
+    while i <= n {
+        if i == n || ord(txt.at(i)) == 10 {
+            let ln = txt.slice(start, i)
+            if ln.len() > kind.len() + 1 && (ln.slice(0, kind.len() + 1) == (kind + " ")) {
+                var ws = 0
+                var j = kind.len() + 1
+                ws = j
+                while j <= ln.len() {
+                    if j == ln.len() || ord(ln.at(j)) == 32 { if j > ws { out.push(ln.slice(ws, j)) }  ws = j + 1 }
+                    j = j + 1
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+/// does `value` end in `entry`, whose one `*` stands for anything?
+fn seam_match(value: Str, entry: Str) -> Bool {
+    var star = 0 - 1
+    var i = 0
+    while i < entry.len() { if ord(entry.at(i)) == 42 { star = i }  i = i + 1 }
+    if star < 0 { return value == entry || ends_with(value, ("/" + entry)) }
+    let pre = entry.slice(0, star)
+    let post = entry.slice(star + 1, entry.len())
+    if !ends_with(value, post) { return false }
+    return has_sub(value, pre)
+}
+/// one `--flag value` of a [native] section: does the native back end build the project without it?
+pub fn native_answers(flag: Str, value: Str) -> Bool {
+    if (flag == "--ldir") { return true }                 // the native link searches it and records it as the run path
+    var kind = ""
+    if (flag == "--cfile") { kind = "=cfile" }
+    if (flag == "--clink") { kind = "=clink" }
+    if (flag == "--ccflag") { kind = "=ccflag" }
+    if (kind == "") { return false }
+    let es = seam_list(kind)
+    var i = 0
+    while i < es.len() { if seam_match(value, es[i]) { return true }  i = i + 1 }
+    return false
+}
+/// every entry of a flag list (`--flag value` pairs), and at least one
+pub fn native_answers_all(flags: Vec<Str>) -> Bool {
+    if flags.len() == 0 { return false }
+    var i = 0
+    while i + 1 < flags.len() {
+        if !native_answers(flags[i], flags[i + 1]) { return false }
+        i = i + 2
+    }
+    return true
+}
+/// the command without the pairs the native back end does without (`--ldir` stays: the native link
+/// searches the directory for the program's shared libraries and records it as the run path)
+pub fn strip_answered(cmd: Vec<Str>) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var i = 0
+    while i < cmd.len() {
+        let f = cmd[i]
+        if ((f == "--cfile") || (f == "--clink") || (f == "--ccflag")) && i + 1 < cmd.len() {
+            if native_answers(f, cmd[i + 1]) { i = i + 2  continue }
+        }
+        out.push(copy f)
+        i = i + 1
+    }
+    return out
+}
+// [native] for a specific target platform ("" = build for the host).
+pub fn add_native_flags_for(inout cmd: Vec<Str>, mf: Str, plat: Str) {
+    add_list_flags(cmd, "--cfile", expand_env(native_key(mf, plat, "cfile")), true)
+    add_list_flags(cmd, "--clink", expand_env(native_key(mf, plat, "clink")), false)
+    // Expanded like `sysroot` and `ccflag`: a library directory differs per machine and per target,
+    // and one that cannot name a variable can only be written for one machine.
+    add_list_flags(cmd, "--ldir", expand_env(native_key(mf, plat, "ldir")), true)
+    // A cross build also needs to say where the target's headers and runtime libraries are. Without
+    // these a `roll build --target` picks the right sources and then compiles them against the host's
+    // libc, which fails inside rt_shim.c with errors about the host's own headers.
+    let sr = expand_env(native_key(mf, plat, "sysroot"))
+    if !(sr == "") { cmd.push("--sysroot")  cmd.push(sr) }
+    add_list_flags(cmd, "--ccflag", expand_env(native_key(mf, plat, "ccflag")), false)
+    // `ldflag` applies to the link only, never a compile. Passing a linker flag through `ccflag` as
+    // `-Xlinker, --whatever` would reach every per-unit `-c` invocation too, where clang reports
+    // "'linker' input unused [-Wunused-command-line-argument]" once per unit.
+    add_list_flags(cmd, "--ldflag", expand_env(native_key(mf, plat, "ldflag")), false)
+    let cc = expand_env(native_key(mf, plat, "cc"))
+    if !(cc == "") { cmd.push("--cc")  cmd.push(cc) }
+}
+// the host OS token for `cfg(...)` selection, from sys::target() ("x86_64-linux" -> "linux"; darwin -> macos).
+pub fn host_os() -> Str {
+    let t = sys::target()
+    let n = t.len()
+    var i = 0
+    while i < n {
+        if ord(t.at(i)) == 45 {
+            let o = t.slice(i + 1, n)
+            if(o == "darwin") {
+                return "macos"
+            }
+            return o
+        }
+        i = i + 1
+    }
+    return "linux"
+}
+// Forward `[removed]` tombstones as `--removed NAME=MESSAGE`, so deleting a public name can still
+// explain itself at the call site. `deprecated` covers a name that still exists; once it is gone the
+// declaration that would carry the message is gone too, and the call collapses to "undefined
+// function", often with a did-you-mean pointing somewhere unrelated. The message therefore lives in
+// the manifest of the package that removed it:
+//   [removed]
+//   old_hash   = use `new_hash` — 2.0 removed it (it collided on short keys)
+//   Box::size  = use `count()` — `size` counted bytes, not items
+// A method is keyed `Type::name`. Entries are read from every resolved dependency's manifest, not
+// just this project's (the package that deleted the name is the one that knows why), and from this
+// project's own manifest too, so a library can exercise its own tombstones.
+fn add_removed_from(inout cmd: Vec<Str>, mf: Str) {
+    let keys = section_keys(mf, "removed")
+    var i = 0
+    while i < keys.len() {
+        var msg = section_get(mf, "removed", keys[i])
+        if msg.len() >= 2 && ord(msg.at(0)) == 34 && ord(msg.at(msg.len() - 1)) == 34 {
+            msg = msg.slice(1, msg.len() - 1)
+        }
+        cmd.push("--removed") cmd.push((keys[i] + ("=" + msg)))
+        i = i + 1
+    }
+}
+/// The cfg OS a build compiles for: the target's, not the host's.
+///
+/// `--os` decides which `cfg(...)` blocks are compiled. Answering it with `host_os()` for a cross
+/// build to Windows would compile every `cfg(linux)` body (the futex mutex floor, the raw-syscall
+/// paths, the epoll scheduler seam) and hand them to a Windows link, where `rt_shim.c` defines the
+/// same names, producing `duplicate symbol` errors. The same holds for any target that is not this
+/// machine.
+///
+/// An Android triple answers `linux`, which is what Android is; the `android` cfg comes from the
+/// triple separately (noric's `target_is_android`), so answering "android" here would turn off
+/// every `cfg(linux)` body the platform needs.
+pub fn build_os(mf: Str) -> Str {
+    let plat = native_platform_of(native_target_triple(mf))
+    if(plat == "") { return host_os() }
+    if(plat == "android") { return "linux" }
+    return plat
+}
+pub fn add_import_flags(inout cmd: Vec<Str>, mf: Str) {
+    cmd.push("--import-root") cmd.push(nori_home())
+    cmd.push("--os") cmd.push(build_os(mf)) // target platform for cfg() (multiplatform std)
+    let req = section_get(mf, "", "nori") // minimum compiler version (optional)
+    if !(req == "") {
+        cmd.push("--require-nori")
+        cmd.push(req)
+    }
+    // top-level `auto-type = false` -> require an explicit `: T` on every let/var (default: inference on)
+    if(section_get(mf, "", "auto-type") == "false") {
+        cmd.push("--no-auto-type")
+    }
+    add_native_flags(cmd, mf) // [native] cfile/clink -> --cfile/--clink
+    let locks = load_lock()
+    var lk: Vec<Str> = vec()
+    lk.push("# nori.lock — exact commits roll resolved for git dependencies. Commit this for\n# reproducible builds; delete a line to re-resolve that dependency.\n")
+    var dirs: Map<Str, Str> = map()
+    var names: Vec<Str> = vec()
+    resolve_graph(mf, locks, lk, dirs, names, true) // full graph (direct + transitive), vendor-aware
+    // a dependency's [native] is part of the program too (see add_dep_native_flags)
+    add_dep_native_flags(cmd, mf, names, dirs, native_platform_of(native_target_triple(mf)))
+    var i = 0
+    while i < names.len() {
+        let nm = names[i]
+        if dirs.has(nm) {
+            cmd.push("--import-map")
+            cmd.push((nm + ("=" + module_in(dirs.get(nm)))))
+        }
+        i = i + 1
+    }
+    add_removed_from(cmd, mf) // this project's own tombstones
+    var ri = 0
+    while ri < names.len() {
+        // …and every dependency's: the remover knows why
+        let rn = names[ri]
+        if dirs.has(rn) {
+            let dmf = (dirs.get(rn) + "/nori.manifest")
+            if os::path_exists(dmf) {
+                add_removed_from(cmd, read_file(dmf))
+            }
+        }
+        ri = ri + 1
+    }
+    if find_substr(lk[0], " commit=") >= 0 {
+        write_file("nori.lock", lk[0])
+    }
+}
+// `roll build --separate`: separate compilation. Each dependency is compiled once into a
+// self-contained object (`noric --build-lib`, exporting only `name__*`) plus an interface
+// (`noric --emit-interface`); the project then type-checks against the interfaces (not the bodies) and
+// links the objects. It forces the incremental (no-LTO) backend so external objects link cleanly, and
+// caches the per-dep object and interface under the dep's cache dir, keyed by a content key
+// (sep_dep_key below), so a mutable `path` dep rebuilds the moment its sources, or its own deps'
+// sources, change.
+// a dep's closure-id tag; it must match noric's clos_tag_of (the lib's id space is tag<<24): the
+// consumer's router uses these to run a dep-created closure in the dep's own dispatcher.
+fn dep_clos_tag(name: Str) -> Int {
+    var cb = 0
+    var ci = 0
+    while ci < name.len() {
+        cb = ((cb * 31 + ord(name.at(ci))) % 4093)
+        ci = ci + 1
+    }
+    return cb + 1
+}
+// ---------- `--separate` freshness: a dependency's content key ----------
+// A present .o cannot simply be trusted: the dep cache dir is commit-addressed and immutable for a
+// git dep (`<cache>/name@<commit>`), but a `path` dep is a mutable working directory someone is
+// editing, and relinking a stale object would produce a binary that does not match its sources.
+//
+// So the object is keyed the way a sep-std module is:
+//   sha256(compiler binary ‖ --os ‖ the module's sources ‖ child keys)
+// The key is the content, not mtime: mtime moves on a fresh checkout, a `touch`, or an editor that
+// rewrites a file it did not change (all of which would rebuild for nothing) and can move backwards
+// (a restored file), which would not rebuild when it must. The key is written next to the object as
+// `<name>.key`.
+//
+// Git deps stay fast: their directory name already carries the commit, so `sep_src_key` returns that
+// name instead of walking and hashing the whole cached tree.
+fn sep_compiler_id() -> Str {
+    let np = noric_path()
+    if os::path_exists(np) {
+        return crypto::sha256_file(np)
+    }
+    return np
+}
+// is `dir` the immutable, commit-addressed package cache? (`<cache>/name@<sha>`; vendor/ and path deps
+// are working directories and are not immutable.)
+fn sep_immutable_dir(dir: Str) -> Bool { return strutil::starts_with(dir, (cache_dir() + "/")) }
+// every `.nori` under `root` (recursively, since a module's subfolders compile into its object too), sorted,
+// with roll's own `.sep/` scratch skipped. Sorted so the key does not depend on readdir order.
+fn sep_nori_files(root: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    if !os::path_exists(root) {
+        return out
+    }
+    let all = os::list_tree(root)
+    var i = 0
+    while i < all.len() {
+        let f = all[i]
+        if ends_with(f, ".nori") && find_substr(f, "/.sep/") < 0 {
+            var j = out.len()
+            out.push(copy f)
+            while j > 0 && str_lt(f, out[j - 1]) {
+                out[j] = copy out[j - 1]
+                out[j - 1] = copy f
+                j = j - 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+// hash of everything about this dep that can change what its object contains: its manifest (entry,
+// native flags, tombstones) and every `.nori` file of its module, so a new file, a deleted file and
+// an edited file all move the key, while a `touch` that changes no bytes does not.
+fn sep_src_key(dir: Str) -> Str {
+    if sep_immutable_dir(dir) {
+        return("git:" + dir)
+    }
+    var acc = ""
+    let dmf = (dir + "/nori.manifest")
+    if os::path_exists(dmf) {
+        acc = (acc + ("manifest " + (crypto::sha256(read_file(dmf)) + "\n")))
+    }
+    let files = sep_nori_files(module_in(dir))
+    var i = 0
+    while i < files.len() {
+        acc = (acc + (files[i] + (" " + (crypto::sha256(read_file(files[i])) + "\n"))))
+        i = i + 1
+    }
+    return crypto::sha256(acc)
+}
+// the full key: compiler ‖ target OS ‖ this dep's sources ‖ its own dependencies' keys. The child keys
+// are what makes an A <- B <- C edit correct: a dep's object inlines its transitive deps' sources, so
+// editing C must rebuild B's object as well as A's. `memo` keeps a diamond linear; `depth` is the
+// backstop for a dependency cycle (resolve_graph tolerates one).
+fn sep_dep_key(nm: Str, dir: Str, cid: Str, dirs: Map<Str, Str>, inout memo: Map<Str, Str>, depth: Int) -> Str {
+    if memo.has(nm) {
+        return copy memo.get(nm)
+    }
+    if depth > 64 {
+        return("cycle:" + nm)
+    }
+    var acc = (cid + ("\n" + (host_os() + ("\n" + (nm + ("\n" + (sep_src_key(dir) + "\n")))))))
+    let dmf = (dir + "/nori.manifest")
+    if os::path_exists(dmf) {
+        let kids = section_keys(read_file(dmf), "deps")
+        var i = 0
+        while i < kids.len() {
+            let cn = kids[i]
+            if dirs.has(cn) && !(cn == nm) {
+                acc = (acc + ("dep " + (cn + (" " + (sep_dep_key(cn, dirs.get(cn), cid, dirs, memo, depth + 1) + "\n")))))
+            }
+            i = i + 1
+        }
+    }
+    let k = crypto::sha256(acc)
+    memo.put(nm, copy k)
+    return k
+}
+// `--emit-interface` reads one file, but a Nori module is a directory whose root files share a scope
+// and all export their `pub` items. Concatenate the module's root files (test files excluded, since they are
+// not API) into `.sep/<name>.mod.nori` and emit the interface from that, so the interface covers every
+// root file the way the object does. A one-file module concatenates to itself.
+fn sep_module_source(root: Str) -> Str {
+    var acc = ""
+    let names = os::read_dir(root)
+    var files: Vec<Str> = vec()
+    var i = 0
+    while i < names.len() {
+        let f = (root + ("/" + names[i]))
+        if ends_with(names[i], ".nori") && !ends_with(names[i], "_test.nori") {
+            if !os::is_dir(copy f) {
+                var j = files.len()
+                files.push(copy f)
+                while j > 0 && str_lt(copy f, files[j - 1]) {
+                    files[j] = copy files[j - 1]
+                    files[j - 1] = copy f
+                    j = j - 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    var k = 0
+    while k < files.len() {
+        acc = (acc + (read_file(files[k]) + "\n"))
+        k = k + 1
+    }
+    return acc
+}
+pub fn add_separate_flags(inout cmd: Vec<Str>, mf: Str) {
+    cmd.push("--import-root") cmd.push(nori_home())
+    cmd.push("--os") cmd.push(build_os(mf))
+    let req = section_get(mf, "", "nori")
+    if !(req == "") {
+        cmd.push("--require-nori")
+        cmd.push(req)
+    }
+    if(section_get(mf, "", "auto-type") == "false") {
+        cmd.push("--no-auto-type")
+    }
+    add_native_flags(cmd, mf)
+    let locks = load_lock()
+    var lk: Vec<Str> = vec()
+    lk.push("# nori.lock — exact commits roll resolved for git dependencies. Commit this for\n# reproducible builds; delete a line to re-resolve that dependency.\n")
+    var dirs: Map<Str, Str> = map()
+    var names: Vec<Str> = vec()
+    resolve_graph(mf, locks, lk, dirs, names, true)
+    add_dep_native_flags(cmd, mf, names, dirs, native_platform_of(native_target_triple(mf)))
+    // pre-resolve every dep's source path (so a dep that imports another dep resolves transitively inside
+    // its own object, which stays self-contained).
+    var srcmaps: Vec<Str> = vec()
+    var di = 0
+    while di < names.len() {
+        let nm = names[di]
+        if dirs.has(nm) {
+            srcmaps.push((nm + ("=" + module_in(dirs.get(nm)))))
+        }
+        di = di + 1
+    }
+    add_removed_from(cmd, mf) // tombstones travel the separate-compilation path too:
+    var rj = 0 // the consumer checks against interfaces, where a
+    while rj < names.len() {
+        // deleted name is just as absent as in the source
+        let rm = names[rj]
+        if dirs.has(rm) {
+            let dmf2 = (dirs.get(rm) + "/nori.manifest")
+            if os::path_exists(dmf2) {
+                add_removed_from(cmd, read_file(dmf2))
+            }
+        }
+        rj = rj + 1
+    }
+    let cid = sep_compiler_id()   // one hash of the compiler binary per build, shared by every dep
+    var keymemo: Map<Str, Str> = map()
+    var i = 0
+    while i < names.len() {
+        let nm = names[i]
+        if dirs.has(nm) {
+            let dir = dirs.get(nm)
+            let src = module_in(dir)   // the whole module, so its interface covers every root file
+            let sep = (dir + "/.sep")
+            os::make_dir_p(sep)
+            let iface = (sep + ("/" + (nm + ".iface")))
+            let obj = (sep + ("/" + (nm + ".o")))
+            let keyf = (sep + ("/" + (nm + ".key")))
+            let wrap = (sep + "/wrap.nori")
+            let modsrc = (sep + ("/" + (nm + ".mod.nori")))
+            write_file(wrap, ("import " + (chr(34) + (nm + (chr(34) + (" as " + (nm + chr(10))))))))
+            write_file(modsrc, sep_module_source(src))
+            // interface (cheap, always refresh)
+            var ic: Vec<Str> = vec() ic.push(noric_path()) ic.push("--emit-interface") ic.push(modsrc) ic.push("--out") ic.push(copy iface)
+            if os::run(ic) != 0 {
+                eprintl((verb("Failed", "1;31") + (" interface for " + nm)))
+                return
+            }
+            // object: rebuilt exactly when its content key moves (see sep_dep_key above): the sources of
+            // this dep, the keys of its own deps, the compiler and the target OS. A git dep's key is its
+            // commit-addressed directory name, so it is cheap and still stays cached.
+            let key = sep_dep_key(nm, dir, cid, dirs, keymemo, 0)
+            var fresh = false
+            if os::path_exists(obj) && os::path_exists(keyf) {
+                if(read_file(keyf) == key) {
+                    fresh = true
+                }
+            }
+            if !fresh {
+                eprintl((verb("Compiling", "1;36") + (" " + (dim("dep ") + nm))))
+                var bc: Vec<Str> = vec()
+                bc.push(noric_path()) bc.push("--build-lib") bc.push(wrap) bc.push(copy obj)
+                bc.push("--export-prefix") bc.push(copy nm)
+                var si = 0
+                while si < srcmaps.len() {
+                    bc.push("--import-map")
+                    bc.push(copy srcmaps[si])
+                    si = si + 1
+                }
+                bc.push("--import-root") bc.push(nori_home()) bc.push("--os") bc.push(host_os())
+                if os::run(bc) != 0 {
+                    eprintl((verb("Failed", "1;31") + (" compiling dep " + nm)))
+                    return
+                }
+                write_file(keyf, key)   // only after the object is really on disk
+            }
+            cmd.push("--import-map") cmd.push((nm + ("=" + iface)))
+            cmd.push("--cfile") cmd.push(copy obj)
+        }
+        i = i + 1
+    }
+    // closure routing table: dep-created closures (a dep pub fn returning Fn, a callback a dep stores)
+    // dispatch back into the dep's own exported dispatcher instead of trapping in the consumer's.
+    var tags = ""
+    i = 0
+    while i < names.len() {
+        let nm = names[i]
+        if dirs.has(nm) {
+            if !(tags == "") {
+                tags = (tags + ",")
+            }
+            tags = (tags + (to_str(dep_clos_tag(nm)) + ("=" + (nm + "__closdisp"))))
+        }
+        i = i + 1
+    }
+    if !(tags == "") {
+        cmd.push("--clos-tags")
+        cmd.push(tags)
+    }
+    if find_substr(lk[0], " commit=") >= 0 {
+        write_file("nori.lock", lk[0])
+    }
+}
+
+// copy a dependency's source tree into `dst` (skipping .git and roll's own .nori-commit / .nori-origin). read_file/write_file are byte-exact,
+// so any file copies intact. Once vendored, builds read from vendor/ and never touch the network.
+pub fn vendor_copy(src: Str, dst: Str) {
+    let files = os::list_tree(src)
+    var i = 0
+    while i < files.len() {
+        let f = files[i]
+        if find_substr(f, "/.git/") < 0 && find_substr(f, "/.nori-commit") < 0 && find_substr(f, "/.nori-origin") < 0 {
+            let target = (dst + f.slice(src.len(), f.len())) // dst + path relative to src
+            os::make_dir_p(dirname(target))
+            write_file(target, read_file(f))
+        }
+        i = i + 1
+    }
+}
+// `roll vendor`: resolve every [deps] dependency (fetching git ones, honouring nori.lock) and copy its
+// source into vendor/<name>/. Commit vendor/ for fully offline builds that need no git (`roll build` then
+// reads vendor/ in preference to fetching).
+pub fn vendor() -> Int {
+    let mf = load_manifest()
+    let locks = load_lock()
+    var lk: Vec<Str> = vec()
+    lk.push("# nori.lock — exact commits roll resolved for git dependencies. Commit this for\n# reproducible builds; delete a line to re-resolve that dependency.\n")
+    os::make_dir("vendor")
+    var dirs: Map<Str, Str> = map()
+    var names: Vec<Str> = vec()
+    resolve_graph(mf, locks, lk, dirs, names, false) // fetch real sources (ignore any existing vendor/)
+    var count = 0
+    var i = 0
+    while i < names.len() {
+        let nm = names[i]
+        if dirs.has(nm) {
+            os::remove_tree(("vendor/" + nm))
+            vendor_copy(dirs.get(nm), ("vendor/" + nm))
+            printl(("  vendored " + nm))
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if find_substr(lk[0], " commit=") >= 0 {
+        write_file("nori.lock", lk[0])
+    }
+    printl(("vendored " + (to_str(count) + " dependencies into vendor/")))
+    return 0
+}

@@ -1,0 +1,117 @@
+// bench_text.nori: std/font's throughput numbers: shaping UI labels (uncached and
+// cached), a mixed-script line, and rasterization.
+//
+//   noric --build std/font/tools/bench_text.nori /tmp/bench_text compiler/runtime.nori --import-root .
+//   /tmp/bench_text
+import "std/font" as font
+import "std/time" as time
+
+fn labels() -> Vec<Str> {
+    var v: Vec<Str> = vec()
+    v.push("File")  v.push("Edit")  v.push("View")  v.push("Help")  v.push("Save As…")
+    v.push("Open Recent")  v.push("Cancel")  v.push("OK")  v.push("Settings")  v.push("Close Window")
+    v.push("Network & Internet")  v.push("Bluetooth")  v.push("Display brightness")  v.push("Volume: 75%")
+    v.push("Wednesday, 2 October 2026")  v.push("Search apps, files and settings")
+    v.push("Downloads")  v.push("Documents")  v.push("Recycle Bin")  v.push("Shut down")
+    return v
+}
+
+fn main() -> Int {
+    let f = font::font_load(read_file("std/font/assets/NotoSans-subset.ttf")).font
+    let ls = labels()
+    // uncached shaping: the plan is built on the first call, then every call shapes from scratch
+    var n = font::shape(f, "warm", "Latn", font::DIR_LTR(), "", "").len()     // build the plan first
+    var t0 = time::now_ns()
+    var rounds = 0
+    while rounds < 200 {
+        var i = 0
+        while i < ls.len() { let g = font::shape(f, ls[i], "Latn", font::DIR_LTR(), "", "")  n = n + g.len()  i = i + 1 }
+        rounds = rounds + 1
+    }
+    var t1 = time::now_ns()
+    let per_s_uncached = 200 * ls.len() * 1000000000 / (t1 - t0)
+    printl("shape (uncached): ${200 * ls.len()} labels in ${(t1 - t0) / 1000000} ms = ${per_s_uncached} labels/s (${n} glyphs)")
+    // layout_run: itemize + cached shaping + layout, what a painter calls per frame
+    t0 = time::now_ns()
+    rounds = 0
+    while rounds < 200 {
+        var i = 0
+        while i < ls.len() { let r = font::layout_run(f, ls[i], 16.0)  n = n + r.len()  i = i + 1 }
+        rounds = rounds + 1
+    }
+    t1 = time::now_ns()
+    printl("layout_run (cached shaping): ${200 * ls.len()} labels in ${(t1 - t0) / 1000000} ms = ${200 * ls.len() * 1000000000 / (t1 - t0)} labels/s")
+    // shape_cached alone
+    t0 = time::now_ns()
+    rounds = 0
+    while rounds < 200 {
+        var i = 0
+        while i < ls.len() { let g = font::shape_cached(f, ls[i], "Latn", font::DIR_LTR(), "", "")  n = n + g.len()  i = i + 1 }
+        rounds = rounds + 1
+    }
+    t1 = time::now_ns()
+    printl("shape_cached (hits): ${200 * ls.len()} labels in ${(t1 - t0) / 1000000} ms = ${200 * ls.len() * 1000000000 / (t1 - t0)} labels/s")
+    // Arabic and Devanagari, uncached
+    let ar = font::font_load(read_file("std/font/assets/NotoSansArabic-subset.ttf")).font
+    let dv = font::font_load(read_file("std/font/assets/NotoSansDevanagari-subset.ttf")).font
+    let warm_a = font::shape(ar, "السلام عليكم", "Arab", font::DIR_RTL(), "ar", "")   // build the plans first
+    let warm_d = font::shape(dv, "नमस्ते दुनिया", "Deva", font::DIR_LTR(), "hi", "")
+    n = n + warm_a.len() + warm_d.len()
+    t0 = time::now_ns()
+    rounds = 0
+    while rounds < 2000 { let g = font::shape(ar, "السلام عليكم", "Arab", font::DIR_RTL(), "ar", "")  n = n + g.len()  rounds = rounds + 1 }
+    t1 = time::now_ns()
+    printl("shape Arabic phrase (uncached): ${2000 * 1000000000 / (t1 - t0)} /s")
+    t0 = time::now_ns()
+    rounds = 0
+    while rounds < 2000 { let g = font::shape(dv, "नमस्ते दुनिया", "Deva", font::DIR_LTR(), "hi", "")  n = n + g.len()  rounds = rounds + 1 }
+    t1 = time::now_ns()
+    printl("shape Devanagari phrase (uncached): ${2000 * 1000000000 / (t1 - t0)} /s")
+    // rasterization: every glyph of the labels at 16 px, uncached
+    var gids: Vec<Int> = vec()
+    var i = 0
+    while i < ls.len() {
+        let g = font::shape(f, ls[i], "Latn", font::DIR_LTR(), "", "")
+        var k = 0
+        while k < g.len() { gids.push(g[k].gid)  k = k + 1 }
+        i = i + 1
+    }
+    t0 = time::now_ns()
+    var px = 0
+    rounds = 0
+    while rounds < 5 {
+        var k = 0
+        while k < gids.len() { let b = font::rasterize(f, gids[k], 16.0)  px = px + b.w * b.h  k = k + 1 }
+        rounds = rounds + 1
+    }
+    t1 = time::now_ns()
+    printl("rasterize 16px (hinted, uncached): ${5 * gids.len()} glyphs in ${(t1 - t0) / 1000000} ms = ${5 * gids.len() * 1000000000 / (t1 - t0)} glyphs/s")
+    font::set_hinting(false)
+    t0 = time::now_ns()
+    rounds = 0
+    while rounds < 5 {
+        var k = 0
+        while k < gids.len() { let b = font::rasterize(f, gids[k], 16.0)  px = px + b.w * b.h  k = k + 1 }
+        rounds = rounds + 1
+    }
+    t1 = time::now_ns()
+    printl("rasterize 16px (unhinted, uncached): ${5 * gids.len() * 1000000000 / (t1 - t0)} glyphs/s")
+    let cjk = font::font_load(read_file("std/font/assets/NotoSansCJKjp-subset.otf")).font
+    t0 = time::now_ns()
+    rounds = 0
+    var cg = 0
+    while rounds < 20 {
+        var gi = 1
+        while gi < 60 { let b = font::rasterize(cjk, gi, 16.0)  px = px + b.w  gi = gi + 1  cg = cg + 1 }
+        rounds = rounds + 1
+    }
+    t1 = time::now_ns()
+    printl("rasterize 16px CFF CJK (unhinted, uncached): ${cg * 1000000000 / (t1 - t0)} glyphs/s")
+    let em = font::font_load(read_file("std/font/assets/NotoColorEmoji-subset.ttf")).font
+    t0 = time::now_ns()
+    let cb = font::rasterize_color(em, font::font_glyph_index(em, 128512), 20.0, 255)
+    t1 = time::now_ns()
+    printl("rasterize_color emoji 20px (PNG decode + resample): ${(t1 - t0) / 1000} us (${cb.w}x${cb.h})")
+    printl("(checksum ${n} ${px})")
+    return 0
+}

@@ -1,0 +1,110 @@
+// Native tests for std/font's shaper against HarfBuzz: run with
+//   noric --test std/font/shape_test.nori compiler/runtime.nori --import-root .
+//
+// testdata/shape_expected.txt is HarfBuzz's output for every case in testdata/shape_cases.txt
+// (oracle/gen_testdata.py); each case here must match it glyph for glyph: ids, clusters, advances
+// and offsets.
+import "std/font" as font
+import "std/strutil" as su
+
+fn utf8_of(cps: Vec<Int>) -> Str {
+    var s = ""
+    var i = 0
+    while i < cps.len() {
+        let c = cps[i]
+        if c < 128 { s = s + chr(c) }
+        else if c < 2048 { s = s + chr(192 | (c >> 6)) + chr(128 | (c & 63)) }
+        else if c < 65536 { s = s + chr(224 | (c >> 12)) + chr(128 | ((c >> 6) & 63)) + chr(128 | (c & 63)) }
+        else { s = s + chr(240 | (c >> 18)) + chr(128 | ((c >> 12) & 63)) + chr(128 | ((c >> 6) & 63)) + chr(128 | (c & 63)) }
+        i = i + 1
+    }
+    return s
+}
+fn hexnum(h: Str) -> Int {
+    var v = 0
+    var k = 0
+    while k < h.len() {
+        let c = ord(h.at(k))
+        var n = 0
+        if c >= 48 && c <= 57 { n = c - 48 } else if c >= 97 && c <= 102 { n = c - 87 } else if c >= 65 && c <= 70 { n = c - 55 }
+        v = v * 16 + n
+        k = k + 1
+    }
+    return v
+}
+
+// run every case whose name starts with `prefix`; returns failures (printing each)
+fn run_cases(prefix: Str) -> Int {
+    let cases = su::split(read_file("std/font/testdata/shape_cases.txt"), "\n")
+    let exp = su::split(read_file("std/font/testdata/shape_expected.txt"), "\n")
+    var fails = 0
+    var ran = 0
+    var ci = 0
+    var ei = 0
+    while ci < cases.len() {
+        let line = cases[ci]
+        ci = ci + 1
+        if line.len() == 0 || su::starts_with(line, "#") { continue }
+        let fld = su::split(line, "\t")
+        let name = fld[0]
+        // find this case in the expected file
+        while ei < exp.len() && !(exp[ei] == "case " + name) { ei = ei + 1 }
+        if ei >= exp.len() { printl("no expected output for ${name}")  fails = fails + 1  continue }
+        var want: Vec<Str> = vec()
+        var k = ei + 2
+        while k < exp.len() && !(exp[k] == "end") { want.push(copy exp[k])  k = k + 1 }
+        ei = k
+        if !su::starts_with(name, prefix) { continue }
+        let f = font::font_load_index(read_file(fld[1]), parse_int(fld[2])).font
+        var cps: Vec<Int> = vec()
+        let hx = su::split(fld[7], " ")
+        var h = 0
+        while h < hx.len() { cps.push(hexnum(hx[h]))  h = h + 1 }
+        var dir = font::DIR_LTR()
+        if fld[4] == "rtl" { dir = font::DIR_RTL() }
+        var lang = fld[5]
+        if lang == "-" { lang = "" }
+        var feats = fld[6]
+        if feats == "-" { feats = "" }
+        let gs = font::shape(f, utf8_of(cps), fld[3], dir, lang, feats)
+        var got: Vec<Str> = vec()
+        var g = 0
+        while g < gs.len() {
+            got.push("glyph ${gs[g].gid} ${gs[g].cluster} ${gs[g].x_advance} ${gs[g].y_advance} ${gs[g].x_offset} ${gs[g].y_offset}")
+            g = g + 1
+        }
+        var same = got.len() == want.len()
+        g = 0
+        while same && g < got.len() { if !(got[g] == want[g]) { same = false }  g = g + 1 }
+        ran = ran + 1
+        if !same {
+            fails = fails + 1
+            printl("MISMATCH ${name}")
+            var r = 0
+            while r < got.len() || r < want.len() {
+                var a = "-"
+                var bb = "-"
+                if r < want.len() { a = want[r] }
+                if r < got.len() { bb = got[r] }
+                var mark = "  "
+                if !(a == bb) { mark = "!!" }
+                printl("  ${mark} want ${a}   got ${bb}")
+                r = r + 1
+            }
+        }
+    }
+    printl("${prefix}: ${ran} cases, ${fails} mismatches")
+    return fails
+}
+
+fn test_shape_latin() { assert_eq(run_cases("NotoSans:"), 0) }
+fn test_shape_arabic() { assert_eq(run_cases("NotoSansArabic:"), 0) }
+fn test_shape_naskh() { assert_eq(run_cases("NotoNaskhArabic:"), 0) }
+fn test_shape_hebrew() { assert_eq(run_cases("NotoSansHebrew:"), 0) }
+fn test_shape_cjk() { assert_eq(run_cases("NotoSansCJKjp:"), 0)  assert_eq(run_cases("NotoSansCJKsc:"), 0) }
+fn test_shape_emoji() { assert_eq(run_cases("NotoColorEmoji:"), 0) }
+fn test_shape_devanagari() { assert_eq(run_cases("NotoSansDevanagari:"), 0) }
+fn test_shape_nastaliq() { assert_eq(run_cases("NotoNastaliqUrdu:"), 0) }
+fn test_shape_mono() { assert_eq(run_cases("AdwaitaMono:"), 0) }
+fn test_shape_bengali() { assert_eq(run_cases("NotoSansBengali:"), 0) }
+fn test_shape_thai() { assert_eq(run_cases("NotoSansThai:"), 0) }

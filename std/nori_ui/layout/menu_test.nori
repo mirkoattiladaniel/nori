@@ -1,0 +1,373 @@
+// Native .nori tests for the menu bar (layout/dock_ui.nori's Menu / MenuBarState /
+// menu_emit / menu_bar_click). Run with
+//   noric --test std/nori_ui/layout/menu_test.nori compiler/runtime.nori --import-root .
+//
+// The bar itself (titles, MenuRects, the hover highlight, DockHit kind 0) is covered
+// first; the rest tests the dropdown: a list that opens, closes, acts,
+// and rides the ComputedOverlay popup layer so it escapes an enclosing clip and beats whatever is
+// drawn beneath it.
+import "std/nori_ui" as ui
+
+// ---- helpers (must not be named test_*) ----
+
+/// the three-menu bar every test below uses.
+///   File   : New Scene / Open… (disabled) / --- / Quit
+///   View   : Reset Camera
+///   Panels : Scene / Inspector
+fn mt_menus() -> Vec<ui::layout::Menu> {
+    var ms: Vec<ui::layout::Menu> = vec()
+    var file = ui::layout::menu_new("File")
+    ui::layout::menu_add(file, ui::layout::menu_item("New Scene", "file.new"))
+    ui::layout::menu_add(file, ui::layout::menu_item_disabled("Open Recent"))
+    ui::layout::menu_add(file, ui::layout::menu_separator())
+    ui::layout::menu_add(file, ui::layout::menu_item("Quit", "file.quit"))
+    ms.push(file)
+    var vw = ui::layout::menu_new("View")
+    ui::layout::menu_add(vw, ui::layout::menu_item("Reset Camera", "view.reset_camera"))
+    ms.push(vw)
+    var pn = ui::layout::menu_new("Panels")
+    ui::layout::menu_add(pn, ui::layout::menu_item("Scene", "panel:scene"))
+    ui::layout::menu_add(pn, ui::layout::menu_item("Inspector", "panel:inspector"))
+    ms.push(pn)
+    return ms
+}
+
+fn mt_ids(a: Str, b: Str) -> Vec<Str> { var v: Vec<Str> = vec()  v.push(copy a)  v.push(copy b)  return v }
+
+/// lay the dock chrome out at `w` x `h` with the three menu titles and hand back the result.
+fn mt_layout(w: Int, h: Int) -> ui::layout::DockLayoutResult {
+    var ds = ui::layout::dock_state_new(mt_ids("scene", "inspector"))
+    var nofill: Vec<Str> = vec()
+    var th = ui::core::theme_default_dark()
+    var titles = ui::layout::menu_titles(mt_menus())
+    return ui::layout::layout_dock_ui(ds, 0, w, h, th, -1, false, 0, titles, nofill)
+}
+
+/// a fresh empty overlay (the host's, before the menu goes into it).
+fn mt_overlay() -> ui::layout::ComputedOverlay {
+    var ids: Vec<Str> = vec()
+    var offs: Vec<Float> = vec()
+    return ui::layout::overlay_new(ids, offs)
+}
+
+/// the state of a bar with menu `i` open.
+fn mt_open(i: Int) -> ui::layout::MenuBarState {
+    var st = ui::layout::menu_bar_state_new()
+    ui::layout::menu_bar_open_at(st, i)
+    return st
+}
+
+/// the centre of row `index` of menu `mi`, in the 900x600 layout the tests use.
+fn mt_row_center(mi: Int, index: Int) -> ui::core::Vec2 {
+    var res = mt_layout(900, 600)
+    var ms = mt_menus()
+    var panel = ui::layout::menu_panel_rect(ms[mi], res.menu_rects[mi].rect, 900.0, 600.0)
+    var row = ui::layout::menu_row_rect(ms[mi], panel, index)
+    return ui::core::vec2(row.min.x + row.width() / 2.0, row.min.y + row.height() / 2.0)
+}
+
+/// the centre of bar title `mi`.
+fn mt_title_center(mi: Int) -> ui::core::Vec2 {
+    var res = mt_layout(900, 600)
+    var r = res.menu_rects[mi].rect
+    return ui::core::vec2(r.min.x + r.width() / 2.0, r.min.y + r.height() / 2.0)
+}
+
+/// the flushed overlay of menu `mi` open, in a 900x600 view, with no pointer.
+fn mt_open_overlay(mi: Int) -> ui::layout::ComputedOverlay {
+    var res = mt_layout(900, 600)
+    return ui::layout::menu_overlay(mt_menus(), mt_open(mi), res.menu_rects, ui::core::theme_default_dark(), 900.0, 600.0, false, ui::core::vec2_zero())
+}
+
+// ---- the bar, closed ----
+
+fn test_a_closed_bar_produces_its_title_hits_and_no_popup() {
+    var res = mt_layout(900, 600)
+    // N titles -> N bar hit rects...
+    assert_eq(res.menu_rects.len(), 3)
+    assert_eq(res.menu_rects[0].index, 0)
+    assert_eq(res.menu_rects[2].index, 2)
+    // …and a click on one still reports DockHit kind 0 with that index.
+    var dh = ui::layout::dock_hit_test(mt_title_center(1), res.menu_rects, res.splitter_infos, res.tab_rects, res.tab_close_rects, res.leaf_collapse_rects, res.leaf_close_rects)
+    assert_eq(dh.kind, 0)
+    assert_eq(dh.index, 1)
+    // ...and nothing is open: the popup overlay is empty, prims and hits both.
+    var st = ui::layout::menu_bar_state_new()
+    assert_false(ui::layout::menu_bar_is_open(st))
+    var ov = ui::layout::menu_overlay(mt_menus(), st, res.menu_rects, ui::core::theme_default_dark(), 900.0, 600.0, false, ui::core::vec2_zero())
+    assert_eq(ov.prims.len(), 0)
+    assert_eq(ov.hits.len(), 0)
+    assert_eq(ov.pop_prims.len(), 0)
+    assert_eq(ov.pop_hits.len(), 0)
+}
+
+fn test_menu_titles_are_the_bar_labels() {
+    var t = ui::layout::menu_titles(mt_menus())
+    assert_eq(t.len(), 3)
+    assert_true(t[0] == "File")
+    assert_true(t[1] == "View")
+    assert_true(t[2] == "Panels")
+}
+
+// ---- the bar, open: everything lands in the popup layer ----
+
+fn test_an_open_menu_puts_its_item_hits_in_the_popup_layer() {
+    var res = mt_layout(900, 600)
+    var out = mt_overlay()
+    ui::layout::menu_emit(out, mt_menus(), mt_open(0), res.menu_rects, ui::core::theme_default_dark(), 900.0, 600.0, false, ui::core::vec2_zero())
+    // Before the flush: the ordinary layers are untouched and the popup layer holds the list.
+    assert_eq(out.prims.len(), 0)
+    assert_eq(out.hits.len(), 0)
+    assert_true(out.pop_prims.len() > 0)
+    // File has 4 rows: 2 clickable, 1 disabled, 1 separator.
+    assert_eq(out.pop_hits.len(), 2)
+    assert_true(out.pop_hits[0].id == ui::layout::menu_hit_id())
+    assert_true(out.pop_hits[0].on_click == "file.new")
+    assert_true(out.pop_hits[1].on_click == "file.quit")
+    // After the flush the painter sees one flat list, with the popup at the end of it.
+    var before = out.pop_prims.len()
+    ui::layout::overlay_flush_popups(out)
+    assert_eq(out.prims.len(), before)
+    assert_eq(out.hits.len(), 2)
+    assert_eq(out.pop_prims.len(), 0)
+    assert_eq(out.pop_hits.len(), 0)
+}
+
+fn test_the_popup_escapes_an_enclosing_clip() {
+    var res = mt_layout(900, 600)
+    // a child overlay carrying the open list, merged into a parent through a 10x10 viewport at the
+    // origin, a clip that contains none of the list. merge_clipped_overlay carries the popup layer
+    // through unchanged; ordinary prims in that child would have been intersected away.
+    var parent = mt_overlay()
+    var child = ui::layout::overlay_child(parent)
+    ui::layout::menu_emit(child, mt_menus(), mt_open(2), res.menu_rects, ui::core::theme_default_dark(), 900.0, 600.0, false, ui::core::vec2_zero())
+    var cut = child.pop_prims.len()
+    assert_true(cut > 0)
+    child.prims.push(ui::layout::pp_rect(ui::core::rect_min_max(ui::core::vec2(400.0, 400.0), ui::core::vec2(500.0, 500.0)), ui::core::color_rgb(255, 0, 0), 0.0))
+    var vp = ui::core::rect_min_max(ui::core::vec2_zero(), ui::core::vec2(10.0, 10.0))
+    ui::layout::merge_clipped_overlay(parent, child, vp)
+    // the ordinary prim was dropped by the clip; every popup prim survived
+    assert_eq(parent.prims.len(), 0)
+    assert_eq(parent.pop_prims.len(), cut)
+    assert_eq(parent.pop_hits.len(), 2)
+    ui::layout::overlay_flush_popups(parent)
+    // and the surviving hit is still at its real screen position, far outside the 10x10 viewport
+    var hit = ui::layout::overlay_hit_test(parent, mt_row_center(2, 0))
+    assert_true(hit.on_click == "panel:scene")
+}
+
+fn test_an_item_hit_wins_over_whatever_is_beneath_it() {
+    var res = mt_layout(900, 600)
+    var out = mt_overlay()
+    // something big and clickable under the menu, a panel's button, say.
+    out.hits.push(ui::layout::HitRegion { id: "panel", on_click: "panel.button", rect: ui::core::rect_min_max(ui::core::vec2_zero(), ui::core::vec2(900.0, 600.0)) })
+    ui::layout::menu_emit(out, mt_menus(), mt_open(1), res.menu_rects, ui::core::theme_default_dark(), 900.0, 600.0, false, ui::core::vec2_zero())
+    ui::layout::overlay_flush_popups(out)
+    // overlay_hit_test walks backwards, and the flush put the row last.
+    var on_row = ui::layout::overlay_hit_test(out, mt_row_center(1, 0))
+    assert_true(on_row.on_click == "view.reset_camera")
+    // one pixel outside the list the panel's own hit is still what answers
+    var off_row = ui::layout::overlay_hit_test(out, ui::core::vec2(880.0, 580.0))
+    assert_true(off_row.on_click == "panel.button")
+}
+
+fn test_a_separator_produces_no_hit() {
+    var ov = mt_open_overlay(0)
+    // File's row 2 is the separator; nothing in the overlay answers there.
+    var hit = ui::layout::overlay_hit_test(ov, mt_row_center(0, 2))
+    assert_true(hit.id == "")
+    assert_true(hit.on_click == "")
+    // it is also shorter than an item row, so the list is not padded by a full row of nothing
+    var ms = mt_menus()
+    var res = mt_layout(900, 600)
+    var panel = ui::layout::menu_panel_rect(ms[0], res.menu_rects[0].rect, 900.0, 600.0)
+    assert_feq(ui::layout::menu_row_rect(ms[0], panel, 2).height(), ui::layout::menu_separator_height(), 0.01)
+    assert_feq(ui::layout::menu_row_rect(ms[0], panel, 3).height(), ui::layout::menu_row_height(), 0.01)
+}
+
+fn test_a_disabled_item_produces_no_hit() {
+    var ov = mt_open_overlay(0)
+    // File's row 1 is "Open Recent", disabled: drawn (there are prims) but not clickable.
+    assert_true(ov.prims.len() > 0)
+    var hit = ui::layout::overlay_hit_test(ov, mt_row_center(0, 1))
+    assert_true(hit.id == "")
+    // its neighbours on either side are clickable, so the miss is the item and not the geometry
+    assert_true(ui::layout::overlay_hit_test(ov, mt_row_center(0, 0)).on_click == "file.new")
+    assert_true(ui::layout::overlay_hit_test(ov, mt_row_center(0, 3)).on_click == "file.quit")
+}
+
+// ---- opening, closing, acting ----
+
+fn test_clicking_a_title_opens_it_and_the_same_title_closes_it() {
+    var res = mt_layout(900, 600)
+    var st = ui::layout::menu_bar_state_new()
+    var shut = ui::layout::menu_overlay(mt_menus(), st, res.menu_rects, ui::core::theme_default_dark(), 900.0, 600.0, false, ui::core::vec2_zero())
+    var a = ui::layout::menu_bar_click(st, mt_menus(), res.menu_rects, shut, mt_title_center(0))
+    assert_true(a.consumed)
+    assert_true(a.action == "")
+    assert_true(ui::layout::menu_bar_is_open(st))
+    assert_eq(ui::layout::menu_bar_open_index(st), 0)
+    // clicking the same title again toggles it shut
+    var b = ui::layout::menu_bar_click(st, mt_menus(), res.menu_rects, mt_open_overlay(0), mt_title_center(0))
+    assert_true(b.consumed)
+    assert_false(ui::layout::menu_bar_is_open(st))
+}
+
+fn test_clicking_another_title_switches_the_open_menu() {
+    var res = mt_layout(900, 600)
+    var st = mt_open(0)
+    var c = ui::layout::menu_bar_click(st, mt_menus(), res.menu_rects, mt_open_overlay(0), mt_title_center(2))
+    assert_true(c.consumed)
+    assert_true(c.action == "")
+    assert_true(ui::layout::menu_bar_is_open(st))
+    assert_eq(ui::layout::menu_bar_open_index(st), 2)
+}
+
+fn test_clicking_an_item_emits_its_action_and_closes() {
+    var res = mt_layout(900, 600)
+    var st = mt_open(0)
+    var c = ui::layout::menu_bar_click(st, mt_menus(), res.menu_rects, mt_open_overlay(0), mt_row_center(0, 3))
+    assert_true(c.consumed)
+    assert_true(c.action == "file.quit")
+    assert_false(ui::layout::menu_bar_is_open(st))
+}
+
+fn test_clicking_a_disabled_item_or_a_separator_closes_without_acting() {
+    var res = mt_layout(900, 600)
+    var st = mt_open(0)
+    var d = ui::layout::menu_bar_click(st, mt_menus(), res.menu_rects, mt_open_overlay(0), mt_row_center(0, 1))
+    assert_true(d.consumed)
+    assert_true(d.action == "")
+    assert_false(ui::layout::menu_bar_is_open(st))
+    var st2 = mt_open(0)
+    var s = ui::layout::menu_bar_click(st2, mt_menus(), res.menu_rects, mt_open_overlay(0), mt_row_center(0, 2))
+    assert_true(s.action == "")
+    assert_false(ui::layout::menu_bar_is_open(st2))
+}
+
+fn test_clicking_away_closes_without_acting_and_swallows_that_click() {
+    var res = mt_layout(900, 600)
+    var st = mt_open(0)
+    var c = ui::layout::menu_bar_click(st, mt_menus(), res.menu_rects, mt_open_overlay(0), ui::core::vec2(700.0, 500.0))
+    assert_false(ui::layout::menu_bar_is_open(st))
+    assert_true(c.action == "")
+    // the click that dismissed the menu is consumed; it must not also press whatever it landed on
+    assert_true(c.consumed)
+    // with the bar already closed, the very same click is not consumed and the host routes it
+    var again = ui::layout::menu_bar_click(st, mt_menus(), res.menu_rects, mt_open_overlay(0), ui::core::vec2(700.0, 500.0))
+    assert_false(again.consumed)
+    assert_true(again.action == "")
+}
+
+fn test_escape_closes_without_acting() {
+    var st = mt_open(1)
+    ui::layout::menu_bar_close(st)
+    assert_false(ui::layout::menu_bar_is_open(st))
+}
+
+// ---- hovering across the bar ----
+
+fn test_hovering_across_the_bar_moves_the_open_menu_but_never_opens_one() {
+    var res = mt_layout(900, 600)
+    // closed: hovering does nothing at all
+    var shut = ui::layout::menu_bar_state_new()
+    ui::layout::menu_bar_hover(shut, res.menu_rects, mt_title_center(2))
+    assert_false(ui::layout::menu_bar_is_open(shut))
+    // open: the pointer crossing another title moves the open menu there
+    var st = mt_open(0)
+    ui::layout::menu_bar_hover(st, res.menu_rects, mt_title_center(2))
+    assert_eq(ui::layout::menu_bar_open_index(st), 2)
+    // ...and a pointer that is not on the bar leaves it where it was
+    ui::layout::menu_bar_hover(st, res.menu_rects, ui::core::vec2(700.0, 400.0))
+    assert_eq(ui::layout::menu_bar_open_index(st), 2)
+    assert_eq(ui::layout::menu_bar_index_at(res.menu_rects, ui::core::vec2(700.0, 400.0)), -1)
+    assert_eq(ui::layout::menu_bar_index_at(res.menu_rects, mt_title_center(1)), 1)
+}
+
+// ---- list geometry ----
+
+fn test_the_list_hangs_under_its_title_and_is_wide_enough_for_its_widest_label() {
+    var res = mt_layout(900, 600)
+    var ms = mt_menus()
+    var panel = ui::layout::menu_panel_rect(ms[0], res.menu_rects[0].rect, 900.0, 600.0)
+    assert_feq(panel.min.x, res.menu_rects[0].rect.min.x, 0.01)
+    assert_feq(panel.min.y, ui::layout::menu_bar_height(), 0.01)
+    assert_feq(panel.height(), ui::layout::menu_panel_height(ms[0]), 0.01)
+    assert_true(panel.width() >= ui::layout::menu_panel_min_width())
+    // 3 item rows + 1 separator + the two pads
+    assert_feq(panel.height(), 3.0 * ui::layout::menu_row_height() + ui::layout::menu_separator_height() + 2.0 * ui::layout::menu_panel_pad(), 0.01)
+    // rows are stacked with no gaps: row 1 starts where row 0 ends
+    assert_feq(ui::layout::menu_row_rect(ms[0], panel, 0).max.y, ui::layout::menu_row_rect(ms[0], panel, 1).min.y, 0.01)
+}
+
+fn test_the_list_flips_up_when_there_is_no_room_below_it() {
+    var ms = mt_menus()
+    // a bar item at the bottom of a tall view: below it there is nothing, above it there is plenty.
+    var anchor = ui::core::rect_min_size(ui::core::vec2(40.0, 380.0), ui::core::vec2(60.0, ui::layout::menu_bar_height()))
+    var panel = ui::layout::menu_panel_rect(ms[0], anchor, 900.0, 420.0)
+    assert_feq(panel.max.y, anchor.min.y, 0.01)
+    assert_true(panel.min.y >= 0.0)
+}
+
+fn test_with_room_in_neither_direction_it_overflows_DOWNWARD() {
+    var ms = mt_menus()
+    // a 40px-tall view: the list fits neither below the bar nor above it. Drawing it off the TOP
+    // would put it where nothing could reach it, so it stays below and overflows the bottom.
+    var anchor = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(60.0, ui::layout::menu_bar_height()))
+    var panel = ui::layout::menu_panel_rect(ms[0], anchor, 900.0, 40.0)
+    assert_feq(panel.min.y, ui::layout::menu_bar_height(), 0.01)
+    assert_true(panel.max.y > 40.0)
+}
+
+fn test_a_list_near_the_right_edge_is_nudged_back_inside() {
+    var ms = mt_menus()
+    var anchor = ui::core::rect_min_size(ui::core::vec2(280.0, 0.0), ui::core::vec2(60.0, ui::layout::menu_bar_height()))
+    var panel = ui::layout::menu_panel_rect(ms[0], anchor, 300.0, 600.0)
+    assert_true(panel.max.x <= 300.01)
+    assert_true(panel.min.x >= 0.0)
+}
+
+fn test_an_empty_menu_opens_nothing() {
+    var res = mt_layout(900, 600)
+    var ms: Vec<ui::layout::Menu> = vec()
+    ms.push(ui::layout::menu_new("Empty"))
+    var ov = ui::layout::menu_overlay(ms, mt_open(0), res.menu_rects, ui::core::theme_default_dark(), 900.0, 600.0, false, ui::core::vec2_zero())
+    assert_eq(ov.prims.len(), 0)
+    assert_eq(ov.hits.len(), 0)
+    // and an index past the end of the list is not a crash either
+    var ov2 = ui::layout::menu_overlay(mt_menus(), mt_open(9), res.menu_rects, ui::core::theme_default_dark(), 900.0, 600.0, false, ui::core::vec2_zero())
+    assert_eq(ov2.prims.len(), 0)
+}
+
+fn test_the_hovered_row_gets_a_highlight_and_a_disabled_one_does_not() {
+    var res = mt_layout(900, 600)
+    var ms = mt_menus()
+    var theme = ui::core::theme_default_dark()
+    var cold = ui::layout::menu_overlay(ms, mt_open(0), res.menu_rects, theme, 900.0, 600.0, false, ui::core::vec2_zero())
+    var hot = ui::layout::menu_overlay(ms, mt_open(0), res.menu_rects, theme, 900.0, 600.0, true, mt_row_center(0, 0))
+    assert_eq(hot.prims.len(), cold.prims.len() + 1)
+    // the pointer over the disabled row adds nothing
+    var dis = ui::layout::menu_overlay(ms, mt_open(0), res.menu_rects, theme, 900.0, 600.0, true, mt_row_center(0, 1))
+    assert_eq(dis.prims.len(), cold.prims.len())
+}
+
+// ---- the dock-layout side: showing a tab from a Panels menu ----
+
+fn test_dock_show_tab_focuses_a_docked_tab_and_adds_one_that_is_not() {
+    var ds = ui::layout::dock_state_new(mt_ids("scene", "inspector"))
+    var vp = ui::core::rect_min_size(ui::core::vec2(0.0, 28.0), ui::core::vec2(900.0, 572.0))
+    ds.layout_surface(0, vp, ui::layout::splitter_width_const())
+    assert_true(ui::layout::dock_tab_is_showing(ds, 0, "scene"))
+    assert_false(ui::layout::dock_tab_is_showing(ds, 0, "inspector"))
+    assert_true(ui::layout::dock_show_tab(ds, 0, "inspector"))
+    assert_true(ui::layout::dock_tab_is_showing(ds, 0, "inspector"))
+    assert_false(ui::layout::dock_tab_is_showing(ds, 0, "scene"))
+    // a tab that is not in the tree at all is docked and then focused
+    assert_false(ds.tab_is_present(0, "console"))
+    assert_true(ui::layout::dock_show_tab(ds, 0, "console"))
+    assert_true(ds.tab_is_present(0, "console"))
+    assert_true(ui::layout::dock_tab_is_showing(ds, 0, "console"))
+    // and showing it twice does not dock it twice
+    assert_true(ui::layout::dock_show_tab(ds, 0, "console"))
+    assert_eq(ui::layout::tree_tab_locations(ds.surface_tree(0), "console").len(), 1)
+}

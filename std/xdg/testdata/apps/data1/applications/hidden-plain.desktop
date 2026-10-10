@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Should Vanish
+Exec=hidden-app
+Hidden=true

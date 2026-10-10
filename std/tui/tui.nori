@@ -1,0 +1,826 @@
+//! std/tui: terminal UI. ANSI rendering primitives, a double-buffered screen you draw into, raw-mode
+//! key input (Linux), and image/thumbnail blitting. The ANSI builders and the Screen are pure (they
+//! build/return strings, so they're testable headlessly); raw mode + key reading need a real terminal
+//! (cfg(linux)).
+//!
+//!   import "std/tui" as tui
+//!   fn main() -> Int {
+//!     var saved = tui::begin()                 // alt screen + hide cursor + raw mode
+//!     var s = tui::screen(40, 10)
+//!     s.box_ex(0, 0, 40, 10, tui::rgb(80, 200, 255), 3)   // rounded box, truecolor
+//!     s.put_ex(2, 1, "héllo, nori", tui::rgb(120, 255, 120), 0 - 1, tui::BOLD())
+//!     tui::draw(s)
+//!     var _k = tui::read_key()                  // blocks for one keypress
+//!     tui::end(saved)                           // restore the terminal
+//!     return 0
+//!   }
+//!
+//! Colors: a color is an Int, either a basic SGR foreground code (BLACK()..WHITE(), 30..37) or a 24-bit
+//! truecolor value from rgb(r,g,b). A background slot of `0 - 1` means "terminal default". Attributes are
+//! a bitmask (BOLD|DIM|ITALIC|UNDERLINE|REVERSE) OR'd together.
+import "std/image" as image
+import "std/unicode" as utf8
+import "std/os" as os
+import "std/strutil" as su
+import "std/io" as io
+
+/// the ESC byte (chr(27)) as a 1-char string.
+pub fn esc() -> Str { return "" + chr(27) }
+
+// --- SGR color codes (foreground). bg = +10; bright = +60. ---
+/// SGR foreground code for black (30).
+pub fn BLACK() -> Int { return 30 }
+/// SGR foreground code for red (31).
+pub fn RED() -> Int { return 31 }
+/// SGR foreground code for green (32).
+pub fn GREEN() -> Int { return 32 }
+/// SGR foreground code for yellow (33).
+pub fn YELLOW() -> Int { return 33 }
+/// SGR foreground code for blue (34).
+pub fn BLUE() -> Int { return 34 }
+/// SGR foreground code for magenta (35).
+pub fn MAGENTA() -> Int { return 35 }
+/// SGR foreground code for cyan (36).
+pub fn CYAN() -> Int { return 36 }
+/// SGR foreground code for white (37).
+pub fn WHITE() -> Int { return 37 }
+/// SGR foreground code for the terminal default color (39).
+pub fn DEFAULT() -> Int { return 39 }
+
+// --- 24-bit truecolor + text attributes ---
+/// pack r,g,b (0..255) into a truecolor value usable anywhere a color Int is expected.
+pub fn rgb(r: Int, g: Int, b: Int) -> Int { return (16777216 | ((r & 255) << 16)) | ((g & 255) << 8) | (b & 255) }
+/// is this color a truecolor value (vs. a basic SGR code)?
+pub fn is_rgb(c: Int) -> Bool { return c >= 16777216 }
+/// attribute bit: bold.
+pub fn BOLD() -> Int { return 1 }
+/// attribute bit: dim/faint.
+pub fn DIM() -> Int { return 2 }
+/// attribute bit: italic.
+pub fn ITALIC() -> Int { return 4 }
+/// attribute bit: underline.
+pub fn UNDERLINE() -> Int { return 8 }
+/// attribute bit: reverse video (swap fg/bg).
+pub fn REVERSE() -> Int { return 16 }
+
+// --- graphics modes (how blit_image draws): set on a Screen via use_graphics(); default AUTO ---
+/// graphics mode: choose from the environment on each blit (the default).
+pub fn GFX_AUTO() -> Int { return 0 }
+/// graphics mode: skip image blits entirely.
+pub fn GFX_NONE() -> Int { return 1 }
+/// graphics mode: truecolor half-blocks (portable to any 24-bit terminal).
+pub fn GFX_HALF() -> Int { return 2 }
+/// graphics mode: Kitty graphics protocol (pixel-perfect).
+pub fn GFX_KITTY() -> Int { return 3 }
+
+/// display width of `s` in terminal columns (wide CJK/emoji count as 2, combining marks as 0).
+pub fn text_width(s: Str) -> Int { return utf8::display_width(s) }
+
+// --- input events (read_event): keyboard + mouse ---
+/// event kind: no event / EOF.
+pub fn EV_NONE() -> Int { return 0 }
+/// event kind: a keypress; see the `key` field (same codes as read_key()).
+pub fn EV_KEY() -> Int { return 1 }
+/// event kind: a mouse button was pressed (`button`, `col`, `row`).
+pub fn EV_MOUSE_DOWN() -> Int { return 2 }
+/// event kind: a mouse button was released.
+pub fn EV_MOUSE_UP() -> Int { return 3 }
+/// event kind: the mouse moved with a button held (drag).
+pub fn EV_MOUSE_DRAG() -> Int { return 4 }
+/// event kind: the scroll wheel moved; see `button` (SCROLL_UP / SCROLL_DOWN).
+pub fn EV_SCROLL() -> Int { return 5 }
+/// mouse button: left.
+pub fn MB_LEFT() -> Int { return 0 }
+/// mouse button: middle.
+pub fn MB_MIDDLE() -> Int { return 1 }
+/// mouse button: right.
+pub fn MB_RIGHT() -> Int { return 2 }
+/// scroll direction (in `button` when kind == EV_SCROLL): up.
+pub fn SCROLL_UP() -> Int { return 0 }
+/// scroll direction (in `button` when kind == EV_SCROLL): down.
+pub fn SCROLL_DOWN() -> Int { return 1 }
+
+// --- named key codes (read_event / read_key `key` field). Arrows use 1000+final-byte codes; the
+// navigation keys below decode the multi-byte CSI escapes (ESC[5~ etc.). Compare against these
+// instead of raw numbers. ---
+/// arrow up (ESC[A).
+pub fn KEY_UP() -> Int { return 1065 }
+/// arrow down (ESC[B).
+pub fn KEY_DOWN() -> Int { return 1066 }
+/// arrow right (ESC[C).
+pub fn KEY_RIGHT() -> Int { return 1067 }
+/// arrow left (ESC[D).
+pub fn KEY_LEFT() -> Int { return 1068 }
+/// Home (ESC[H or ESC[1~).
+pub fn KEY_HOME() -> Int { return 1080 }
+/// End (ESC[F or ESC[4~).
+pub fn KEY_END() -> Int { return 1081 }
+/// Page Up (ESC[5~).
+pub fn KEY_PGUP() -> Int { return 1082 }
+/// Page Down (ESC[6~).
+pub fn KEY_PGDN() -> Int { return 1083 }
+/// Insert (ESC[2~).
+pub fn KEY_INS() -> Int { return 1084 }
+/// Delete (ESC[3~).
+pub fn KEY_DEL() -> Int { return 1085 }
+/// Escape (a lone ESC, or any unrecognized escape sequence).
+pub fn KEY_ESC() -> Int { return 27 }
+
+/// one input event from read_event(). For EV_KEY, `key` holds the byte/arrow code (as read_key()); for
+/// mouse kinds, `col`/`row` are 0-based cell coordinates and `button` is a MB_* button or, for EV_SCROLL,
+/// a SCROLL_* direction.
+pub struct Event { kind: Int, key: Int, button: Int, col: Int, row: Int }
+
+// --- ANSI escape builders (each returns the control string) ---
+/// erase the whole screen and move the cursor home (ESC[2J ESC[H).
+pub fn clear() -> Str { return esc() + "[2J" + esc() + "[H" }       // clear + home
+/// move the cursor to the top-left (ESC[H).
+pub fn home() -> Str { return esc() + "[H" }
+/// move the cursor to (row, col), both 1-based (ESC[row;colH).
+pub fn move_to(row: Int, col: Int) -> Str { return esc() + "[" + row + ";" + col + "H" }   // 1-based
+/// set the foreground SGR color to `code` (ESC[<code>m).
+pub fn fg(code: Int) -> Str { return esc() + "[" + code + "m" }
+/// set the background SGR color to `code` (uses code+10, ESC[<code+10>m).
+pub fn bg(code: Int) -> Str { return esc() + "[" + (code + 10) + "m" }
+/// set the foreground to a 24-bit color (ESC[38;2;r;g;bm).
+pub fn fg_rgb(r: Int, g: Int, b: Int) -> Str { return esc() + "[38;2;" + r + ";" + g + ";" + b + "m" }
+/// set the background to a 24-bit color (ESC[48;2;r;g;bm).
+pub fn bg_rgb(r: Int, g: Int, b: Int) -> Str { return esc() + "[48;2;" + r + ";" + g + ";" + b + "m" }
+/// reset all SGR attributes to defaults (ESC[0m).
+pub fn reset() -> Str { return esc() + "[0m" }
+/// hide the cursor (ESC[?25l).
+pub fn hide_cursor() -> Str { return esc() + "[?25l" }
+/// show the cursor (ESC[?25h).
+pub fn show_cursor() -> Str { return esc() + "[?25h" }
+/// switch to the alternate screen buffer (ESC[?1049h).
+pub fn alt_enter() -> Str { return esc() + "[?1049h" }
+/// leave the alternate screen buffer, restoring the primary one (ESC[?1049l).
+pub fn alt_exit() -> Str { return esc() + "[?1049l" }
+/// enable mouse reporting: button press/release + drag, with SGR extended coordinates
+/// (ESC[?1000;1002;1006h). Send this (or use begin_mouse) before reading mouse events with read_event.
+pub fn mouse_on() -> Str { return ((esc() + "[?1000h") + (esc() + "[?1002h")) + (esc() + "[?1006h") }
+/// disable mouse reporting (the counterpart of mouse_on()).
+pub fn mouse_off() -> Str { return ((esc() + "[?1000l") + (esc() + "[?1002l")) + (esc() + "[?1006l") }
+
+// --- a decoded image queued as a terminal graphics overlay (Kitty protocol path) ---
+struct ImgOverlay { seq: Str, col: Int, row: Int }
+
+// --- the screen buffer: a w*h grid of single-glyph cells, each with a fg color, bg color and attrs ---
+pub struct Screen { w: Int, h: Int, cells: Vec<Str>, colors: Vec<Int>, bg: Vec<Int>, attr: Vec<Int>, overlays: Vec<ImgOverlay>, gfx: Int }
+
+/// allocate a w*h Screen with every cell a space in the default color.
+pub fn screen(w: Int, h: Int) -> Screen {
+    var cells: Vec<Str> = vec()
+    var colors: Vec<Int> = vec()
+    var bgv: Vec<Int> = vec()
+    var attrv: Vec<Int> = vec()
+    var i = 0
+    while i < w * h { cells.push(" ")  colors.push(39)  bgv.push(0 - 1)  attrv.push(0)  i = i + 1 }
+    var ov: Vec<ImgOverlay> = vec()
+    return Screen { w: w, h: h, cells: cells, colors: colors, bg: bgv, attr: attrv, overlays: ov, gfx: 0 }
+}
+
+impl Screen {
+    /// pin the image-drawing mode for this screen (GFX_AUTO/NONE/HALF/KITTY). Call once with
+    /// detect_graphics() for a live-probed result instead of the AUTO environment heuristic.
+    fn use_graphics(inout self, mode: Int) { self.gfx = mode }
+    /// reset every cell to a space in the default color and drop any queued image overlays.
+    fn wipe(inout self) {
+        var i = 0
+        while i < self.w * self.h { self.cells[i] = " "  self.colors[i] = 39  self.bg[i] = 0 - 1  self.attr[i] = 0  i = i + 1 }
+        var ov: Vec<ImgOverlay> = vec()
+        self.overlays = ov
+    }
+    /// set the glyph and foreground color of the cell at (x, y); out-of-bounds writes are ignored.
+    fn cell(self, x: Int, y: Int, ch: Str, color: Int) { self.cell_ex(x, y, ch, color, 0 - 1, 0) }
+    /// set glyph, fg color, bg color (`0 - 1` = default) and attribute mask of the cell at (x, y).
+    fn cell_ex(self, x: Int, y: Int, ch: Str, fgc: Int, bgc: Int, at: Int) {
+        if x < 0 { return }
+        if y < 0 { return }
+        if x >= self.w { return }
+        if y >= self.h { return }
+        var idx = y * self.w + x
+        self.cells[idx] = copy ch
+        self.colors[idx] = fgc
+        self.bg[idx] = bgc
+        self.attr[idx] = at
+    }
+    /// write string `s` left-to-right from (x, y), one cell per Unicode code point, in `color`.
+    fn put(inout self, x: Int, y: Int, s: Str, color: Int) { self.put_ex(x, y, s, color, 0 - 1, 0) }
+    /// write string `s` (UTF-8 aware) from (x, y) with fg color, bg color and attribute mask. Advances by
+    /// each code point's display width: double-width CJK/emoji take two cells (the second is reserved),
+    /// combining/zero-width marks take none.
+    fn put_ex(self, x: Int, y: Int, s: Str, fgc: Int, bgc: Int, at: Int) {
+        var i = 0
+        var col = x
+        let n = s.len()
+        while i < n {
+            let d = utf8::decode_at(s, i)
+            let w = utf8::width(d.cp)
+            if w == 0 { i = d.next  continue }                          // combining / zero-width: skip
+            self.cell_ex(col, y, utf8::encode(d.cp), fgc, bgc, at)
+            if w == 2 { self.cell_ex(col + 1, y, "", fgc, bgc, at) }     // reserve the trailing column
+            col = col + w
+            i = d.next
+        }
+    }
+    /// fill a w*h rectangle at (x, y) with spaces on background color `bgc` (a colored panel).
+    fn fill(self, x: Int, y: Int, w: Int, h: Int, bgc: Int) {
+        var j = 0
+        while j < h {
+            var i = 0
+            while i < w { self.cell_ex(x + i, y + j, " ", 39, bgc, 0)  i = i + 1 }
+            j = j + 1
+        }
+    }
+    /// draw an ASCII box border (corners '+', edges '-'/'|') of size w*h with top-left at (x, y).
+    fn box(self, x: Int, y: Int, w: Int, h: Int, color: Int) { self.box_ex(x, y, w, h, color, 0) }
+    /// draw a box of size w*h at (x, y). style: 0 ASCII (+-|), 1 single line, 2 double line, 3 rounded.
+    fn box_ex(self, x: Int, y: Int, w: Int, h: Int, color: Int, style: Int) {
+        var tl = "+"
+        var tr = "+"
+        var bl = "+"
+        var br = "+"
+        var hz = "-"
+        var vt = "|"
+        if style == 1 { tl = glyph(0x250C)  tr = glyph(0x2510)  bl = glyph(0x2514)  br = glyph(0x2518)  hz = glyph(0x2500)  vt = glyph(0x2502) }
+        if style == 2 { tl = glyph(0x2554)  tr = glyph(0x2557)  bl = glyph(0x255A)  br = glyph(0x255D)  hz = glyph(0x2550)  vt = glyph(0x2551) }
+        if style == 3 { tl = glyph(0x256D)  tr = glyph(0x256E)  bl = glyph(0x2570)  br = glyph(0x256F)  hz = glyph(0x2500)  vt = glyph(0x2502) }
+        var i = 1
+        while i < w - 1 { self.cell(x + i, y, hz, color)  self.cell(x + i, y + h - 1, hz, color)  i = i + 1 }
+        var j = 1
+        while j < h - 1 { self.cell(x, y + j, vt, color)  self.cell(x + w - 1, y + j, vt, color)  j = j + 1 }
+        self.cell(x, y, tl, color)
+        self.cell(x + w - 1, y, tr, color)
+        self.cell(x, y + h - 1, bl, color)
+        self.cell(x + w - 1, y + h - 1, br, color)
+    }
+    /// build the full ANSI string that paints this screen: cleared, absolute-positioned, with fg/bg/attr
+    /// runs coalesced, then any queued image overlays.
+    fn frame(self) -> Str {
+        var out = clear() + reset()
+        var lf = 39
+        var lb = 0 - 1
+        var la = 0
+        var y = 0
+        while y < self.h {
+            out = out + move_to(y + 1, 1)
+            var x = 0
+            while x < self.w {
+                let idx = y * self.w + x
+                let cf = self.colors[idx]
+                let cb = self.bg[idx]
+                let ca = self.attr[idx]
+                if (cf != lf) || (cb != lb) || (ca != la) {
+                    out = out + style_seq(cf, cb, ca, lf, lb, la)
+                    lf = cf
+                    lb = cb
+                    la = ca
+                }
+                out = out + self.cells[idx]
+                x = x + 1
+            }
+            y = y + 1
+        }
+        out = out + reset()
+        var oi = 0
+        while oi < self.overlays.len() {
+            let ov = self.overlays[oi]
+            out = out + move_to(ov.row + 1, ov.col + 1) + ov.seq
+            oi = oi + 1
+        }
+        return out
+    }
+}
+
+// glyph: one Unicode code point as its UTF-8 string.
+fn glyph(cp: Int) -> Str { return utf8::encode(cp) }
+
+// sgr_fg_seq / sgr_bg_seq: the escape that sets fg / bg for a color Int (basic code or truecolor).
+fn sgr_fg_seq(c: Int) -> Str {
+    if c >= 16777216 { return fg_rgb((c >> 16) & 255, (c >> 8) & 255, c & 255) }
+    return fg(c)
+}
+fn sgr_bg_seq(c: Int) -> Str {
+    if c >= 16777216 { return bg_rgb((c >> 16) & 255, (c >> 8) & 255, c & 255) }
+    return bg(c)
+}
+
+// style_seq: the escape sequence to move from the previous (pf,pb,pa) style to (cf,cb,ca). Keeps a
+// byte-identical fast path for the common "plain foreground only" case so legacy output is unchanged.
+fn style_seq(cf: Int, cb: Int, ca: Int, pf: Int, pb: Int, pa: Int) -> Str {
+    let plain = ((cb == 0 - 1) && (ca == 0)) && (cf < 16777216)
+    let prev_plain = (pb == 0 - 1) && (pa == 0)
+    if plain && prev_plain { return fg(cf) }
+    var out = reset()
+    if (ca & 1) != 0 { out = out + esc() + "[1m" }
+    if (ca & 2) != 0 { out = out + esc() + "[2m" }
+    if (ca & 4) != 0 { out = out + esc() + "[3m" }
+    if (ca & 8) != 0 { out = out + esc() + "[4m" }
+    if (ca & 16) != 0 { out = out + esc() + "[7m" }
+    out = out + sgr_fg_seq(cf)
+    if cb != 0 - 1 { out = out + sgr_bg_seq(cb) }
+    return out
+}
+
+/// paint a screen to the terminal (one frame). printl adds a trailing newline; the frame positions
+/// every cell absolutely, so the only effect is the cursor ending on a fresh line.
+pub fn draw(s: Screen) -> Int { printl(s.frame())  return 0 }
+
+// --- images: half-block (portable) + Kitty graphics protocol (hi-fi where supported) ---
+
+// alpha-composite channel `c` (alpha `a`) over background channel `p`: out = c*a + p*(255-a).
+fn blend(c: Int, a: Int, p: Int) -> Int { return ((c * a) + (p * (255 - a))) / 255 }
+
+// blit_half_bg: render `im` scaled to cols x rows character cells using the upper-half-block glyph, so
+// each cell shows two vertical pixels (fg = top, bg = bottom). Transparent pixels are composited over
+// the pad color (pr,pg,pb). Works in any truecolor terminal.
+fn blit_half_bg(s: Screen, im: image::Image, x: Int, y: Int, cols: Int, rows: Int, pr: Int, pg: Int, pb: Int) {
+    let small = image::resize(im, cols, rows * 2)
+    if !image::ok(small) { return }
+    let gl = glyph(0x2580)
+    var ry = 0
+    while ry < rows {
+        var cx = 0
+        while cx < cols {
+            let tp = image::pixel_rgba(small, cx, ry * 2)
+            let bp = image::pixel_rgba(small, cx, ry * 2 + 1)
+            let ta = tp & 255
+            let ba = bp & 255
+            let tc = rgb(blend((tp >> 24) & 255, ta, pr), blend((tp >> 16) & 255, ta, pg), blend((tp >> 8) & 255, ta, pb))
+            let bc = rgb(blend((bp >> 24) & 255, ba, pr), blend((bp >> 16) & 255, ba, pg), blend((bp >> 8) & 255, ba, pb))
+            s.cell_ex(x + cx, y + ry, gl, tc, bc, 0)
+            cx = cx + 1
+        }
+        ry = ry + 1
+    }
+    image::dispose(small)
+}
+
+// effective_gfx: resolve GFX_AUTO to a concrete mode using the environment heuristic.
+fn effective_gfx(m: Int) -> Int {
+    if m == 0 { if supports_kitty() { return 3 } return 2 }
+    return m
+}
+
+/// draw a decoded image into the screen at cell (x, y), scaled to fit `cols` x `rows` character cells,
+/// honoring the screen's graphics mode (GFX_AUTO uses the environment heuristic). The Kitty path queues
+/// a pixel-perfect overlay (emitted when the frame is drawn); otherwise truecolor half-block cells over a
+/// black background. `im` may be disposed right after this call returns (both paths copy what they need).
+pub fn blit_image(inout s: Screen, im: image::Image, x: Int, y: Int, cols: Int, rows: Int) {
+    if !image::ok(im) { return }
+    let mode = effective_gfx(s.gfx)
+    if mode == 3 { blit_kitty_image(s, im, x, y, cols, rows)  return }
+    if mode == 1 { return }
+    blit_half_image(s, im, x, y, cols, rows)
+}
+
+/// render `im` as truecolor half-block cells (2 vertical pixels per cell), transparent pixels over black.
+/// Portable to any truecolor terminal; use this to force the fallback even where Kitty is available (e.g.
+/// tmux without passthrough).
+pub fn blit_half_image(s: Screen, im: image::Image, x: Int, y: Int, cols: Int, rows: Int) {
+    if !image::ok(im) { return }
+    blit_half_bg(s, im, x, y, cols, rows, 0, 0, 0)
+}
+
+/// like blit_half_image, but composite transparent pixels over `bg_color` (a truecolor rgb() value; a
+/// basic SGR code is treated as black). Use this so thumbnails blend into your panel instead of black.
+pub fn blit_half_image_over(s: Screen, im: image::Image, x: Int, y: Int, cols: Int, rows: Int, bg_color: Int) {
+    if !image::ok(im) { return }
+    var pr = 0
+    var pg = 0
+    var pb = 0
+    if bg_color >= 16777216 { pr = (bg_color >> 16) & 255  pg = (bg_color >> 8) & 255  pb = bg_color & 255 }
+    blit_half_bg(s, im, x, y, cols, rows, pr, pg, pb)
+}
+
+/// build the Kitty graphics escape that displays `im` scaled to cols x rows cells, without drawing it.
+/// Pair with add_overlay to place it. Useful for caching an expensive image so it isn't re-encoded every
+/// frame. Returns "" if `im` is bad or the payload can't be built.
+pub fn kitty_image_seq(im: image::Image, cols: Int, rows: Int) -> Str {
+    if !image::ok(im) { return "" }
+    return kitty_seq(im, cols, rows)
+}
+
+/// queue a prebuilt overlay escape `seq` (e.g. from kitty_image_seq) at cell (col, row); it is emitted
+/// when the screen is drawn. A no-op for an empty `seq`.
+pub fn add_overlay(inout s: Screen, sink seq: Str, col: Int, row: Int) {
+    if seq.len() > 0 { s.overlays.push(ImgOverlay { seq: seq, col: col, row: row }) }
+}
+
+/// queue `im` as a Kitty graphics overlay at cell (x, y), scaled to cols x rows. Falls back to half-block
+/// if the payload can't be built. Only visible on Kitty-capable terminals.
+pub fn blit_kitty_image(inout s: Screen, im: image::Image, x: Int, y: Int, cols: Int, rows: Int) {
+    if !image::ok(im) { return }
+    let seq = kitty_seq(im, cols, rows)
+    if seq.len() > 0 { s.overlays.push(ImgOverlay { seq: seq, col: x, row: y })  return }
+    blit_half_bg(s, im, x, y, cols, rows, 0, 0, 0)
+}
+
+/// does the current terminal support the Kitty graphics protocol (kitty, ghostty, wezterm)? A cheap
+/// env-based heuristic (TERM / KITTY_WINDOW_ID / TERM_PROGRAM); for a definitive answer use
+/// detect_graphics(), which asks the terminal directly.
+pub fn supports_kitty() -> Bool {
+    if (os::env("KITTY_WINDOW_ID")).len() > 0 { return true }
+    if (os::env("GHOSTTY_RESOURCES_DIR")).len() > 0 { return true }
+    let term = os::env("TERM")
+    if su::contains(term, "kitty") { return true }
+    if su::contains(term, "ghostty") { return true }
+    if su::contains(os::env("TERM_PROGRAM"), "WezTerm") { return true }
+    return false
+}
+
+// are we running under a terminal multiplexer (tmux / GNU screen)?
+fn in_tmux() -> Bool {
+    if (os::env("TMUX")).len() > 0 { return true }
+    let t = os::env("TERM")
+    if su::starts_with(t, "screen") { return true }
+    if su::starts_with(t, "tmux") { return true }
+    return false
+}
+
+// wrap an escape sequence in a tmux passthrough envelope (ESC Ptmux; <every ESC doubled> ESC \) so it
+// reaches the outer terminal. Requires `set -g allow-passthrough on` in tmux; harmless otherwise.
+fn wrap_tmux(s: Str) -> Str {
+    var out = esc() + "Ptmux;"
+    var i = 0
+    let n = s.len()
+    while i < n {
+        let c = s.at(i)
+        if ord(c) == 27 { out = out + esc() + esc() } else { out = out + ("" + c) }
+        i = i + 1
+    }
+    return out + esc() + "\\"
+}
+
+// the terminal-capability probe: a 1x1 Kitty query (a=q) followed by a DA1 request. Kitty-capable
+// terminals answer the query with `_G...;OK`; every terminal answers DA1, bounding the wait.
+fn graphics_query() -> Str {
+    let g = esc() + "_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA" + esc() + "\\"
+    let da1 = esc() + "[c"
+    if in_tmux() { return wrap_tmux(g) + da1 }
+    return g + da1
+}
+
+// did the probe response contain a Kitty "OK" acknowledgement?
+fn has_kitty_ok(r: Str) -> Bool { return su::contains(r, esc() + "_G") && su::contains(r, ";OK") }
+
+/// the Kitty escape that removes all currently-displayed images. clear() (ESC[2J) does not erase Kitty
+/// graphics, so emit this each frame before redrawing to avoid ghost thumbnails. No-op on other terminals.
+pub fn clear_images() -> Str {
+    let s = esc() + "_Ga=d,d=A" + esc() + "\\"
+    if in_tmux() { return wrap_tmux(s) }
+    return s
+}
+
+// b64 alphabet + one character.
+fn b64alpha() -> Str { return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" }
+fn b64char(v: Int) -> Str { return "" + b64alpha().at(v) }
+
+// base64-encode `n` raw bytes read directly from memory at `ptr` (output is ASCII, so it is safe to
+// build with chr()). Avoids materializing the binary as a Nori Str.
+fn b64_from_mem(ptr: Int, n: Int) -> Str {
+    let bld = io::builder()
+    var i = 0
+    unsafe {
+        while i + 3 <= n {
+            let tr = ((peek8(ptr + i) << 16) | (peek8(ptr + i + 1) << 8)) | peek8(ptr + i + 2)
+            io::add(bld, b64char((tr >> 18) & 63))
+            io::add(bld, b64char((tr >> 12) & 63))
+            io::add(bld, b64char((tr >> 6) & 63))
+            io::add(bld, b64char(tr & 63))
+            i = i + 3
+        }
+        let rem = n - i
+        if rem == 1 {
+            let tr = peek8(ptr + i) << 16
+            io::add(bld, b64char((tr >> 18) & 63))
+            io::add(bld, b64char((tr >> 12) & 63))
+            io::add(bld, "=")
+            io::add(bld, "=")
+        }
+        if rem == 2 {
+            let tr = (peek8(ptr + i) << 16) | (peek8(ptr + i + 1) << 8)
+            io::add(bld, b64char((tr >> 18) & 63))
+            io::add(bld, b64char((tr >> 12) & 63))
+            io::add(bld, b64char((tr >> 6) & 63))
+            io::add(bld, "=")
+        }
+    }
+    return io::build(bld)
+}
+
+// ascii substring [a, b).
+fn sub_ascii(s: Str, a: Int, b: Int) -> Str {
+    var out = ""
+    var i = a
+    while i < b { out = out + ("" + s.at(i))  i = i + 1 }
+    return out
+}
+
+// kitty_seq: the full Kitty graphics escape that transmits `im` as RGBA and displays it scaled into
+// cols x rows cells. Large sources are capped to keep the base64 payload bounded; the terminal scales.
+fn kitty_seq(im: image::Image, cols: Int, rows: Int) -> Str {
+    let cap = 256
+    var scaled = im
+    if (im.w > cap) || (im.h > cap) {
+        var nw = cap
+        var nh = cap
+        if im.w >= im.h { nh = (im.h * cap) / im.w } else { nw = (im.w * cap) / im.h }
+        if nw < 1 { nw = 1 }
+        if nh < 1 { nh = 1 }
+        scaled = image::resize(im, nw, nh)                 // freed with the frame; `im` stays the caller's
+        if !image::ok(scaled) { return "" }
+    }
+    let w = scaled.w
+    let h = scaled.h
+    let b64 = b64_from_mem(scaled.px, (w * h) * 4)
+    let n = b64.len()
+    let chunk = 4096
+    let bld = io::builder()
+    var i = 0
+    var first = true
+    while i < n {
+        var e = i + chunk
+        if e > n { e = n }
+        let piece = sub_ascii(b64, i, e)
+        let more = e < n
+        io::add(bld, esc() + "_G")
+        if first {
+            io::add(bld, "a=T,f=32,C=1,s=" + w + ",v=" + h + ",c=" + cols + ",r=" + rows)   // C=1: don't move cursor
+            if more { io::add(bld, ",m=1") }
+            first = false
+        } else {
+            if more { io::add(bld, "m=1") } else { io::add(bld, "m=0") }
+        }
+        io::add(bld, ";" + piece + esc() + "\\")
+        i = e
+    }
+    let result = io::build(bld)
+    if in_tmux() { return wrap_tmux(result) }      // pass the graphics escapes through tmux
+    return result
+}
+
+cfg(linux) {
+    extern fn tcgetattr(Int, Int) -> Int          // (fd, struct termios*)
+    extern fn tcsetattr(Int, Int, Int) -> Int     // (fd, optional_actions, struct termios*); TCSANOW=0
+    extern fn ioctl(Int, Int, Int) -> Int         // (fd, request, void*)
+    extern fn read(Int, Int, Int) -> I32          // (fd, buf, n)
+    extern fn write(Int, Int, Int) -> I32         // (fd, buf, n)
+    extern fn poll(Int, Int, Int) -> Int          // (struct pollfd*, nfds, timeout_ms)
+    extern fn malloc(Int) -> Int
+    extern fn free(Int)
+    extern fn isatty(Int) -> I32
+
+    // write the raw bytes of `s` to stdout (no trailing newline; exact control sequences).
+    fn write_bytes(s: Str) {
+        let n = s.len()
+        unsafe {
+            let b = malloc(n)
+            var i = 0
+            while i < n { poke8(b + i, ord(s.at(i)))  i = i + 1 }
+            write(1, b, n)
+            free(b)
+        }
+    }
+
+    // poll fd for readable data up to `ms` milliseconds; returns the revents bitmask (0 on timeout).
+    fn poll_in(fd: Int, ms: Int) -> Int {
+        var rev = 0
+        unsafe {
+            let pf = malloc(8)
+            poke8(pf, fd & 255)  poke8(pf + 1, (fd >> 8) & 255)  poke8(pf + 2, (fd >> 16) & 255)  poke8(pf + 3, (fd >> 24) & 255)
+            poke8(pf + 4, 1)  poke8(pf + 5, 0)  poke8(pf + 6, 0)  poke8(pf + 7, 0)   // events = POLLIN
+            let r = poll(pf, 1, ms)
+            if r > 0 { rev = (peek8(pf + 6) | (peek8(pf + 7) << 8)) }
+            free(pf)
+        }
+        return rev
+    }
+
+    /// probe the terminal for graphics support by sending a Kitty query + DA1 and reading the reply.
+    /// Returns GFX_KITTY if the terminal acknowledges Kitty graphics, else GFX_HALF. Toggles raw mode
+    /// around the probe, so it is safe to call before or after begin(). Non-tty stdin returns GFX_HALF.
+    pub fn detect_graphics() -> Int {
+        if !stdin_is_tty() { return 2 }
+        let saved = raw_enter()
+        write_bytes(graphics_query())
+        var resp = ""
+        unsafe {
+            let buf = malloc(64)
+            var idle = 0
+            while idle < 2 {
+                let rev = poll_in(0, 150)
+                if rev <= 0 { idle = idle + 1 } else {
+                    let got = to_int(read(0, buf, 64))
+                    if got <= 0 { idle = 2 } else {
+                        var k = 0
+                        while k < got { resp = resp + chr(peek8(buf + k))  k = k + 1 }
+                        if su::ends_with(resp, "c") { idle = 2 }   // DA1 terminator -> reply complete
+                    }
+                }
+            }
+            free(buf)
+        }
+        raw_exit(saved)
+        if has_kitty_ok(resp) { return 3 }
+        return 2
+    }
+
+    // enter cbreak/raw mode on stdin (no echo, no line buffering). Returns a handle holding the original
+    // termios: pass it to raw_exit to restore. On Linux x86-64, struct termios has tcflag_t (4B) fields
+    // c_iflag@0 c_oflag@4 c_cflag@8 c_lflag@12, so the i64 at offset 8 is c_cflag | (c_lflag << 32);
+    // ECHO=0x8 and ICANON=0x2 live in c_lflag, i.e. bits 35 and 33 of that word.
+    /// enter cbreak/raw mode on stdin (no echo, no line buffering); returns a handle holding the original termios; pass it to raw_exit to restore.
+    pub fn raw_enter() -> Int {
+        var t = 0
+        unsafe {
+            t = malloc(64)
+            tcgetattr(0, t)
+            let lf = peek(t + 8)
+            poke(t + 8, (lf & (~((8 | 2) << 32))))   // clear ECHO|ICANON in c_lflag
+            tcsetattr(0, 0, t)
+            poke(t + 8, lf)                                    // restore the saved value into the buffer for raw_exit
+        }
+        return t
+    }
+    /// restore the original terminal mode from the handle `t` returned by raw_enter, and free it. A handle
+    /// of 0, not one raw_enter gave, does nothing and returns -1, rather than hand libc a null pointer:
+    /// `tui::raw_exit(0)` segfaulted a program that called it to "reset" the terminal.
+    pub fn raw_exit(t: Int) -> Int {
+        if t == 0 { return 0 - 1 }
+        unsafe { tcsetattr(0, 0, t)  free(t) }
+        return 0
+    }
+
+    /// block for one keypress and return its byte; arrow keys (ESC[A/B/C/D) return 1000+final byte (UP=1065 DOWN=1066 RIGHT=1067 LEFT=1068); EOF/error returns -1.
+    pub fn read_key() -> Int {
+        var b = 0
+        unsafe {
+            let buf = malloc(8)
+            let n = to_int(read(0, buf, 1))
+            if n <= 0 { b = 0 - 1 } else {
+                b = peek8(buf)
+                if b == 27 {
+                    let n2 = read(0, buf, 1)
+                    if n2 > 0 { if peek8(buf) == 91 {
+                        let n3 = read(0, buf, 1)
+                        if n3 > 0 { b = 1000 + peek8(buf) }
+                    } }
+                }
+            }
+            free(buf)
+        }
+        return b
+    }
+
+    /// block for one input event: a keypress or an SGR mouse event (press/release/drag/scroll). For a key,
+    /// `key` is the byte, or a named code for a navigation key: arrows KEY_UP/DOWN/LEFT/RIGHT and
+    /// KEY_HOME/END/PGUP/PGDN/INS/DEL (the multi-byte CSI escapes are decoded whole: no stray '~' leaks).
+    /// Mouse events only arrive after mouse_on()/begin_mouse(). EOF/error yields EV_NONE. Any unrecognized
+    /// escape sequence is consumed and reported as KEY_ESC.
+    pub fn read_event() -> Event {
+        var kind = 0
+        var key = 0
+        var button = 0
+        var col = 0
+        var row = 0
+        unsafe {
+            let buf = malloc(8)
+            let n = to_int(read(0, buf, 1))
+            if n <= 0 { kind = 0 } else {
+                let b0 = peek8(buf)
+                if b0 != 27 { kind = 1  key = b0 } else {
+                    let n1 = read(0, buf, 1)
+                    if n1 <= 0 { kind = 1  key = 27 } else {
+                        if peek8(buf) != 91 { kind = 1  key = 27 } else {
+                            let n2 = read(0, buf, 1)
+                            if n2 <= 0 { kind = 1  key = 27 } else {
+                                let b2 = peek8(buf)
+                                if b2 == 60 {
+                                    // SGR mouse: <Cb;Cx;Cy(M|m)
+                                    var f0 = 0
+                                    var f1 = 0
+                                    var f2 = 0
+                                    var fld = 0
+                                    var cur = 0
+                                    var fin = 0
+                                    var done = false
+                                    while !done {
+                                        let nn = read(0, buf, 1)
+                                        if nn <= 0 { done = true } else {
+                                            let c = peek8(buf)
+                                            if (c >= 48) && (c <= 57) { cur = (cur * 10) + (c - 48) } else {
+                                                if c == 59 {
+                                                    if fld == 0 { f0 = cur }
+                                                    if fld == 1 { f1 = cur }
+                                                    fld = fld + 1
+                                                    cur = 0
+                                                } else { f2 = cur  fin = c  done = true }
+                                            }
+                                        }
+                                    }
+                                    col = f1 - 1
+                                    row = f2 - 1
+                                    if (f0 & 64) != 0 {
+                                        kind = 5
+                                        button = 1
+                                        if (f0 & 3) == 0 { button = 0 }
+                                    } else {
+                                        button = f0 & 3
+                                        if fin == 109 { kind = 3 } else {
+                                            if (f0 & 32) != 0 { kind = 4 } else { kind = 2 }
+                                        }
+                                    }
+                                } else {
+                                    kind = 1
+                                    if ((b2 == 65) || (b2 == 66)) || ((b2 == 67) || (b2 == 68)) { key = 1000 + b2 }   // arrows ESC[A/B/C/D
+                                    else if b2 == 72 { key = 1080 }                    // ESC[H  -> Home
+                                    else if b2 == 70 { key = 1081 }                    // ESC[F  -> End
+                                    else if (b2 >= 48) && (b2 <= 57) {
+                                        // numeric CSI `ESC[<n>~`: accumulate the number, then the '~' (or other final byte)
+                                        var num = b2 - 48
+                                        var d2 = false
+                                        while !d2 {
+                                            let nn = read(0, buf, 1)
+                                            if nn <= 0 { d2 = true } else {
+                                                let c = peek8(buf)
+                                                if (c >= 48) && (c <= 57) { num = (num * 10) + (c - 48) } else { d2 = true }   // consumes the '~'
+                                            }
+                                        }
+                                        if num == 1 { key = 1080 }                     // Home
+                                        else if num == 2 { key = 1084 }                // Insert
+                                        else if num == 3 { key = 1085 }                // Delete
+                                        else if num == 4 { key = 1081 }                // End
+                                        else if num == 5 { key = 1082 }                // Page Up
+                                        else if num == 6 { key = 1083 }                // Page Down
+                                        else if num == 7 { key = 1080 }                // Home (rxvt)
+                                        else if num == 8 { key = 1081 }                // End (rxvt)
+                                        else { key = 27 }                              // unknown numeric CSI -> ESC
+                                    }
+                                    else {
+                                        // unrecognized CSI: consume to its final byte [64,126], report ESC
+                                        var done = false
+                                        while !done {
+                                            let nn = read(0, buf, 1)
+                                            if nn <= 0 { done = true } else {
+                                                let c = peek8(buf)
+                                                if (c >= 64) && (c <= 126) { done = true }
+                                            }
+                                        }
+                                        key = 27
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            free(buf)
+        }
+        return Event { kind: kind, key: key, button: button, col: col, row: row }
+    }
+
+    /// true if input is already waiting on stdin (non-blocking poll). Use to debounce expensive work —
+    /// e.g. skip decoding an image preview while the user is holding a key or scrolling.
+    pub fn input_pending() -> Bool { return poll_in(0, 0) > 0 }
+
+    /// the terminal size packed as (rows << 16) | cols via TIOCGWINSZ, or 0 if unavailable.
+    pub fn term_size() -> Int {
+        var packed = 0
+        unsafe {
+            let ws = malloc(8)
+            if ioctl(0, 21523, ws) == 0 {
+                let rows = (peek8(ws) | (peek8(ws + 1) << 8))
+                let cols = (peek8(ws + 2) | (peek8(ws + 3) << 8))
+                packed = ((rows << 16) | cols)
+            }
+            free(ws)
+        }
+        return packed
+    }
+    /// the terminal height in rows (high 16 bits of term_size), or 0 if unavailable.
+    pub fn term_rows() -> Int { return ((term_size() >> 16) & 65535) }
+    /// the terminal width in columns (low 16 bits of term_size), or 0 if unavailable.
+    pub fn term_cols() -> Int { return (term_size() & 65535) }
+    /// true if stdin is connected to a terminal (isatty(0)).
+    pub fn stdin_is_tty() -> Bool { var r = 0  unsafe { r = to_int(isatty(0)) }  return r == 1 }
+
+    /// begin a full-screen session (alt screen + hide cursor + raw mode); returns the saved-termios handle for end().
+    pub fn begin() -> Int {
+        printl(alt_enter() + hide_cursor())
+        return raw_enter()
+    }
+    /// like begin(), but also enable mouse reporting so read_event() delivers mouse events.
+    pub fn begin_mouse() -> Int {
+        printl((alt_enter() + hide_cursor()) + mouse_on())
+        return raw_enter()
+    }
+    /// end the session: restore terminal mode from `saved`, disable mouse reporting, show the cursor, and
+    /// leave the alternate screen. Safe to call whether or not mouse reporting was enabled.
+    pub fn end(saved: Int) -> Int {
+        raw_exit(saved)
+        printl((mouse_off() + show_cursor()) + alt_exit())
+        return 0
+    }
+}

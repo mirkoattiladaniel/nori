@@ -1,0 +1,616 @@
+//! std/archive: DEFLATE compression (RFC 1951) and the zlib wrapper (RFC 1950).
+//!
+//! The mirror of this module's `inflate_zlib`. `deflate(data)` produces a raw DEFLATE stream and
+//! `deflate_zlib(data)` wraps it in zlib's 2-byte header and Adler-32 trailer, which is the form a
+//! PNG IDAT wants (see std/image::save_png).
+//!
+//! How it compresses. LZ77 over a 32 KB window with a hash-chain match finder (3-byte hash, 128-deep
+//! chains, zlib's lazy-match rule: a match is only taken when the next position cannot do better),
+//! then Huffman coding. Every block is costed three ways (stored, fixed-Huffman, dynamic-Huffman)
+//! in bits, and the cheapest one is emitted. That is what makes incompressible input safe: random
+//! bytes cost more under either Huffman tree than they do raw, so they come out stored, and the
+//! stream grows by 5 bytes per 64 KB instead of by a third.
+//!
+//! Code lengths are capped at 15 bits (7 for the code-length alphabet) by halving the frequencies and
+//! rebuilding until the tree fits, which is slower than the package-merge algorithm and much shorter.
+//! Symbols are buffered 32768 at a time, so a long input is many blocks and each block gets a tree
+//! fitted to its own statistics.
+
+// ---- bit-level output over a growable raw buffer ------------------------------------------------
+// Bits go out LSB-first (RFC 1951 §3.1.1); Huffman codes are bit-reversed on the way out because the
+// canonical code's MSB is transmitted first while everything else is LSB-first.
+struct DfW { p: Int, len: Int, cap: Int, bb: Int, bc: Int }
+
+fn df_new() -> DfW {
+    var w: DfW = DfW { p: 0, len: 0, cap: 65536, bb: 0, bc: 0 }
+    unsafe { w.p = malloc(65536) }
+    return w
+}
+fn df_byte(inout w: DfW, v: Int) {
+    if w.len == w.cap { w.cap = w.cap * 2  unsafe { w.p = realloc(w.p, w.cap) } }
+    unsafe { poke8(w.p + w.len, v & 255) }
+    w.len = w.len + 1
+}
+fn df_bits(inout w: DfW, v: Int, n: Int) {
+    if n > 0 {
+        w.bb = w.bb | ((v & ((1 << n) - 1)) << w.bc)
+        w.bc = w.bc + n
+        while w.bc >= 8 { df_byte(w, w.bb & 255)  w.bb = (w.bb >> 8)  w.bc = w.bc - 8 }
+    }
+}
+fn df_align(inout w: DfW) {
+    if w.bc > 0 { df_byte(w, w.bb & 255)  w.bb = 0  w.bc = 0 }
+}
+fn df_rev(v: Int, n: Int) -> Int {
+    var r = 0
+    var i = 0
+    while i < n { r = ((r << 1) | ((v >> i) & 1))  i = i + 1 }
+    return r
+}
+fn df_code(inout w: DfW, code: Int, n: Int) { df_bits(w, df_rev(code, n), n) }
+
+// a fresh literal/length frequency table. Symbol 256 (end-of-block) starts at 1 because every block
+// emits exactly one of it, and a tree built without counting it would give it no code at all.
+fn df_new_lfq() -> Vec<Int> {
+    var v = df_zeros(286)
+    v[256] = 1
+    return v
+}
+
+fn df_zeros(n: Int) -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    var i = 0
+    while i < n { v.push(0)  i = i + 1 }
+    return v
+}
+
+// ---- Huffman code lengths from frequencies ------------------------------------------------------
+// Two-queue construction over frequency-sorted leaves (O(n) after the sort), then the depth of each
+// leaf is its code length. A tree deeper than `maxbits` is not representable in DEFLATE, so the
+// frequencies are halved and the tree rebuilt until it fits (the halving flattens the distribution,
+// so this terminates; all-ones gives a balanced tree of depth ceil(log2 n) <= 9 here).
+fn df_lengths(freq0: Vec<Int>, n: Int, maxbits: Int) -> Vec<Int> {
+    var freq = df_zeros(n)
+    var i = 0
+    while i < n { freq[i] = freq0[i]  i = i + 1 }
+    // DEFLATE has no way to spell a tree with fewer than two codes, so force two.
+    var used = 0
+    i = 0
+    while i < n { if freq[i] > 0 { used = used + 1 }  i = i + 1 }
+    i = 0
+    while used < 2 && i < n { if freq[i] == 0 { freq[i] = 1  used = used + 1 }  i = i + 1 }
+
+    var lens = df_zeros(n)
+    var fitting = 0
+    while fitting == 0 {
+        // leaves sorted ascending by frequency (insertion sort; n <= 286)
+        var ls: Vec<Int> = vec()
+        var lf: Vec<Int> = vec()
+        i = 0
+        while i < n {
+            if freq[i] > 0 {
+                var j = ls.len()
+                ls.push(i)  lf.push(freq[i])
+                while j > 0 && lf[j - 1] > freq[i] { ls[j] = ls[j - 1]  lf[j] = lf[j - 1]  j = j - 1 }
+                ls[j] = i  lf[j] = freq[i]
+            }
+            i = i + 1
+        }
+        let m = ls.len()
+        let total = 2 * m - 1
+        var nf = df_zeros(total)
+        var par = df_zeros(total)
+        i = 0
+        while i < total { par[i] = 0 - 1  i = i + 1 }
+        i = 0
+        while i < m { nf[i] = lf[i]  i = i + 1 }
+        var qa = 0            // next unused leaf
+        var qb = m            // next unused internal node
+        var nxt = m           // where the next internal node goes
+        while nxt < total {
+            var c1 = 0 - 1
+            var c2 = 0 - 1
+            var k = 0
+            while k < 2 {
+                var pick = 0 - 1
+                if qa < m {
+                    if qb < nxt { if nf[qa] <= nf[qb] { pick = qa  qa = qa + 1 } else { pick = qb  qb = qb + 1 } }
+                    else { pick = qa  qa = qa + 1 }
+                } else { pick = qb  qb = qb + 1 }
+                if k == 0 { c1 = pick } else { c2 = pick }
+                k = k + 1
+            }
+            nf[nxt] = nf[c1] + nf[c2]
+            par[c1] = nxt
+            par[c2] = nxt
+            nxt = nxt + 1
+        }
+        var deepest = 0
+        i = 0
+        while i < n { lens[i] = 0  i = i + 1 }
+        i = 0
+        while i < m {
+            var d = 0
+            var cur = i
+            while par[cur] >= 0 { cur = par[cur]  d = d + 1 }
+            if m == 1 { d = 1 }
+            lens[ls[i]] = d
+            if d > deepest { deepest = d }
+            i = i + 1
+        }
+        if deepest <= maxbits { fitting = 1 }
+        else {
+            i = 0
+            while i < n { if freq[i] > 1 { freq[i] = (freq[i] + 1) >> 1 }  i = i + 1 }
+        }
+    }
+    return lens
+}
+
+// canonical codes for a set of code lengths (RFC 1951 §3.2.2)
+fn df_canon(lens: Vec<Int>, n: Int) -> Vec<Int> {
+    var blcount = df_zeros(16)
+    var i = 0
+    while i < n { if lens[i] > 0 { blcount[lens[i]] = blcount[lens[i]] + 1 }  i = i + 1 }
+    var next = df_zeros(16)
+    var code = 0
+    var b = 1
+    while b <= 15 { code = ((code + blcount[b - 1]) << 1)  next[b] = code  b = b + 1 }
+    var out = df_zeros(n)
+    i = 0
+    while i < n { if lens[i] > 0 { out[i] = next[lens[i]]  next[lens[i]] = next[lens[i]] + 1 }  i = i + 1 }
+    return out
+}
+
+// ---- length / distance symbol tables ------------------------------------------------------------
+// Forward lookups: length 3..258 -> its index into Tabs.lbase, distance 1..32768 -> index into
+// Tabs.dbase. Built once per deflate() call and indexed directly, so the hot path does no search.
+fn df_len_index(t: Tabs) -> Vec<Int> {
+    var v = df_zeros(259)
+    var li = 0
+    while li < 29 {
+        var top = 258
+        if li < 28 { top = t.lbase[li + 1] - 1 }
+        var l = t.lbase[li]
+        while l <= top { v[l] = li  l = l + 1 }
+        li = li + 1
+    }
+    return v
+}
+fn df_dist_index(t: Tabs) -> Vec<Int> {
+    var v = df_zeros(32769)
+    var di = 0
+    while di < 30 {
+        var top = 32768
+        if di < 29 { top = t.dbase[di + 1] - 1 }
+        var d = t.dbase[di]
+        while d <= top { v[d] = di  d = d + 1 }
+        di = di + 1
+    }
+    return v
+}
+
+// ---- the code-length alphabet (RFC 1951 §3.2.7) --------------------------------------------------
+fn df_cl_order() -> Vec<Int> {
+    var o: Vec<Int> = vec()
+    o.push(16) o.push(17) o.push(18) o.push(0) o.push(8) o.push(7) o.push(9) o.push(6)
+    o.push(10) o.push(5) o.push(11) o.push(4) o.push(12) o.push(3) o.push(13) o.push(2)
+    o.push(14) o.push(1) o.push(15)
+    return o
+}
+// run-length encode the concatenated litlen+dist code lengths into the 0..18 alphabet
+fn df_rle(lens: Vec<Int>, n: Int, inout rs: Vec<Int>, inout rx: Vec<Int>, inout cf: Vec<Int>) {
+    var i = 0
+    while i < n {
+        let v = lens[i]
+        var run = 1
+        while i + run < n && lens[i + run] == v { run = run + 1 }
+        if v == 0 {
+            while run >= 11 {
+                var r = run
+                if r > 138 { r = 138 }
+                rs.push(18)  rx.push(r - 11)  cf[18] = cf[18] + 1
+                run = run - r
+                i = i + r
+            }
+            while run >= 3 {
+                var r = run
+                if r > 10 { r = 10 }
+                rs.push(17)  rx.push(r - 3)  cf[17] = cf[17] + 1
+                run = run - r
+                i = i + r
+            }
+            while run > 0 { rs.push(0)  rx.push(0)  cf[0] = cf[0] + 1  run = run - 1  i = i + 1 }
+        } else {
+            rs.push(v)  rx.push(0)  cf[v] = cf[v] + 1
+            run = run - 1
+            i = i + 1
+            while run >= 3 {
+                var r = run
+                if r > 6 { r = 6 }
+                rs.push(16)  rx.push(r - 3)  cf[16] = cf[16] + 1
+                run = run - r
+                i = i + r
+            }
+            while run > 0 { rs.push(v)  rx.push(0)  cf[v] = cf[v] + 1  run = run - 1  i = i + 1 }
+        }
+    }
+}
+
+fn df_fixed_dist_lens() -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    var i = 0
+    while i < 30 { v.push(5)  i = i + 1 }
+    return v
+}
+
+// bits the block's symbols cost under a given pair of trees (excluding the block header)
+fn df_data_bits(sy: Vec<Int>, dy: Vec<Int>, llen: Vec<Int>, dlen: Vec<Int>, t: Tabs) -> Int {
+    var bits = 0
+    var i = 0
+    let n = sy.len()
+    while i < n {
+        let s = sy[i]
+        bits = bits + llen[s]
+        if dy[i] >= 0 { bits = bits + t.lext[s - 257] + dlen[dy[i]] + t.dext[dy[i]] }
+        i = i + 1
+    }
+    return bits + llen[256]
+}
+
+// ---- one block ----------------------------------------------------------------------------------
+// Costs the block three ways and emits the cheapest. `src`/`bstart`/`bend` describe the input range
+// the symbols cover, which is what a stored block has to reproduce byte for byte.
+fn df_flush(inout w: DfW, sy: Vec<Int>, sx: Vec<Int>, dy: Vec<Int>, dx: Vec<Int>, lfq: Vec<Int>, dfq: Vec<Int>, t: Tabs, src: Int, bstart: Int, bend: Int, last: Int) {
+    let nsym = sy.len()
+    let rawn = bend - bstart
+
+    // fixed-Huffman cost
+    let flit = fixed_litlens()
+    let fdist = df_fixed_dist_lens()
+    let fixed_bits = 3 + df_data_bits(sy, dy, flit, fdist, t)
+
+    // dynamic-Huffman cost: build both trees, RLE their lengths, build the code-length tree
+    var llen = df_lengths(lfq, 286, 15)
+    var dlen = df_lengths(dfq, 30, 15)
+    var hlit = 286
+    while hlit > 257 && llen[hlit - 1] == 0 { hlit = hlit - 1 }
+    var hdist = 30
+    while hdist > 1 && dlen[hdist - 1] == 0 { hdist = hdist - 1 }
+    var cat = df_zeros(hlit + hdist)
+    var i = 0
+    while i < hlit { cat[i] = llen[i]  i = i + 1 }
+    i = 0
+    while i < hdist { cat[hlit + i] = dlen[i]  i = i + 1 }
+    var rs: Vec<Int> = vec()
+    var rx: Vec<Int> = vec()
+    var cf = df_zeros(19)
+    df_rle(cat, hlit + hdist, rs, rx, cf)
+    let cllen = df_lengths(cf, 19, 7)
+    let order = df_cl_order()
+    var hclen = 19
+    while hclen > 4 && cllen[order[hclen - 1]] == 0 { hclen = hclen - 1 }
+    var hdr_bits = 3 + 14 + 3 * hclen
+    i = 0
+    while i < rs.len() {
+        hdr_bits = hdr_bits + cllen[rs[i]]
+        if rs[i] == 16 { hdr_bits = hdr_bits + 2 }
+        if rs[i] == 17 { hdr_bits = hdr_bits + 3 }
+        if rs[i] == 18 { hdr_bits = hdr_bits + 7 }
+        i = i + 1
+    }
+    let dyn_bits = hdr_bits + df_data_bits(sy, dy, llen, dlen, t)
+
+    // stored cost: pad to a byte boundary, then 5 bytes of header per 65535-byte chunk
+    var nchunk = (rawn + 65534) / 65535
+    if nchunk == 0 { nchunk = 1 }
+    let pad = (8 - ((w.bc + 3) & 7)) & 7
+    let stored_bits = 3 + pad + nchunk * 40 + (nchunk - 1) * 8 + rawn * 8
+
+    if stored_bits <= fixed_bits && stored_bits <= dyn_bits {
+        var off = 0
+        var c = 0
+        while c < nchunk {
+            var len = rawn - off
+            if len > 65535 { len = 65535 }
+            var fin = 0
+            if last == 1 && c == nchunk - 1 { fin = 1 }
+            df_bits(w, fin, 1)
+            df_bits(w, 0, 2)
+            df_align(w)
+            df_byte(w, len & 255)  df_byte(w, (len >> 8) & 255)
+            df_byte(w, (65535 - len) & 255)  df_byte(w, ((65535 - len) >> 8) & 255)
+            var k = 0
+            while k < len {
+                var b = 0
+                unsafe { b = peek8(src + bstart + off + k) }
+                df_byte(w, b)
+                k = k + 1
+            }
+            off = off + len
+            c = c + 1
+        }
+    } else {
+        // The fixed pair and the dynamic pair of code-length tables are all owned by this frame, and
+        // which pair the block uses is decided at run time. Binding the choice to a local
+        // (`var ll = flit  …  ll = llen`) would make `ll` an alias of whichever it picked, and an
+        // aliased local cannot be freed. Passing the chosen pair to a helper that only reads it
+        // avoids the alias, so each of the four tables is freed once by the frame that built it.
+        if dyn_bits < fixed_bits {
+            df_bits(w, last, 1)
+            df_bits(w, 2, 2)
+            df_bits(w, hlit - 257, 5)
+            df_bits(w, hdist - 1, 5)
+            df_bits(w, hclen - 4, 4)
+            i = 0
+            while i < hclen { df_bits(w, cllen[order[i]], 3)  i = i + 1 }
+            let clcode = df_canon(cllen, 19)
+            i = 0
+            while i < rs.len() {
+                df_code(w, clcode[rs[i]], cllen[rs[i]])
+                if rs[i] == 16 { df_bits(w, rx[i], 2) }
+                if rs[i] == 17 { df_bits(w, rx[i], 3) }
+                if rs[i] == 18 { df_bits(w, rx[i], 7) }
+                i = i + 1
+            }
+            df_emit_symbols(w, llen, dlen, sy, sx, dy, dx, nsym, t)
+        } else {
+            df_bits(w, last, 1)
+            df_bits(w, 1, 2)
+            df_emit_symbols(w, flit, fdist, sy, sx, dy, dx, nsym, t)
+        }
+    }
+}
+
+// the block body: canonical codes for this block's length/distance tables, then every symbol.
+// `ll`/`dl` are read here and nowhere kept, which is what lets df_flush own all four of its tables.
+fn df_emit_symbols(inout w: DfW, ll: Vec<Int>, dl: Vec<Int>, sy: Vec<Int>, sx: Vec<Int>, dy: Vec<Int>, dx: Vec<Int>, nsym: Int, t: Tabs) {
+    let lcode = df_canon(ll, ll.len())
+    let dcode = df_canon(dl, dl.len())
+    var i = 0
+    while i < nsym {
+        let s = sy[i]
+        df_code(w, lcode[s], ll[s])
+        if dy[i] >= 0 {
+            df_bits(w, sx[i], t.lext[s - 257])
+            df_code(w, dcode[dy[i]], dl[dy[i]])
+            df_bits(w, dx[i], t.dext[dy[i]])
+        }
+        i = i + 1
+    }
+    df_code(w, lcode[256], ll[256])
+}
+
+// ---- the hash-chain match finder ----------------------------------------------------------------
+// `head[h]` is the most recent position whose 3-byte hash is h, `prev[pos & 32767]` the one before
+// it; both store position+1 so 0 means "none". prev is cyclic over the 32 KB window, which is the
+// range a DEFLATE distance can reach.
+struct DfHash { head: Int, prev: Int }
+
+fn df_hash_at(src: Int, i: Int) -> Int {
+    var h = 0
+    unsafe { h = (((peek8(src + i) << 10) ^ (peek8(src + i + 1) << 5)) ^ peek8(src + i + 2)) & 32767 }
+    return h
+}
+fn df_insert(hs: DfHash, src: Int, i: Int) -> Int {
+    let h = df_hash_at(src, i)
+    var old = 0
+    unsafe {
+        old = peek32(hs.head + h * 4)
+        poke32(hs.prev + (i & 32767) * 4, old)
+        poke32(hs.head + h * 4, i + 1)
+    }
+    return old
+}
+fn df_find(hs: DfHash, src: Int, n: Int, i: Int, chain_start: Int, inout bd: Int) -> Int {
+    bd = 0
+    var maxlen = n - i
+    if maxlen > 258 { maxlen = 258 }
+    if maxlen < 3 { return 0 }
+    var limit = i - 32768
+    if limit < 0 { limit = 0 }
+    var best = 0
+    var cur = chain_start
+    var chain = 128
+    while cur != 0 && chain > 0 {
+        let p = cur - 1
+        if p < limit { chain = 0 }
+        else {
+            var l = 0
+            unsafe { while l < maxlen && peek8(src + p + l) == peek8(src + i + l) { l = l + 1 } }
+            if l > best { best = l  bd = i - p }
+            if best >= maxlen { chain = 0 }
+            else {
+                unsafe { cur = peek32(hs.prev + (p & 32767) * 4) }
+                chain = chain - 1
+            }
+        }
+    }
+    if best < 3 { bd = 0  return 0 }
+    return best
+}
+
+// ---- the driver ---------------------------------------------------------------------------------
+fn df_lit(inout sy: Vec<Int>, inout sx: Vec<Int>, inout dy: Vec<Int>, inout dx: Vec<Int>, inout lfq: Vec<Int>, b: Int) {
+    sy.push(b)  sx.push(0)  dy.push(0 - 1)  dx.push(0)
+    lfq[b] = lfq[b] + 1
+}
+fn df_match(inout sy: Vec<Int>, inout sx: Vec<Int>, inout dy: Vec<Int>, inout dx: Vec<Int>, inout lfq: Vec<Int>, inout dfq: Vec<Int>, t: Tabs, lidx: Vec<Int>, didx: Vec<Int>, ln: Int, dist: Int) {
+    let li = lidx[ln]
+    let di = didx[dist]
+    sy.push(257 + li)  sx.push(ln - t.lbase[li])
+    dy.push(di)  dx.push(dist - t.dbase[di])
+    lfq[257 + li] = lfq[257 + li] + 1
+    dfq[di] = dfq[di] + 1
+}
+
+// compress [src, src+n) into `w` as a raw DEFLATE stream
+fn df_compress(inout w: DfW, src: Int, n: Int) {
+    let t = tabs()
+    let lidx = df_len_index(t)
+    let didx = df_dist_index(t)
+    var hs: DfHash = DfHash { head: 0, prev: 0 }
+    unsafe { hs.head = malloc(32768 * 4)  hs.prev = malloc(32768 * 4) }
+    var z = 0
+    unsafe { while z < 32768 { poke32(hs.head + z * 4, 0)  poke32(hs.prev + z * 4, 0)  z = z + 1 } }
+
+    var sy: Vec<Int> = vec()
+    var sx: Vec<Int> = vec()
+    var dy: Vec<Int> = vec()
+    var dx: Vec<Int> = vec()
+    var lfq = df_new_lfq()
+    var dfq = df_zeros(30)
+    var bstart = 0
+    var i = 0
+    var prev_len = 0
+    var prev_dist = 0
+    var pending = 0                                   // a match found at i-1 that i might beat
+    while i < n {
+        var chain = 0
+        if i + 2 < n { chain = df_insert(hs, src, i) }
+        var md = 0
+        var ml = 0
+        if i + 2 < n { ml = df_find(hs, src, n, i, chain, md) }
+        if pending == 1 {
+            if ml > prev_len {
+                var b = 0
+                unsafe { b = peek8(src + i - 1) }
+                df_lit(sy, sx, dy, dx, lfq, b)
+                prev_len = ml
+                prev_dist = md
+                i = i + 1
+            } else {
+                df_match(sy, sx, dy, dx, lfq, dfq, t, lidx, didx, prev_len, prev_dist)
+                let stop = (i - 1) + prev_len
+                var k = i + 1
+                while k < stop { if k + 2 < n { let _o = df_insert(hs, src, k) }  k = k + 1 }
+                i = stop
+                pending = 0
+                prev_len = 0
+            }
+        } else {
+            if ml >= 3 { prev_len = ml  prev_dist = md  pending = 1  i = i + 1 }
+            else {
+                var b = 0
+                unsafe { b = peek8(src + i) }
+                df_lit(sy, sx, dy, dx, lfq, b)
+                i = i + 1
+            }
+        }
+        if pending == 0 && sy.len() >= 32768 {
+            df_flush(w, sy, sx, dy, dx, lfq, dfq, t, src, bstart, i, 0)
+            sy = vec()  sx = vec()  dy = vec()  dx = vec()
+            lfq = df_new_lfq()  dfq = df_zeros(30)
+            bstart = i
+        }
+    }
+    if pending == 1 {
+        var b = 0
+        unsafe { b = peek8(src + n - 1) }
+        df_lit(sy, sx, dy, dx, lfq, b)
+    }
+    df_flush(w, sy, sx, dy, dx, lfq, dfq, t, src, bstart, n, 1)
+    df_align(w)
+    unsafe { free(hs.head)  free(hs.prev) }
+}
+
+/// Adler-32 of `data`, the checksum zlib streams carry in their trailer.
+pub fn adler32(data: Str) -> Int {
+    var a = 1
+    var b = 0
+    var i = 0
+    let n = data.len()
+    while i < n {
+        a = (a + ord(data.at(i))) % 65521
+        b = (b + a) % 65521
+        i = i + 1
+    }
+    return (b * 65536) + a
+}
+
+/// compress `data` to a raw DEFLATE stream (RFC 1951), the inverse of this module's `inflate`.
+///
+/// The result is what a zlib or gzip payload holds with the wrapper stripped off; for a PNG IDAT or
+/// anything else that wants the checksummed form, use `deflate_zlib`. Blocks are chosen per 32768
+/// symbols between stored, fixed-Huffman and dynamic-Huffman by counting the bits each would take, so
+/// incompressible input is stored rather than expanded.
+pub fn deflate(data: Str) -> Str {
+    let n = data.len()
+    var w = df_new()
+    var src = 0
+    if n > 0 { src = nori_str_ptr(data) }
+    df_compress(w, src, n)
+    var out = ""
+    unsafe { out = str_from_buf(w.p, w.len) }
+    unsafe { free(w.p) }
+    return out
+}
+
+/// wrap `data` in a zlib stream without compressing it: stored DEFLATE blocks of at most 65,535
+/// bytes each, with the zlib header and Adler-32. Valid for anything that reads zlib, including a
+/// PNG IDAT, and as fast as copying.
+///
+/// For when the bytes matter less than the time, such as short-lived screenshots written to a
+/// directory that is deleted at the end, where compression was a large share of the cost.
+pub fn deflate_zlib_stored(data: Str) -> Str {
+    let n = data.len()
+    var out = ("" + chr(120)) + chr(1)                 // CM=8 CINFO=7, FLEVEL=0; 0x7801 % 31 == 0
+    var at = 0
+    while at < n || (n == 0 && at == 0) {
+        var len = n - at
+        if len > 65535 { len = 65535 }
+        var last = 0
+        if at + len >= n { last = 1 }
+        out = out + chr(last)                            // BFINAL, BTYPE=00; the rest of the byte is padding
+        out = out + chr(len & 255)
+        out = out + chr((len >> 8) & 255)
+        out = out + chr((65535 - len) & 255)
+        out = out + chr(((65535 - len) >> 8) & 255)
+        out = out + data.slice(at, at + len)
+        at = at + len
+        if n == 0 { at = 1 }
+    }
+    let ad = adler32(data)
+    out = out + chr((ad >> 24) & 255)
+    out = out + chr((ad >> 16) & 255)
+    out = out + chr((ad >> 8) & 255)
+    out = out + chr(ad & 255)
+    return out
+}
+
+/// compress `data` to a gzip member (RFC 1952: 10-byte header + DEFLATE + CRC-32 + size). It is what
+/// `gunzip_checked` reads, what a `.gz` file holds, and what HTTP's `Content-Encoding: gzip` means.
+/// The header carries no name and no time (MTIME 0), so the same input always gives the same bytes.
+pub fn gzip(data: Str) -> Str {
+    let n = data.len()
+    var crc = 0
+    if n > 0 { crc = crc_ptr(nori_str_ptr(data), n) }
+    // ID1 ID2 CM=8, then FLG, MTIME (4), XFL all 0, and OS 255 (unknown)
+    var out = (("" + chr(31)) + chr(139)) + chr(8)
+    var z = 0
+    while z < 6 { out = out + chr(0)  z = z + 1 }
+    out = out + chr(255)
+    out = out + deflate(data)
+    out = out + le32(crc)
+    out = out + le32(n & 4294967295)
+    return out
+}
+
+// four bytes, least significant first
+fn le32(v: Int) -> Str {
+    return (((("" + chr(v & 255)) + chr((v >> 8) & 255)) + chr((v >> 16) & 255)) + chr((v >> 24) & 255))
+}
+
+/// compress `data` to a zlib stream (RFC 1950: 2-byte header + DEFLATE + Adler-32), the inverse of
+/// `inflate_zlib`, and the shape a PNG IDAT chunk holds.
+pub fn deflate_zlib(data: Str) -> Str {
+    let body = deflate(data)
+    let ad = adler32(data)
+    var out = ("" + chr(120)) + chr(156)               // CM=8 CINFO=7, FLEVEL=2, FCHECK makes 0x789C % 31 == 0
+    out = out + body
+    out = out + chr((ad >> 24) & 255)
+    out = out + chr((ad >> 16) & 255)
+    out = out + chr((ad >> 8) & 255)
+    out = out + chr(ad & 255)
+    return out
+}

@@ -1,0 +1,681 @@
+//! std/c: a C declarations front end: preprocessor, tokenizer, declaration parser, x86-64 System V
+//! layout and constant evaluation, in Nori. It reads a header the way a GCC-compatible compiler on
+//! x86-64 Linux does and answers with plain data: functions, records with their layout, enums,
+//! typedefs, variables, `#define` constants, and a located note for every declaration it skipped.
+//!
+//!   import "std/c" as c
+//!   let u = c::parse_file("/usr/include/zlib.h", c::default_options())
+//!   foreach f in u.functions { printl(c::prototype_str(u, f)) }
+//!   let r = c::find_record(u, "z_stream_s")
+//!   printl("z_stream is ${u.records[r].size} bytes")
+//!
+//! ## Types
+//!
+//! A type is an `Int` index into `unit.types`. Each `Type` carries a `kind` (one of the `K_*`
+//! constants), qualifier bits (`Q_CONST`, `Q_VOLATILE`, `Q_RESTRICT`, `Q_ATOMIC`), and by kind: the
+//! pointee, element, return or underlying type in `base`; the array length in `len` (`-1` for a
+//! flexible or unsized array); the record, enum or typedef index in `ref`; the parameters and the
+//! variadic flag of a function type; and in `align` an alignment set on the type itself (a
+//! typedef's `aligned` attribute, a `vector_size` type), 0 when the kind's own applies. The
+//! unqualified primitive types sit at the index equal to their kind, so `K_INT` is also the type
+//! `int`.
+//!
+//! ## Preprocessor
+//!
+//! `#include "..."` searches the including file's directory, then `include_dirs`, then `system_dirs`;
+//! `#include <...>` skips the first. `#include_next` resumes after the directory the current file was
+//! found in, and `#include MACRO` expands first. Include guards and `#pragma once` stop a second
+//! read. Macros follow the C standard's rescanning rules: `#`, `##`, `__VA_ARGS__`, `__VA_OPT__`,
+//! GNU `, ## __VA_ARGS__` and named variadic parameters, and a macro never expands inside its own
+//! expansion. `#if`/`#elif` evaluate full 64-bit expressions with `defined`, `__has_include`,
+//! `__has_include_next`, `__has_attribute` and `__has_builtin` (true for the attributes and builtins
+//! GCC has), `__has_feature` and the rest (false), and read an unknown name as 0. `#elifdef`,
+//! `#elifndef`, `#pragma pack`, `__FILE__`, `__LINE__` and `__COUNTER__` are supported; `#line`,
+//! `#warning` and `#ident` are accepted and ignored.
+//!
+//! The predefined macros are those of GCC 13 compiling C17 for x86-64 Linux (`__x86_64__`,
+//! `__linux__`, `__LP64__`, `__GNUC__`, `__STDC_VERSION__` 201710L, the `__SIZEOF_*__`, `*_MAX__`,
+//! `*_TYPE__` and float-model families), so glibc takes its usual paths. With `target` "windows" in
+//! the options they are those of the mingw-w64 GCC for x86_64-w64-mingw32 instead (`_WIN32`,
+//! `_WIN64`, `__MINGW64__`, no `__linux__`/`__unix__`/`__LP64__`, `__SIZEOF_LONG__` 4,
+//! `__SIZEOF_WCHAR_T__` 2, 64-bit types spelled `long long`).
+//!
+//! ## Declarations
+//!
+//! typedefs; struct, union and enum definitions, forward declarations and tags used before their
+//! definition; anonymous and nested records; bitfields; arrays with constant-expression lengths,
+//! flexible members and parameters' variable lengths; declarators of any nesting; `const`,
+//! `volatile`, `restrict` and `_Atomic` in their GNU spellings too; storage classes and function
+//! specifiers; `__attribute__((...))` and `[[...]]` wherever they may stand (`packed`, `aligned`,
+//! `mode` and `vector_size` take effect), `__asm__`, `__extension__`, `_Static_assert`, `_Alignas`;
+//! `__typeof__` of a type or a declared name; `__int128`, `_Float128` and the `_FloatN` family,
+//! `_Complex`, `__builtin_va_list` (an array of one 24-byte `struct __va_list_tag`). Function
+//! definitions, old-style ones included, are recorded and their bodies skipped. Parameters of array
+//! and function type decay to pointers. A redeclaration keeps the first declaration.
+//!
+//! ## What is noted and skipped
+//!
+//! Nothing in a header stops the parse. A declaration the parser cannot read is skipped to its `;`
+//! (or its closing `}`) and recorded in `notes` with its file, line and a short reason. `#error` in
+//! a live branch, an unresolvable `#include`, `__typeof__` of an expression that is not a known name,
+//! and `mode` attributes on non-integer types are noted the same way. An unresolvable include is
+//! noted as `include not found: NAME`, with the name in quotes when the include was quoted.
+//!
+//! ## Layout
+//!
+//! Sizes, alignments and field offsets follow the x86-64 System V ABI as GCC and clang implement it:
+//! padding, unions, bitfields allocated in units of their declared type (a field that does not fit
+//! starts a new unit, a zero-width field aligns to the next unit and does not raise the record's
+//! alignment, an unnamed field does not either), flexible array members, `packed`, `aligned(N)` and
+//! `#pragma pack`. Field offsets are in bits. The fields of an anonymous struct or union member are
+//! listed after it with `promoted` set and their offsets taken from the enclosing record.
+//!
+//! For the "windows" target the data model is LLP64: `long` and `unsigned long` are 4 bytes (`long
+//! long`, pointers and `size_t` stay 8), an `L` suffix makes a 32-bit constant when the value fits,
+//! `L'x'` is an unsigned 16-bit `wchar_t`, `__builtin_va_list` is a `char *`, and bitfields are laid
+//! out as mingw-w64 GCC does by default (`-mms-bitfields`): a bitfield starts a new unit whenever the
+//! previous member was not a bitfield of a type of the same size or its unit has too few bits left,
+//! and unnamed bitfields count towards the record's alignment.
+
+import "std/os" as os
+
+// ── type kinds ───────────────────────────────────────────────────────────────────────────────────
+
+/// `void`
+pub global K_VOID: Int = 0
+/// `_Bool`
+pub global K_BOOL: Int = 1
+/// plain `char` (signed on x86-64)
+pub global K_CHAR: Int = 2
+/// `signed char`
+pub global K_SCHAR: Int = 3
+/// `unsigned char`
+pub global K_UCHAR: Int = 4
+/// `short`
+pub global K_SHORT: Int = 5
+/// `unsigned short`
+pub global K_USHORT: Int = 6
+/// `int`
+pub global K_INT: Int = 7
+/// `unsigned int`
+pub global K_UINT: Int = 8
+/// `long`
+pub global K_LONG: Int = 9
+/// `unsigned long`
+pub global K_ULONG: Int = 10
+/// `long long`
+pub global K_LLONG: Int = 11
+/// `unsigned long long`
+pub global K_ULLONG: Int = 12
+/// `__int128`
+pub global K_INT128: Int = 13
+/// `unsigned __int128`
+pub global K_UINT128: Int = 14
+/// `float`
+pub global K_FLOAT: Int = 15
+/// `double`
+pub global K_DOUBLE: Int = 16
+/// `long double` (80-bit extended, 16 bytes)
+pub global K_LDOUBLE: Int = 17
+/// `_Float128` / `__float128`
+pub global K_FLOAT128: Int = 18
+/// `float _Complex`
+pub global K_CFLOAT: Int = 19
+/// `double _Complex`
+pub global K_CDOUBLE: Int = 20
+/// `long double _Complex`
+pub global K_CLDOUBLE: Int = 21
+/// `_Float16`
+pub global K_FLOAT16: Int = 22
+/// a pointer; `base` is the pointee
+pub global K_POINTER: Int = 23
+/// an array; `base` is the element, `len` the length or -1
+pub global K_ARRAY: Int = 24
+/// a function; `base` is the return type, `params` and `variadic` the rest
+pub global K_FUNCTION: Int = 25
+/// a struct or union; `ref` indexes `unit.records`
+pub global K_RECORD: Int = 26
+/// an enum; `ref` indexes `unit.enums`
+pub global K_ENUM: Int = 27
+/// a typedef name; `ref` indexes `unit.typedefs`
+pub global K_TYPEDEF: Int = 28
+
+/// `const`
+pub global Q_CONST: Int = 1
+/// `volatile`
+pub global Q_VOLATILE: Int = 2
+/// `restrict`
+pub global Q_RESTRICT: Int = 4
+/// `_Atomic`
+pub global Q_ATOMIC: Int = 8
+
+/// a `Constant` holding an integer
+pub global CONST_INT: Int = 0
+/// a `Constant` holding a floating value
+pub global CONST_FLOAT: Int = 1
+/// a `Constant` holding a string literal
+pub global CONST_STRING: Int = 2
+
+// ── the unit ─────────────────────────────────────────────────────────────────────────────────────
+
+/// where to look for headers and which macros to start from.
+///
+/// `include_dirs` are searched first (for both `"..."` and `<...>` includes, after the including
+/// file's own directory for `"..."`), then `system_dirs`. `defines` are `NAME` or `NAME=VALUE`,
+/// applied after the predefined macros; `undefines` are removed after that. `target` is "" (or
+/// "linux") for x86-64 Linux and "windows" for x86_64-w64-mingw32: it picks the predefined macros
+/// and the data model (LP64 or LLP64) sizes and layouts are computed in.
+pub struct Options {
+    include_dirs: Vec<Str>,
+    system_dirs: Vec<Str>,
+    defines: Vec<Str>,
+    undefines: Vec<Str>,
+    predefined: Bool = true,
+    target: Str = "",
+}
+
+/// a parameter of a function type or declaration; `name` is "" when the declaration has none.
+pub struct Param { name: Str, ty: Int }
+
+/// one C type; see the module overview for how the fields read per kind.
+pub struct Type {
+    kind: Int,
+    quals: Int = 0,
+    base: Int = 0,
+    len: Int = 0,
+    ref: Int = 0,
+    params: Vec<Param>,
+    variadic: Bool = false,
+    align: Int = 0,
+}
+
+/// a struct or union member. `offset` is in bits from the start of the record; `width` is the
+/// bitfield width or -1 for an ordinary member. An anonymous struct or union member has `name` "" and
+/// is followed by its own fields with `promoted` set.
+pub struct Field { name: Str, ty: Int, offset: Int, width: Int = -1, promoted: Bool = false }
+
+/// a struct or union. `name` is the tag, or a synthetic `__anon_<kind>_<n>` for an untagged one
+/// (`anonymous` is set). An incomplete record was declared but never defined: size and align are 0.
+pub struct Record {
+    name: Str,
+    is_union: Bool,
+    anonymous: Bool,
+    complete: Bool,
+    fields: Vec<Field>,
+    size: Int,
+    align: Int,
+    packed: Bool,
+    file: Int,
+    line: Int,
+}
+
+/// an enumerator and its value.
+pub struct EnumConst { name: Str, value: Int }
+
+/// an enum with its constants; `size` is 4 or 8 (1 or 2 when packed), `unsigned` says whether the
+/// underlying type is unsigned.
+pub struct Enum {
+    name: Str,
+    anonymous: Bool,
+    complete: Bool,
+    consts: Vec<EnumConst>,
+    size: Int,
+    unsigned: Bool,
+    file: Int,
+    line: Int,
+}
+
+/// a `typedef` name and the type it names.
+pub struct Typedef { name: Str, ty: Int, file: Int, line: Int }
+
+/// a function declaration or definition (an inline body in a header is skipped, `definition` set).
+pub struct Function {
+    name: Str,
+    ty: Int,
+    ret: Int,
+    params: Vec<Param>,
+    variadic: Bool,
+    definition: Bool,
+    is_static: Bool,
+    file: Int,
+    line: Int,
+}
+
+/// a file-scope object declaration (`extern int errno;`).
+pub struct Variable { name: Str, ty: Int, is_extern: Bool, is_static: Bool, file: Int, line: Int }
+
+/// an object-like `#define` from a header whose body is a constant: an integer expression
+/// (`ivalue`, `unsigned`), a floating literal expression (`fvalue`) or a string literal (`svalue`, the
+/// decoded bytes). `kind` is one of the `CONST_*` values.
+pub struct Constant {
+    name: Str,
+    kind: Int,
+    ivalue: Int,
+    fvalue: Float,
+    svalue: Str,
+    unsigned: Bool,
+    file: Int,
+    line: Int,
+}
+
+/// a located message about something the front end skipped.
+pub struct Note { file: Int, line: Int, reason: Str }
+
+/// everything read from one translation unit. `file` fields index `files`. `long_size` is the size
+/// of `long` in the target's data model: 8 (LP64) or 4 (LLP64, the "windows" target).
+pub struct Unit {
+    files: Vec<Str>,
+    types: Vec<Type>,
+    functions: Vec<Function>,
+    records: Vec<Record>,
+    enums: Vec<Enum>,
+    typedefs: Vec<Typedef>,
+    variables: Vec<Variable>,
+    constants: Vec<Constant>,
+    notes: Vec<Note>,
+    long_size: Int = 8,
+}
+
+/// the kind of a token in a `Translation`: an identifier or keyword
+pub global TOK_IDENT: Int = 1
+/// a preprocessing number (`42`, `0x1fUL`, `1.5e-3f`)
+pub global TOK_NUMBER: Int = 2
+/// a character constant, prefix included (`'a'`, `L'x'`)
+pub global TOK_CHAR: Int = 3
+/// a string literal, prefix included (`"abc"`, `u8"x"`)
+pub global TOK_STRING: Int = 4
+/// a punctuator (`->`, `...`, `<<=`)
+pub global TOK_PUNCT: Int = 5
+/// any other character the tokenizer met (`@`, a stray backslash)
+pub global TOK_OTHER: Int = 6
+
+/// a macro defined at the end of a translation unit. `body` is its replacement list, spelled with one
+/// space wherever the definition had whitespace; `params` names a function-like macro's parameters
+/// (`__VA_ARGS__` for an unnamed `...`).
+pub struct Macro { name: Str, function: Bool, params: Vec<Str>, variadic: Bool, body: Str, file: Int, line: Int }
+
+/// a translation unit together with the preprocessed tokens it was parsed from. Token `i` is of kind
+/// `kinds[i]` (a `TOK_*` value) and spelled `texts[i]`; it comes from line `lines[i]` of
+/// `unit.files[files[i]]`, and a token a macro produced is placed where the macro's name was used.
+/// `spaced[i]` says whitespace or a line break comes before it. Adjacent string literals stay
+/// separate tokens. `macros` are the macros still defined at the end, in definition order.
+pub struct Translation {
+    unit: Unit,
+    kinds: Vec<Int>,
+    texts: Vec<Str>,
+    files: Vec<Int>,
+    lines: Vec<Int>,
+    spaced: Vec<Bool>,
+    macros: Vec<Macro>,
+}
+
+// ── options ──────────────────────────────────────────────────────────────────────────────────────
+
+// is `p` an existing file that is not a directory?
+fn cop_is_file(p: Str) -> Bool {
+    let st = os::stat_path(p)
+    return st.ok && !st.is_dir
+}
+
+fn cop_is_dir(p: Str) -> Bool {
+    let st = os::stat_path(p)
+    return st.ok && st.is_dir
+}
+
+// the numeric value of a leading run of digits ("16.2" -> 16), or -1
+fn cop_leading_int(s: Str) -> Int {
+    var i = 0
+    var v = 0
+    while i < s.len() && ord(s.at(i)) >= 48 && ord(s.at(i)) <= 57 { v = v * 10 + (ord(s.at(i)) - 48)  i = i + 1 }
+    if i == 0 { return 0 - 1 }
+    return v
+}
+
+// the newest `<root>/<version>/include` holding stddef.h, or ""
+fn cop_newest_include(root: Str) -> Str {
+    if !cop_is_dir(root) { return "" }
+    let ents = os::read_dir(root)
+    var best = ""
+    var bestv = 0 - 1
+    foreach e in ents {
+        let v = cop_leading_int(e)
+        let cand = root + "/" + e + "/include"
+        if v > bestv && cop_is_file(cand + "/stddef.h") { bestv = v  best = copy cand }
+    }
+    return copy best
+}
+
+/// options for this host: no user include directories, and the system search path `/usr/local/include`,
+/// the compiler's own builtin include directory (GCC's under /usr/lib/gcc/x86_64-pc-linux-gnu or
+/// /usr/lib/gcc/x86_64-linux-gnu, else clang's under /usr/lib/clang) when one exists, and /usr/include.
+pub fn default_options() -> Options {
+    var sys: Vec<Str> = vec()
+    sys.push("/usr/local/include")
+    var b = cop_newest_include("/usr/lib/gcc/x86_64-pc-linux-gnu")
+    if b.len() == 0 { b = cop_newest_include("/usr/lib/gcc/x86_64-linux-gnu") }
+    if b.len() == 0 { b = cop_newest_include("/usr/lib/clang") }
+    if b.len() > 0 { sys.push(copy b) }
+    sys.push("/usr/include")
+    return Options { include_dirs: vec(), system_dirs: sys, defines: vec(), undefines: vec() }
+}
+
+/// options for reading headers as x86_64-w64-mingw32 GCC does (`target` "windows"): the system search
+/// path is that compiler's builtin include directory (under /usr/lib/gcc/x86_64-w64-mingw32) when one
+/// is installed, then the mingw-w64 headers in /usr/x86_64-w64-mingw32/include.
+pub fn windows_options() -> Options {
+    var sys: Vec<Str> = vec()
+    let b = cop_newest_include("/usr/lib/gcc/x86_64-w64-mingw32")
+    if b.len() > 0 { sys.push(copy b) }
+    sys.push("/usr/x86_64-w64-mingw32/include")
+    return Options { include_dirs: vec(), system_dirs: sys, defines: vec(), undefines: vec(), target: "windows" }
+}
+
+/// options with no search path at all: only `#include "..."` next to the including file resolves.
+pub fn bare_options() -> Options {
+    return Options { include_dirs: vec(), system_dirs: vec(), defines: vec(), undefines: vec() }
+}
+
+// ── entry points ─────────────────────────────────────────────────────────────────────────────────
+
+/// preprocess and parse the header at `path`. A file that cannot be read yields a unit whose only
+/// content is a note saying so.
+pub fn parse_file(path: Str, opts: Options) -> Unit {
+    var s = cst_new(opts)
+    if !cop_is_file(path) {
+        cst_note_at(s, 0, 0, "cannot read " + path)
+        return sink s.unit
+    }
+    let text = read_file(path)
+    return cst_run(s, text, path)
+}
+
+/// preprocess and parse `text` as if it were a file called `name`; quoted includes resolve against
+/// the directory part of `name`.
+pub fn parse_text(text: Str, name: Str, opts: Options) -> Unit {
+    var s = cst_new(opts)
+    return cst_run(s, text, name)
+}
+
+/// preprocess and parse the file at `path` as `parse_file` does, keeping the token stream and the
+/// macros.
+pub fn translate_file(path: Str, opts: Options) -> Translation {
+    var s = cst_new(opts)
+    if !cop_is_file(path) {
+        cst_note_at(s, 0, 0, "cannot read " + path)
+        return Translation { unit: sink s.unit, kinds: vec(), texts: vec(), files: vec(), lines: vec(), spaced: vec(), macros: vec() }
+    }
+    let text = read_file(path)
+    return cst_translate(s, text, path)
+}
+
+/// preprocess and parse `text` as `parse_text` does, keeping the token stream and the macros.
+pub fn translate_text(text: Str, name: Str, opts: Options) -> Translation {
+    var s = cst_new(opts)
+    return cst_translate(s, text, name)
+}
+
+// ── lookups ──────────────────────────────────────────────────────────────────────────────────────
+
+/// the index of the record tagged `name` (or with that synthetic name), or -1.
+pub fn find_record(u: Unit, name: Str) -> Int {
+    var i = 0
+    while i < u.records.len() { if u.records[i].name == name { return i }  i = i + 1 }
+    return 0 - 1
+}
+
+/// the index of the function `name`, or -1.
+pub fn find_function(u: Unit, name: Str) -> Int {
+    var i = 0
+    while i < u.functions.len() { if u.functions[i].name == name { return i }  i = i + 1 }
+    return 0 - 1
+}
+
+/// the index of the typedef `name`, or -1.
+pub fn find_typedef(u: Unit, name: Str) -> Int {
+    var i = 0
+    while i < u.typedefs.len() { if u.typedefs[i].name == name { return i }  i = i + 1 }
+    return 0 - 1
+}
+
+/// the index of the enum tagged `name`, or -1.
+pub fn find_enum(u: Unit, name: Str) -> Int {
+    var i = 0
+    while i < u.enums.len() { if u.enums[i].name == name { return i }  i = i + 1 }
+    return 0 - 1
+}
+
+/// the index of the `#define` constant `name`, or -1.
+pub fn find_constant(u: Unit, name: Str) -> Int {
+    var i = 0
+    while i < u.constants.len() { if u.constants[i].name == name { return i }  i = i + 1 }
+    return 0 - 1
+}
+
+/// the index of the field `name` in record `r` (promoted fields included), or -1.
+pub fn find_field(u: Unit, r: Int, name: Str) -> Int {
+    var i = 0
+    while i < u.records[r].fields.len() { if u.records[r].fields[i].name == name { return i }  i = i + 1 }
+    return 0 - 1
+}
+
+/// the value of the enumerator `name` in any enum; `dflt` when there is none.
+pub fn enum_value(u: Unit, name: Str, dflt: Int) -> Int {
+    foreach e in u.enums {
+        foreach k in e.consts { if k.name == name { return k.value } }
+    }
+    return dflt
+}
+
+/// "file:line" for a file index and line.
+pub fn loc_str(u: Unit, file: Int, line: Int) -> Str {
+    if file >= 0 && file < u.files.len() { return u.files[file] + ":" + to_str(line) }
+    return "?:" + to_str(line)
+}
+
+// ── type queries ─────────────────────────────────────────────────────────────────────────────────
+
+/// `ty` with typedefs followed to the type they finally name, as a type index. Qualifiers written on
+/// the typedefs passed through are not part of the answer; `quals_of` collects them.
+pub fn resolve(u: Unit, ty: Int) -> Int {
+    var t = ty
+    var hops = 0
+    while u.types[t].kind == K_TYPEDEF && hops < 100 {
+        t = u.typedefs[u.types[t].ref].ty
+        hops = hops + 1
+    }
+    return t
+}
+
+/// the qualifiers of `ty` including those of every typedef it passes through.
+pub fn quals_of(u: Unit, ty: Int) -> Int {
+    var t = ty
+    var q = u.types[t].quals
+    var hops = 0
+    while u.types[t].kind == K_TYPEDEF && hops < 100 {
+        t = u.typedefs[u.types[t].ref].ty
+        q = q | u.types[t].quals
+        hops = hops + 1
+    }
+    return q
+}
+
+/// the size of `ty` in bytes: 0 for an incomplete type, 1 for `void` and function types (as GCC).
+pub fn sizeof(u: Unit, ty: Int) -> Int {
+    let k = u.types[ty].kind
+    if k == K_TYPEDEF { return sizeof(u, u.typedefs[u.types[ty].ref].ty) }
+    if k == K_RECORD { return u.records[u.types[ty].ref].size }
+    if k == K_ENUM { return u.enums[u.types[ty].ref].size }
+    if k == K_ARRAY {
+        let n = u.types[ty].len
+        if n <= 0 { return 0 }
+        return n * sizeof(u, u.types[ty].base)
+    }
+    if k == K_LONG || k == K_ULONG { return u.long_size }
+    return cty_prim_size(k)
+}
+
+/// the alignment of `ty` in bytes, an explicit `aligned`/`_Alignas` on the type included.
+pub fn alignof(u: Unit, ty: Int) -> Int {
+    let k = u.types[ty].kind
+    var a = 1
+    if k == K_TYPEDEF { a = alignof(u, u.typedefs[u.types[ty].ref].ty) }
+    else if k == K_RECORD { a = u.records[u.types[ty].ref].align  if a == 0 { a = 1 } }
+    else if k == K_ENUM { a = u.enums[u.types[ty].ref].size  if a == 0 { a = 4 } }
+    else if k == K_ARRAY { a = alignof(u, u.types[ty].base) }
+    else { a = cty_prim_size(k)  if k == K_CFLOAT { a = 4 } else if k == K_CDOUBLE { a = 8 } else if k == K_CLDOUBLE { a = 16 } else if k == K_VOID || k == K_FUNCTION { a = 1 } else if k == K_LONG || k == K_ULONG { a = u.long_size } }
+    if u.types[ty].align > 0 { a = u.types[ty].align }
+    return a
+}
+
+// size in bytes of a kind that needs no table
+fn cty_prim_size(k: Int) -> Int {
+    if k == K_VOID || k == K_BOOL || k == K_CHAR || k == K_SCHAR || k == K_UCHAR { return 1 }
+    if k == K_SHORT || k == K_USHORT || k == K_FLOAT16 { return 2 }
+    if k == K_INT || k == K_UINT || k == K_FLOAT { return 4 }
+    if k == K_LONG || k == K_ULONG || k == K_LLONG || k == K_ULLONG || k == K_DOUBLE || k == K_POINTER || k == K_CFLOAT { return 8 }
+    if k == K_INT128 || k == K_UINT128 || k == K_LDOUBLE || k == K_FLOAT128 || k == K_CDOUBLE { return 16 }
+    if k == K_CLDOUBLE { return 32 }
+    if k == K_FUNCTION { return 1 }
+    return 0
+}
+
+/// is `ty` (after typedefs) an integer type, `_Bool` and enums included?
+pub fn is_integer(u: Unit, ty: Int) -> Bool {
+    let k = u.types[resolve(u, ty)].kind
+    return (k >= K_BOOL && k <= K_UINT128) || k == K_ENUM
+}
+
+/// is `ty` (after typedefs) an unsigned integer type? Enums answer by their underlying type.
+pub fn is_unsigned(u: Unit, ty: Int) -> Bool {
+    let t = resolve(u, ty)
+    let k = u.types[t].kind
+    if k == K_ENUM { return u.enums[u.types[t].ref].unsigned }
+    return k == K_BOOL || k == K_UCHAR || k == K_USHORT || k == K_UINT || k == K_ULONG || k == K_ULLONG || k == K_UINT128
+}
+
+/// is `ty` (after typedefs) a floating type?
+pub fn is_float(u: Unit, ty: Int) -> Bool {
+    let k = u.types[resolve(u, ty)].kind
+    return k >= K_FLOAT && k <= K_FLOAT16
+}
+
+// ── printing ─────────────────────────────────────────────────────────────────────────────────────
+
+// the spelling of a kind with no table behind it
+fn cty_prim_name(k: Int) -> Str {
+    if k == K_VOID { return "void" }
+    if k == K_BOOL { return "_Bool" }
+    if k == K_CHAR { return "char" }
+    if k == K_SCHAR { return "signed char" }
+    if k == K_UCHAR { return "unsigned char" }
+    if k == K_SHORT { return "short" }
+    if k == K_USHORT { return "unsigned short" }
+    if k == K_INT { return "int" }
+    if k == K_UINT { return "unsigned int" }
+    if k == K_LONG { return "long" }
+    if k == K_ULONG { return "unsigned long" }
+    if k == K_LLONG { return "long long" }
+    if k == K_ULLONG { return "unsigned long long" }
+    if k == K_INT128 { return "__int128" }
+    if k == K_UINT128 { return "unsigned __int128" }
+    if k == K_FLOAT { return "float" }
+    if k == K_DOUBLE { return "double" }
+    if k == K_LDOUBLE { return "long double" }
+    if k == K_FLOAT128 { return "_Float128" }
+    if k == K_CFLOAT { return "float _Complex" }
+    if k == K_CDOUBLE { return "double _Complex" }
+    if k == K_CLDOUBLE { return "long double _Complex" }
+    if k == K_FLOAT16 { return "_Float16" }
+    return "?"
+}
+
+// "const volatile " style prefix for a qualifier set
+fn cty_quals_str(q: Int) -> Str {
+    var o = ""
+    if (q & Q_CONST) != 0 { o = o + "const " }
+    if (q & Q_VOLATILE) != 0 { o = o + "volatile " }
+    if (q & Q_ATOMIC) != 0 { o = o + "_Atomic " }
+    return o
+}
+
+/// `ty` in C syntax as an abstract declarator (`int (*)(void)`, `struct stat *const`).
+pub fn type_str(u: Unit, ty: Int) -> Str { return decl_str(u, ty, "") }
+
+/// a declaration of `name` with type `ty` in C syntax (`void (*(*f)(int))(void)`); `name` may be "".
+pub fn decl_str(u: Unit, ty: Int, name: Str) -> Str {
+    var inner = copy name
+    var t = ty
+    var go = true
+    // Build the declarator from the outside in: each pointer wraps what is already there, and an
+    // array or function suffix applied to a pointer declarator needs parentheses around it.
+    var last_ptr = false
+    while go {
+        let k = u.types[t].kind
+        if k == K_POINTER {
+            var q = ""
+            let qs = u.types[t].quals
+            if (qs & Q_CONST) != 0 { q = q + " const" }
+            if (qs & Q_VOLATILE) != 0 { q = q + " volatile" }
+            if (qs & Q_RESTRICT) != 0 { q = q + " restrict" }
+            if q.len() == 0 { inner = "*" + inner }
+            else if inner.len() == 0 { inner = "*" + q.slice(1, q.len()) }
+            else { inner = "*" + q.slice(1, q.len()) + " " + inner }
+            t = u.types[t].base
+            last_ptr = true
+        } else if k == K_ARRAY {
+            if last_ptr { inner = "(" + inner + ")" }
+            if u.types[t].len >= 0 { inner = inner + "[" + to_str(u.types[t].len) + "]" } else { inner = inner + "[]" }
+            t = u.types[t].base
+            last_ptr = false
+        } else if k == K_FUNCTION {
+            if last_ptr { inner = "(" + inner + ")" }
+            var ps: Vec<Str> = vec()
+            foreach p in u.types[t].params { ps.push(decl_str(u, p.ty, p.name)) }
+            if u.types[t].variadic { ps.push("...") }
+            if ps.len() == 0 { ps.push("void") }
+            inner = inner + "(" + cty_join(ps, ", ") + ")"
+            t = u.types[t].base
+            last_ptr = false
+        } else {
+            go = false
+        }
+    }
+    let base = cty_base_str(u, t)
+    if inner.len() == 0 { return base }
+    return base + " " + inner
+}
+
+// the specifier part of a non-derived type, qualifiers first
+fn cty_base_str(u: Unit, t: Int) -> Str {
+    let k = u.types[t].kind
+    let q = cty_quals_str(u.types[t].quals)
+    if k == K_RECORD {
+        let r = u.types[t].ref
+        if u.records[r].is_union { return q + "union " + u.records[r].name }
+        return q + "struct " + u.records[r].name
+    }
+    if k == K_ENUM { return q + "enum " + u.enums[u.types[t].ref].name }
+    if k == K_TYPEDEF { return q + u.typedefs[u.types[t].ref].name }
+    return q + cty_prim_name(k)
+}
+
+// `parts` joined with `sep`
+fn cty_join(parts: Vec<Str>, sep: Str) -> Str {
+    var o = ""
+    var i = 0
+    while i < parts.len() {
+        if i > 0 { o = o + sep }
+        o = o + parts[i]
+        i = i + 1
+    }
+    return o
+}
+
+/// the function as a C prototype: `int deflate(z_streamp strm, int flush)`.
+pub fn prototype_str(u: Unit, f: Function) -> Str {
+    var ps: Vec<Str> = vec()
+    foreach p in f.params { ps.push(decl_str(u, p.ty, p.name)) }
+    if f.variadic { ps.push("...") }
+    if ps.len() == 0 { ps.push("void") }
+    return decl_str(u, f.ret, f.name + "(" + cty_join(ps, ", ") + ")")
+}

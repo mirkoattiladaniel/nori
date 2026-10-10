@@ -1,0 +1,118 @@
+// boot.nori: multiboot entry + 32->64-bit long-mode trampoline, in Nori.
+//
+// This is boot.S with no .S file: each block below is a `naked fn` whose body is one assembly block,
+// annotated with the section it belongs in (`@section`), the alignment it is placed at (`@align`) and
+// the mode its first instruction is assembled in (`@code32`). The native freestanding linker reads
+// those annotations and places the bytes itself, so `noric --build kmain.nori kernel --native
+// --freestanding --lds kernel.lds --flatbin` needs no --asm at all.
+//
+// A block is assembler source for the same subset a --asm file is: its
+// labels become symbols of the image, and a name it does not define (`nori_kentry`, or a symbol the
+// linker script sets, like __mb_load_start) is resolved by the linker.
+//
+// What has to happen here, in order: QEMU (`-kernel kernel.bin`) or GRUB loads us at 1 MiB via the
+// multiboot v1 a.out kludge and enters in 32-bit protected mode with paging off. We identity-map the
+// first 1 GiB with 2 MiB pages, enable PAE and long mode, load a 64-bit GDT, enable SSE (Nori's Float
+// is an f64 and the backend emits SSE2), and call nori_kentry.
+
+// ---- multiboot v1 header (a.out kludge: bit 16 tells the loader the addresses) ----
+// The linker script places .mbheader first, so this lands at offset 0 of the flat image.
+@section(".mbheader") @align(4)
+naked fn _mb_header() {
+    unsafe { asm(".long 0x1BADB002\n" +                       // magic
+        ".long 0x00010003\n" +                       // flags: kludge | meminfo | page-align
+        ".long -(0x1BADB002 + 0x00010003)\n" +       // checksum
+        ".long _mb_header\n" +                       // header_addr
+        ".long __mb_load_start\n" +                  // load_addr
+        ".long __mb_load_end\n" +                    // load_end_addr
+        ".long __mb_bss_end\n" +                     // bss_end_addr (the loader zeroes our .bss)
+        ".long _start\n", "") }                      // entry_addr
+}
+
+// ---- 32-bit entry ----
+@section(".text") @code32
+naked fn _start() {
+    unsafe { asm("cli\n" +
+        "movl $_stack_top, %esp\n" +
+        // page tables: pml4[0] -> pdpt, pdpt[0] -> pd, pd[i] = i*2MiB | present|write|huge
+        "movl $_pdpt, %eax\n" +
+        "orl $0x3, %eax\n" +
+        "movl %eax, _pml4\n" +
+        "movl $_pd, %eax\n" +
+        "orl $0x3, %eax\n" +
+        "movl %eax, _pdpt\n" +
+        "movl $0, %ecx\n" +
+        "movl $_pd, %edi\n" +
+        "1:\n" +
+        "movl %ecx, %eax\n" +
+        "shll $21, %eax\n" +                         // i * 2 MiB (< 1 GiB, fits in 32 bits)
+        "orl $0x83, %eax\n" +                        // present | writable | 2MiB page
+        "movl %eax, (%edi)\n" +
+        "movl $0, 4(%edi)\n" +
+        "addl $8, %edi\n" +
+        "incl %ecx\n" +
+        "cmpl $512, %ecx\n" +
+        "jne 1b\n" +
+        "movl %cr4, %eax\n" +                        // PAE on
+        "orl $0x20, %eax\n" +
+        "movl %eax, %cr4\n" +
+        "movl $_pml4, %eax\n" +                      // root table
+        "movl %eax, %cr3\n" +
+        "movl $0xC0000080, %ecx\n" +                 // EFER.LME: long mode enable
+        "rdmsr\n" +
+        "orl $0x100, %eax\n" +
+        "wrmsr\n" +
+        "movl %cr0, %eax\n" +                        // paging on -> now in 32-bit compatibility mode
+        "orl $0x80000000, %eax\n" +
+        "movl %eax, %cr0\n" +
+        "lgdt _gdt_ptr\n" +
+        "ljmp $0x08, $_long_mode\n", "") }           // far jump into the 64-bit code segment
+}
+
+// ---- 64-bit ----
+@section(".text")
+naked fn _long_mode() {
+    unsafe { asm("movw $0x10, %ax\n" +
+        "movw %ax, %ds\n" +
+        "movw %ax, %es\n" +
+        "movw %ax, %ss\n" +
+        "xorw %ax, %ax\n" +
+        "movw %ax, %fs\n" +
+        "movw %ax, %gs\n" +
+        "movq $_stack_top, %rsp\n" +
+        "movq %cr0, %rax\n" +                        // SSE: clear EM, set MP ...
+        "andq $~0x4, %rax\n" +
+        "orq $0x2, %rax\n" +
+        "movq %rax, %cr0\n" +
+        "movq %cr4, %rax\n" +                        // ... and OSFXSR | OSXMMEXCPT
+        "orq $0x600, %rax\n" +
+        "movq %rax, %cr4\n" +
+        "call nori_kentry\n" +                       // the bare floor: serial up, then nori_main()
+        "2:\n" +
+        "cli\n" +
+        "hlt\n" +
+        "jmp 2b\n", "") }
+}
+
+// ---- GDT: null, 64-bit code, data. `_gdt_ptr - _gdt` is a difference of two labels of one block,
+// which is why both live in this one.
+@section(".rodata") @align(8)
+naked fn _gdt() {
+    unsafe { asm(".quad 0\n" +
+        ".quad 0x00AF9A000000FFFF\n" +
+        ".quad 0x00AF92000000FFFF\n" +
+        "_gdt_ptr:\n" +
+        ".word _gdt_ptr - _gdt - 1\n" +
+        ".long _gdt\n", "") }
+}
+
+// ---- zero-filled by the loader (the bss_end_addr field above) ----
+@section(".bss") @align(4096)
+naked fn _pml4() {
+    unsafe { asm(".skip 4096\n" +
+        "_pdpt: .skip 4096\n" +
+        "_pd: .skip 4096\n" +
+        ".align 16\n" +
+        "_stack: .skip 262144\n" +                   // 256 KiB kernel stack
+        "_stack_top:\n", "") }
+}

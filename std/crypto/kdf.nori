@@ -1,0 +1,83 @@
+// HKDF (RFC 5869): turn one shared secret into as many independent keys as a protocol needs.
+//
+// Two steps for a reason worth keeping in mind. Extract concentrates whatever entropy the input
+// has into a uniform key; a raw Diffie-Hellman output is not uniform and must not be used as a
+// key directly. Expand then produces named, separated outputs from it: two keys derived under
+// different `info` labels are independent, which is what lets one handshake key a send direction,
+// a receive direction and a rekey chain without any of them revealing the others.
+
+// ---- hash-parameterised HKDF ------------------------------------------------------------------
+//
+// TLS 1.3 picks the hash with the cipher suite: SHA-256 or SHA-384. Everything below therefore
+// takes the hash as an argument, named by its output length (32 or 48), because that length is
+// what the construction actually uses, in the zero-filled default salt, in the block count, and in
+// how much of the last block is kept. Naming it any other way would mean carrying a tag and a
+// length that could disagree.
+//
+// "" for any other length. A KDF that silently substituted a hash would produce keys that look
+// perfect and match nothing.
+
+fn kdf_hash(hlen: Int, data: Str) -> Str {
+    if hlen == 32 { return sha256_raw(data) }
+    if hlen == 48 { return sha384_raw(data) }
+    return ""
+}
+fn kdf_hmac(hlen: Int, key: Str, msg: Str) -> Str {
+    if hlen == 32 { return hmac_sha256_raw(key, msg) }
+    if hlen == 48 { return hmac_sha384_raw(key, msg) }
+    return ""
+}
+
+/// HKDF-Extract over the hash named by `hlen` (32 = SHA-256, 48 = SHA-384). An empty salt means a
+/// block of `hlen` zero bytes, which is not the same thing as an empty HMAC key.
+pub fn hkdf_extract_h(hlen: Int, salt: Str, ikm: Str) -> Str {
+    if hlen != 32 { if hlen != 48 { return "" } }
+    var s = salt
+    if s.len() == 0 {
+        var z = ""
+        var i = 0
+        while i < hlen { z = (z + chr(0))  i = i + 1 }
+        s = sink z
+    }
+    return kdf_hmac(hlen, s, ikm)
+}
+
+/// HKDF-Expand over the hash named by `hlen`. "" if `n` is negative or exceeds 255 blocks, the
+/// limit the single-byte counter imposes.
+pub fn hkdf_expand_h(hlen: Int, prk: Str, info: Str, n: Int) -> Str {
+    if hlen != 32 { if hlen != 48 { return "" } }
+    if n < 0 { return "" }
+    if n > (255 * hlen) { return "" }
+    var out = ""
+    var prev = ""
+    var counter = 1
+    while out.len() < n {
+        let block = kdf_hmac(hlen, prk, ((prev + info) + chr(counter)))
+        out = (out + block)
+        prev = sink block
+        counter = counter + 1
+    }
+    return out.slice(0, n)
+}
+
+/// HKDF-Extract (RFC 5869): concentrate the entropy of `ikm` into a uniform 32-byte pseudorandom
+/// key. An empty salt is legal and means a block of zeros, which is not the same thing as an
+/// empty HMAC key.
+///
+/// This step is not optional. A raw Diffie-Hellman output is not uniformly distributed
+/// and must not be used as a key directly; extract is what makes it one.
+pub fn hkdf_extract(salt: Str, ikm: Str) -> Str { return hkdf_extract_h(32, salt, ikm) }
+
+/// `n` bytes derived from a pseudorandom key, bound to the label `info`. Two outputs taken under
+/// different labels are independent, so one handshake secret can key a send direction, a receive
+/// direction and a rekey chain without any of them revealing the others.
+///
+/// Returns "" if `n` is negative or exceeds 255 hash blocks (8160 bytes), which is the limit the
+/// construction allows. A shorter request is a prefix of a longer one; this is a stream, not a
+/// per-length function.
+pub fn hkdf_expand(prk: Str, info: Str, n: Int) -> Str { return hkdf_expand_h(32, prk, info, n) }
+
+/// extract then expand, which is how HKDF is almost always used.
+pub fn hkdf(salt: Str, ikm: Str, info: Str, n: Int) -> Str {
+    return hkdf_expand(hkdf_extract(salt, ikm), info, n)
+}

@@ -1,0 +1,401 @@
+use core::*
+import "std/font" as font
+import "std/math" as math
+
+// ===========================================================================
+// layout/text_edit: where a caret may stand, which way the arrows move it, and what a deletion
+// takes, in every script. The editors (multiline_edit, field_edit, area_edit, code_editor) keep
+// their state as byte offsets into the string, in logical order; this file answers the questions
+// that order alone cannot.
+//
+// Clusters. A caret stands only between grapheme clusters (UAX #29, std/font's grapheme_breaks):
+// never between a letter and its accent, inside a Devanagari conjunct, between the halves of a
+// flag or inside an emoji ZWJ sequence. A ligature ("ffi", Arabic lam-alef) is one glyph over several
+// clusters: the caret still stops between them, and is drawn inside the glyph at an even share of
+// its advance.
+//
+// Backspace takes one code point, Delete one cluster, the convention Windows, macOS and the
+// browsers share. Backspace after "कि" removes the vowel sign and leaves "क", which is how a typist
+// corrects the last thing typed; after "e" + combining acute it removes the accent. Where a code
+// point alone means nothing to a user it takes the whole cluster: an emoji sequence (ZWJ, skin
+// tone, keycap, variation selector), a flag, a Hangul syllable written in jamo, CR LF.
+//
+// Arrows move visually. In a line that mixes directions, Right moves the caret one cluster to the
+// right on screen, which inside a run of Arabic is backwards through the string. That is what
+// Windows does (and what its users expect); logical movement, with Right always meaning "next in the
+// string", makes the caret jump across the line at every direction change. A line with nothing
+// right-to-left in it moves logically, which is the same thing and costs no bidi pass. The order of
+// caret stops on screen depends on the bidi levels alone, not on glyph widths, so moving needs no
+// font: the editors move with unit widths, and draw and hit-test with the shaped ones.
+// ===========================================================================
+
+// is byte `b` of a UTF-8 string the start of a character no cluster rule can join to its
+// neighbours? (ASCII other than CR and LF: never Extend, SpacingMark, ZWJ, Prepend or RI)
+fn tx_lone(b: Int) -> Bool { return b < 128 && b != 10 && b != 13 }
+
+// the [start, end) of the line around byte `i` (newlines are hard boundaries: a cluster never
+// crosses one except CR LF, which stays inside the line's end)
+fn tx_line_start(text: Str, i: Int) -> Int {
+    var s = i
+    if s > text.len() { s = text.len() }
+    while s > 0 && ord(text.at(s - 1)) != 10 { s = s - 1 }
+    return s
+}
+fn tx_line_end(text: Str, i: Int) -> Int {
+    var e = i
+    if e < 0 { e = 0 }
+    while e < text.len() && ord(text.at(e)) != 10 { e = e + 1 }
+    return e
+}
+
+/// the grapheme cluster boundary before byte `i` (0 at the start).
+pub fn text_prev_cluster(text: Str, i: Int) -> Int {
+    if i <= 0 { return 0 }
+    var at = i
+    if at > text.len() { at = text.len() }
+    // a lone ASCII character before the caret, itself not following a non-ASCII byte (a Prepend
+    // character joins what follows it): one byte back
+    let b = ord(text.at(at - 1))
+    if tx_lone(b) && (at - 1 == 0 || ord(text.at(at - 2)) < 128) { return at - 1 }
+    if b == 10 {
+        // a newline: CR LF is one cluster
+        if at >= 2 && ord(text.at(at - 2)) == 13 { return at - 2 }
+        return at - 1
+    }
+    let ls = tx_line_start(text, at - 1)
+    var le = tx_line_end(text, at)
+    let gs = font::grapheme_offsets(text.slice(ls, le))
+    var prev = 0
+    var k = 0
+    while k < gs.len() && ls + gs[k] < at { prev = gs[k]  k = k + 1 }
+    return ls + prev
+}
+/// the grapheme cluster boundary after byte `i` (the length at the end).
+pub fn text_next_cluster(text: Str, i: Int) -> Int {
+    let n = text.len()
+    if i >= n { return n }
+    var at = i
+    if at < 0 { at = 0 }
+    let b = ord(text.at(at))
+    if tx_lone(b) && (at + 1 == n || ord(text.at(at + 1)) < 128) { return at + 1 }
+    if b == 13 && at + 1 < n && ord(text.at(at + 1)) == 10 { return at + 2 }
+    if b == 10 || b == 13 { return at + 1 }
+    let ls = tx_line_start(text, at)
+    let le = tx_line_end(text, at)
+    let gs = font::grapheme_offsets(text.slice(ls, le))
+    var k = 0
+    while k < gs.len() {
+        if ls + gs[k] > at { return ls + gs[k] }
+        k = k + 1
+    }
+    return le
+}
+/// `i` moved back to the start of the cluster it is inside (unchanged when it is on a boundary).
+pub fn text_snap_cluster(text: Str, i: Int) -> Int {
+    if i <= 0 { return 0 }
+    if i >= text.len() { return text.len() }
+    let b = ord(text.at(i))
+    if b < 128 && ord(text.at(i - 1)) < 128 { return i }
+    let ls = tx_line_start(text, i)
+    let le = tx_line_end(text, i)
+    let gs = font::grapheme_offsets(text.slice(ls, le))
+    var prev = 0
+    var k = 0
+    while k < gs.len() && ls + gs[k] <= i { prev = gs[k]  k = k + 1 }
+    return ls + prev
+}
+
+// is the cluster `cps` one a user thinks of as a single symbol, deleted whole?
+fn tx_atomic(cps: Vec<Int>) -> Bool {
+    if cps.len() < 2 { return true }
+    var i = 0
+    while i < cps.len() {
+        let c = cps[i]
+        if c == 8205 || font::ucd_is_extended_pictographic(c) || font::ucd_is_emoji_modifier(c) { return true }   // ZWJ, emoji
+        if (c >= 65024 && c <= 65039) || c == 8419 { return true }                                    // VS1-16, keycap
+        if c >= 127462 && c <= 127487 { return true }                                                 // regional indicators
+        if (c >= 4352 && c <= 4607) || (c >= 44032 && c <= 55203) || (c >= 43360 && c <= 43391) || (c >= 55216 && c <= 55295) { return true }   // Hangul
+        if c == 13 { return true }                                                                    // CR LF
+        i = i + 1
+    }
+    return false
+}
+/// where Backspace at byte `i` deletes from (it deletes [result, i)): the last code point of the
+/// cluster before `i`, or the whole cluster when it is one symbol (see the header).
+pub fn text_backspace_from(text: Str, i: Int) -> Int {
+    if i <= 0 { return 0 }
+    let s = text_prev_cluster(text, i)
+    if i - s == 1 { return s }
+    let cps = font::utf8_codepoints(text.slice(s, i))
+    if tx_atomic(cps) { return s }
+    // the start of the last code point
+    var j = i - 1
+    while j > s && ord(text.at(j)) >= 128 && ord(text.at(j)) < 192 { j = j - 1 }
+    return j
+}
+
+// ---- carets on one line ----------------------------------------------------------------------
+
+/// one line's caret geometry: its grapheme clusters (starts `gs`, then the line's length), each
+/// cluster's visual extent [x0, x1) and whether it runs right to left, and the paragraph direction.
+pub struct TextCarets { gs: Vec<Int>, x0: Vec<Float>, x1: Vec<Float>, rtl: Vec<Int>, para_rtl: Bool, bidi: Bool, width: Float, lev: Vec<Int> = vec() }
+
+// does `line` hold anything that could run right to left? (nothing below U+0590 is R, AL or AN,
+// and no bidi control sits below U+200E)
+fn tx_has_rtl(line: Str) -> Bool {
+    var i = 0
+    while i < line.len() { if ord(line.at(i)) >= 214 { return true }  i = i + 1 }
+    return false
+}
+
+/// the caret geometry of one `line` (no newline in it) measured with `style` in paragraph
+/// direction `dir` (dir_ltr/dir_rtl/dir_auto). With `unit` every cluster is one unit wide, which gives the
+/// visual order of the stops (all moving needs) without a font.
+pub fn text_carets(line: Str, style: TextMeasureStyle, dir: Int, unit: Bool) -> TextCarets {
+    let gs = font::grapheme_offsets(line)
+    let m = gs.len() - 1
+    var x0: Vec<Float> = vec()
+    var x1: Vec<Float> = vec()
+    var rtl: Vec<Int> = vec()
+    var prtl = false
+    if dir == 1 { prtl = true }
+    if !tx_has_rtl(line) && dir != 1 {
+        // left to right throughout: the logical caret table is the visual one
+        var k = 0
+        if unit {
+            while k < m { x0.push(to_float(k))  x1.push(to_float(k + 1))  rtl.push(0)  k = k + 1 }
+            return TextCarets { gs: gs, x0: x0, x1: x1, rtl: rtl, para_rtl: false, bidi: false, width: to_float(m) }
+        }
+        let cum = text_measure_cumulative_x(line, style)
+        while k < m { x0.push(cum[gs[k]])  x1.push(cum[gs[k + 1]])  rtl.push(0)  k = k + 1 }
+        return TextCarets { gs: gs, x0: x0, x1: x1, rtl: rtl, para_rtl: false, bidi: false, width: cum[line.len()] }
+    }
+    // the bidi levels of the clusters (UAX #9, the line as one paragraph, L1 at its end)
+    var cps: Vec<Int> = vec()
+    var offs: Vec<Int> = vec()
+    font::utf8_decode_offsets(line, cps, offs)
+    let br = font::bidi_resolve(cps, dir)
+    prtl = (br.para_level & 1) == 1
+    let lv = font::bidi_line_levels(br, 0, cps.len())
+    var glv: Vec<Int> = vec()                               // each cluster's level
+    var ci = 0
+    var k = 0
+    while k < m {
+        var l = 0 - 1
+        while ci < offs.len() && offs[ci] < gs[k + 1] { if l < 0 && lv[ci] >= 0 { l = lv[ci] }  ci = ci + 1 }
+        if l < 0 { l = br.para_level }
+        glv.push(l)
+        rtl.push(l & 1)
+        x0.push(0.0)
+        x1.push(0.0)
+        k = k + 1
+    }
+    var pdir = 0
+    if prtl { pdir = 1 }
+    if !unit && text_engine_on() {
+        // the shaped line, as the painters draw it: each glyph's extent goes to the
+        // cluster it belongs to; a cluster spanning several graphemes (a ligature) is shared out
+        let sl = text_engine_shape(line, style.size_px, style.stack, pdir, style.lang)
+        var cx0: Vec<Float> = vec()
+        var cx1: Vec<Float> = vec()
+        var has: Vec<Int> = vec()
+        var b = 0
+        while b <= line.len() { cx0.push(0.0)  cx1.push(0.0)  has.push(0)  b = b + 1 }
+        var gi = 0
+        while gi < sl.glyphs.len() {
+            let g = sl.glyphs[gi]
+            let c = g.cluster
+            if c >= 0 && c < line.len() {
+                let a = g.x
+                let e = g.x + g.advance
+                if has[c] == 0 { cx0[c] = a  cx1[c] = e  has[c] = 1 }
+                else { if a < cx0[c] { cx0[c] = a }  if e > cx1[c] { cx1[c] = e } }
+            }
+            gi = gi + 1
+        }
+        // walk the clusters in logical order; the graphemes inside each share its extent
+        var gk = 0
+        var cstart = 0
+        while cstart < line.len() {
+            if has[cstart] == 0 { cstart = cstart + 1  continue }
+            var cend = cstart + 1
+            while cend < line.len() && has[cend] == 0 { cend = cend + 1 }
+            while gk < m && gs[gk] < cstart { gk = gk + 1 }
+            var first = gk
+            var cnt = 0
+            while gk + cnt < m && gs[gk + cnt] < cend { cnt = cnt + 1 }
+            if cnt > 0 {
+                let w = (cx1[cstart] - cx0[cstart]) / to_float(cnt)
+                var j = 0
+                while j < cnt {
+                    var p = j
+                    if rtl[first + j] == 1 { p = cnt - 1 - j }        // right to left: the first is rightmost
+                    x0[first + j] = cx0[cstart] + w * to_float(p)
+                    x1[first + j] = cx0[cstart] + w * to_float(p + 1)
+                    j = j + 1
+                }
+            }
+            gk = first + cnt
+            cstart = cend
+        }
+        return TextCarets { gs: gs, x0: x0, x1: x1, rtl: rtl, para_rtl: prtl, bidi: true, width: sl.width, lev: glv }
+    }
+    // no font (or unit widths): lay the clusters out in visual order with the measured (or unit)
+    // width of each
+    var cum: Vec<Float> = vec()
+    if !unit { cum = text_measure_cumulative_x(line, style) }
+    let order = font::bidi_reorder(glv, 0)
+    var x = 0.0
+    var oi = 0
+    while oi < order.len() {
+        let g = order[oi]
+        var w = 1.0
+        if !unit { w = cum[gs[g + 1]] - cum[gs[g]] }
+        x0[g] = x
+        x1[g] = x + w
+        x = x + w
+        oi = oi + 1
+    }
+    return TextCarets { gs: gs, x0: x0, x1: x1, rtl: rtl, para_rtl: prtl, bidi: true, width: x, lev: glv }
+}
+
+// the cluster index whose start is byte `i` (or the last one starting before it), -1 for none
+fn tc_cluster_at(tc: TextCarets, i: Int) -> Int {
+    var k = 0
+    var best = 0 - 1
+    while k < tc.gs.len() - 1 && tc.gs[k] <= i { best = k  k = k + 1 }
+    return best
+}
+/// the x of a caret at byte `i` of the line: the leading edge of the cluster that starts there
+/// (its left for a left-to-right cluster, its right for a right-to-left one); at the line's end the
+/// trailing edge of the logically last cluster.
+///
+/// Where two directions meet a position has two places on screen (the end of one run and the start
+/// of the other), and drawing every such position at the same one of them leaves the other place
+/// unreachable. The caret goes with the run nested deeper (the higher bidi level): after an Arabic
+/// word in an English sentence it is drawn at the word's left end, where the word ended, and
+/// before the word at its right end, where it starts, so every place on screen is some position.
+pub fn text_carets_x(tc: TextCarets, i: Int) -> Float {
+    let m = tc.gs.len() - 1
+    if m == 0 { return 0.0 }
+    if i >= tc.gs[m] { return tc_trailing(tc, m - 1) }
+    var k = tc_cluster_at(tc, i)
+    if k < 0 { k = 0 }
+    if k > 0 && tc.gs[k] == i && tc.lev.len() == m && tc.lev[k - 1] > tc.lev[k] { return tc_trailing(tc, k - 1) }
+    if tc.rtl[k] == 1 { return tc.x1[k] }
+    return tc.x0[k]
+}
+fn tc_trailing(tc: TextCarets, k: Int) -> Float {
+    if tc.rtl[k] == 1 { return tc.x0[k] }
+    return tc.x1[k]
+}
+/// the caret stop (a byte offset) nearest to `x`; a tie goes to the later stop in the string.
+pub fn text_carets_hit(tc: TextCarets, x: Float) -> Int {
+    var best = 0
+    var bestd = 0.0 - 1.0
+    var k = 0
+    while k < tc.gs.len() {
+        var d = text_carets_x(tc, tc.gs[k]) - x
+        if d < 0.0 { d = 0.0 - d }
+        if bestd < 0.0 || d <= bestd { bestd = d  best = tc.gs[k] }
+        k = k + 1
+    }
+    return best
+}
+/// the caret stop one step to the right (`delta` 1) or left (-1) of byte `i` on screen, or -1 when
+/// there is none in this line.
+pub fn text_carets_move(tc: TextCarets, i: Int, delta: Int) -> Int {
+    let cur = text_carets_x(tc, i)
+    var best = 0 - 1
+    var bx = 0.0
+    var k = 0
+    while k < tc.gs.len() {
+        let s = tc.gs[k]
+        if s != i {
+            let x = text_carets_x(tc, s)
+            if delta > 0 && x > cur + 0.0001 && (best < 0 || x < bx) { best = s  bx = x }
+            if delta < 0 && x < cur - 0.0001 && (best < 0 || x > bx) { best = s  bx = x }
+        }
+        k = k + 1
+    }
+    return best
+}
+/// the screen spans [x0, x1, x0, x1, ...] of the selection [a, b) in this line: one per visual run of
+/// selected clusters (a selection through mixed directions is several pieces on screen).
+pub fn text_carets_sel(tc: TextCarets, a: Int, b: Int) -> Vec<Float> {
+    var lo: Vec<Float> = vec()
+    var hi: Vec<Float> = vec()
+    let m = tc.gs.len() - 1
+    var k = 0
+    while k < m {
+        if tc.gs[k] >= a && tc.gs[k + 1] <= b && tc.x1[k] > tc.x0[k] {
+            // merge with a span it touches
+            var merged = false
+            var j = 0
+            while j < lo.len() && !merged {
+                if tc.x0[k] <= hi[j] + 0.01 && tc.x1[k] >= lo[j] - 0.01 {
+                    if tc.x0[k] < lo[j] { lo[j] = tc.x0[k] }
+                    if tc.x1[k] > hi[j] { hi[j] = tc.x1[k] }
+                    merged = true
+                }
+                j = j + 1
+            }
+            if !merged { lo.push(tc.x0[k])  hi.push(tc.x1[k]) }
+        }
+        k = k + 1
+    }
+    var out: Vec<Float> = vec()
+    var i = 0
+    while i < lo.len() { out.push(lo[i])  out.push(hi[i])  i = i + 1 }
+    return out
+}
+
+// ---- the editors' movement ---------------------------------------------------------------------
+
+/// the caret after one Left (`delta` -1) or Right (1) press from byte `i` of `text`, in a paragraph
+/// running `dir`: one cluster on screen within the line; past the line's visual edge, to the
+/// neighbouring line (the next one when the press points forward in the paragraph's direction).
+pub fn text_move_visual(text: Str, i: Int, delta: Int, dir: Int) -> Int {
+    let ls = tx_line_start(text, i)
+    let le = tx_line_end(text, i)
+    let line = text.slice(ls, le)
+    if !tx_has_rtl(line) && dir != 1 {
+        if delta > 0 { return text_next_cluster(text, i) }
+        return text_prev_cluster(text, i)
+    }
+    let tc = text_carets(line, text_measure_style(1.0), dir, true)
+    let r = text_carets_move(tc, i - ls, delta)
+    if r >= 0 { return ls + r }
+    // off the line's edge: forward in the paragraph's direction is the next line's start
+    let forward = (delta > 0) != tc.para_rtl
+    if forward { if le < text.len() { return le + 1 }  return text.len() }
+    if ls > 0 { return ls - 1 }
+    return 0
+}
+
+// ---- input method pre-edit ---------------------------------------------------------------------
+// What an input method is composing (a Japanese reading before conversion, a Korean syllable being
+// built, a dead-key accent) belongs at the caret of the focused field, drawn underlined, and is not
+// yet part of the value: the host says what it is, once per frame, the same arrangement as
+// set_focused_widget and set_caret_on. A widget's document cannot carry it, because it is the
+// host's input state and changes between keystrokes the plugin never sees.
+global g_ime_text: Str
+global g_ime_begin: Int = 0
+global g_ime_end: Int = 0
+/// tell this image of the library what the input method is composing for the focused widget
+/// ("" for nothing), and the pre-edit's own cursor/selection as byte offsets into it.
+pub fn set_ime_preedit(text: Str, cursor_begin: Int, cursor_end: Int) {
+    g_ime_text = copy text
+    g_ime_begin = cursor_begin
+    g_ime_end = cursor_end
+}
+/// ...from an InputState (the immediate-mode runner's frame input).
+pub fn set_ime_preedit_from(input: InputState) { set_ime_preedit(input.ime_preedit, input.ime_preedit_cursor_begin, input.ime_preedit_cursor_end) }
+/// the pre-edit text ("" when nothing is being composed).
+pub fn ime_preedit() -> Str { return copy g_ime_text }
+pub fn ime_preedit_cursor() -> Int {
+    var c = g_ime_end
+    if c < 0 { c = 0 }
+    if c > g_ime_text.len() { c = g_ime_text.len() }
+    return c
+}

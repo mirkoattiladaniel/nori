@@ -1,0 +1,9 @@
+//! std/prelude: the two enums that `try` and `expr else d` are syntax over.
+//! They are in scope in every program without an import. Nothing else lives here (no externs, no
+//! helpers, no allocation), so it is safe to inject everywhere. Helper fns (mget, vget, lookup_or,
+//! …) stay in std/result behind an explicit import.
+
+/// `Result<T, E>` is the full form; the error type may be omitted: `Result<T>` is `Result<T, Str>`
+/// (the compiler normalizes the shorthand, so an `Err` payload is always typed).
+pub enum Option<T> { Some(T) None }
+pub enum Result<T, E> { Ok(T) Err(E) }

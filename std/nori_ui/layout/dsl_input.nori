@@ -1,0 +1,904 @@
+use core::*
+import "std/parse" as parse
+import "std/math" as math
+
+// ===========================================================================
+// `.ui` input-family node parsers: number/drag_value, picker, text_input,
+// text_area.
+//
+// A sibling root file of std/nori_ui/layout; see dsl_widgets.nori's header
+// for why the split exists and what the entry contract is.
+//
+// Keeping the error-message wording consistent forces local
+// copies of a few value helpers: dsl.nori's dsl_str_of says "must be a string
+// or ident" where the input family says "must be string or ident", and
+// ds_cross / dsl_apply_attr's `classes` arm use different wording again.
+// Everything else (dsl_num_of, dsl_bool_of) already matches that wording
+// and is reused.
+// ===========================================================================
+
+// ---- local value helpers (error text specific to this family) ----
+
+/// `{label} must be string or ident`.
+fn di_str_of(inout p: DslP, v: DslValue, label: Str) -> Str {
+    if v.kind == 0 || v.kind == 3 { return copy v.s }
+    dsl_fail(p, (label + " must be string or ident"))
+    return ""
+}
+/// `classes must be [...]` / `class names must be strings or identifiers`.
+fn di_classes_of(inout p: DslP, v: DslValue) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    if v.kind != 4 { dsl_fail(p, "classes must be [...]")  return out }
+    var i = 0
+    while i < v.arr.len() {
+        var e = v.arr[i]
+        if e.kind != 0 && e.kind != 3 { dsl_fail(p, "class names must be strings or identifiers")  var empty: Vec<Str> = vec()  return empty }
+        out.push(copy e.s)
+        i = i + 1
+    }
+    return out
+}
+/// `unknown cross_align "X"` / `cross_align must be stretch, center, or end`.
+fn di_cross_of(inout p: DslP, v: DslValue) -> Int {
+    if v.kind == 3 {
+        if (v.s == "stretch") { return cross_stretch() }
+        if (v.s == "start") { return cross_start() }
+        if (v.s == "center") { return cross_center() }
+        if (v.s == "end") { return cross_end() }
+        dsl_fail(p, ("unknown cross_align \"" + (v.s + "\"")))
+        return cross_stretch()
+    }
+    dsl_fail(p, "cross_align must be stretch, center, or end")
+    return cross_stretch()
+}
+/// Debug-style quoting of a char: single quotes, with the usual escapes.
+fn di_char_debug(c: Int) -> Str {
+    if c == 10 { return "'\\n'" }
+    if c == 13 { return "'\\r'" }
+    if c == 9 { return "'\\t'" }
+    if c == 92 { return "'\\\\'" }
+    if c == 39 { return "'\\''" }
+    return ("'" + (chr(c) + "'"))
+}
+/// Style B `:` enforcement: the attribute name must be followed by `:`, with this family's error text.
+fn di_expect_colon(inout p: DslP) {
+    dsl_skip(p)
+    var c = dsl_peek(p)
+    if c == 58 { dsl_bump(p)  return }
+    if c < 0 { dsl_fail(p, "expected ':', found end of file")  return }
+    dsl_fail(p, ("expected ':', found " + di_char_debug(c)))
+}
+/// fixed-precision formatting (`{:.N}` style): fixed decimals, no trailing-zero trimming.
+fn di_fixed(value: Float, decimals: Int) -> Str {
+    var neg = value < 0.0
+    var x = value
+    if neg { x = 0.0 - x }
+    var scale = 1.0
+    var k = 0
+    while k < decimals { scale = scale * 10.0  k = k + 1 }
+    let scaled = math::round(x * scale)
+    let ip = math::floor(scaled / scale + 0.0000001)
+    var out = to_str(to_int(ip))
+    if decimals > 0 {
+        var fs = to_str(to_int(scaled - ip * scale))
+        while fs.len() < decimals { fs = ("0" + fs) }
+        out = (out + ("." + fs))
+    }
+    if neg && scaled != 0.0 { out = ("-" + out) }
+    return out
+}
+/// a one-element `classes` list (`class` replaces `classes`).
+fn di_single_class(name: Str) -> Vec<Str> {
+    var nc: Vec<Str> = vec()
+    nc.push(copy name)
+    return nc
+}
+/// true when `node` carries the runtime "focused" class (rs_add_focus's marker), the only
+/// focus signal the `.ui` tree has; widget.nori's TextFieldFocus does not exist here.
+fn di_focused(node: UiNode) -> Bool {
+    var i = 0
+    while i < node.classes.len() { if (node.classes[i] == "focused") { return true }  i = i + 1 }
+    // Or the host says so. `classes: [focused]` means a document that knows it is focused, which a
+    // plugin can only claim by tracking the host's focus for itself, and a plugin is never told
+    // when it loses focus, so tracking it is guesswork. Focus belongs to the host: it decides which
+    // widget a click focused and which keystrokes go where, and this is it saying which one that is.
+    //
+    // Set per panel, immediately before that panel is laid out, and cleared after. Ids are unique
+    // inside a document and nowhere else, so a search box called `search` in one panel must not put
+    // a caret in a search box called `search` in another.
+    return g_focus_widget.len() > 0 && node.id == g_focus_widget
+}
+
+// Which widget the host has focused, for the document being laid out right now. Empty means none,
+// which is what every embedder that never calls the setter gets.
+global g_focus_widget: Str
+
+/// tell this image of the library which widget id the host has focused.
+///
+/// Scoped to one document: set it before laying that document out and clear it after. The same
+/// arrangement as `set_caret_on` (caret_blink.nori) and `set_char_advances` (text_measure.nori):
+/// a plugin `.so` has its own image of this module and its own copy of this global.
+pub fn set_focused_widget(id: Str) { g_focus_widget = copy id }
+
+
+// ---- colour-valued pickers ------------------------------------------------
+// Which `picker` this is. The `.ui` `picker` node and the immediate-mode colour picker (widget.nori)
+// are two different widgets sharing one name. The `.ui` node's own
+// contract (`value: Str`, click emits `picker:{id}` for the host to answer) is complete
+// in di_layout_field. The colour picker is layered on top
+// without touching the parser: when a picker's `value` is a colour literal (`#RGB` / `#RRGGBB` /
+// `#RRGGBBAA`) the field also shows a swatch, and when that picker additionally carries the runtime
+// `focused` class (the only interaction signal this family has, di_focused) it opens the colour
+// popup below. A picker whose value is a path, a name, or empty is untouched: it stays the
+// browse field, `"Browse..."` and all.
+
+/// the result of reading a `#...` colour literal out of a picker's `value`.
+struct DiHexParse { ok: Bool, col: Color }
+/// one hex digit, or -1.
+fn di_hexdig(c: Int) -> Int {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    return 0 - 1
+}
+/// `#RGB` / `#RRGGBB` / `#RRGGBBAA` -> a Color. `ok` is false for anything else, including a string
+/// of the right length holding a non-hex digit: this decides whether a picker is a colour picker,
+/// so it must not accept `#browse`. dsl.nori's dsl_color cannot be reused: it needs a live DslP to
+/// report into, and it treats a bad digit as a parse error rather than "not a colour".
+fn di_hex_color(s: Str) -> DiHexParse {
+    var bad = DiHexParse { ok: false, col: color_transparent() }
+    if s.len() != 4 && s.len() != 7 && s.len() != 9 { return bad }
+    if ord(s.at(0)) != 35 { return bad }
+    var d: Vec<Int> = vec()
+    var i = 1
+    while i < s.len() {
+        var v = di_hexdig(ord(s.at(i)))
+        if v < 0 { return bad }
+        d.push(v)
+        i = i + 1
+    }
+    if d.len() == 3 { return DiHexParse { ok: true, col: color_rgba(d[0] * 17, d[1] * 17, d[2] * 17, 255) } }
+    if d.len() == 6 { return DiHexParse { ok: true, col: color_rgba(d[0] * 16 + d[1], d[2] * 16 + d[3], d[4] * 16 + d[5], 255) } }
+    return DiHexParse { ok: true, col: color_rgba(d[0] * 16 + d[1], d[2] * 16 + d[3], d[4] * 16 + d[5], d[6] * 16 + d[7]) }
+}
+/// contrasting stroke colour (white on dark, black on light), as widget.nori does.
+fn di_contrast(copy c: Color) -> Color {
+    var intensity = (to_float(c.r) * 0.299 + to_float(c.g) * 0.587 + to_float(c.b) * 0.114) / 255.0
+    if intensity < 0.5 { return color_white() }
+    return color_black()
+}
+/// how many cells the SV square is subdivided into per axis: 1, i.e. no subdivision at all.
+///
+/// Both painters honour PaintPrimitive's has_grad / grad_to / grad_a / grad_b / grad_horizontal on
+/// kind-0 fills (paint_cpu::fill_rect_grad_cl, paint_gpu::gpu_fill_grad), so the square does not
+/// have to be approximated by sampling. An HSV S/V square factorises exactly into two of the
+/// one-axis ramps the primitive already
+/// carries, because hsv(h, s, v) = v * ((1 - s) * white + s * hue): linear in s at v = 1, and a
+/// plain multiply by v, which is black composited at alpha 1 - v. So one horizontal white -> hue
+/// ramp with one vertical transparent -> black ramp over it is the square, to rounding, in two
+/// primitives instead of 256 flat cells (or the 16 bilinear quads widget.nori uses, which are
+/// themselves an approximation of the same surface).
+///
+/// The constant stays because the subdivision is still well defined (every cell would be exact at
+/// any N) and 1 is simply the value that costs least.
+fn di_sv_grid() -> Int { return 1 }
+/// the popup's rect for a colour picker anchored under `field`. Flips above when the popup would
+/// run off the bottom of the viewport and there is room above; the viewport's top is y = 0, for the
+/// same reason as dw_dropdown_popup_rect.
+fn di_color_popup_rect(field: Rect, ctx: LayoutLengthContext) -> Rect {
+    var sz = color_picker_popup_size()
+    var gap = 2.0
+    var y = field.max.y + gap
+    if y + sz.y > ctx.viewport_h && field.min.y - gap - sz.y >= 0.0 { y = field.min.y - gap - sz.y }
+    var x = field.min.x
+    if x + sz.x > ctx.viewport_w { x = math::fmax(ctx.viewport_w - sz.x, 0.0) }
+    return rect_min_size(vec2(x, y), sz)
+}
+
+/// the floating colour popup: a true-gradient HSV S/V square with a contrasting marker and a
+/// 36-segment hue strip with its own marker. It follows widget.nori's colour picker popup,
+/// expressed as PaintPrimitive in the overlay popup layer so it is
+/// not clipped by an enclosing scroll viewport and paints last.
+///
+/// Events: the square emits `picker_sv:{id}` and the hue strip `picker_hue:{id}`. Neither carries
+/// numbers, because it does not have to: a HitRegion carries its own `rect`, so the host converts
+/// the click point to s/v (or h) itself, at whatever precision it wants, as it already
+/// converts a `picker:{id}` click into a file dialog.
+fn di_paint_color_popup(node: UiNode, field: Rect, ctx: LayoutLengthContext, copy col: Color, inout out: ComputedOverlay) {
+    var popup = di_color_popup_rect(field, ctx)
+    out.pop_prims.push(pp_rect(popup, color_rgba(24, 24, 30, 255), 6.0))
+    out.pop_prims.push(pp_border(popup, color_rgba(90, 90, 115, 255), 1.0))
+    var pad = picker_popup_padding()
+    var hue_bar_w = picker_hue_bar_width()
+    var available = math::fmax(popup.width() - (pad * 2.0 + picker_popup_gap() + hue_bar_w), 0.0)
+    var square_size = math::fmax(math::fmin(picker_square_size(), available), 40.0)
+    var square = rect_min_size(vec2(popup.min.x + pad, popup.min.y + pad), vec2(square_size, square_size))
+    var hue = rect_min_max(vec2(square.max.x + picker_popup_gap(), square.min.y), vec2(square.max.x + picker_popup_gap() + hue_bar_w, square.max.y))
+    var hsv = rgb_to_hsv(col.r, col.g, col.b)
+    var hh = hsv.h
+    var gridn = di_sv_grid()
+    var cell = square_size / to_float(gridn)
+    var cy = 0
+    while cy < gridn {
+        var cx = 0
+        while cx < gridn {
+            // the cell's saturation runs left -> right and its value runs bottom -> top, so the two
+            // ramps are: a horizontal one between the cell's two saturation ends at full value, and
+            // a vertical black one whose alpha is 1 - v, composited over it. +0.5 on the size closes
+            // the seams the float cell width would otherwise leave (a no-op at gridn = 1).
+            var s0 = to_float(cx) / to_float(gridn)
+            var s1 = to_float(cx + 1) / to_float(gridn)
+            var v0 = 1.0 - to_float(cy) / to_float(gridn)
+            var v1 = 1.0 - to_float(cy + 1) / to_float(gridn)
+            var cell_r = rect_min_size(vec2(square.min.x + to_float(cx) * cell, square.min.y + to_float(cy) * cell), vec2(cell + 0.5, cell + 0.5))
+            var base = pp_rect(cell_r, hsv_to_rgb(hh, s0, 1.0), 0.0)
+            base.has_grad = true
+            base.grad_to = hsv_to_rgb(hh, s1, 1.0)
+            base.grad_a = cell_r.min.x
+            base.grad_b = cell_r.width()
+            base.grad_horizontal = true
+            out.pop_prims.push(base)
+            var shade = pp_rect(cell_r, color_rgba(0, 0, 0, to_int((1.0 - v0) * 255.0 + 0.5)), 0.0)
+            shade.has_grad = true
+            shade.grad_to = color_rgba(0, 0, 0, to_int((1.0 - v1) * 255.0 + 0.5))
+            shade.grad_a = cell_r.min.y
+            shade.grad_b = cell_r.height()
+            shade.grad_horizontal = false
+            out.pop_prims.push(shade)
+            cx = cx + 1
+        }
+        cy = cy + 1
+    }
+    var border = color_rgb(70, 70, 75)
+    out.pop_prims.push(pp_border(square, border, 1.0))
+    // the S/V marker
+    var marker_r = math::fmax(square_size / 14.0, 4.0)
+    var mo_x = math::fclamp(square.min.x + hsv.s * square_size - marker_r, square.min.x, square.max.x - 2.0 * marker_r)
+    var mo_y = math::fclamp(square.min.y + (1.0 - hsv.v) * square_size - marker_r, square.min.y, square.max.y - 2.0 * marker_r)
+    var mrgb = hsv_to_rgb(hh, hsv.s, hsv.v)
+    out.pop_prims.push(pp_rect(rect_min_size(vec2(mo_x, mo_y), vec2(2.0 * marker_r, 2.0 * marker_r)), di_contrast(mrgb), marker_r))
+    out.pop_prims.push(pp_rect(rect_min_size(vec2(mo_x + 1.5, mo_y + 1.5), vec2(math::fmax(2.0 * marker_r - 3.0, 0.0), math::fmax(2.0 * marker_r - 3.0, 0.0))), mrgb, math::fmax(marker_r - 1.5, 0.0)))
+    // the hue strip, 36 segments.
+    var segs = 36
+    var seg_h = hue.height() / to_float(segs)
+    var sg = 0
+    while sg < segs {
+        var h_seg = (to_float(sg) + 0.5) / to_float(segs) * 360.0
+        out.pop_prims.push(pp_rect(rect_min_size(vec2(hue.min.x, hue.min.y + to_float(sg) * seg_h), vec2(hue_bar_w, seg_h + 0.5)), hsv_to_rgb(h_seg, 1.0, 1.0), 0.0))
+        sg = sg + 1
+    }
+    out.pop_prims.push(pp_border(hue, border, 1.0))
+    var hrgb = hsv_to_rgb(hh, 1.0, 1.0)
+    var hm_h = 4.0
+    var hm_y = math::fclamp(hue.min.y + (hh / 360.0) * hue.height() - hm_h / 2.0, hue.min.y, hue.max.y - hm_h)
+    out.pop_prims.push(pp_rect(rect_min_size(vec2(hue.min.x - 1.0, math::fmax(hm_y - 1.0, hue.min.y)), vec2(hue_bar_w + 2.0, hm_h + 2.0)), di_contrast(hrgb), 0.0))
+    out.pop_prims.push(pp_rect(rect_min_size(vec2(hue.min.x, hm_y), vec2(hue_bar_w, hm_h)), hrgb, 0.0))
+    if node.disabled { return }
+    out.pop_hits.push(HitRegion { id: copy node.id, on_click: ("picker_sv:" + node.id), rect: square })
+    out.pop_hits.push(HitRegion { id: copy node.id, on_click: ("picker_hue:" + node.id), rect: hue })
+}
+
+// ---- per-kind attribute tables ----
+
+/// attributes shared by every input kind that are not kind-specific; returns true when handled.
+fn di_attr_common(inout p: DslP, inout node: UiNode, name: Str, v: DslValue) -> Bool {
+    if (name == "bind") { node.bind = di_str_of(p, v, "bind")  return true }
+    if (name == "bind_visible") { node.bind_visible = di_str_of(p, v, "bind_visible")  return true }
+    if (name == "bind_disabled") { node.bind_disabled = di_str_of(p, v, "bind_disabled")  return true }
+    if (name == "classes") { node.classes = di_classes_of(p, v)  return true }
+    if (name == "class") { node.classes = di_single_class(di_str_of(p, v, "class"))  return true }
+    if (name == "height") || (name == "h") { node.h = ui_px(dsl_num_of(p, v, "height"))  return true }
+    // And a width. An input could be given a height and not a width, so the only way to size one
+    // horizontally was `fill_w`, fine in a settings form, useless for a field that has to fit a
+    // measured gap, such as a rename editor sharing its row with a clear button.
+    if (name == "width") || (name == "w") { node.w = ui_px(dsl_num_of(p, v, "width"))  return true }
+    if (name == "fill_w") { node.fill_w = dsl_bool_of(p, v, "fill_w")  return true }
+    if (name == "align_self") { node.has_align_self = true  node.align_self = di_cross_of(p, v)  return true }
+    if (name == "tab_index") || (name == "focus_order") { node.has_tab_index = true  node.tab_index = to_int(dsl_num_of(p, v, "tab_index"))  return true }
+    if (name == "dir") || (name == "direction") { node.text_dir = ds_dir(p, v)  return true }
+    if (name == "lang") { node.lang = di_str_of(p, v, "lang")  return true }
+    if (name == "font_family") { node.font_family = ds_family(p, v)  return true }
+    if (name == "font_weight") { node.font_weight = ds_weight(p, v)  return true }
+    if (name == "font_style") { node.font_slant = ds_slant(p, v)  return true }
+    return false
+}
+
+/// `number` / `drag_value`. `number` is canonical: every message says "number".
+fn di_attr_number(inout p: DslP, inout node: UiNode, name: Str, v: DslValue) {
+    if (name == "id") { node.id = di_str_of(p, v, "number id")  return }
+    if (name == "label") { node.text = di_str_of(p, v, "number label")  return }
+    if (name == "value") { node.value_f = dsl_num_of(p, v, "value")  return }
+    if (name == "min") || (name == "lo") { node.vmin = dsl_num_of(p, v, "min")  return }
+    if (name == "max") || (name == "hi") { node.vmax = dsl_num_of(p, v, "max")  return }
+    if (name == "step") { node.has_step = true  node.step = dsl_num_of(p, v, "step")  return }
+    if (name == "suffix") { node.suffix = di_str_of(p, v, "suffix")  return }
+    if (name == "precision") {
+        // the only real clamp in this family: precision is clamped to 0..6 and rounded
+        // half away from zero (math::round).
+        let pv = dsl_num_of(p, v, "precision")
+        node.has_precision = true
+        node.precision = to_int(math::round(math::fclamp(pv, 0.0, 6.0)))
+        return
+    }
+    if di_attr_common(p, node, name, v) { return }
+    dsl_fail(p, ("unknown number field \"" + (name + "\"")))
+}
+
+/// `text_input` and `picker`: field for field identical;
+/// only the error-label prefix differs.
+fn di_attr_field(inout p: DslP, inout node: UiNode, name: Str, v: DslValue, kn: Str) {
+    if (name == "id") { node.id = di_str_of(p, v, (kn + " id"))  return }
+    if (name == "label") { node.text = di_str_of(p, v, (kn + " label"))  return }
+    if (name == "value") { node.value_s = di_str_of(p, v, "value")  return }
+    // Where the caret is, as a byte offset into `value`. Owned by the caller for the same reason the
+    // code editor's is: this widget keeps nothing between frames, so the one thing it must be told
+    // is the thing that cannot be derived from the text.
+    if (name == "caret") { node.caret = di_nonneg_int(p, v, "caret")  node.has_caret = true  return }
+    // ...and where the selection started, for the same reason. `text_area` and `code_editor` take
+    // this too; with it a single-line field can select text as well.
+    if (name == "sel_anchor") { node.sel_anchor = di_nonneg_int(p, v, "sel_anchor")  return }
+    if di_attr_common(p, node, name, v) { return }
+    dsl_fail(p, ("unknown " + (kn + (" field \"" + (name + "\"")))))
+}
+
+/// `text_area`. Note: no `label` attribute.
+///
+/// `caret`, `sel_anchor`, `scroll_y` and `size_px` are what make this a box you can type in rather
+/// than a surface that displays text. A panel wanting a multi-line input would otherwise have to
+/// reach for a code editor and switch its gutter off. The paint below draws a caret and a selection
+/// from them.
+///
+/// `max_rows` caps the height it grows to. Unset it grows with its content without limit, which is
+/// right for an editor filling a pane and wrong for an input bar.
+fn di_attr_text_area(inout p: DslP, inout node: UiNode, name: Str, v: DslValue) {
+    if (name == "size_px") {
+        let sp = dsl_num_of(p, v, "size_px")
+        if sp > 0.0 { node.size_px = sp }
+        return
+    }
+    if (name == "caret") { node.caret = di_nonneg_int(p, v, "caret")  node.has_caret = true  return }
+    if (name == "sel_anchor") { node.sel_anchor = di_nonneg_int(p, v, "sel_anchor")  return }
+    if (name == "scroll_y") {
+        var sy = dsl_num_of(p, v, "scroll_y")
+        if sy < 0.0 { sy = 0.0 }
+        node.scroll_y = sy
+        return
+    }
+    if (name == "min_rows") { node.min_rows = di_nonneg_int(p, v, "min_rows")  return }
+    if (name == "max_rows") { node.max_rows = di_nonneg_int(p, v, "max_rows")  return }
+    // Padding, the way every other node takes it. `padding` already cascades onto any node from a
+    // stylesheet class (apply_style_to_node); these are the per-node overrides that `row` and
+    // `column` accept, and `node_pad_y` resolves the pair the same way CSS does:
+    // the specific axis when it is given, the shorthand otherwise.
+    if (name == "padding") || (name == "pad") { node.padding = dsl_num_of(p, v, "padding")  return }
+    if (name == "padding_x") || (name == "pad_x") { node.has_padding_x = true  node.padding_x = dsl_num_of(p, v, "padding_x")  return }
+    if (name == "padding_y") || (name == "pad_y") { node.has_padding_y = true  node.padding_y = dsl_num_of(p, v, "padding_y")  return }
+    if (name == "id") { node.id = di_str_of(p, v, "text_area id")  return }
+    if (name == "value") { node.value_s = di_str_of(p, v, "value")  return }
+    if (name == "fill_h") { node.fill_h = dsl_bool_of(p, v, "fill_h")  return }
+    if (name == "read_only") { node.read_only = dsl_bool_of(p, v, "read_only")  return }
+    if (name == "tab_size") {
+        // the value is converted to an unsigned int and floored at 1 at construction. A negative or
+        // fractional float converted that way truncates toward zero and saturates at 0, so <=0 lands on 1.
+        let ts = dsl_num_of(p, v, "tab_size")
+        var n = 0
+        if ts > 0.0 { n = to_int(ts) }
+        if n < 1 { n = 1 }
+        node.tab_size = n
+        return
+    }
+    if (name == "hard_tabs") { node.hard_tabs = dsl_bool_of(p, v, "hard_tabs")  return }
+    if (name == "word_wrap") { node.word_wrap = dsl_bool_of(p, v, "word_wrap")  return }
+    if di_attr_common(p, node, name, v) { return }
+    dsl_fail(p, ("unknown text_area field \"" + (name + "\"")))
+}
+
+/// code_editor: text_area's attributes, plus the language and the three caller-owned state fields.
+///
+/// `caret`, `sel_anchor` and `scroll_y` are what make this widget usable from a plugin. The layout
+/// is a pure function of them: it never remembers where the caret was, so a caller that re-emits its
+/// document every frame keeps its own MultilineEditState and writes the three numbers out.
+fn di_attr_code_editor(inout p: DslP, inout node: UiNode, name: Str, v: DslValue) {
+    if (name == "id") { node.id = di_str_of(p, v, "code_editor id")  return }
+    // `scroll_x` alongside `scroll_y`: with wrapping off a long line runs past the right edge, and
+    // the offset that brings it back is the caller's to hold, like the other two state fields.
+    if (name == "scroll_x") {
+        var sx = dsl_num_of(p, v, "scroll_x")
+        if sx < 0.0 { sx = 0.0 }
+        node.scroll_x = sx
+        return
+    }
+    if (name == "value") { node.value_s = di_str_of(p, v, "value")  return }
+    if (name == "language") { node.language = di_str_of(p, v, "language")  return }
+    if (name == "fill_h") { node.fill_h = dsl_bool_of(p, v, "fill_h")  return }
+    if (name == "read_only") { node.read_only = dsl_bool_of(p, v, "read_only")  return }
+    if (name == "line_numbers") { node.line_numbers = dsl_bool_of(p, v, "line_numbers")  return }
+    if (name == "gutter_marks") { node.gutter_marks = dsl_str_of(p, v, "gutter_marks")  return }
+    if (name == "line_notes") { node.line_notes = dsl_str_of(p, v, "line_notes")  return }
+    if (name == "diags") { node.diags = dsl_str_of(p, v, "diags")  return }
+    if (name == "focus_from") { node.focus_from = to_int(dsl_num_of(p, v, "focus_from"))  return }
+    if (name == "focus_to") { node.focus_to = to_int(dsl_num_of(p, v, "focus_to"))  return }
+    if (name == "highlight_line") { node.highlight_line = dsl_bool_of(p, v, "highlight_line")  return }
+    if (name == "hot_line") { node.hot_line = to_int(dsl_num_of(p, v, "hot_line"))  return }
+    if (name == "word_wrap") { node.word_wrap = dsl_bool_of(p, v, "word_wrap")  return }
+    if (name == "hard_tabs") { node.hard_tabs = dsl_bool_of(p, v, "hard_tabs")  return }
+    if (name == "tab_size") {
+        let ts = dsl_num_of(p, v, "tab_size")
+        var n = 0
+        if ts > 0.0 { n = to_int(ts) }
+        if n < 1 { n = 1 }
+        node.tab_size = n
+        return
+    }
+    // the only input node that takes a text size: a code editor's font size is a user setting, and
+    // the caller needs to know it to hit-test a click back to a caret (code_editor_caret_at).
+    if (name == "size_px") {
+        let sp = dsl_num_of(p, v, "size_px")
+        if sp > 0.0 { node.size_px = sp }
+        return
+    }
+    if (name == "caret") { node.caret = di_nonneg_int(p, v, "caret")  return }
+    if (name == "sel_anchor") { node.sel_anchor = di_nonneg_int(p, v, "sel_anchor")  return }
+    if (name == "scroll_y") {
+        var sy = dsl_num_of(p, v, "scroll_y")
+        if sy < 0.0 { sy = 0.0 }
+        node.scroll_y = sy
+        return
+    }
+    if di_attr_common(p, node, name, v) { return }
+    dsl_fail(p, ("unknown code_editor field \"" + (name + "\"")))
+}
+
+/// a non-negative integer attribute. Offsets into a buffer cannot be negative, and clamping here
+/// rather than in the paint keeps `layout_code_editor` free of validation.
+fn di_nonneg_int(inout p: DslP, v: DslValue, what: Str) -> Int {
+    let f = dsl_num_of(p, v, what)
+    if f <= 0.0 { return 0 }
+    return to_int(f)
+}
+
+/// parse one input-family node body (the opening `{` is already consumed).
+fn dsl_input_node(inout p: DslP, kindname: Str, kind: Int) -> UiNode {
+    var node = ui_node_blank(kind)
+    // parse-time defaults:
+    // fill_w = true on all four; min/max = 0.0/1.0 on number (ui_node_blank already sets those).
+    node.fill_w = true
+    // height: None -> 28.0 for number/text_input/picker;
+    // text_area's unset height is intrinsic, left at Px(0).
+    if kind != nk_text_area() && kind != nk_code_editor() { node.h = ui_px(28.0) }
+    // Wrap off by default, unlike every other member of the input family. `ui_node_blank` sets
+    // word_wrap true because a prose field should wrap; source is read by column, and a code editor
+    // that reflowed every file the first time it was opened would be wrong far more often than right.
+    if kind == nk_code_editor() { node.word_wrap = false }
+    // `number` is canonical: a `drag_value` element still reports itself as `number`
+    var kn = "number"
+    if kind == nk_text_input() { kn = "text_input" }
+    else if kind == nk_text_area() { kn = "text_area" }
+    else if kind == nk_picker() { kn = "picker" }
+    var got_id = false
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 {
+            dsl_bump(p)
+            if !got_id { dsl_fail(p, (kn + " requires id:")) }
+            return node
+        }
+        var name = dsl_ident(p)
+        if p.failed[0] == 1 { return node }
+        di_expect_colon(p)                                // Style B
+        if p.failed[0] == 1 { return node }
+        var v = dsl_value(p)
+        if p.failed[0] == 1 { return node }
+        if (name == "id") { got_id = true }
+        if kind == nk_number() { di_attr_number(p, node, name, v) }
+        else if kind == nk_text_area() { di_attr_text_area(p, node, name, v) }
+        else if kind == nk_code_editor() { di_attr_code_editor(p, node, name, v) }
+        else { di_attr_field(p, node, name, v, kn) }
+        if p.failed[0] == 1 { return node }
+    }
+    return node
+}
+
+// ---- measure ----
+
+/// lines in `text` = newline count + 1.
+fn di_line_count(text: Str) -> Int {
+    var n = 1
+    var i = 0
+    while i < text.len() { if ord(text.at(i)) == 10 { n = n + 1 }  i = i + 1 }
+    return n
+}
+/// Row height is line_height = size_px + MIN_LINE_HEIGHT_EXTRA(5.0), plus CONTENT_PAD=8.0 of padding.
+/// how tall a `text_area` wants to be: one row per line, never fewer than `min_rows`, never more
+/// than `max_rows`, past which it keeps its height and scrolls its own content.
+///
+/// The floor is three unless asked otherwise, which is what an editor surface wants. It is also why
+/// an input bar that sets only `max_rows: 8` comes up three rows tall: an empty box is floored at
+/// three and the explicit height on the row it sits in loses to the intrinsic one. An input bar
+/// says `min_rows: 1` and grows from a single line.
+fn di_text_area_rows(value: Str, min_rows: Int, max_rows: Int) -> Int {
+    var lo = 3
+    if min_rows > 0 { lo = min_rows }
+    if max_rows > 0 && max_rows < lo { lo = max_rows }
+    var lines = di_line_count(value)
+    if lines < lo { lines = lo }
+    if max_rows > 0 && lines > max_rows { lines = max_rows }
+    return lines
+}
+
+/// a `text_area`'s content inset. 8 is `CONTENT_PAD`, the editor-pane default; an input bar
+/// sitting in a row of 28px controls asks for less.
+///
+/// `padding: 8` is not the same as unset: the shorthand lands on `node.padding`,
+/// which every node has a default 8.0 for, so reading it directly would make every text_area behave as
+/// though it had been styled. The pair is read through `node_pad_*`, and the default it falls back to
+/// is the one this widget has always used.
+fn di_area_pad_x(node: UiNode) -> Float {
+    var p = node_pad_x(node)
+    if p < 0.0 { p = 0.0 }
+    return p
+}
+fn di_area_pad_y(node: UiNode) -> Float {
+    var p = node_pad_y(node)
+    if p < 0.0 { p = 0.0 }
+    return p
+}
+
+fn di_text_area_intrinsic_h(value: Str, size_px: Float, min_rows: Int, max_rows: Int, pad_y: Float) -> Float {
+    var sp = size_px
+    if sp <= 0.0 { sp = 12.0 }
+    let line_h = sp + 5.0
+    let lines = di_text_area_rows(value, min_rows, max_rows)
+    return math::fmax(to_float(lines) * line_h + pad_y * 2.0, line_h + pad_y * 2.0)
+}
+/// widest line of `value` at `size_px`.
+fn di_widest_line(value: Str, size_px: Float) -> Float {
+    var best = 0.0
+    var start = 0
+    var i = 0
+    let n = value.len()
+    while i <= n {
+        if i == n || ord(value.at(i)) == 10 {
+            best = math::fmax(best, overlay_text_width(value.slice(start, i), size_px))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return best
+}
+
+/// intrinsic size of number / text_input / text_area / picker (see nodes_ext.nori).
+fn ui_measure_input(node: UiNode, ctx: LayoutLengthContext) -> Vec2 {
+    var k = node.kind
+    var h = ui_length_resolve(node.h, ctx, 1)
+    var w = ui_length_resolve(node.w, ctx, 0)
+    if k == nk_text_area() || k == nk_code_editor() {
+        // height: the multiline field row's intrinsic height.
+        if h <= 0.0 { h = di_text_area_intrinsic_h(node.value_s, node.size_px, node.min_rows, node.max_rows, di_area_pad_y(node)) }
+        // width: no intrinsic width is defined (text_area is fill_w), so this is the widest line + CONTENT_PAD*2
+        if w <= 0.0 { w = di_widest_line(node.value_s, node.size_px) + di_area_pad_x(node) * 2.0 }
+        return vec2(w, h)
+    }
+    if h <= 0.0 { h = 28.0 }
+    if w <= 0.0 {
+        if k == nk_number() {
+            // widget.nori (wk_drag): lab_w = len(label)*widget_char_width() + item_x,
+            // field_w = fmax(remaining, 30.0). item_x is the theme item spacing x (core/theme.nori).
+            let item_x = 10.0
+            let lab_w = to_float(node.text.len()) * widget_char_width() + item_x
+            var vtext = number_value_text(node.value_f, di_precision_of(node), node.suffix)
+            w = lab_w + math::fmax(overlay_text_width(vtext, node.size_px) + item_x * 2.0, 30.0)
+        } else {
+            // label column (place.width()*0.34).clamp(80,150) + an 8px
+            // gap + the field. At intrinsic width the clamp bottoms out at 80.
+            var vtext = node.value_s
+            if k == nk_picker() && vtext.len() == 0 { vtext = "Browse..." }
+            w = 80.0 + 8.0 + math::fmax(overlay_text_width(vtext, node.size_px) + 16.0, 80.0)
+        }
+    }
+    return vec2(w, h)
+}
+
+// ---- layout + paint ----
+
+/// number_value_text's precision argument: <0 means "unset" (3 decimals, trimmed).
+fn di_precision_of(node: UiNode) -> Int {
+    if node.has_precision { return node.precision }
+    return 0 - 1
+}
+/// the resolved text colour for an input node (node `color:` wins over the family default).
+fn di_text_color(node: UiNode, copy fallback: Color) -> Color {
+    if node.has_color { return rgba_color(node.color) }
+    return fallback
+}
+
+/// number / drag_value, following widget.nori's wk_drag: label, field rect, value text.
+fn di_layout_number(inout node: UiNode, rect: Rect, inout out: ComputedOverlay) {
+    let item_x = 10.0                                     // item_spacing.x
+    let row_h = rect.height()
+    let tcol = di_text_color(node, color_rgba(255, 255, 255, 255))
+    let lab_y = rect.min.y + (row_h - 16.0) / 2.0
+    if node.text.len() > 0 { out.prims.push(pp_text(vec2(rect.min.x, lab_y), node.text, tcol, node.size_px)) }
+    let lab_w = to_float(node.text.len()) * widget_char_width() + item_x
+    let field_x = rect.min.x + lab_w
+    let field_w = math::fmax(rect.max.x - field_x, 30.0)
+    let field_rect = rect_min_size(vec2(field_x, rect.min.y), vec2(field_w, row_h))
+    var fbg = color_rgba(38, 38, 44, 255)
+    if node.has_bg { fbg = rgba_color(node.bg) }
+    out.prims.push(pp_rect(field_rect, fbg, node.radius))
+    let vtext = number_value_text(node.value_f, di_precision_of(node), node.suffix)
+    out.prims.push(pp_text(vec2(field_x + item_x, lab_y), vtext, tcol, node.size_px))
+    if node.disabled { return }
+    // lo/hi are ordered here even though the parser does
+    // not validate min <= max, and `value` is clamped only now.
+    let lo = math::fmin(node.vmin, node.vmax)
+    let hi = math::fmax(node.vmax, node.vmin)
+    let vc = math::fclamp(node.value_f, lo, hi)
+    var dstep = math::fmax(math::fabs(hi - lo) / 200.0, 0.000001)
+    if node.has_step { dstep = node.step }
+    let edit_s = number_value_text(node.value_f, di_precision_of(node), "")
+    // Largest rect first (the drag region), smallest second (the click-to-edit box);
+    // overlay_hit_test walks backwards, so the value box wins where they overlap.
+    let nums = (di_fixed(vc, 6) + (":" + (di_fixed(lo, 6) + (":" + (di_fixed(hi, 6) + (":" + di_fixed(dstep, 6)))))))
+    out.hits.push(HitRegion { id: copy node.id, on_click: ("number:" + (node.id + (":" + nums))), rect: rect_dup(rect) })
+    out.hits.push(HitRegion { id: copy node.id, on_click: ("number_edit:" + (node.id + (":" + (nums + (":" + edit_s))))), rect: field_rect })
+}
+
+/// text_input / picker geometry, following widget.nori's wk_text_field:
+/// focus ring + caret chrome.
+fn di_layout_field(inout node: UiNode, rect: Rect, ctx: LayoutLengthContext, inout out: ComputedOverlay) {
+    // No label, no label column. A label column would reserve a third of the width (80px at the
+    // very least) whether or not there was anything to put in it, so an unlabelled field would sit
+    // 88px right of where it was placed with nothing in front of it. Harmless in a settings form,
+    // where every field has a label; fatal anywhere a field has to line up with something, such as
+    // a rename editor that must appear exactly over the name it is editing.
+    var label_w = 0.0
+    var label_gap = 0.0
+    if node.text.len() > 0 {
+        label_w = math::fclamp(rect.width() * 0.34, 80.0, 150.0)
+        label_gap = 8.0
+    }
+    let field_h = math::fmax(rect.height() - 4.0, 1.0)
+    let field = rect_min_size(vec2(rect.min.x + label_w + label_gap, rect.min.y + (rect.height() - field_h) * 0.5), vec2(math::fmax(rect.width() - label_w - label_gap, 1.0), field_h))
+    let tcol = di_text_color(node, color_rgba(168, 170, 178, 255))
+    let lh = overlay_line_height(node.size_px)
+    if node.text.len() > 0 { out.prims.push(pp_text(vec2(rect.min.x, rect.min.y + (rect.height() - lh) * 0.5), node.text, tcol, node.size_px)) }
+    var bg = color_rgba(18, 18, 22, 255)
+    if node.has_bg { bg = rgba_color(node.bg) }
+    out.prims.push(pp_rect(field, bg, node.radius))
+    let focused = di_focused(node)
+    // A hairline that follows the field, not a band painted over its corners.
+    //
+    // widget.nori stacks four square 2px rects inside the field, which is wrong here: square
+    // corners on a rounded field make a focused box look broken rather than focused; 2px of the
+    // interior is eaten; and all of it at full saturation against a near-black panel, a hint drawn
+    // louder than the thing it is hinting at.
+    //
+    // One 1px stroke on the field's own boundary instead, drawn with `pp_border_round` so the
+    // border follows the field's radius.
+    //
+    // The colour is the theme's existing accent: one matching nothing else in
+    // the theme would be a second one.
+    // A style that gives the field a border colour gives its focus ring that colour (transparent: none;
+    // a search field that is always focused, the launcher's, shows its caret and no ring)
+    if focused {
+        var ring = color_rgba(120, 160, 240, 255)
+        if node.has_border { ring = rgba_color(node.border_color) }
+        if ring.a > 0 { out.prims.push(pp_border_round(field, ring, 1.0, node.radius)) }
+    }
+    var disp = node.value_s
+    if node.kind == nk_picker() && disp.len() == 0 { disp = "Browse..." }
+
+    // A field is a window onto its value. Drawing the whole string from the left edge, unclipped, at
+    // whatever width it comes to would let text longer than the field run out of the right-hand side
+    // and across whatever is next to it (a `reset` button, another panel), with no way to see the end
+    // of it.
+    //
+    // Two things prevent that, and both are needed. Clip, so nothing is drawn outside the box. And
+    // scroll, so the part you are typing is the part inside it: a clip alone would hide the caret the
+    // moment the text got long, which is a text field you cannot type into.
+    let pad = field_pad()
+    // the value in the field's own face (font_family / font_weight / font_style): measured, scrolled
+    // and drawn with the same stack, or the caret stands off the letters it is between
+    let stack = node_font_stack(node)
+    var sty = text_measure_style(node.size_px)
+    sty.stack = stack
+    var ci = disp.len()
+    if node.has_caret { ci = node.caret  if ci > disp.len() { ci = disp.len() }  if ci < 0 { ci = 0 } }
+    ci = text_snap_cluster(disp, ci)
+    // What an input method is composing is shown at the caret, underlined, before it is part of the
+    // value (set_ime_preedit): the drawn string is the value with the pre-edit spliced in, and the
+    // caret sits at the pre-edit's own cursor.
+    var pre = ""
+    if focused && node.kind == nk_text_input() { pre = ime_preedit() }
+    var shown = copy disp
+    var cshow = ci
+    if pre.len() > 0 {
+        shown = disp.slice(0, ci) + pre + disp.slice(ci, disp.len())
+        cshow = ci + ime_preedit_cursor()
+    }
+    // the value's caret geometry, in its paragraph direction: x of every caret stop on screen
+    let tc = text_carets(shown, sty, node.text_dir, false)
+    // One place for the scroll, because a click has to land on the character it is over: the panel
+    // turns a press's x into a caret index and must undo the shift the paint applied. Two
+    // copies of this arithmetic would put the caret a few characters off, which reads as an
+    // inaccurate pointer rather than as a bug.
+    let origin = field_origin_st(shown, cshow, field.width(), sty, focused, node.text_dir)
+    let tx = field.min.x + pad + origin
+    let ty = field.min.y + (field.height() - lh) * 0.5
+    let clipr = rect_min_max(vec2(field.min.x + pad, field.min.y), vec2(field.max.x - pad, field.max.y))
+
+    // The selection, under the text. `sel_anchor` equal to the caret means none, which is what a
+    // field that has never been dragged in reports, so nothing is drawn for the overwhelmingly
+    // common case. Through mixed directions a selection is several pieces on screen.
+    if focused && pre.len() == 0 {
+        var a = node.sel_anchor
+        if a < 0 { a = 0 }
+        if a > disp.len() { a = disp.len() }
+        if !(a == ci) {
+            var s0 = a
+            var s1 = ci
+            if s0 > s1 { s0 = ci  s1 = a }
+            let spans = text_carets_sel(tc, s0, s1)
+            var k = 0
+            while k + 1 < spans.len() {
+                var selr = rect_min_max(vec2(tx + spans[k], ty), vec2(tx + spans[k + 1], ty + lh))
+                if let Option::Some(vis) = selr.intersect(clipr) {
+                    var sprim = pp_rect(vis, color_rgba(52, 82, 132, 255), 2.0)
+                    sprim.has_clip = true
+                    sprim.clip = rect_dup(clipr)
+                    out.prims.push(sink sprim)
+                }
+                k = k + 2
+            }
+        }
+    }
+
+    var tprim = pp_text(vec2(tx, ty), shown, tcol, node.size_px)
+    tprim.has_clip = true
+    tprim.clip = rect_dup(clipr)
+    var tdir = "L"
+    if tc.para_rtl { tdir = "R" }
+    let nox: Vec<Float> = vec()
+    pp_text_set_lines(tprim, stack, node.lang, tdir, nox)
+    out.prims.push(sink tprim)
+    // the pre-edit's underline, under every piece of it on screen
+    if pre.len() > 0 {
+        let pspans = text_carets_sel(tc, ci, ci + pre.len())
+        var k = 0
+        while k + 1 < pspans.len() {
+            var ur = pp_rect(rect_min_max(vec2(tx + pspans[k], ty + lh - 2.0), vec2(tx + pspans[k + 1], ty + lh - 1.0)), tcol, 0.0)
+            ur.has_clip = true
+            ur.clip = rect_dup(clipr)
+            out.prims.push(sink ur)
+            k = k + 2
+        }
+    }
+    // The caret is a bar at an offset, not a `|` stuck on the end.
+    //
+    // Appending a character says only "this field is focused": it cannot be anywhere but after the
+    // last letter, so Left and Right would have nothing to move and a field would be
+    // an append-only buffer. The caret's x is its stop's on screen (text_carets_x): between two
+    // clusters, at the leading edge of the one after it in the string.
+    //
+    // Without a `caret` attribute it goes after the text.
+    // When blinking turns it off it is still there, clear: the paint list keeps its length, so a retained document repaints
+    // the caret's few pixels and not the whole field
+    if focused {
+        let cx = tx + text_carets_x(tc, cshow)
+        var ccol = copy tcol
+        if !caret_on() { ccol = color_rgba(tcol.r, tcol.g, tcol.b, 0) }
+        var cprim = pp_rect(rect_min_size(vec2(cx, ty), vec2(1.5, lh)), ccol, 0.0)
+        cprim.has_clip = true
+        cprim.clip = rect_dup(clipr)
+        out.prims.push(sink cprim)
+    }
+    // a colour-valued picker additionally shows a swatch at the right end of the field, and opens
+    // the colour popup while it is focused. Every other picker (a path, a name, empty -> the
+    // literal "Browse...") is left as the browse field.
+    var hexc = di_hex_color(node.value_s)
+    var is_color_picker = node.kind == nk_picker() && hexc.ok
+    if is_color_picker {
+        var sw_s = math::fmax(field.height() - 6.0, 1.0)
+        var swatch = rect_min_size(vec2(field.max.x - 3.0 - sw_s, field.min.y + 3.0), vec2(sw_s, sw_s))
+        out.prims.push(pp_rect(swatch, hexc.col, 3.0))
+        out.prims.push(pp_border(swatch, color_rgba(90, 90, 115, 255), 1.0))
+    }
+    if node.disabled { return }
+    var ev = ("picker:" + node.id)
+    if node.kind == nk_text_input() { ev = ("text_edit:" + (node.id + (":@px=" + (di_fixed(node.size_px, 3) + (":" + node.value_s))))) }
+    out.hits.push(HitRegion { id: copy node.id, on_click: ev, rect: rect_dup(field) })
+    if is_color_picker && focused { di_paint_color_popup(node, field, ctx, hexc.col, out) }
+}
+
+/// text_area chrome + hit, with the line painting delegated to
+/// layout_multiline_edit (multiline_edit.nori), which already emits PaintPrimitive.
+fn di_layout_text_area(inout node: UiNode, rect: Rect, inout out: ComputedOverlay) {
+    var bg = color_rgba(11, 11, 13, 255)
+    if node.has_bg { bg = rgba_color(node.bg) }
+    out.prims.push(pp_rect(rect, bg, node.radius))
+    var st = multiline_edit_new(node.value_s)
+    st.tab_size = node.tab_size
+    st.word_wrap = node.word_wrap
+    st.read_only = node.read_only
+    // The caller's editing state. Without these three the caret would sit at offset 0 whatever the
+    // caller did and a selection could not be drawn at all: the widget would look like an input and
+    // not behave as one.
+    var tcar = node.caret
+    if tcar > st.text.len() { tcar = st.text.len() }
+    var tsel = node.sel_anchor
+    if tsel > st.text.len() { tsel = st.text.len() }
+    st.caret = tcar
+    st.sel_anchor = tsel
+    st.scroll_y = node.scroll_y
+    var opts = multiline_paint_opts()
+    opts.pad_x = di_area_pad_x(node)
+    opts.pad_y = di_area_pad_y(node)
+    opts.line_numbers = false                             // the text_area has no gutter
+    opts.highlight_current = false
+    opts.text_color = di_text_color(node, color_rgba(168, 170, 178, 255))
+    var ps = layout_multiline_edit(st, rect, node.size_px, di_focused(node), opts)
+    var i = 0
+    while i < ps.len() { out.prims.push(sink ps[i])  i = i + 1 }
+    if node.disabled { return }
+    var ev = ("text_area_edit:" + node.id)
+    if node.read_only { ev = ("text_area_view:" + node.id) }
+    out.hits.push(HitRegion { id: copy node.id, on_click: ev, rect: rect_dup(rect) })
+}
+
+/// code_editor: the same chrome as text_area, with the gutter and the colours turned on and the
+/// caller's caret/selection/scroll fed into the state instead of a fresh zeroed one.
+///
+/// This is the whole difference between the two widgets, and it is small: everything
+/// underneath is `layout_code_editor` (code_editor.nori), which is itself `layout_multiline_edit`
+/// with per-token text runs.
+fn di_layout_code_editor(inout node: UiNode, rect: Rect, inout out: ComputedOverlay) {
+    var bg = color_rgba(11, 11, 13, 255)
+    if node.has_bg { bg = rgba_color(node.bg) }
+    out.prims.push(pp_rect(rect, bg, node.radius))
+
+    var st = multiline_edit_new(node.value_s)
+    st.tab_size = node.tab_size
+    st.word_wrap = node.word_wrap
+    st.read_only = node.read_only
+    // clamped, because the caller's offsets are attributes and a stale caret from a longer buffer
+    // would index off the end of a freshly-opened shorter one.
+    var n = node.value_s.len()
+    var car = node.caret
+    if car > n { car = n }
+    var anc = node.sel_anchor
+    if anc > n { anc = n }
+    st.caret = car
+    st.sel_anchor = anc
+    st.scroll_y = node.scroll_y
+    st.scroll_x = node.scroll_x
+
+    var opts = multiline_paint_opts()
+    opts.line_numbers = node.line_numbers
+    opts.marks = me_parse_perline(node.gutter_marks)
+    opts.diags = me_parse_diags(node.diags)
+    opts.notes = me_parse_perline(node.line_notes)
+    opts.focus_from = node.focus_from
+    opts.focus_to = node.focus_to
+    opts.highlight_current = node.highlight_line
+    opts.text_color = di_text_color(node, color_rgba(212, 212, 212, 255))
+    var pal = palette_defaults(opts.text_color)
+
+    opts.hot_line = node.hot_line
+    var ps = layout_code_editor(st, rect, node.size_px, di_focused(node), opts, pal, node.language, node.word_wrap)
+    var i = 0
+    while i < ps.len() { out.prims.push(sink ps[i])  i = i + 1 }
+    if node.disabled { return }
+    var ev = ("code_editor_edit:" + node.id)
+    if node.read_only { ev = ("code_editor_view:" + node.id) }
+    out.hits.push(HitRegion { id: copy node.id, on_click: ev, rect: rect_dup(rect) })
+}
+
+/// paint + hit number / text_input / text_area / picker (see nodes_ext.nori).
+fn ui_layout_input(inout node: UiNode, rect: Rect, ctx: LayoutLengthContext, inout out: ComputedOverlay) {
+    var k = node.kind
+    if k == nk_number() { di_layout_number(node, rect, out)  return }
+    if k == nk_text_area() { di_layout_text_area(node, rect, out)  return }
+    if k == nk_code_editor() { di_layout_code_editor(node, rect, out)  return }
+    di_layout_field(node, rect, ctx, out)
+}

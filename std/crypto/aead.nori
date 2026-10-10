@@ -1,0 +1,575 @@
+// AES-GCM (NIST SP 800-38D), at both 128- and 256-bit keys. It is the only symmetric cipher in this
+// library: AES rather than ChaCha20 because a browser has to decrypt what a node sealed, and
+// WebCrypto offers AES-GCM natively but not ChaCha20-Poly1305; shipping a hand-written cipher in
+// JavaScript to avoid that would be the worse trade.
+//
+// The two key lengths share everything below. They differ in how many words the key occupies and
+// therefore how many rounds follow from it, and both numbers are derived rather than passed, so
+// there is no way for a caller to pair a key with the wrong round count.
+//
+// GCM uses the AES forward direction only (CTR mode for the keystream, GHASH for the tag), so
+// there is no inverse cipher here and none is needed. Decryption re-derives the same keystream.
+//
+// This is a straightforward table-and-loop implementation, not a bitsliced one, so its timing
+// depends on S-box cache lines. That is the accepted trade: the code seals a file on the machine
+// that owns it, and an attacker close enough to measure its cache already has the plaintext.
+// A threat model with key-dependent timing (shared hosting, a server sealing for many tenants) would
+// need a different implementation.
+
+frozen global SBOX: [Int] = [
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5,
+    0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0,
+    0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc,
+    0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a,
+    0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0,
+    0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b,
+    0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85,
+    0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5,
+    0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17,
+    0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88,
+    0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c,
+    0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9,
+    0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6,
+    0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e,
+    0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94,
+    0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68,
+    0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16
+]
+
+// Ten, not seven. AES-256 consumes one round constant per eight key words and so never reaches
+// the eighth; AES-128 takes one per four and uses all ten. The last two are where the constant
+// stops being a plain doubling, because 0x80 doubled leaves the byte and is reduced by the AES
+// polynomial: 0x1b, then 0x36.
+frozen global RCON: [Int] = [
+    0x01000000, 0x02000000, 0x04000000, 0x08000000, 0x10000000,
+    0x20000000, 0x40000000, 0x80000000, 0x1b000000, 0x36000000
+]
+
+/// x times 2 in GF(2^8), the AES field.
+fn xt(b: Int) -> Int {
+    let x = (b << 1)
+    if (x & 0x100) != 0 { return ((x ^ 0x1b) & 0xff) }
+    return (x & 0xff)
+}
+
+fn sub_word(w: Int) -> Int {
+    return (((SBOX[((w >> 24) & 0xff)] << 24) | (SBOX[((w >> 16) & 0xff)] << 16))
+          | ((SBOX[((w >> 8) & 0xff)] << 8) | SBOX[(w & 0xff)]))
+}
+
+fn rot_word(w: Int) -> Int { return ((((w << 8) & 0xffffffff)) | ((w >> 24) & 0xff)) }
+
+/// AES key schedule for a 16- or 32-byte key: `4 * (rounds + 1)` round-key words.
+///
+/// One function for both, because the two differ in three numbers and nothing else: how many
+/// words the key occupies (Nk), how many rounds follow from that (Nk + 6), and one extra
+/// substitution that applies only when Nk is greater than 6. Writing the 128-bit case out
+/// separately would duplicate the loop in order to change those numbers.
+fn aes_schedule(key: Str) -> Vec<Int> {
+    let nk = (key.len() / 4)                 // 4 for AES-128, 8 for AES-256
+    let total = ((nk + 7) * 4)               // 4 * (Nr + 1), with Nr = Nk + 6
+    var w: Vec<Int> = vec()
+    var i = 0
+    while i < nk {
+        let p = (i * 4)
+        w.push((((ord(key.at(p)) << 24) | (ord(key.at(p + 1)) << 16))
+              | ((ord(key.at(p + 2)) << 8) | ord(key.at(p + 3)))))
+        i = i + 1
+    }
+    i = nk
+    while i < total {
+        var t = w[i - 1]
+        if (i % nk) == 0 { t = (sub_word(rot_word(t)) ^ RCON[(i / nk) - 1]) }
+        // The `nk > 6` guard cannot fire at Nk = 4 (`i % 4` is never 4), so for the two key
+        // lengths here it is unreachable either way. It is written out because FIPS 197 states
+        // the condition that way and because Nk = 6 (AES-192) is the case where `i % nk == 4`
+        // is reachable and the substitution must still not happen.
+        else { if nk > 6 { if (i % nk) == 4 { t = sub_word(t) } } }
+        w.push(((w[i - nk] ^ t) & 0xffffffff))
+        i = i + 1
+    }
+    return w
+}
+
+// The round, as four table lookups per column.
+//
+// SubBytes, ShiftRows and MixColumns are separate steps in the specification. Done as separate
+// loops they cost sixteen substitutions, a sixteen-byte permutation into a second vector, and four
+// columns of field doublings, with two vectors allocated per block. A block is sixteen bytes and a
+// page of TLS is a hundred thousand of them.
+//
+// The three steps compose into one table per column position, each holding the substituted byte
+// already multiplied by the MixColumns coefficients and rotated to that column's place, so a round
+// is four lookups and three xors per column, on 32-bit words. This is the standard table form; the
+// tables are derived from SBOX rather than written out, because they are SBOX, doubled.
+//
+// The whole state lives in four words instead of two sixteen-element vectors.
+//
+// The tables are a value the caller holds, not a global: a fetch runs in a task, a global read from
+// a task is a data race the compiler refuses, and a lock around every block would cost more than the
+// table saves. One set is built per sealed or opened message (a thousand and twenty-four entries
+// against a record's tens of thousands of lookups) and passed down with the round keys.
+//
+// The four tables are packed into one vector, 256 entries each, so a message carries one value.
+fn aes_tables() -> Vec<Int> {
+    var t: Vec<Int> = vec()
+    var i = 0
+    while i < 256 {
+        let sb = SBOX[i]
+        let s2 = xt(sb)
+        let s3 = (s2 ^ sb)
+        t.push(((((s2 << 24) | (sb << 16)) | (sb << 8)) | s3))
+        i = i + 1
+    }
+    i = 0
+    while i < 256 {
+        let w0 = t[i]
+        t.push(((((w0 >> 8) & 0x00ffffff) | ((w0 & 0xff) << 24))))
+        i = i + 1
+    }
+    i = 0
+    while i < 256 {
+        let w0 = t[i]
+        t.push(((((w0 >> 16) & 0x0000ffff) | ((w0 & 0xffff) << 16))))
+        i = i + 1
+    }
+    i = 0
+    while i < 256 {
+        let w0 = t[i]
+        t.push(((((w0 >> 24) & 0x000000ff) | ((w0 & 0xffffff) << 8))))
+        i = i + 1
+    }
+    return t
+}
+
+/// one AES block. `s` is 16 bytes in input order; index = 4*column + row.
+///
+/// The round count comes from the schedule rather than from a parameter: a schedule holds exactly
+/// 4 * (rounds + 1) words, so it already says how many rounds it is for. Passing the number
+/// alongside would let a caller pass one that disagrees with the key.
+fn aes_block(w: Vec<Int>, t: Vec<Int>, s: Vec<Int>) -> Vec<Int> {
+    let nr = ((w.len() / 4) - 1)             // 10 for AES-128, 14 for AES-256
+    var a0 = (((((s[0] << 24) | (s[1] << 16)) | (s[2] << 8)) | s[3]) ^ w[0])
+    var a1 = (((((s[4] << 24) | (s[5] << 16)) | (s[6] << 8)) | s[7]) ^ w[1])
+    var a2 = (((((s[8] << 24) | (s[9] << 16)) | (s[10] << 8)) | s[11]) ^ w[2])
+    var a3 = (((((s[12] << 24) | (s[13] << 16)) | (s[14] << 8)) | s[15]) ^ w[3])
+    var r = 1
+    while r < nr {
+        let k = (r * 4)
+        let b0 = ((((t[((a0 >> 24) & 0xff)] ^ t[256 + ((a1 >> 16) & 0xff)]) ^ t[512 + ((a2 >> 8) & 0xff)]) ^ t[768 + (a3 & 0xff)]) ^ w[k])
+        let b1 = ((((t[((a1 >> 24) & 0xff)] ^ t[256 + ((a2 >> 16) & 0xff)]) ^ t[512 + ((a3 >> 8) & 0xff)]) ^ t[768 + (a0 & 0xff)]) ^ w[k + 1])
+        let b2 = ((((t[((a2 >> 24) & 0xff)] ^ t[256 + ((a3 >> 16) & 0xff)]) ^ t[512 + ((a0 >> 8) & 0xff)]) ^ t[768 + (a1 & 0xff)]) ^ w[k + 2])
+        let b3 = ((((t[((a3 >> 24) & 0xff)] ^ t[256 + ((a0 >> 16) & 0xff)]) ^ t[512 + ((a1 >> 8) & 0xff)]) ^ t[768 + (a2 & 0xff)]) ^ w[k + 3])
+        a0 = b0  a1 = b1  a2 = b2  a3 = b3
+        r = r + 1
+    }
+    // The last round has no MixColumns, so it is the substitution and the shift alone.
+    let lk = (nr * 4)
+    let c0 = (aes_last(a0, a1, a2, a3) ^ w[lk])
+    let c1 = (aes_last(a1, a2, a3, a0) ^ w[lk + 1])
+    let c2 = (aes_last(a2, a3, a0, a1) ^ w[lk + 2])
+    let c3 = (aes_last(a3, a0, a1, a2) ^ w[lk + 3])
+    var out: Vec<Int> = vec()
+    aes_push_word(out, c0)
+    aes_push_word(out, c1)
+    aes_push_word(out, c2)
+    aes_push_word(out, c3)
+    return out
+}
+// one output column of the final round: each byte substituted, taken from the column ShiftRows
+// would have moved it from.
+fn aes_last(x0: Int, x1: Int, x2: Int, x3: Int) -> Int {
+    return ((((SBOX[((x0 >> 24) & 0xff)] << 24) | (SBOX[((x1 >> 16) & 0xff)] << 16))
+          | ((SBOX[((x2 >> 8) & 0xff)] << 8) | SBOX[(x3 & 0xff)])))
+}
+fn aes_push_word(inout v: Vec<Int>, x: Int) {
+    v.push(((x >> 24) & 0xff))
+    v.push(((x >> 16) & 0xff))
+    v.push(((x >> 8) & 0xff))
+    v.push((x & 0xff))
+}
+
+// GHASH, four bits at a time.
+//
+// The bit-serial field multiply costs 128 rounds per 16-byte block, each round
+// shifting a 128-bit value held as sixteen separate bytes and conditionally xoring another sixteen:
+// roughly four thousand byte operations for every sixteen bytes of TLS record, which on a page
+// of a megabyte and a half was a third of the time spent loading it.
+//
+// This is the windowed form. H is multiplied by each of the sixteen four-bit values once per key
+// (`ghash_key`), and a block then costs 32 table lookups and shifts of two 64-bit words. The tables
+// are [0..15] the low words of H·i, [16..31] the high words, and [32..47] the reduction constants
+// for the four bits that fall off the bottom on each step, all in one vector so a key is one value.
+//
+// The lookups are key-dependent: a table index is the operand's nibble. That is the standard trade every software GCM makes, and the
+// operand here is the ciphertext, which an attacker already has.
+fn ghash_key(h: Vec<Int>) -> Vec<Int> {
+    var t: Vec<Int> = vec()
+    var i = 0
+    while i < 48 { t.push(0)  i = i + 1 }
+    var vh = ghash_be64(h, 0)
+    var vl = ghash_be64(h, 8)
+    t[8] = vl  t[24] = vh
+    i = 4
+    while i > 0 {
+        var r = 0
+        if (vl & 1) != 0 { r = 0xe1000000 }
+        vl = ((vh << 63) | (vl >> 1))
+        vh = ((vh >> 1) ^ (r << 32))
+        t[i] = vl  t[16 + i] = vh
+        i = (i >> 1)
+    }
+    i = 2
+    while i <= 8 {
+        let bh = t[16 + i]
+        let bl = t[i]
+        var j = 1
+        while j < i {
+            t[16 + i + j] = (bh ^ t[16 + j])
+            t[i + j] = (bl ^ t[j])
+            j = j + 1
+        }
+        i = (i * 2)
+    }
+    // x^128 + x^7 + x^2 + x + 1, reduced for each value the low four bits can take.
+    t[32] = 0x0000  t[33] = 0x1c20  t[34] = 0x3840  t[35] = 0x2460
+    t[36] = 0x7080  t[37] = 0x6ca0  t[38] = 0x48c0  t[39] = 0x54e0
+    t[40] = 0xe100  t[41] = 0xfd20  t[42] = 0xd940  t[43] = 0xc560
+    t[44] = 0x9180  t[45] = 0x8da0  t[46] = 0xa9c0  t[47] = 0xb5e0
+    return t
+}
+
+fn ghash_be64(b: Vec<Int>, off: Int) -> Int {
+    var v = 0
+    var i = 0
+    while i < 8 { v = ((v << 8) | (b[off + i] & 0xff))  i = i + 1 }
+    return v
+}
+// byte `i` of the 128-bit value (xh, xl), numbered from the top as GHASH numbers them.
+fn ghash_byte(xh: Int, xl: Int, i: Int) -> Int {
+    if i < 8 { return ((xh >> (56 - i * 8)) & 0xff) }
+    return ((xl >> (120 - i * 8)) & 0xff)
+}
+/// Z := Z * H, both held as a high and a low 64-bit word.
+fn ghash_mul_words(t: Vec<Int>, inout zh: Int, inout zl: Int) {
+    let xh = zh
+    let xl = zl
+    var nh = t[16 + (xl & 0xf)]
+    var nl = t[(xl & 0xf)]
+    var i = 15
+    while i >= 0 {
+        let b = ghash_byte(xh, xl, i)
+        if i != 15 {
+            let r1 = (nl & 0xf)
+            nl = ((nh << 60) | (nl >> 4))
+            nh = (nh >> 4)
+            nh = (nh ^ (t[32 + r1] << 48))
+            nh = (nh ^ t[16 + (b & 0xf)])
+            nl = (nl ^ t[(b & 0xf)])
+        }
+        let r2 = (nl & 0xf)
+        nl = ((nh << 60) | (nl >> 4))
+        nh = (nh >> 4)
+        nh = (nh ^ (t[32 + r2] << 48))
+        nh = (nh ^ t[16 + ((b >> 4) & 0xf)])
+        nl = (nl ^ t[((b >> 4) & 0xf)])
+        i = i - 1
+    }
+    zh = nh
+    zl = nl
+}
+// `data[from..to]` hashed into the state, the last block zero-padded, which is the padding
+// GCM specifies between the additional data, the ciphertext and the lengths.
+fn ghash_run(t: Vec<Int>, st: Vec<Int>, data: Vec<Int>, from: Int, to: Int) -> Vec<Int> {
+    var zh = st[0]
+    var zl = st[1]
+    var off = from
+    while off < to {
+        var bh = 0
+        var bl = 0
+        var i = 0
+        while i < 8 {
+            var c = 0
+            if (off + i) < to { c = (data[off + i] & 0xff) }
+            bh = ((bh << 8) | c)
+            i = i + 1
+        }
+        while i < 16 {
+            var c = 0
+            if (off + i) < to { c = (data[off + i] & 0xff) }
+            bl = ((bl << 8) | c)
+            i = i + 1
+        }
+        zh = (zh ^ bh)
+        zl = (zl ^ bl)
+        ghash_mul_words(t, zh, zl)
+        off = off + 16
+    }
+    var out: Vec<Int> = vec()
+    out.push(zh)  out.push(zl)
+    return out
+}
+// The final block: the two lengths, in bits.
+fn ghash_lens(t: Vec<Int>, st: Vec<Int>, aadBits: Int, ctBits: Int) -> Vec<Int> {
+    var zh = (st[0] ^ aadBits)
+    var zl = (st[1] ^ ctBits)
+    ghash_mul_words(t, zh, zl)
+    var out: Vec<Int> = vec()
+    out.push(zh)  out.push(zl)
+    return out
+}
+fn ghash_start() -> Vec<Int> {
+    var st: Vec<Int> = vec()
+    st.push(0)  st.push(0)
+    return st
+}
+// the state as the sixteen bytes GCM hands to the tag.
+fn ghash_out(st: Vec<Int>) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    var i = 0
+    while i < 8 { out.push(((st[0] >> (56 - i * 8)) & 0xff))  i = i + 1 }
+    i = 0
+    while i < 8 { out.push(((st[1] >> (56 - i * 8)) & 0xff))  i = i + 1 }
+    return out
+}
+
+fn bytes_of(s: Str) -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    var i = 0
+    let n = s.len()
+    while i < n { v.push(ord(s.at(i)))  i = i + 1 }
+    return v
+}
+
+/// Vec<Int> of bytes back to a byte Str, assembled in 256-byte pieces so this stays linear
+/// instead of copying the whole accumulator once per byte.
+fn str_of(v: Vec<Int>) -> Str {
+    var out = ""
+    var piece = ""
+    var i = 0
+    let n = v.len()
+    while i < n {
+        piece = (piece + chr((v[i] & 0xff)))
+        if (piece.len() >= 256) { out = (out + piece)  piece = "" }
+        i = i + 1
+    }
+    if (piece.len() > 0) { out = (out + piece) }
+    return out
+}
+
+fn zeros(n: Int) -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    var i = 0
+    while i < n { v.push(0)  i = i + 1 }
+    return v
+}
+
+/// counter block, 32-bit big-endian increment of the low word
+fn inc32(cb: Vec<Int>) -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    var i = 0
+    while i < 16 { v.push(cb[i])  i = i + 1 }
+    var j = 15
+    var carry = 1
+    while j >= 12 {
+        let t = (v[j] + carry)
+        v[j] = (t & 0xff)
+        if t > 255 { carry = 1 } else { carry = 0 }
+        j = j - 1
+    }
+    return v
+}
+
+/// CTR-mode keystream over `data`, starting at counter block `cb`.
+fn gctr(w: Vec<Int>, t: Vec<Int>, cb: Vec<Int>, data: Vec<Int>) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    var ctr: Vec<Int> = vec()
+    var i = 0
+    while i < 16 { ctr.push(cb[i])  i = i + 1 }
+    var off = 0
+    let n = data.len()
+    while off < n {
+        let ks = aes_block(w, t, ctr)
+        i = 0
+        while i < 16 {
+            if (off + i) < n { out.push(((data[off + i] ^ ks[i]) & 0xff)) }
+            i = i + 1
+        }
+        ctr = inc32(ctr)
+        off = off + 16
+    }
+    return out
+}
+
+/// append `x` as 8 big-endian bytes. `inout` because appending to a parameter bound by value
+/// would push into a view of the caller's vector and be rejected.
+fn gcm_core(key: Str, nonce: Str, aad: Str, data: Vec<Int>, seal: Bool) -> Vec<Int> {
+    let w = aes_schedule(key)
+    let t = aes_tables()
+    let h = aes_block(w, t, zeros(16))
+
+    var j0: Vec<Int> = vec()
+    var i = 0
+    while i < 12 { j0.push(ord(nonce.at(i)))  i = i + 1 }
+    j0.push(0) j0.push(0) j0.push(0) j0.push(1)
+
+    // Ownership of the ciphertext vector is decided here, statically, which is why this function is
+    // split in two. Written as one body (`let ct = if seal { gctr(…) } else { data }`), whether `ct`
+    // belonged to this frame or to the caller would be a property of the run, and no
+    // whole-program rule can free a handle that is sometimes a borrow, so the sealing path would
+    // strand the entire keystream, eight bytes per ciphertext byte, once per
+    // record. Here the sealing path owns what it just made and drops it at the end of this scope;
+    // the opening path reads the caller's vector and owns nothing. `gcm_tail` only ever reads `ct`.
+    if seal {
+        let ct = gctr(w, t, inc32(j0), data)
+        return gcm_tail(w, t, h, j0, aad, ct, true)
+    }
+    return gcm_tail(w, t, h, j0, aad, data, false)
+}
+
+// S = GHASH(A ‖ pad ‖ C ‖ pad ‖ len(A)*8 ‖ len(C)*8), then the tag, then the record body.
+fn gcm_tail(w: Vec<Int>, t2: Vec<Int>, h: Vec<Int>, j0: Vec<Int>, aad: Str, ct: Vec<Int>, seal: Bool) -> Vec<Int> {
+    // Hashed where the bytes already are. Copying the additional data, the ciphertext and the
+    // padding into one accumulator first would mean a second copy of every record before a byte of it
+    // is hashed, and a record is sixteen kilobytes.
+    let t = ghash_key(h)
+    let ab = bytes_of(aad)
+    var i = 0
+    var st = ghash_start()
+    st = ghash_run(t, st, ab, 0, ab.len())
+    st = ghash_run(t, st, ct, 0, ct.len())
+    st = ghash_lens(t, st, (ab.len() * 8), (ct.len() * 8))
+    let s = ghash_out(st)
+    let e0 = aes_block(w, t2, j0)
+
+    var tag: Vec<Int> = vec()
+    i = 0
+    while i < 16 { tag.push(((s[i] ^ e0[i]) & 0xff))  i = i + 1 }
+
+    var out: Vec<Int> = vec()
+    if seal {
+        i = 0
+        while i < ct.len() { out.push(ct[i])  i = i + 1 }
+        i = 0
+        while i < 16 { out.push(tag[i])  i = i + 1 }
+    } else {
+        i = 0
+        while i < 16 { out.push(tag[i])  i = i + 1 }
+    }
+    return out
+}
+
+// The seal/open bodies below, with the key length already checked. AES-128 and AES-256 differ
+// only in that check: GCM itself does not care how many rounds the block cipher ran.
+fn gcm_seal_checked(key: Str, nonce: Str, aad: Str, plain: Str) -> Str {
+    if nonce.len() != 12 { return "" }
+    return str_of(gcm_core(key, nonce, aad, bytes_of(plain), true))
+}
+/// does `sealed` carry a tag that verifies under this key/nonce/aad? The authenticity question on
+/// its own, so a caller can tell a forgery from an authentic empty plaintext.
+fn gcm_tag_ok(key: Str, nonce: Str, aad: Str, sealed: Str) -> Bool {
+    if nonce.len() != 12 { return false }
+    if sealed.len() < 16 { return false }
+    let all = bytes_of(sealed)
+    var ct: Vec<Int> = vec()
+    var i = 0
+    let ctlen = (all.len() - 16)
+    while i < ctlen { ct.push(all[i])  i = i + 1 }
+    let want = gcm_core(key, nonce, aad, ct, false)
+    var same = 0
+    i = 0
+    while i < 16 { same = (same | (want[i] ^ all[ctlen + i]))  i = i + 1 }   // constant-time: always all 16
+    return same == 0
+}
+
+fn gcm_open_checked(key: Str, nonce: Str, aad: Str, sealed: Str) -> Str {
+    if nonce.len() != 12 { return "" }
+    if sealed.len() < 16 { return "" }
+    let all = bytes_of(sealed)
+    var ct: Vec<Int> = vec()
+    var i = 0
+    let ctlen = (all.len() - 16)
+    while i < ctlen { ct.push(all[i])  i = i + 1 }
+
+    let want = gcm_core(key, nonce, aad, ct, false)
+    var same = 0
+    i = 0
+    while i < 16 { same = (same | (want[i] ^ all[ctlen + i]))  i = i + 1 }
+    if same != 0 { return "" }        // constant-time: every byte is compared, always
+
+    let w = aes_schedule(key)
+    let t = aes_tables()
+    var j0: Vec<Int> = vec()
+    i = 0
+    while i < 12 { j0.push(ord(nonce.at(i)))  i = i + 1 }
+    j0.push(0) j0.push(0) j0.push(0) j0.push(1)
+    return str_of(gctr(w, t, inc32(j0), ct))
+}
+
+/// Seal `plain` under a 32-byte `key` and a 12-byte `nonce`, authenticating `aad` alongside it.
+/// Returns ciphertext ‖ 16-byte tag, or "" if the key or nonce is the wrong length.
+///
+/// A nonce must never repeat under one key. Reusing one in GCM does not degrade the cipher, it
+/// breaks it: two messages sealed under the same nonce XOR to their plaintexts, and the
+/// authentication key becomes recoverable. Derive nonces, do not pick them.
+pub fn aes256_gcm_seal(key: Str, nonce: Str, aad: Str, plain: Str) -> Str {
+    if key.len() != 32 { return "" }
+    return gcm_seal_checked(key, nonce, aad, plain)
+}
+
+/// Open what `aes256_gcm_seal` produced. Returns the plaintext, or "" if the tag does not
+/// verify, meaning the input was altered, truncated, sealed under a different key or nonce, or
+/// carried different `aad`.
+///
+/// "" is ambiguous: an authentic empty plaintext opens to "" as well, so this cannot distinguish
+/// "the sender sent nothing" from "someone forged this". For an authenticated cipher that
+/// distinction is the entire point, so use `try_aes256_gcm_open`, which returns Err only for a real
+/// authentication failure.
+pub fn aes256_gcm_open(key: Str, nonce: Str, aad: Str, sealed: Str) -> Str {
+    if key.len() != 32 { return "" }
+    return gcm_open_checked(key, nonce, aad, sealed)
+}
+
+/// Open what `aes256_gcm_seal` produced, reporting authentication failure as Err.
+///
+/// Prefer this over `aes256_gcm_open`. An AEAD's job is to answer "is this genuine?", and a plain
+/// Str cannot carry that answer when the plaintext may legitimately be empty.
+pub fn try_aes256_gcm_open(key: Str, nonce: Str, aad: Str, sealed: Str) -> Result<Str> {
+    if key.len() != 32 { return Result::Err("aes256-gcm: the key must be 32 bytes") }
+    if nonce.len() != 12 { return Result::Err("aes256-gcm: the nonce must be 12 bytes") }
+    if sealed.len() < 16 { return Result::Err("aes256-gcm: the input is too short to carry a tag") }
+    if !gcm_tag_ok(key, nonce, aad, sealed) { return Result::Err("aes256-gcm: authentication failed") }
+    return Result::Ok(gcm_open_checked(key, nonce, aad, sealed))
+}
+
+/// AES-128-GCM seal: a 16-byte `key`, a 12-byte `nonce`, ciphertext ‖ 16-byte tag.
+///
+/// Here because TLS 1.3 makes `TLS_AES_128_GCM_SHA256` mandatory to implement, so a client that
+/// offers only AES-256 will meet servers it cannot talk to. The nonce rule from `aes256_gcm_seal`
+/// applies unchanged and matters more, not less: a 128-bit key does not make a repeated nonce
+/// any less fatal.
+pub fn aes128_gcm_seal(key: Str, nonce: Str, aad: Str, plain: Str) -> Str {
+    if key.len() != 16 { return "" }
+    return gcm_seal_checked(key, nonce, aad, plain)
+}
+
+/// Open what `aes128_gcm_seal` produced, or "" if the tag does not verify.
+pub fn aes128_gcm_open(key: Str, nonce: Str, aad: Str, sealed: Str) -> Str {
+    if key.len() != 16 { return "" }
+    return gcm_open_checked(key, nonce, aad, sealed)
+}

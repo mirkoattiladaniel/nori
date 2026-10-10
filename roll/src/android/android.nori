@@ -1,0 +1,483 @@
+// roll: Android, turning a `kind = bin` project into an installable APK.
+//
+// One directory module of roll (see src/main.nori for the layout).
+//
+// The target decides the artifact, not the manifest. The same project, unchanged, is a program on a
+// desktop and an app on a phone, so there is no `kind = app` and nothing in a manifest has to say
+// "this is for Android". `roll build --target aarch64-linux-android24` is the whole difference.
+//
+// What an app needs beyond an ordinary cross build is small: it is a shared library rather than an
+// executable, it carries the NativeActivity glue that gives the Nori program a thread of its own,
+// and it is packaged and signed. aapt2, zipalign and apksigner do the parts that need the SDK; the
+// zip step is std/archive, so nothing outside the SDK is required.
+
+import "std/os" as os
+import "std/strutil" as strutil
+import "std/archive" as archive
+import "../ui" as ui
+
+/// is this triple an Android one? (the same answer `cfg(android)` gives)
+pub fn is_android(triple: Str) -> Bool { return strutil::contains(triple, "android") }
+
+/// the ABI directory an APK wants for a triple (Android names these; the triple does not).
+pub fn abi_of(triple: Str) -> Str {
+    if strutil::contains(triple, "aarch64") { return "arm64-v8a" }
+    if strutil::contains(triple, "arm64") { return "arm64-v8a" }
+    if strutil::contains(triple, "x86_64") { return "x86_64" }
+    if strutil::contains(triple, "i686") { return "x86" }
+    if strutil::contains(triple, "arm") { return "armeabi-v7a" }
+    return "arm64-v8a"
+}
+
+fn env_first(a: Str, b: Str, dflt: Str) -> Str {
+    let x = os::env_or(a, "")
+    if !(x == "") { return x }
+    let y = os::env_or(b, "")
+    if !(y == "") { return y }
+    return copy dflt
+}
+/// the Android SDK root (ANDROID_HOME / ANDROID_SDK_ROOT).
+pub fn sdk_root() -> Str { return env_first("ANDROID_HOME", "ANDROID_SDK_ROOT", (os::env_or("HOME", "") + "/Android/sdk")) }
+
+// a > b, byte by byte. Nori does not order Str with `>`; the names compared here have the same
+// shape, so the later version is the greater string.
+fn str_gt(a: Str, b: Str) -> Bool {
+    let n = if a.len() < b.len() { a.len() } else { b.len() }
+    var i = 0
+    while i < n {
+        let x = ord(a.at(i))
+        let y = ord(b.at(i))
+        if x != y { return x > y }
+        i = i + 1
+    }
+    return a.len() > b.len()
+}
+// The newest entry of a versioned SDK directory (build-tools/34.0.0, platforms/android-34). Highest
+// name wins: these share a prefix and a shape, so ordering by name orders them by version.
+fn newest_in(dir: Str) -> Str {
+    if !os::path_exists(dir) { return "" }
+    let names = os::read_dir(dir)
+    var best = ""
+    var i = 0
+    while i < names.len() {
+        let n = names[i]
+        if !(n == ".") { if !(n == "..") { if str_gt(n, best) { best = n } } }
+        i = i + 1
+    }
+    if (best == "") { return "" }
+    return (dir + ("/" + best))
+}
+
+/// the flags that make a build an app rather than a program. `-fPIC` is a compile flag (every object
+/// in a shared library needs one) and `-shared` is a link flag (only the final link is one); they
+/// cannot travel together, because the C-interop glue is combined with `clang -r` and `-r` refuses
+/// to sit beside `-shared`.
+pub fn add_app_flags(inout cmd: Vec<Str>, nori_home: Str) {
+    cmd.push("--ccflag")  cmd.push("-fPIC")
+    cmd.push("--ldflag")  cmd.push("-shared")
+    // The activity glue: what gives the Nori program its own thread and turns Android's callbacks
+    // into the window backend's state. A manifest's [native.android] names the window backend; this
+    // is added here because an app always needs it and a manifest should not have to know that.
+    cmd.push("--cfile")  cmd.push((nori_home + "/std/window/android_native_activity.c"))
+    cmd.push("--clink")  cmd.push("android")
+    cmd.push("--clink")  cmd.push("log")
+}
+
+// `android:hasCode="false"` is what lets an APK carry no Java at all. `android.app.lib_name` is the
+// library without its lib prefix and .so suffix, and a mismatch there is a runtime "Unable to load
+// native library" rather than any sort of build error.
+// Extra permissions a project needs, from NORI_APK_PERMISSIONS: a comma-separated list of bare
+// names ("REQUEST_INSTALL_PACKAGES"). INTERNET is always included; everything else is requested
+// by name, because a permission a reader cannot see in the manifest is one nobody can audit.
+fn extra_permissions() -> Str {
+    let raw = os::env_or("NORI_APK_PERMISSIONS", "")
+    if raw == "" { return "" }
+    var out = ""
+    var cur = ""
+    var i = 0
+    while i <= raw.len() {
+        var ch = ","
+        if i < raw.len() { ch = raw.slice(i, i + 1) }
+        if ch == "," {
+            let name = strutil::trim(cur)
+            if !(name == "") && !(name == "INTERNET") {
+                out = out + ("    <uses-permission android:name=\"android.permission." + (name + "\" />\n"))
+            }
+            cur = ""
+        } else { cur = cur + ch }
+        i = i + 1
+    }
+    return out
+}
+
+/// Split a comma-separated manifest value into trimmed, non-empty entries.
+fn split_list(spec: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var cur = ""
+    var i = 0
+    while i <= spec.len() {
+        var ch = ","
+        if i < spec.len() { ch = spec.slice(i, i + 1) }
+        if ch == "," {
+            let t = strutil::trim(cur)
+            if !(t == "") { out.push(t) }
+            cur = ""
+        } else { cur = cur + ch }
+        i = i + 1
+    }
+    return out
+}
+
+/// Split on newlines, dropping empties; the permission block is built a line at a time.
+fn split_list_nl(spec: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var cur = ""
+    var i = 0
+    while i <= spec.len() {
+        var ch = "\n"
+        if i < spec.len() { ch = spec.slice(i, i + 1) }
+        if ch == "\n" {
+            if !(strutil::trim(cur) == "") { out.push(cur) }
+            cur = ""
+        } else { cur = cur + ch }
+        i = i + 1
+    }
+    return out
+}
+/// "android.permission.FOO" out of a <uses-permission> line, for comparing two of them.
+fn perm_name_of(line: Str) -> Str {
+    let k = strutil::index_of(line, "android.permission.")
+    if k < 0 { return copy line }
+    var j = k
+    while j < line.len() && !(line.slice(j, j + 1) == "\"") { j = j + 1 }
+    return line.slice(k, j)
+}
+
+fn manifest_xml(pkg: Str, label: Str, has_code: Bool, app_extra: Str, extra_perms: Str) -> Str {
+    var x = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+    x = x + ("<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" package=\"" + (pkg + "\">\n"))
+    x = x + "    <uses-permission android:name=\"android.permission.INTERNET\" />\n"
+    let asked = extra_permissions()
+    x = x + asked
+    // Only what is not already there. A program may have named these itself, and a manifest
+    // listing the same permission twice reads like a mistake even though Android tolerates it.
+    var pi = 0
+    let plines = split_list_nl(extra_perms)
+    while pi < plines.len() {
+        if !strutil::contains(asked, perm_name_of(plines[pi])) { x = x + (plines[pi] + "\n") }
+        pi = pi + 1
+    }
+    // hasCode="false" is what lets an APK carry no Java at all, and it is wrong the moment one
+    // does: the loader skips classes.dex entirely and every class in it is not found at runtime.
+    var code = "false"
+    if has_code { code = "true" }
+    x = x + ("    <application android:label=\"" + (label + ("\" android:hasCode=\"" + (code + "\">\n"))))
+    x = x + ("        <activity android:name=\"android.app.NativeActivity\" android:label=\"" + (label + "\"\n"))
+    x = x + "                  android:configChanges=\"orientation|keyboardHidden|screenSize\"\n"
+    x = x + "                  android:exported=\"true\">\n"
+    x = x + "            <meta-data android:name=\"android.app.lib_name\" android:value=\"noriapp\" />\n"
+    x = x + "            <intent-filter>\n"
+    x = x + "                <action android:name=\"android.intent.action.MAIN\" />\n"
+    x = x + "                <category android:name=\"android.intent.category.LAUNCHER\" />\n"
+    x = x + "            </intent-filter>\n"
+    x = x + "        </activity>\n"
+    // Anything else the program needs inside <application>: a service, a receiver, a provider.
+    // Copied as given, since this is the app's own XML.
+    if !(app_extra == "") { x = x + (app_extra + "\n") }
+    x = x + "    </application>\n</manifest>\n"
+    return x
+}
+
+/// Check the build produced what Android will try to load. A compiler that does not understand
+/// `--ldflag` ignores it, links an executable instead of a shared library and reports success; the
+/// APK then installs and dies at launch with "Unable to load native library". Neither the build nor
+/// the packaging would complain, so the artifact itself is checked. "" when it is fine.
+pub fn verify_app_so(so_path: Str) -> Str {
+    if !os::path_exists(so_path) { return "the library was not produced" }
+    let b = read_file(so_path)
+    if b.len() < 18 { return "the library is too small to be an ELF object" }
+    // e_type, a little-endian u16 at offset 16. ET_DYN = 3; an executable is ET_EXEC = 2. A PIE is
+    // ET_DYN too, which is why the entry point is checked as well as the type.
+    let et = ord(b.at(16)) | (ord(b.at(17)) << 8)
+    if !(et == 3) { return "a program, not a shared library — does this noric support --ldflag?" }
+    if !strutil::contains(b, "ANativeActivity_onCreate") { return "no ANativeActivity_onCreate — is the activity glue compiled in?" }
+    return ""
+}
+
+/// Package a built `.so` into a signed, installable APK. 0 on success.
+///
+/// aapt2 -> add the library -> zipalign -> apksigner. No d8 and no javac, because there is no Java:
+/// the activity is a platform class. The library goes in uncompressed: the loader maps it straight
+/// out of the APK, which it can only do for stored bytes; a deflated one installs and then fails at
+/// launch. std/archive does that step, so the only tools needed are the SDK's own.
+/// Compile the program's Java to a classes.dex, or "" when it has none.
+///
+/// A Nori program needs no Java, and almost none want any: the point of hasCode="false" is an APK
+/// with no runtime, no dex and nothing to verify at install. But some things on Android are not
+/// reachable from native code: anything that has to run when the app is not running (a JobService,
+/// a BroadcastReceiver) is started by the framework, and the framework starts classes. There is no
+/// C entry point for "wake up in six hours".
+///
+/// So this is a seam, not a platform: name .java files in the manifest and they are compiled with
+/// the SDK's own javac and d8 and dropped in beside the .so. Name none, and nothing here runs and
+/// the APK stays dex-free.
+fn build_dex(java_spec: Str, work: Str, plat: Str, bt: Str) -> Str {
+    let files = split_list(java_spec)
+    if files.len() == 0 { return "" }
+
+    let classes = (work + "/classes")
+    os::make_dir_p(classes)
+    var jc: Vec<Str> = vec()
+    jc.push("javac")
+    // --release, not -source/-target: it also restricts the JDK API surface, so a class that
+    // reaches for something newer than the phone has fails here rather than at run time on a
+    // device the developer does not own.
+    jc.push("--release")  jc.push("8")
+    jc.push("-classpath")  jc.push((plat + "/android.jar"))
+    jc.push("-d")  jc.push(copy classes)
+    var i = 0
+    while i < files.len() { jc.push(copy files[i])  i = i + 1 }
+    if os::run_silent(jc) != 0 { ui::eprintl("javac failed")  return "FAIL" }
+
+    // d8 takes archives, not directories, so the classes go through a jar on the way. `jar` ships
+    // with the same JDK as javac, so anything that could compile can package.
+    let jar = (work + "/classes.jar")
+    var ja: Vec<Str> = vec()
+    ja.push("jar")  ja.push("--create")  ja.push("--file")  ja.push(copy jar)
+    ja.push("-C")  ja.push(copy classes)  ja.push(".")
+    if os::run_silent(ja) != 0 { ui::eprintl("jar failed")  return "FAIL" }
+
+    var dc: Vec<Str> = vec()
+    dc.push((bt + "/d8"))
+    dc.push("--lib")  dc.push((plat + "/android.jar"))
+    dc.push("--min-api")  dc.push("24")
+    dc.push("--output")  dc.push(copy work)
+    dc.push(copy jar)
+    if os::run_silent(dc) != 0 { ui::eprintl("d8 failed")  return "FAIL" }
+    return (work + "/classes.dex")
+}
+
+/* What `background = true` adds, so that a program asking to be woken needs to know none of it:
+   the generic job class, the service declaration that lets the framework start it, and the two
+   permissions JobScheduler insists on. ACCESS_NETWORK_STATE is the one nobody expects — a job with
+   a connectivity constraint is REFUSED without it, by throwing, which is easily swallowed into a
+   background check that simply never runs. */
+fn bg_service_xml() -> Str {
+    var x = "        <!-- roll: background = true. Started by the framework, which is the whole
+"
+    x = x + "             reason this class exists; BIND_JOB_SERVICE is what allows only the
+"
+    x = x + "             system to start it. -->
+"
+    x = x + "        <service android:name=\"nori.bg.NoriJob\"
+"
+    x = x + "                 android:permission=\"android.permission.BIND_JOB_SERVICE\"
+"
+    x = x + "                 android:exported=\"false\" />
+"
+    return x
+}
+fn bg_permissions() -> Str {
+    var x = "    <uses-permission android:name=\"android.permission.RECEIVE_BOOT_COMPLETED\" />
+"
+    x = x + "    <uses-permission android:name=\"android.permission.ACCESS_NETWORK_STATE\" />
+"
+    return x
+}
+
+/// Shared libraries the program links but does not build: they have to travel inside the APK,
+/// under lib/<abi>/, because an Android app can load nothing from outside its own package.
+///
+/// Named as a directory holding one subdirectory per ABI, which is how Android build systems
+/// arrange these and so what a build script will already have produced.
+fn add_jni_libs(apk: Str, dir: Str, abi: Str) -> Str {
+    if dir == "" { return copy apk }
+    let from = (dir + ("/" + abi))
+    if !os::path_exists(from) { return copy apk }
+    var out = apk
+    let names = os::read_dir(from)
+    var i = 0
+    while i < names.len() {
+        let nm = names[i]
+        if strutil::ends_with(nm, ".so") {
+            out = archive::zip_add_stored(out, ("lib/" + (abi + ("/" + nm))), read_file((from + ("/" + nm))))
+            if out.len() == 0 { ui::eprintl(("could not add " + (nm + " to the APK")))  return "" }
+            ui::eprintl(("    bundled lib/" + (abi + ("/" + nm))))
+        }
+        i = i + 1
+    }
+    return copy out
+}
+
+pub fn package_apk(so_path: Str, out_apk: Str, pkg: Str, label: Str, abi: Str, work: Str,
+                   java_spec: Str, app_extra_path: Str, background: Bool, nori_home: Str,
+                   jni_dir: Str) -> Int {
+    let sdk = sdk_root()
+    let bt = newest_in((sdk + "/build-tools"))
+    let plat = newest_in((sdk + "/platforms"))
+    if (bt == "") { ui::eprintl(("no build-tools under " + (sdk + " — set ANDROID_HOME")))  return 1 }
+    if (plat == "") { ui::eprintl(("no platform under " + (sdk + " — set ANDROID_HOME")))  return 1 }
+
+    let bad = verify_app_so(so_path)
+    if !(bad == "") { ui::eprintl(("cannot package: " + bad))  return 1 }
+
+    os::make_dir_p(work)
+
+    var java_all = java_spec
+    var perms = ""
+    if background {
+        // The program named no Java and will never see this file. It is the same class in every
+        // program that asks; nothing in it is specific to any of them.
+        let noribg = (nori_home + "/std/background/NoriJob.java")
+        if java_all == "" { java_all = copy noribg } else { java_all = (java_all + ("," + noribg)) }
+        perms = bg_permissions()
+    }
+
+    let dex = build_dex(java_all, work, plat, bt)
+    if dex == "FAIL" { return 1 }
+
+    var app_extra = ""
+    if !(app_extra_path == "") {
+        if !os::path_exists(app_extra_path) {
+            ui::eprintl(("manifest_application names a file that is not there: " + app_extra_path))
+            return 1
+        }
+        app_extra = read_file(app_extra_path)
+    }
+
+    if background { app_extra = (app_extra + bg_service_xml()) }
+
+    let mfp = (work + "/AndroidManifest.xml")
+    write_file(mfp, manifest_xml(pkg, label, !(dex == ""), app_extra, perms))
+
+    var c1: Vec<Str> = vec()
+    c1.push((bt + "/aapt2"))  c1.push("link")  c1.push("-o")  c1.push((work + "/base.apk"))
+    c1.push("-I")  c1.push((plat + "/android.jar"))
+    c1.push("--manifest")  c1.push(mfp)
+    c1.push("--min-sdk-version")  c1.push("24")
+    c1.push("--target-sdk-version")  c1.push("34")
+    if os::run_silent(c1) != 0 { ui::eprintl("aapt2 link failed")  return 1 }
+
+    var withlib = archive::zip_add_stored(read_file((work + "/base.apk")), ("lib/" + (abi + "/libnoriapp.so")), read_file(so_path))
+    if withlib.len() == 0 { ui::eprintl("aapt2 did not produce a readable APK")  return 1 }
+    if !(dex == "") {
+        withlib = archive::zip_add_stored(withlib, "classes.dex", read_file(dex))
+        if withlib.len() == 0 { ui::eprintl("could not add classes.dex to the APK")  return 1 }
+    }
+    withlib = add_jni_libs(withlib, jni_dir, abi)
+    if withlib.len() == 0 { return 1 }
+    write_file((work + "/withlib.apk"), withlib)
+
+    var c3: Vec<Str> = vec()
+    c3.push((bt + "/zipalign"))  c3.push("-p")  c3.push("-f")  c3.push("4")
+    c3.push((work + "/withlib.apk"))  c3.push((work + "/aligned.apk"))
+    if os::run_silent(c3) != 0 { ui::eprintl("zipalign failed")  return 1 }
+
+    // A debug key, made once. An APK must be signed to install at all, so refusing until a key is
+    // configured would leave `roll build --target android` with nothing usable.
+    let ks = os::env_or("NORI_APK_KEYSTORE", (os::env_or("HOME", "") + "/.nori/android-debug.keystore"))
+    if !os::path_exists(ks) {
+        os::make_dir_p(dirname_of(ks))
+        var kc: Vec<Str> = vec()
+        kc.push("keytool")  kc.push("-genkeypair")  kc.push("-keystore")  kc.push(copy ks)
+        kc.push("-alias")  kc.push("nori")  kc.push("-keyalg")  kc.push("RSA")  kc.push("-keysize")  kc.push("2048")
+        kc.push("-validity")  kc.push("10000")
+        kc.push("-storepass")  kc.push("norinori")  kc.push("-keypass")  kc.push("norinori")
+        kc.push("-dname")  kc.push("CN=Nori, OU=Dev, O=Nori, L=X, S=X, C=XX")
+        if os::run_silent(kc) != 0 { ui::eprintl("keytool could not create a debug keystore")  return 1 }
+    }
+
+    var c4: Vec<Str> = vec()
+    c4.push((bt + "/apksigner"))  c4.push("sign")
+    c4.push("--ks")  c4.push(copy ks)
+    c4.push("--ks-pass")  c4.push("pass:norinori")
+    c4.push("--key-pass")  c4.push("pass:norinori")
+    c4.push("--out")  c4.push(copy out_apk)
+    c4.push((work + "/aligned.apk"))
+    if os::run_silent(c4) != 0 { ui::eprintl("apksigner failed")  return 1 }
+    return 0
+}
+
+fn dirname_of(p: Str) -> Str {
+    var i = p.len() - 1
+    while i >= 0 { if ord(p.at(i)) == 47 { return p.slice(0, i) }  i = i - 1 }
+    return "."
+}
+
+/// the `adb` binary: the SDK's platform-tools copy, else whatever $PATH has.
+pub fn adb_bin() -> Str {
+    let p = (sdk_root() + "/platform-tools/adb")
+    if os::path_exists(p) { return p }
+    return "adb"
+}
+
+/// Is a device attached and ready? `adb get-state` answers 0 only for a device in the `device`
+/// state, so an unauthorized phone or one still booting reads as absent rather than as ready.
+/// That is what the caller wants, since a push to either of those fails halfway.
+pub fn device_ready() -> Bool {
+    var q: Vec<Str> = vec()
+    q.push(adb_bin())  q.push("get-state")
+    return os::run_silent(q) == 0
+}
+
+/// `roll run --device`: push a built Android executable to the phone and run it there.
+///
+/// This is for the static, libc-free binary an Android cross build produces, not for an APK: it goes
+/// to /data/local/tmp, the one place adb may write and execute without installing anything.
+/// Each program gets a directory of its own under it so a program that writes beside itself does not
+/// tread on the last one, and the directory is removed afterwards so nothing is left on the phone.
+///
+/// The program's exit status comes back as this function's: `adb shell` forwards it as of
+/// platform-tools 1.0.41, so nothing has to be passed through stdout.
+pub fn run_on_device(bin: Str, name: Str, args: Vec<Str>) -> Int {
+    let adb = adb_bin()
+    if !device_ready() {
+        ui::eprintl("roll: --device: no device attached (check `adb devices`; `adb kill-server` if it hangs)")
+        return 1
+    }
+    let dir = ("/data/local/tmp/nori/" + name)
+    var mk: Vec<Str> = vec()
+    mk.push(copy adb)  mk.push("shell")  mk.push(("rm -rf " + (dir + ("; mkdir -p " + dir))))
+    if os::run_silent(mk) != 0 { ui::eprintl("roll: --device: could not make " + dir + " on the device")  return 1 }
+    var pu: Vec<Str> = vec()
+    pu.push(copy adb)  pu.push("push")  pu.push(copy bin)  pu.push((dir + "/" + name))
+    if os::run_silent(pu) != 0 { ui::eprintl("roll: --device: pushing " + bin + " failed")  return 1 }
+    var ch: Vec<Str> = vec()
+    ch.push(copy adb)  ch.push("shell")  ch.push(("chmod 755 " + (dir + ("/" + name))))
+    let _c = os::run_silent(ch)
+    // the arguments are appended to one shell line, which is all `adb shell` accepts; an argument
+    // with a space in it would split, so it is quoted here rather than left to the device's shell
+    var line = ("cd " + (dir + (" && ./" + name)))
+    var ai = 0
+    while ai < args.len() { line = (line + (" '" + (args[ai] + "'")))  ai = ai + 1 }
+    var rn: Vec<Str> = vec()
+    rn.push(copy adb)  rn.push("shell")  rn.push(copy line)
+    let rc = os::run(rn)
+    var rm: Vec<Str> = vec()
+    rm.push(copy adb)  rm.push("shell")  rm.push(("rm -rf " + dir))
+    let _r = os::run_silent(rm)
+    return rc
+}
+
+/// `roll run --device` for an APK: install it and start its activity. 0 when the app is running.
+///
+/// The install is `-r`, a reinstall over whatever version is there, because uninstalling first
+/// would throw away the app's data every time somebody runs the project. A launch
+/// through the activity manager rather than the package name: an APK roll packaged has one
+/// NativeActivity and no launcher intent worth resolving.
+pub fn install_and_launch(apk: Str, pkg: Str) -> Int {
+    let adb = adb_bin()
+    if !device_ready() {
+        ui::eprintl("roll: --device: no device attached (check `adb devices`)")
+        return 1
+    }
+    var iv: Vec<Str> = vec()
+    iv.push(copy adb)  iv.push("install")  iv.push("-r")  iv.push(copy apk)
+    if os::run(iv) != 0 { ui::eprintl("roll: --device: installing " + apk + " failed")  return 1 }
+    var sv: Vec<Str> = vec()
+    sv.push(copy adb)  sv.push("shell")  sv.push("am")  sv.push("start")  sv.push("-n")
+    sv.push((pkg + "/android.app.NativeActivity"))
+    if os::run(sv) != 0 { ui::eprintl("roll: --device: " + pkg + " installed but would not start")  return 1 }
+    ui::eprintl("roll: " + pkg + " is running — `adb logcat -s nori` for its output")
+    return 0
+}

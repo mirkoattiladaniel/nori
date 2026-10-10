@@ -1,0 +1,488 @@
+// std/video/vp9_recon.nori: VP9's prediction (spec §8.5: intra §8.5.1, inter §8.5.2 with its motion vector
+// selection, clamping and scaling) and reconstruction (§8.6.2: the dequantized coefficients through the 2D inverse
+// transform of §8.7.2, added to the prediction and clipped).
+
+/// Round2(x, n) for x of either sign (Nori's >> is logical: the offset 2^62 makes it arithmetic for |x| < 2^62)
+fn r2s(x: Int, n: Int) -> Int { return ((x + 4611686018427387904 + (1 << (n - 1))) >> n) - (4611686018427387904 >> n) }
+fn clip255(v: Int) -> Int { if v < 0 { return 0 }  if v > 255 { return 255 }  return v }
+
+// ---- intra prediction (§8.5.1) ----------------------------------------------------------------------------------------
+
+fn v9_predict_intra(d: V9, t: T9, b: Blk, plane: Int, x: Int, y: Int, have_left: Bool, have_above: Bool, not_right: Bool, txsz: Int, idx: Int, base: Int, stride: Int) {
+    var mode = b.uv_mode
+    if plane == 0 { if b.size >= 3 { mode = b.y_mode } else { mode = b.sub[idx] } }
+    let size = 4 << txsz
+    let log2 = txsz + 2
+    var maxx = d.mi_cols * 8 - 1
+    var maxy = d.mi_rows * 8 - 1
+    if plane > 0 { maxx = ((d.mi_cols * 8) >> 1) - 1  maxy = ((d.mi_rows * 8) >> 1) - 1 }
+    let ab = t.edge + 8                         // aboveRow[-1..2*size-1] (Ints), aboveRow[i] at ab + i*8
+    let lc = t.edge + 8 * 80                    // leftCol[0..size-1]
+    unsafe {
+        let up = base + (y - 1) * stride
+        var i = 0
+        if !have_above { while i < 2 * size { poke(ab + i * 8, 127)  i = i + 1 } }
+        else {
+            while i < size { var xx = x + i  if xx > maxx { xx = maxx }  poke(ab + i * 8, peek8(up + xx))  i = i + 1 }
+            if not_right && txsz == 0 {
+                while i < 2 * size { var xx2 = x + i  if xx2 > maxx { xx2 = maxx }  poke(ab + i * 8, peek8(up + xx2))  i = i + 1 }
+            } else {
+                let lastv = peek(ab + (size - 1) * 8)
+                while i < 2 * size { poke(ab + i * 8, lastv)  i = i + 1 }
+            }
+        }
+        if have_above && have_left { var xm = x - 1  if xm > maxx { xm = maxx }  poke(ab - 8, peek8(up + xm)) }
+        else if have_above { poke(ab - 8, 129) }
+        else { poke(ab - 8, 127) }
+        i = 0
+        if have_left { while i < size { var yy = y + i  if yy > maxy { yy = maxy }  poke(lc + i * 8, peek8(base + yy * stride + x - 1))  i = i + 1 } }
+        else { while i < size { poke(lc + i * 8, 129)  i = i + 1 } }
+    }
+    let dst = base + y * stride + x
+    unsafe {
+        if mode == 1 {                                              // V_PRED
+            var r = 0
+            while r < size { var c = 0  while c < size { poke8(dst + r * stride + c, peek(ab + c * 8))  c = c + 1 }  r = r + 1 }
+        } else if mode == 2 {                                       // H_PRED
+            var r = 0
+            while r < size { memset(dst + r * stride, peek(lc + r * 8), size)  r = r + 1 }
+        } else if mode == 7 {                                       // D207_PRED
+            v9_d207(dst, stride, size, lc)
+        } else if mode == 3 {                                       // D45_PRED
+            var r = 0
+            while r < size {
+                var c = 0
+                while c < size {
+                    var v = 0
+                    if r + c + 2 < size * 2 { v = (peek(ab + (r + c) * 8) + peek(ab + (r + c + 1) * 8) * 2 + peek(ab + (r + c + 2) * 8) + 2) >> 2 }
+                    else { v = peek(ab + (2 * size - 1) * 8) }
+                    poke8(dst + r * stride + c, v)
+                    c = c + 1
+                }
+                r = r + 1
+            }
+        } else if mode == 8 {                                       // D63_PRED
+            var r = 0
+            while r < size {
+                var c = 0
+                let i2 = r / 2
+                while c < size {
+                    var v = 0
+                    if (r & 1) == 1 { v = (peek(ab + (i2 + c) * 8) + peek(ab + (i2 + c + 1) * 8) * 2 + peek(ab + (i2 + c + 2) * 8) + 2) >> 2 }
+                    else { v = (peek(ab + (i2 + c) * 8) + peek(ab + (i2 + c + 1) * 8) + 1) >> 1 }
+                    poke8(dst + r * stride + c, v)
+                    c = c + 1
+                }
+                r = r + 1
+            }
+        } else if mode == 5 {                                       // D117_PRED
+            var c = 0
+            while c < size { poke8(dst + c, (peek(ab + (c - 1) * 8) + peek(ab + c * 8) + 1) >> 1)  c = c + 1 }
+            poke8(dst + stride, (peek(lc) + 2 * peek(ab - 8) + peek(ab) + 2) >> 2)
+            c = 1
+            while c < size { poke8(dst + stride + c, (peek(ab + (c - 2) * 8) + 2 * peek(ab + (c - 1) * 8) + peek(ab + c * 8) + 2) >> 2)  c = c + 1 }
+            poke8(dst + 2 * stride, (peek(ab - 8) + 2 * peek(lc) + peek(lc + 8) + 2) >> 2)
+            var r = 3
+            while r < size { poke8(dst + r * stride, (peek(lc + (r - 3) * 8) + 2 * peek(lc + (r - 2) * 8) + peek(lc + (r - 1) * 8) + 2) >> 2)  r = r + 1 }
+            r = 2
+            while r < size {
+                c = 1
+                while c < size { poke8(dst + r * stride + c, peek8(dst + (r - 2) * stride + c - 1))  c = c + 1 }
+                r = r + 1
+            }
+        } else if mode == 4 {                                       // D135_PRED
+            poke8(dst, (peek(lc) + 2 * peek(ab - 8) + peek(ab) + 2) >> 2)
+            var c = 1
+            while c < size { poke8(dst + c, (peek(ab + (c - 2) * 8) + 2 * peek(ab + (c - 1) * 8) + peek(ab + c * 8) + 2) >> 2)  c = c + 1 }
+            poke8(dst + stride, (peek(ab - 8) + 2 * peek(lc) + peek(lc + 8) + 2) >> 2)
+            var r = 2
+            while r < size { poke8(dst + r * stride, (peek(lc + (r - 2) * 8) + 2 * peek(lc + (r - 1) * 8) + peek(lc + r * 8) + 2) >> 2)  r = r + 1 }
+            r = 1
+            while r < size {
+                c = 1
+                while c < size { poke8(dst + r * stride + c, peek8(dst + (r - 1) * stride + c - 1))  c = c + 1 }
+                r = r + 1
+            }
+        } else if mode == 6 {                                       // D153_PRED
+            poke8(dst, (peek(lc) + peek(ab - 8) + 1) >> 1)
+            var r = 1
+            while r < size { poke8(dst + r * stride, (peek(lc + (r - 1) * 8) + peek(lc + r * 8) + 1) >> 1)  r = r + 1 }
+            poke8(dst + 1, (peek(lc) + 2 * peek(ab - 8) + peek(ab) + 2) >> 2)
+            poke8(dst + stride + 1, (peek(ab - 8) + 2 * peek(lc) + peek(lc + 8) + 2) >> 2)
+            r = 2
+            while r < size { poke8(dst + r * stride + 1, (peek(lc + (r - 2) * 8) + 2 * peek(lc + (r - 1) * 8) + peek(lc + r * 8) + 2) >> 2)  r = r + 1 }
+            var c = 2
+            while c < size { poke8(dst + c, (peek(ab + (c - 3) * 8) + 2 * peek(ab + (c - 2) * 8) + peek(ab + (c - 1) * 8) + 2) >> 2)  c = c + 1 }
+            r = 1
+            while r < size {
+                c = 2
+                while c < size { poke8(dst + r * stride + c, peek8(dst + (r - 1) * stride + c - 2))  c = c + 1 }
+                r = r + 1
+            }
+        } else if mode == 9 {                                       // TM_PRED
+            let tl = peek(ab - 8)
+            var r = 0
+            while r < size {
+                let l = peek(lc + r * 8) - tl
+                var c = 0
+                while c < size { poke8(dst + r * stride + c, clip255(peek(ab + c * 8) + l))  c = c + 1 }
+                r = r + 1
+            }
+        } else {                                                    // DC_PRED
+            var v = 128
+            if have_left && have_above {
+                var sum = 0
+                var k = 0
+                while k < size { sum = sum + peek(lc + k * 8) + peek(ab + k * 8)  k = k + 1 }
+                v = (sum + size) >> (log2 + 1)
+            } else if have_left {
+                var sum2 = 0
+                var k2 = 0
+                while k2 < size { sum2 = sum2 + peek(lc + k2 * 8)  k2 = k2 + 1 }
+                v = (sum2 + (1 << (log2 - 1))) >> log2
+            } else if have_above {
+                var sum3 = 0
+                var k3 = 0
+                while k3 < size { sum3 = sum3 + peek(ab + k3 * 8)  k3 = k3 + 1 }
+                v = (sum3 + (1 << (log2 - 1))) >> log2
+            }
+            var r = 0
+            while r < size { memset(dst + r * stride, v, size)  r = r + 1 }
+        }
+    }
+}
+
+/// D207_PRED (§8.5.1): from the left column, the last rows first
+fn v9_d207(dst: Int, stride: Int, size: Int, lc: Int) {
+    unsafe {
+        var c = 0
+        while c < size { poke8(dst + (size - 1) * stride + c, peek(lc + (size - 1) * 8))  c = c + 1 }
+        var r = 0
+        while r < size - 1 { poke8(dst + r * stride, (peek(lc + r * 8) + peek(lc + (r + 1) * 8) + 1) >> 1)  r = r + 1 }
+        r = 0
+        while r < size - 2 { poke8(dst + r * stride + 1, (peek(lc + r * 8) + 2 * peek(lc + (r + 1) * 8) + peek(lc + (r + 2) * 8) + 2) >> 2)  r = r + 1 }
+        poke8(dst + (size - 2) * stride + 1, (peek(lc + (size - 2) * 8) + 3 * peek(lc + (size - 1) * 8) + 2) >> 2)
+        r = size - 2
+        while r >= 0 {
+            c = 2
+            while c < size { poke8(dst + r * stride + c, peek8(dst + (r + 1) * stride + c - 2))  c = c + 1 }
+            r = r - 1
+        }
+    }
+}
+
+// ---- inter prediction (§8.5.2) -----------------------------------------------------------------------------------------
+
+fn rmv_q2(v: Int) -> Int { if v < 0 { return (v - 1) / 2 }  return (v + 1) / 2 }
+fn rmv_q4(v: Int) -> Int { if v < 0 { return (v - 2) / 4 }  return (v + 2) / 4 }
+
+fn v9_predict_inter(d: V9, t: T9, b: Blk, plane: Int, x: Int, y: Int, w: Int, h: Int, idx: Int, base: Int, stride: Int) {
+    var compound = false
+    if b.ref1 > 0 && b.ref1 != NONE_REF() { compound = true }
+    let p0 = t.pred                              // the first prediction (w x h bytes, stride 64)
+    var l = 0
+    var nl = 1
+    if compound { nl = 2 }
+    while l < nl {
+        // the motion vector (§8.5.2.1)
+        var mvr = b.bmv[l * 8 + idx * 2]
+        var mvc = b.bmv[l * 8 + idx * 2 + 1]
+        if plane > 0 && b.size < 3 {
+            mvr = rmv_q4(b.bmv[l * 8] + b.bmv[l * 8 + 2] + b.bmv[l * 8 + 4] + b.bmv[l * 8 + 6])
+            mvc = rmv_q4(b.bmv[l * 8 + 1] + b.bmv[l * 8 + 3] + b.bmv[l * 8 + 5] + b.bmv[l * 8 + 7])
+        }
+        // clamping (§8.5.2.2)
+        var sx = 0
+        var sy = 0
+        if plane > 0 { sx = 1  sy = 1 }
+        let bh = n8h(b.size)
+        let bw = n8w(b.size)
+        let top = sar_(0 - ((b.row * 8) * 16), sy)
+        let bot = sar_(((d.mi_rows - bh - b.row) * 8) * 16, sy)
+        let lft = sar_(0 - ((b.col * 8) * 16), sx)
+        let rgt = sar_(((d.mi_cols - bw - b.col) * 8) * 16, sx)
+        let spel_l = (4 + ((bw * 8) >> sx)) << 4
+        let spel_r = spel_l - 16
+        let spel_t = (4 + ((bh * 8) >> sy)) << 4
+        let spel_b = spel_t - 16
+        let cr = clip3(top - spel_t, bot + spel_b, sar_(2 * mvr, sy))
+        let cc = clip3(lft - spel_l, rgt + spel_r, sar_(2 * mvc, sx))
+        // scaling (§8.5.2.3)
+        var rf = b.ref0
+        if l == 1 { rf = b.ref1 }
+        let ridx = d.ref_idx[rf - 1]
+        let rw = d.ref_w[ridx]
+        let rh = d.ref_h[ridx]
+        let xscale = (rw << 14) / d.width
+        let yscale = (rh << 14) / d.height
+        let fb = fb_of(d.refs[ridx])
+        var ref = fb.y
+        var rstride = fb.ys
+        var border = 96
+        if plane == 1 { ref = fb.u  rstride = fb.uvs  border = 48 }
+        if plane == 2 { ref = fb.v  rstride = fb.uvs  border = 48 }
+        var out = p0
+        if l == 1 { out = p0 + 4096 }
+        if xscale == 16384 && yscale == 16384 {
+            let sxp = (x << 4) + cc
+            let syp = (y << 4) + cr
+            let ix = sar_(sxp, 4)
+            let iy = sar_(syp, 4)
+            let lastx = ((rw + sx) >> sx) - 1
+            let lasty = ((rh + sy) >> sy) - 1
+            // inside the border on every side the filter reaches: read directly
+            if ix - 3 >= 0 - border + 1 && ix + w + 4 <= lastx + border && iy - 3 >= 0 - border + 1 && iy + h + 4 <= lasty + border {
+                v9_mc_fast(d, ref + iy * rstride + ix, rstride, sxp & 15, syp & 15, w, h, b.filt, out, t.pred + 8192)
+            } else { v9_mc_slow(d, ref, rstride, lastx, lasty, sxp, syp, 16, 16, w, h, b.filt, out, t.pred + 8192) }
+        } else {
+            let basex = (x * xscale) >> 14
+            let basey = (y * yscale) >> 14
+            var lumax = x
+            var lumay = y
+            if plane > 0 { lumax = x << 1  lumay = y << 1 }
+            let fracx = ((16 * lumax * xscale) >> 14) & 15
+            let fracy = ((16 * lumay * yscale) >> 14) & 15
+            let dx = sar_(cc * xscale, 14) + fracx
+            let dy = sar_(cr * yscale, 14) + fracy
+            let stepx = (16 * xscale) >> 14
+            let stepy = (16 * yscale) >> 14
+            let lastx2 = ((rw + sx) >> sx) - 1
+            let lasty2 = ((rh + sy) >> sy) - 1
+            v9_mc_slow(d, ref, rstride, lastx2, lasty2, (basex << 4) + dx, (basey << 4) + dy, stepx, stepy, w, h, b.filt, out, t.pred + 8192)
+        }
+        l = l + 1
+    }
+    // into the frame: the prediction, or the two averaged (Round2(p0 + p1, 1))
+    let dst = base + y * stride + x
+    unsafe {
+        var r = 0
+        if !compound { while r < h { memcpy(dst + r * stride, p0 + r * 64, w)  r = r + 1 } }
+        else {
+            while r < h {
+                var c = 0
+                let a = p0 + r * 64
+                let bb = p0 + 4096 + r * 64
+                let o = dst + r * stride
+                while c < w { poke8(o + c, (peek8(a + c) + peek8(bb + c) + 1) >> 1)  c = c + 1 }
+                r = r + 1
+            }
+        }
+    }
+}
+fn sar_(v: Int, n: Int) -> Int { if n == 0 { return v }  return ((v + 4611686018427387904) >> n) - (4611686018427387904 >> n) }
+
+/// the 8-tap filter `f` at fraction `frac`, tap k (signed)
+fn ftap(tab: Int, f: Int, frac: Int, k: Int) -> Int {
+    var v = 0
+    unsafe { v = peek16(tab + ((f * 16 + frac) * 8 + k) * 2) }
+    if v >= 32768 { return v - 65536 }
+    return v
+}
+
+/// a block from an unscaled reference read directly (it lies within the reference's border): `src` is the sample at
+/// the integer position, (fx, fy) the sixteenths; out: w x h bytes at stride 64; `tmp` the intermediate (bytes,
+/// stride 64: §8.5.2.4's intermediate is clipped to 8 bits).
+fn v9_mc_fast(d: V9, src: Int, rs: Int, fx: Int, fy: Int, w: Int, h: Int, filt: Int, out: Int, tmp: Int) {
+    let tab = d.tab + TB_FILT()
+    unsafe {
+        if fx == 0 && fy == 0 {
+            var r = 0
+            while r < h { memcpy(out + r * 64, src + r * rs, w)  r = r + 1 }
+            return
+        }
+        // the horizontal pass: into the output directly when there is no vertical one, else into tmp (rows -3..h+4)
+        var hsrc = src
+        var hdst = out
+        var hrows = h
+        if fy != 0 { hsrc = src - 3 * rs  hdst = tmp  hrows = h + 7 }
+        if fx != 0 {
+            let f0 = ftap(tab, filt, fx, 0)  let f1 = ftap(tab, filt, fx, 1)  let f2 = ftap(tab, filt, fx, 2)  let f3 = ftap(tab, filt, fx, 3)
+            let f4 = ftap(tab, filt, fx, 4)  let f5 = ftap(tab, filt, fx, 5)  let f6 = ftap(tab, filt, fx, 6)  let f7 = ftap(tab, filt, fx, 7)
+            var r = 0
+            while r < hrows {
+                let srow = hsrc + r * rs - 3
+                let orow = hdst + r * 64
+                var c = 0
+                while c < w {
+                    let q = srow + c
+                    var sum = f0 * peek8(q) + f1 * peek8(q + 1) + f2 * peek8(q + 2) + f3 * peek8(q + 3) + f4 * peek8(q + 4) + f5 * peek8(q + 5) + f6 * peek8(q + 6) + f7 * peek8(q + 7) + 64
+                    if sum < 0 { sum = 0 } else { sum = sum >> 7  if sum > 255 { sum = 255 } }
+                    poke8(orow + c, sum)
+                    c = c + 1
+                }
+                r = r + 1
+            }
+        } else if fy != 0 {
+            var r2 = 0
+            while r2 < hrows { memcpy(tmp + r2 * 64, hsrc + r2 * rs, w)  r2 = r2 + 1 }
+        }
+        if fy == 0 { return }
+        // the vertical pass, column by column down tmp
+        let g0 = ftap(tab, filt, fy, 0)  let g1 = ftap(tab, filt, fy, 1)  let g2 = ftap(tab, filt, fy, 2)  let g3 = ftap(tab, filt, fy, 3)
+        let g4 = ftap(tab, filt, fy, 4)  let g5 = ftap(tab, filt, fy, 5)  let g6 = ftap(tab, filt, fy, 6)  let g7 = ftap(tab, filt, fy, 7)
+        var r3 = 0
+        while r3 < h {
+            let trow = tmp + r3 * 64
+            let orow2 = out + r3 * 64
+            var c2 = 0
+            while c2 < w {
+                let q2 = trow + c2
+                var sum2 = g0 * peek8(q2) + g1 * peek8(q2 + 64) + g2 * peek8(q2 + 128) + g3 * peek8(q2 + 192) + g4 * peek8(q2 + 256) + g5 * peek8(q2 + 320) + g6 * peek8(q2 + 384) + g7 * peek8(q2 + 448) + 64
+                if sum2 < 0 { sum2 = 0 } else { sum2 = sum2 >> 7  if sum2 > 255 { sum2 = 255 } }
+                poke8(orow2 + c2, sum2)
+                c2 = c2 + 1
+            }
+            r3 = r3 + 1
+        }
+    }
+}
+
+/// §8.5.2.4 as written: every reference sample's position clamped to the plane (a scaled reference, or one reaching
+/// past the border). x, y in sixteenths; steps in sixteenths.
+fn v9_mc_slow(d: V9, ref: Int, rs: Int, lastx: Int, lasty: Int, x: Int, y: Int, stepx: Int, stepy: Int, w: Int, h: Int, filt: Int, out: Int, tmp: Int) {
+    let tab = d.tab + TB_FILT()
+    let ih = (((h - 1) * stepy + 15) >> 4) + 8
+    unsafe {
+        var r = 0
+        while r < ih {
+            let ry = clip3(0, lasty, sar_(y, 4) + r - 3)
+            var c = 0
+            while c < w {
+                let p = x + stepx * c
+                var s = 0
+                var k = 0
+                while k < 8 {
+                    s = s + ftap(tab, filt, p & 15, k) * peek8(ref + ry * rs + clip3(0, lastx, sar_(p, 4) + k - 3))
+                    k = k + 1
+                }
+                s = s + 64
+                if s < 0 { s = 0 } else { s = s >> 7  if s > 255 { s = 255 } }
+                poke(tmp + (r * 64 + c) * 8, s)
+                c = c + 1
+            }
+            r = r + 1
+        }
+        r = 0
+        while r < h {
+            var c2 = 0
+            while c2 < w {
+                let p2 = (y & 15) + stepy * r
+                var s2 = 0
+                var k2 = 0
+                while k2 < 8 { s2 = s2 + ftap(tab, filt, p2 & 15, k2) * peek(tmp + (((p2 >> 4) + k2) * 64 + c2) * 8)  k2 = k2 + 1 }
+                s2 = s2 + 64
+                if s2 < 0 { s2 = 0 } else { s2 = s2 >> 7  if s2 > 255 { s2 = 255 } }
+                poke8(out + r * 64 + c2, s2)
+                c2 = c2 + 1
+            }
+            r = r + 1
+        }
+    }
+}
+
+// ---- reconstruction (§8.6.2, §8.7.2) ---------------------------------------------------------------------------------
+
+/// the dequantized coefficients in t.coef (n0 x n0 raster Ints) inverse transformed and added to the n0 x n0 samples
+/// at `dst`; t.coef is left all zero again
+fn v9_reconstruct(d: V9, t: T9, b: Blk, plane: Int, dst: Int, stride: Int, txsz: Int, txtype: Int, eob: Int) {
+    let n = txsz + 2
+    let n0 = 1 << n
+    let coef = t.coef
+    unsafe {
+        if d.lossless == 1 { v9_iwht_add(coef, dst, stride)  memset(coef, 0, 16 * 8)  return }
+        // only the DC: every sample the same (the DCT of a lone DC is flat)
+        if eob == 1 && txtype == 0 {
+            let dc = peek(coef)
+            var v = r2s(dc * 11585, 14)
+            v = r2s(v * 11585, 14)
+            var sh = n + 2
+            if sh > 6 { sh = 6 }
+            v = r2s(v, sh)
+            var r = 0
+            while r < n0 {
+                let row = dst + r * stride
+                var c = 0
+                while c < n0 { poke8(row + c, clip255(peek8(row + c) + v))  c = c + 1 }
+                r = r + 1
+            }
+            poke(coef, 0)
+            return
+        }
+        // rows: DCT for DCT_DCT and ADST_DCT, else ADST; a row of zeros stays zeros
+        let row_dct = txtype == 0 || txtype == 1
+        var i = 0
+        while i < n0 {
+            let rp = coef + i * n0 * 8
+            var any = 0
+            var j = 0
+            while j < n0 { any = any | peek(rp + j * 8)  j = j + 1 }
+            if any != 0 { v9_1d(rp, 8, n, row_dct) }
+            i = i + 1
+        }
+        // columns, then Round2 by Min(6, n + 2)
+        let col_dct = txtype == 0 || txtype == 2
+        var sh2 = n + 2
+        if sh2 > 6 { sh2 = 6 }
+        var j2 = 0
+        while j2 < n0 {
+            let cp = coef + j2 * 8
+            v9_1d(cp, n0 * 8, n, col_dct)
+            var r2 = 0
+            while r2 < n0 {
+                let a = dst + r2 * stride + j2
+                poke8(a, clip255(peek8(a) + r2s(peek(cp + r2 * n0 * 8), sh2)))
+                r2 = r2 + 1
+            }
+            j2 = j2 + 1
+        }
+        memset(coef, 0, n0 * n0 * 8)
+    }
+}
+
+/// one 1D inverse transform of 2^n values (DCT or ADST; there is no 32-point ADST)
+fn v9_1d(p: Int, st: Int, n: Int, dct: Bool) {
+    if dct {
+        if n == 2 { v9_idct4(p, st) } else if n == 3 { v9_idct8(p, st) } else if n == 4 { v9_idct16(p, st) } else { v9_idct32(p, st) }
+    } else {
+        if n == 2 { v9_iadst4(p, st) } else if n == 3 { v9_iadst8(p, st) } else { v9_iadst16(p, st) }
+    }
+}
+
+/// the lossless inverse Walsh-Hadamard transform (§8.7.1.10), rows with shift 2, columns with 0, added to dst
+fn v9_iwht_add(coef: Int, dst: Int, stride: Int) {
+    unsafe {
+        var pass = 0
+        while pass < 2 {
+            var i = 0
+            while i < 4 {
+                var p = coef + i * 32
+                var st = 8
+                var sh = 2
+                if pass == 1 { p = coef + i * 8  st = 32  sh = 0 }
+                var a = sar_(peek(p), sh)
+                var c = sar_(peek(p + st), sh)
+                var dd = sar_(peek(p + 2 * st), sh)
+                var bb = sar_(peek(p + 3 * st), sh)
+                a = a + c
+                dd = dd - bb
+                let e = sar_(a - dd, 1)
+                bb = e - bb
+                c = e - c
+                a = a - bb
+                dd = dd + c
+                poke(p, a)
+                poke(p + st, bb)
+                poke(p + 2 * st, c)
+                poke(p + 3 * st, dd)
+                i = i + 1
+            }
+            pass = pass + 1
+        }
+        var r = 0
+        while r < 4 {
+            var c2 = 0
+            while c2 < 4 { let a2 = dst + r * stride + c2  poke8(a2, clip255(peek8(a2) + peek(coef + (r * 4 + c2) * 8)))  c2 = c2 + 1 }
+            r = r + 1
+        }
+    }
+}

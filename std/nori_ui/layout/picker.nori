@@ -1,0 +1,660 @@
+use core::*
+import "std/math" as math
+
+// ===========================================================================
+// The picker: a prompt, a ranked list, and a preview, floating over everything.
+//
+// A context menu opened at a point, with three additions: it owns the keyboard
+// while it is open, its rows are ranked against what you have typed, and it can
+// show what the selection contains. That is the whole difference between a menu
+// and a picker.
+//
+// It knows nothing about files. The host hands it rows and, when the selection
+// changes, the lines to preview, because reading a file is not a layout
+// module's business, and a picker over commands or over open buffers wants the
+// same widget with nothing previewable in it at all.
+// ===========================================================================
+
+/// one candidate. `label` is what is matched and shown first (a basename, a
+/// command); `detail` is the dimmer context after it; `note` a short right-hand
+/// marker (a git letter, a tab index). `action` is the host's business.
+pub struct PickerItem { label: Str, detail: Str, note: Str, action: Str }
+/// a PickerItem of its own.
+pub fn picker_item_dup(it: PickerItem) -> PickerItem { return PickerItem { label: copy it.label, detail: copy it.detail, note: copy it.note, action: copy it.action } }
+/// a fresh list of item copies.
+pub fn picker_items_dup(v: Vec<PickerItem>) -> Vec<PickerItem> {
+    var out: Vec<PickerItem> = vec()
+    var i = 0
+    while i < v.len() { out.push(picker_item_dup(v[i]))  i = i + 1 }
+    return out
+}
+
+pub fn picker_item(label: Str, detail: Str, note: Str, action: Str) -> PickerItem {
+    return PickerItem { label: copy label, detail: copy detail, note: copy note, action: copy action }
+}
+
+/// a candidate that survived the query: which item, how well, and where it
+/// matched, so the matched characters can be lit up.
+///
+/// The runs are indices into `label + " " + detail`, the string the match was
+/// actually run against: a path typed as `fltree/lib` matches across the join,
+/// and highlighting only the basename would leave half the match invisible.
+pub struct PickerHit { index: Int, score: Int, runs: Vec<Int> }
+
+/// an open (or closed) picker.
+///
+/// `items` is everything the host offered; `hits` is what survived the query,
+/// in rank order. `sel` indexes `hits`, not `items`; the selection follows the
+/// list you can see.
+///
+/// `scope` is a narrowing that is not part of the query.
+///
+/// A picker that can answer for more than one kind of thing needs a way to say which, and typing
+/// the name of the kind into the same box the query lives in means the query no longer matches
+/// anything. The scope is held apart: it is drawn as `name::` before the caret, it is not matched
+/// against, and backspacing out of an empty query pops it. The host decides what the scopes are and
+/// what rows each one holds; this only carries and shows it.
+pub struct Picker {
+    open: Bool, kind: Str, scope: Str, query: Str,
+    items: Vec<PickerItem>, hits: Vec<PickerHit>,
+    sel: Int, top: Int,
+    preview: Vec<Str>, preview_of: Str, preview_lang: Str,
+    // A picture, when lines of text are the wrong answer. A font file previewed as text is its own
+    // bytes drawn as boxes, which is worse than nothing: it looks like the font is broken. What
+    // somebody choosing a font wants is to see it, and the only way to show a face this canvas is
+    // not drawn in is to render it elsewhere and blit the result.
+    preview_img: Str
+}
+
+pub fn picker_none() -> Picker {
+    var it: Vec<PickerItem> = vec()
+    var hs: Vec<PickerHit> = vec()
+    var pv: Vec<Str> = vec()
+    return Picker { open: false, kind: "", scope: "", query: "", items: it, hits: hs, sel: 0, top: 0, preview: pv, preview_of: "", preview_lang: "", preview_img: "" }
+}
+
+pub fn picker_is_open(p: Picker) -> Bool { return p.open }
+pub fn picker_kind(p: Picker) -> view Str { return p.kind }
+/// the scope this picker is narrowed to, or "".
+pub fn picker_scope(p: Picker) -> view Str { return p.scope }
+pub fn picker_query(p: Picker) -> view Str { return p.query }
+pub fn picker_close(inout p: Picker) { p.open = false }
+
+/// open `kind` over `items`. An empty list opens nothing: a picker with nothing
+/// to pick is a box you have to dismiss.
+pub fn picker_open(inout p: Picker, kind: Str, items: Vec<PickerItem>) {
+    if items.len() == 0 { p.open = false  return }
+    p.open = true
+    p.kind = copy kind
+    p.scope = ""
+    p.query = ""
+    p.items = picker_items_dup(items)
+    p.sel = 0
+    p.top = 0
+    var pv: Vec<Str> = vec()
+    p.preview = pv
+    p.preview_of = ""
+    p.preview_lang = ""
+    p.preview_img = ""
+    picker_rerank(p)
+}
+
+/// how many rows the list shows at once.
+pub fn picker_rows() -> Int { return 14 }
+/// the height of one row.
+pub fn picker_row_h() -> Float { return 22.0 }
+/// the height of the prompt.
+pub fn picker_prompt_h() -> Float { return 30.0 }
+/// the font the list is drawn in.
+pub fn picker_font() -> Float { return 13.0 }
+/// the font the preview is drawn in: smaller, because it is context and not the thing you are
+/// choosing.
+pub fn picker_preview_font() -> Float { return 11.0 }
+
+/// where the box goes: centred, and a fixed share of the view.
+///
+/// A share rather than a size, because the same picker has to be usable on a
+/// laptop and on a monitor, and a box that is 800px on both is either most of
+/// the first or a stamp on the second.
+pub fn picker_rect(view_w: Float, view_h: Float) -> Rect {
+    var w = view_w * 0.66
+    if w > 1000.0 { w = 1000.0 }
+    if w < 420.0 { w = math::fmin(420.0, view_w - 20.0) }
+    let h = picker_prompt_h() + to_float(picker_rows()) * picker_row_h() + 8.0
+    let x = (view_w - w) / 2.0
+    var y = view_h * 0.14
+    if y + h > view_h { y = math::fmax(view_h - h - 10.0, 0.0) }
+    return rect_min_size(vec2(x, y), vec2(w, h))
+}
+
+/// the list occupies the left of the box when there is a preview, all of it otherwise.
+pub fn picker_list_rect(p: Picker, box: Rect) -> Rect {
+    if p.preview.len() == 0 && p.preview_img.len() == 0 { return rect_dup(box) }
+    return rect_min_size(box.min, vec2(box.width() * 0.46, box.height()))
+}
+
+/// and the preview the right.
+pub fn picker_preview_rect(p: Picker, box: Rect) -> Rect {
+    if p.preview.len() == 0 && p.preview_img.len() == 0 { return rect_min_size(box.min, vec2(0.0, 0.0)) }
+    let lw = box.width() * 0.46
+    return rect_min_size(vec2(box.min.x + lw, box.min.y), vec2(box.width() - lw, box.height()))
+}
+
+/// the rect of visible row `i`; 0 is the topmost row drawn, not hit 0.
+pub fn picker_row_rect(p: Picker, box: Rect, i: Int) -> Rect {
+    let lr = picker_list_rect(p, box)
+    let y = lr.min.y + picker_prompt_h() + to_float(i) * picker_row_h()
+    return rect_min_size(vec2(lr.min.x + 4.0, y), vec2(math::fmax(lr.width() - 8.0, 0.0), picker_row_h()))
+}
+
+// ---- the query -----------------------------------------------------------
+
+pub fn picker_type(inout p: Picker, text: Str) { p.query = p.query + text  picker_rerank(p) }
+
+/// replace the query outright, which is what a host does after it has taken a `scope::` prefix out of it.
+pub fn picker_set_query(inout p: Picker, q: Str) { p.query = copy q  picker_rerank(p) }
+
+/// narrow to `scope` over `items`, keeping the picker open and starting a fresh query.
+///
+/// The rows come from the host because only the host knows what a scope means. An empty list is
+/// still accepted here, unlike `picker_open`: a scope that currently matches nothing is a state you
+/// can back out of with one backspace, not a reason to close the picker under the person's hands.
+pub fn picker_set_scope(inout p: Picker, scope: Str, items: Vec<PickerItem>) {
+    p.scope = copy scope
+    p.query = ""
+    p.items = picker_items_dup(items)
+    p.sel = 0
+    p.top = 0
+    picker_rerank(p)
+}
+
+/// drop the last segment of the scope, and say whether there was one to drop.
+///
+/// A scope is a path (`preference::editor`), so backing out of it goes one level at a time, the way
+/// backing out of anything typed with a `::` in it should. The host has to refill the rows
+/// afterwards, which is why this answers rather than doing it: this module has no idea what any of
+/// those names mean.
+pub fn picker_scope_pop(inout p: Picker) -> Bool {
+    if p.scope.len() == 0 { return false }
+    var cut = 0 - 1
+    var i = 0
+    while i + 1 < p.scope.len() {
+        if ord(p.scope.at(i)) == 58 && ord(p.scope.at(i + 1)) == 58 { cut = i }
+        i = i + 1
+    }
+    if cut < 0 { p.scope = "" } else { p.scope = p.scope.slice(0, cut) }
+    return true
+}
+
+pub fn picker_backspace(inout p: Picker) {
+    if p.query.len() == 0 { return }
+    p.query = p.query.slice(0, p.query.len() - 1)
+    picker_rerank(p)
+}
+
+/// move the selection, clamped, keeping it inside the window of drawn rows.
+pub fn picker_move(inout p: Picker, delta: Int) {
+    if p.hits.len() == 0 { return }
+    var s = p.sel + delta
+    if s < 0 { s = 0 }
+    if s >= p.hits.len() { s = p.hits.len() - 1 }
+    p.sel = s
+    if p.sel < p.top { p.top = p.sel }
+    if p.sel >= p.top + picker_rows() { p.top = p.sel - picker_rows() + 1 }
+    if p.top < 0 { p.top = 0 }
+}
+
+/// select the visible row `i`, which is what a click does.
+pub fn picker_select_visible(inout p: Picker, i: Int) {
+    let at = p.top + i
+    if at < 0 || at >= p.hits.len() { return }
+    p.sel = at
+}
+
+pub fn picker_hit_count(p: Picker) -> Int { return p.hits.len() }
+pub fn picker_item_count(p: Picker) -> Int { return p.items.len() }
+pub fn picker_selected_index(p: Picker) -> Int { return p.sel }
+pub fn picker_top(p: Picker) -> Int { return p.top }
+
+/// the item under the selection, or an empty one.
+pub fn picker_selected(p: Picker) -> PickerItem {
+    if p.sel < 0 || p.sel >= p.hits.len() { return picker_item("", "", "", "") }
+    return picker_item_dup(p.items[p.hits[p.sel].index])
+}
+
+/// the item at rank `i` of the surviving list, which is what a test reads.
+pub fn picker_hit_item(p: Picker, i: Int) -> PickerItem {
+    if i < 0 || i >= p.hits.len() { return picker_item("", "", "", "") }
+    return picker_item_dup(p.items[p.hits[i].index])
+}
+
+pub fn picker_hit_score(p: Picker, i: Int) -> Int {
+    if i < 0 || i >= p.hits.len() { return 0 }
+    return p.hits[i].score
+}
+
+/// what a candidate is matched against and drawn as: the detail, then the label, which for a file
+/// is the path in its natural order.
+///
+/// In that order because that is the order people type. `ftlib` means "something like lib in
+/// something like file_tree", and a haystack of `lib.nori plugins/file_tree/src` cannot match it:
+/// the `l` of `lib` comes before the `f` of `file_tree`, and a subsequence has to be in order.
+/// Basename-first reads better in a list and is unusable as a target.
+///
+/// The row is drawn from this same string, so the matched positions line up with the characters
+/// under them without anything having to be mapped between two spellings. There is one string
+/// for both: two ways to find the same row would be two things to keep true, and the one on the
+/// screen is the one the editor means.
+pub fn picker_haystack(it: PickerItem) -> Str {
+    if it.detail.len() == 0 { return copy it.label }
+    return it.detail + ("/" + it.label)
+}
+
+/// where the label starts inside the haystack; everything before it is context and is drawn dim.
+pub fn picker_label_at(it: PickerItem) -> Int {
+    if it.detail.len() == 0 { return 0 }
+    return it.detail.len() + 1
+}
+
+/// a PNG to show instead of lines (see `preview_img`). "" goes back to text.
+pub fn picker_set_preview_image(inout p: Picker, of: Str, path: Str) {
+    p.preview_of = copy of
+    p.preview_img = copy path
+    var none: Vec<Str> = vec()
+    p.preview = none
+    p.preview_lang = ""
+}
+pub fn picker_preview_image(p: Picker) -> view Str { return p.preview_img }
+
+/// set the preview to `lines` of language `lang`. The host fills this when the selection changes;
+/// the widget only draws it.
+pub fn picker_set_preview(inout p: Picker, of: Str, lang: Str, lines: Vec<Str>) {
+    p.preview_of = copy of
+    p.preview_lang = copy lang
+    p.preview_img = ""
+    p.preview = path_copy_str(lines)
+}
+
+pub fn picker_preview_of(p: Picker) -> view Str { return p.preview_of }
+
+/// the lines the preview is showing.
+///
+/// The host hands these in and could not read them back, so what the preview contained was
+/// unobservable from outside: a test could say which file was previewed and never that the window
+/// was around the right line. A picker that shows the wrong twenty lines looks exactly like one
+/// that shows the right twenty.
+pub fn picker_preview_lines(p: Picker) -> view Vec<Str> { return p.preview }
+
+/// how many lines of preview fit.
+pub fn picker_preview_rows() -> Int { return 24 }
+
+// ---- ranking -------------------------------------------------------------
+
+/// re-rank every item against the query, best first.
+///
+/// An empty query keeps the host's order, which is the order it thought was
+/// useful (most-recently-opened, or the order of the menu bar). Sorting by a
+/// score everything ties on would replace that with nothing.
+pub fn picker_rerank(inout p: Picker) {
+    var hits: Vec<PickerHit> = vec()
+    let q = picker_lower(p.query)
+    var i = 0
+    while i < p.items.len() {
+        if q.len() == 0 {
+            var none: Vec<Int> = vec()
+            hits.push(PickerHit { index: i, score: 0, runs: none })
+        } else {
+            let hay = picker_haystack(p.items[i])
+            var m = picker_match(picker_lower(hay), q, picker_label_at(p.items[i]))
+            if m.ok { hits.push(PickerHit { index: i, score: m.score, runs: sink m.runs }) }
+        }
+        i = i + 1
+    }
+    if q.len() > 0 { picker_sort(hits) }
+    p.hits = hits
+    p.sel = 0
+    p.top = 0
+}
+
+/// insertion sort, best score first, stable, so two candidates that score the
+/// same stay in the order the host gave them.
+fn picker_sort(inout hits: Vec<PickerHit>) {
+    var a = 1
+    while a < hits.len() {
+        var b = a
+        while b > 0 {
+            if hits[b].score > hits[b - 1].score {
+                let t = sink hits[b - 1]  hits[b - 1] = sink hits[b]  hits[b] = t
+                b = b - 1
+            } else { b = 0 }
+        }
+        a = a + 1
+    }
+}
+
+/// ASCII lower case. Enough for matching a filename, and it does not pretend otherwise.
+pub fn picker_lower(s: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        let c = ord(s.at(i))
+        if c >= 65 && c <= 90 { out = out + chr(c + 32) } else { out = out + s.at(i) }
+        i = i + 1
+    }
+    return out
+}
+
+pub struct PickerMatch { ok: Bool, score: Int, runs: Vec<Int> }
+
+/// true when `c` starts a word: after a separator, or at the very beginning.
+fn picker_boundary(hay: Str, at: Int) -> Bool {
+    if at == 0 { return true }
+    let prev = ord(hay.at(at - 1))
+    return prev == 47 || prev == 95 || prev == 45 || prev == 46 || prev == 32
+}
+
+/// does `needle` appear in `hay` as a subsequence, and how good is the fit?
+///
+/// Subsequence, not substring, which is the reason a picker is faster than
+/// the file tree's search box: `fltree` has to find `plugins/file_tree/...`, and no
+/// substring of that path is `fltree`. The tree's filter narrows a thing you are
+/// reading and should be exactly predictable; a picker ranks things you are
+/// jumping to, and ranking is what makes three keystrokes enough.
+///
+/// The score is four rules, and they are meant to be statable in one breath:
+///
+///   * a character adjacent to the previous match is worth much more than a
+///     scattered one; that is what makes `fltr` prefer `file_tree` to a path
+///     with an f, an l, a t and an r sprinkled through it;
+///   * a character starting a word (after `/`, `_`, `-`, `.`) is worth more
+///     again, so typing initials works;
+///   * matching inside the label beats matching in the detail, because you
+///     usually mean the filename and not the folder it is in;
+///   * shorter candidates break ties, because a short path that matches is
+///     almost always the one meant.
+///
+/// Greedy left to right. A backtracking matcher would find a better alignment in
+/// some cases; it would also make the score something you cannot predict from
+/// looking, which for a list you steer by eye is the worse trade.
+pub fn picker_match(hay: Str, needle: Str, label_at: Int) -> PickerMatch {
+    var runs: Vec<Int> = vec()
+    if needle.len() == 0 { return PickerMatch { ok: true, score: 0, runs: runs } }
+    var score = 0
+    var hi = 0
+    var ni = 0
+    var last = 0 - 2
+    while ni < needle.len() {
+        let want = needle.at(ni)
+        var found = 0 - 1
+        while hi < hay.len() {
+            if hay.at(hi) == want { found = hi  hi = hay.len() }
+            else { hi = hi + 1 }
+        }
+        if found < 0 { return PickerMatch { ok: false, score: 0, runs: runs } }
+        runs.push(found)
+        score = score + 2
+        if found == last + 1 { score = score + 8 }
+        if picker_boundary(hay, found) { score = score + 6 }
+        // Matching the filename beats matching the folder it is in, because that is usually what was
+        // meant: `lib` should find the library before it finds everything under a `lib/` directory.
+        if found >= label_at { score = score + 3 }
+        last = found
+        hi = found + 1
+        ni = ni + 1
+    }
+    // shorter wins ties, gently: a candidate twice as long is not twice as wrong
+    score = score - hay.len() / 8
+    return PickerMatch { ok: true, score: score, runs: runs }
+}
+
+/// is index `at` of the haystack one of the matched characters of hit `i`?
+pub fn picker_run_has(p: Picker, i: Int, at: Int) -> Bool {
+    if i < 0 || i >= p.hits.len() { return false }
+    var k = 0
+    while k < p.hits[i].runs.len() { if p.hits[i].runs[k] == at { return true }  k = k + 1 }
+    return false
+}
+
+// ---- drawing -------------------------------------------------------------
+
+/// a text primitive clipped to `to`.
+///
+/// Everything in the box is clipped to the box. A path longer than the list and a source line longer
+/// than the preview are both the normal case, not the exception; unclipped, they run out of the
+/// picker and across the editor behind it.
+fn pp_text_in(copy pos: Vec2, text: Str, copy color: Color, size_px: Float, to: Rect) -> PaintPrimitive {
+    var t = pp_text(pos, text, color, size_px)
+    t.has_clip = true
+    t.clip = rect_dup(to)
+    return t
+}
+
+/// the id every picker row's hit region carries.
+pub fn picker_hit_id() -> Str { return "picker.row" }
+
+/// which visible row is at `cursor`, or -1.
+pub fn picker_row_at(p: Picker, box: Rect, copy cursor: Vec2) -> Int {
+    if !p.open { return 0 - 1 }
+    var i = 0
+    let n = picker_visible_count(p)
+    while i < n {
+        if picker_row_rect(p, box, i).contains(cursor) { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// how many rows are actually drawn: the window, or what is left of the list.
+pub fn picker_visible_count(p: Picker) -> Int {
+    var n = p.hits.len() - p.top
+    if n > picker_rows() { n = picker_rows() }
+    if n < 0 { n = 0 }
+    return n
+}
+
+/// the picker as an overlay of its own, drawn after everything else. Its rows go into the
+/// overlay's popup layer, which is what puts it over every panel and gets it hit-tested first.
+///
+/// The counterpart of `context_menu_overlay`, and here for the same reason: a host cannot build one
+/// itself without naming `Theme`, which is private to this module.
+pub fn picker_overlay(p: Picker, theme: Theme, view_w: Float, view_h: Float, has_cursor: Bool, copy cursor: Vec2) -> ComputedOverlay {
+    var ids: Vec<Str> = vec()
+    var offs: Vec<Float> = vec()
+    var ov = overlay_new(ids, offs)
+    picker_emit(ov, p, theme, view_w, view_h, has_cursor, cursor)
+    // The popup layer has to be flushed. Nothing downstream reads `pop_prims`: it is a staging
+    // area that `overlay_flush_popups` moves into `prims`, so an overlay that only fills it draws
+    // nothing at all.
+    overlay_flush_popups(ov)
+    return ov
+}
+
+pub fn picker_emit(inout out: ComputedOverlay, p: Picker, theme: Theme, view_w: Float, view_h: Float, has_cursor: Bool, copy cursor: Vec2) {
+    if !p.open { return }
+    var v = theme.visuals
+    let box = picker_rect(view_w, view_h)
+    // A scrim. The picker is modal (every keystroke is its) and a modal thing that does not dim
+    // what it has taken over looks like a panel you can click past.
+    out.pop_prims.push(pp_rect(rect_min_size(vec2(0.0, 0.0), vec2(view_w, view_h)), color_rgba(0, 0, 0, 120), 0.0))
+    // Opaque, and spelled here rather than taken from the theme: this box covers the editor, and a
+    // fill that is even slightly transparent leaves source code legible through a file picker.
+    out.pop_prims.push(pp_rect(box, color_rgba(24, 27, 34, 255), 6.0))
+    out.pop_prims.push(pp_border(box, v.dock_menu_bar_border, 1.0))
+
+    let lr = picker_list_rect(p, box)
+    // ---- the prompt ----
+    let py = box.min.y + (picker_prompt_h() - 18.0) / 2.0
+    out.pop_prims.push(pp_text(vec2(lr.min.x + 12.0, py), "›", picker_prompt_color(), 16.0))
+    // The scope sits before the caret, in the prompt's own colour, so it reads as part of what you
+    // typed and is plainly not part of what is being matched.
+    var qx = lr.min.x + 28.0
+    if p.scope.len() > 0 {
+        let chip = p.scope + "::"
+        out.pop_prims.push(pp_text_in(vec2(qx, py), chip, picker_prompt_color(), picker_font(), lr))
+        // A gap after it, so the chip and what follows read as two things. Without it an empty query
+        // shows `preference::editor::type to filter`, which looks like one long word.
+        qx = qx + overlay_text_width(chip, picker_font()) + 5.0
+    }
+    var shown = p.query
+    if shown.len() == 0 { shown = picker_placeholder(p.scope) }
+    if shown.len() == 0 { shown = picker_placeholder(p.kind) }
+    if shown.len() == 0 { shown = "type to filter" }
+    var qcol = picker_text_color()
+    if p.query.len() == 0 { qcol = picker_dim_color() }
+    out.pop_prims.push(pp_text_in(vec2(qx, py), shown, qcol, picker_font(), lr))
+    // The caret is a character, not a rect: the prompt is one line of plain text and a drawn bar
+    // would need its own measurement to sit in the right place.
+    if p.query.len() > 0 && caret_on() {
+        let cw = overlay_text_width(p.query, picker_font())
+        out.pop_prims.push(pp_text(vec2(qx + cw, py), "|", picker_prompt_color(), picker_font()))
+    }
+    // how much of the list survived, at the right of the prompt
+    var count = to_str(p.hits.len()) + ("/" + to_str(p.items.len()))
+    let cwid = overlay_text_width(count, 11.0)
+    out.pop_prims.push(pp_text(vec2(lr.max.x - cwid - 12.0, py + 2.0), count, picker_dim_color(), 11.0))
+    out.pop_prims.push(pp_rect(rect_min_size(vec2(lr.min.x + 6.0, box.min.y + picker_prompt_h() - 1.0), vec2(lr.width() - 12.0, 1.0)), v.dock_menu_bar_border, 0.0))
+
+    // ---- the rows ----
+    let n = picker_visible_count(p)
+    var i = 0
+    while i < n {
+        let at = p.top + i
+        let row = picker_row_rect(p, box, i)
+        if at == p.sel {
+            out.pop_prims.push(pp_rect(row, v.dock_menu_item_hover_fill, 4.0))
+        } else {
+            if has_cursor && row.contains(cursor) {
+                out.pop_prims.push(pp_rect(row, color_rgba(255, 255, 255, 14), 4.0))
+            }
+        }
+        picker_emit_row(out, p, at, row)
+        out.pop_hits.push(HitRegion { id: picker_hit_id(), on_click: to_str(i), rect: row })
+        i = i + 1
+    }
+    if p.hits.len() == 0 {
+        out.pop_prims.push(pp_text_in(vec2(lr.min.x + 14.0, box.min.y + picker_prompt_h() + 6.0), "no matches", picker_dim_color(), picker_font(), lr))
+    }
+
+    // ---- the preview ----
+    if p.preview_img.len() > 0 {
+        let ir = picker_preview_rect(p, box)
+        out.pop_prims.push(pp_rect(rect_min_size(vec2(ir.min.x, ir.min.y + 4.0), vec2(1.0, ir.height() - 8.0)), v.dock_menu_bar_border, 0.0))
+        // At the top, at its own size. `pp_image` letterboxes into the rect it is given, so a strip
+        // handed the whole tall pane would be scaled up to fill it, and a sample of a typeface blown up
+        // four times tells you about the blitter, not about the face.
+        let iw = ir.width() - 20.0
+        var ih = iw * 0.325                                     // the sample strip is 560 x 182
+        if ih > ir.height() - 20.0 { ih = ir.height() - 20.0 }
+        out.pop_prims.push(pp_image(rect_min_size(vec2(ir.min.x + 10.0, ir.min.y + 10.0), vec2(iw, ih)), copy p.preview_img))
+    }
+    if p.preview.len() > 0 {
+        let pr = picker_preview_rect(p, box)
+        out.pop_prims.push(pp_rect(rect_min_size(vec2(pr.min.x, pr.min.y + 4.0), vec2(1.0, pr.height() - 8.0)), v.dock_menu_bar_border, 0.0))
+        let syn = palette_defaults(picker_text_color())
+        var ly = pr.min.y + 6.0
+        var k = 0
+        while k < p.preview.len() && k < picker_preview_rows() {
+            if ly + 14.0 > pr.max.y { k = p.preview.len() }
+            else {
+                picker_emit_source(out, p.preview[k], p.preview_lang, syn, pr.min.x + 10.0, ly, pr)
+                ly = ly + 14.0
+                k = k + 1
+            }
+        }
+    }
+}
+
+/// one row: the label with its matched characters lit, the detail after it, the note at the end.
+fn picker_emit_row(inout out: ComputedOverlay, p: Picker, at: Int, row: Rect) {
+    let it = p.items[p.hits[at].index]
+    let hay = picker_haystack(it)
+    let y = row.min.y + (row.height() - 15.0) / 2.0
+    var x = row.min.x + 8.0
+    // The label stops where the note starts. If both were clipped to the whole row, a long one would run
+    // underneath the other and the two would draw on top of each other, legible in neither; it reads
+    // as a rendering fault rather than as a row that is too long for its box. A font's path is the
+    // first row long enough to show it.
+    var textrow = rect_dup(row)
+    if it.note.len() > 0 {
+        let nres = overlay_text_width(it.note, 11.0) + 16.0
+        if row.width() > nres { textrow = rect_min_max(row.min, vec2(row.max.x - nres, row.max.y)) }
+    }
+    // Each character is drawn on its own only where a run starts or ends; consecutive characters of
+    // the same colour go out as one primitive, because a text prim per character is a glyph batch
+    // that cannot be batched.
+    var i = 0
+    var runstart = 0
+    var lit = false
+    while i <= hay.len() {
+        let end = i == hay.len()
+        var now = false
+        if !end { now = picker_run_has(p, at, i) }
+        if end || now != lit {
+            if i > runstart {
+                let part = hay.slice(runstart, i)
+                var col = picker_text_color()
+                if lit { col = picker_match_color() }
+                else { if runstart < picker_label_at(it) { col = picker_dim_color() } }
+                out.pop_prims.push(pp_text_in(vec2(x, y), part, col, picker_font(), textrow))
+                x = x + overlay_text_width(part, picker_font())
+            }
+            runstart = i
+            lit = now
+        }
+        i = i + 1
+    }
+    if it.note.len() > 0 {
+        let nw = overlay_text_width(it.note, 11.0)
+        out.pop_prims.push(pp_text_in(vec2(row.max.x - nw - 8.0, y + 1.0), it.note, picker_note_color(), 11.0, row))
+    }
+}
+
+/// one line of the preview, syntax-coloured through the same lexer the editor uses.
+fn picker_emit_source(inout out: ComputedOverlay, line: Str, lang: Str, syn: SyntaxTokenPalette, x0: Float, y: Float, to: Rect) {
+    let sz = picker_preview_font()
+    if lang.len() == 0 {
+        out.pop_prims.push(pp_text_in(vec2(x0, y), line, picker_dim_color(), sz, to))
+        return
+    }
+    let spans = language_line_spans(lang, line)
+    if spans.len() == 0 {
+        out.pop_prims.push(pp_text_in(vec2(x0, y), line, picker_text_color(), sz, to))
+        return
+    }
+    var at = 0
+    var k = 0
+    while k < spans.len() {
+        let sp = spans[k]
+        if sp.start_col > at {
+            let plain = line.slice(at, sp.start_col)
+            out.pop_prims.push(pp_text_in(vec2(x0 + overlay_text_width(line.slice(0, at), sz), y), plain, picker_text_color(), sz, to))
+        }
+        let tok = line.slice(sp.start_col, sp.end_col)
+        out.pop_prims.push(pp_text_in(vec2(x0 + overlay_text_width(line.slice(0, sp.start_col), sz), y), tok, palette_color(syn, sp.cls), sz, to))
+        at = sp.end_col
+        k = k + 1
+    }
+    if at < line.len() {
+        out.pop_prims.push(pp_text_in(vec2(x0 + overlay_text_width(line.slice(0, at), sz), y), line.slice(at, line.len()), picker_text_color(), sz, to))
+    }
+}
+
+/// what the empty prompt says. Called with the scope first and the kind second, so a narrowed
+/// picker says what it is narrowed to; "" means "nothing to say about this one, ask about the kind".
+pub fn picker_placeholder(kind: Str) -> Str {
+    if kind == "files" || kind == "file" { return "open a file" }
+    if kind == "commands" || kind == "command" { return "run a command" }
+    if kind == "buffers" || kind == "buffer" { return "switch to an open file" }
+    if kind == "preferences" || kind == "preference" { return "find a setting" }
+    if kind == "all" { return "a file, a command, a setting — or a scope, like preferences::" }
+    // "" is not a kind. This is asked about the scope first and the kind second, and a picker with no
+    // scope must fall through to what its kind has to say rather than answering for it.
+    if kind.len() == 0 { return "" }
+    return "type to filter"
+}
+
+pub fn picker_text_color() -> Color { return color_rgb(233, 236, 244) }
+pub fn picker_dim_color() -> Color { return color_rgb(141, 149, 166) }
+pub fn picker_match_color() -> Color { return color_rgb(127, 179, 255) }
+pub fn picker_prompt_color() -> Color { return color_rgb(150, 196, 255) }
+pub fn picker_note_color() -> Color { return color_rgb(224, 184, 119) }

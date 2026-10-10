@@ -1,0 +1,386 @@
+// the fixed names every unit interns first, in this order, so each has a known id
+fn cnm_fixed() -> Str {
+    return ""
+        + " ("
+        + " )"
+        + " ,"
+        + " #"
+        + " ##"
+        + " ..."
+        + " ;"
+        + " {"
+        + " }"
+        + " ["
+        + " ]"
+        + " *"
+        + " ="
+        + " :"
+        + " ?"
+        + " !"
+        + " ~"
+        + " -"
+        + " +"
+        + " /"
+        + " %"
+        + " <<"
+        + " >>"
+        + " <"
+        + " >"
+        + " <="
+        + " >="
+        + " =="
+        + " !="
+        + " &"
+        + " ^"
+        + " |"
+        + " &&"
+        + " ||"
+        + " ."
+        + " ->"
+        + " 0"
+        + " 1"
+        + " define"
+        + " undef"
+        + " include"
+        + " include_next"
+        + " if"
+        + " ifdef"
+        + " ifndef"
+        + " elif"
+        + " else"
+        + " endif"
+        + " elifdef"
+        + " elifndef"
+        + " pragma"
+        + " error"
+        + " warning"
+        + " line"
+        + " once"
+        + " defined"
+        + " __VA_ARGS__"
+        + " __VA_OPT__"
+        + " __has_include"
+        + " __has_include_next"
+        + " __has_attribute"
+        + " __has_builtin"
+        + " __has_feature"
+        + " __has_extension"
+        + " __has_c_attribute"
+        + " __has_cpp_attribute"
+        + " __has_warning"
+        + " __FILE__"
+        + " __LINE__"
+        + " __COUNTER__"
+        + " __DATE__"
+        + " __TIME__"
+        + " __BASE_FILE__"
+        + " __is_identifier"
+        + " pack"
+        + " push"
+        + " pop"
+        + " import"
+        + " ident"
+        + " sccs"
+        + " assert"
+        + " unassert"
+        + " typedef"
+        + " extern"
+        + " static"
+        + " auto"
+        + " register"
+        + " inline"
+        + " __inline"
+        + " __inline__"
+        + " _Noreturn"
+        + " _Thread_local"
+        + " __thread"
+        + " thread_local"
+        + " constexpr"
+        + " const"
+        + " __const"
+        + " __const__"
+        + " volatile"
+        + " __volatile"
+        + " __volatile__"
+        + " restrict"
+        + " __restrict"
+        + " __restrict__"
+        + " _Atomic"
+        + " _Nullable"
+        + " _Nonnull"
+        + " _Null_unspecified"
+        + " __auto_type"
+        + " void"
+        + " char"
+        + " short"
+        + " int"
+        + " long"
+        + " signed"
+        + " __signed"
+        + " __signed__"
+        + " unsigned"
+        + " float"
+        + " double"
+        + " _Bool"
+        + " bool"
+        + " __int128"
+        + " __int128_t"
+        + " __uint128_t"
+        + " _Float128"
+        + " __float128"
+        + " _Float64x"
+        + " _Float80"
+        + " __float80"
+        + " _Float128x"
+        + " __ibm128"
+        + " _Float32"
+        + " _Float64"
+        + " _Float32x"
+        + " _Float16"
+        + " _Complex"
+        + " __complex__"
+        + " __builtin_va_list"
+        + " struct"
+        + " union"
+        + " enum"
+        + " __attribute__"
+        + " __attribute"
+        + " __extension__"
+        + " __asm__"
+        + " __asm"
+        + " asm"
+        + " _Static_assert"
+        + " static_assert"
+        + " __typeof__"
+        + " __typeof"
+        + " typeof"
+        + " __typeof_unqual__"
+        + " typeof_unqual"
+        + " _Alignas"
+        + " alignas"
+        + " sizeof"
+        + " _Alignof"
+        + " __alignof__"
+        + " alignof"
+        + " __alignof"
+        + " packed"
+        + " __packed__"
+        + " aligned"
+        + " __aligned__"
+        + " mode"
+        + " __mode__"
+        + " __builtin_offsetof"
+        + " true"
+        + " false"
+        + " nullptr"
+        + " _Generic"
+        + " vector_size"
+        + " __vector_size__"
+        + " QI"
+        + " HI"
+        + " SI"
+        + " DI"
+        + " TI"
+        + " word"
+        + " pointer"
+        + " __QI__"
+        + " __HI__"
+        + " __SI__"
+        + " __DI__"
+        + " __TI__"
+        + " __word__"
+        + " __pointer__"
+        + " unused"
+}
+global CNM_FIRST_WORD: Int = 39
+global CNM_COUNT: Int = 191
+global P_LPAREN: Int = 1
+global P_RPAREN: Int = 2
+global P_COMMA: Int = 3
+global P_HASH: Int = 4
+global P_HASHHASH: Int = 5
+global P_ELLIPSIS: Int = 6
+global P_SEMI: Int = 7
+global P_LBRACE: Int = 8
+global P_RBRACE: Int = 9
+global P_LBRACK: Int = 10
+global P_RBRACK: Int = 11
+global P_STAR: Int = 12
+global P_ASSIGN: Int = 13
+global P_COLON: Int = 14
+global P_QUESTION: Int = 15
+global P_NOT: Int = 16
+global P_TILDE: Int = 17
+global P_MINUS: Int = 18
+global P_PLUS: Int = 19
+global P_SLASH: Int = 20
+global P_PERCENT: Int = 21
+global P_SHL: Int = 22
+global P_SHR: Int = 23
+global P_LT: Int = 24
+global P_GT: Int = 25
+global P_LE: Int = 26
+global P_GE: Int = 27
+global P_EQ: Int = 28
+global P_NE: Int = 29
+global P_AMP: Int = 30
+global P_CARET: Int = 31
+global P_PIPE: Int = 32
+global P_ANDAND: Int = 33
+global P_OROR: Int = 34
+global P_DOT: Int = 35
+global P_ARROW: Int = 36
+global P_ZERO: Int = 37
+global P_ONE: Int = 38
+global KW_define: Int = 39
+global KW_undef: Int = 40
+global KW_include: Int = 41
+global KW_include_next: Int = 42
+global KW_if: Int = 43
+global KW_ifdef: Int = 44
+global KW_ifndef: Int = 45
+global KW_elif: Int = 46
+global KW_else: Int = 47
+global KW_endif: Int = 48
+global KW_elifdef: Int = 49
+global KW_elifndef: Int = 50
+global KW_pragma: Int = 51
+global KW_error: Int = 52
+global KW_warning: Int = 53
+global KW_line: Int = 54
+global KW_once: Int = 55
+global KW_defined: Int = 56
+global KW_UUVA_ARGS__: Int = 57
+global KW_UUVA_OPT__: Int = 58
+global KW_UUhas_include: Int = 59
+global KW_UUhas_include_next: Int = 60
+global KW_UUhas_attribute: Int = 61
+global KW_UUhas_builtin: Int = 62
+global KW_UUhas_feature: Int = 63
+global KW_UUhas_extension: Int = 64
+global KW_UUhas_c_attribute: Int = 65
+global KW_UUhas_cpp_attribute: Int = 66
+global KW_UUhas_warning: Int = 67
+global KW_UUFILE__: Int = 68
+global KW_UULINE__: Int = 69
+global KW_UUCOUNTER__: Int = 70
+global KW_UUDATE__: Int = 71
+global KW_UUTIME__: Int = 72
+global KW_UUBASE_FILE__: Int = 73
+global KW_UUis_identifier: Int = 74
+global KW_pack: Int = 75
+global KW_push: Int = 76
+global KW_pop: Int = 77
+global KW_import: Int = 78
+global KW_ident: Int = 79
+global KW_sccs: Int = 80
+global KW_assert: Int = 81
+global KW_unassert: Int = 82
+global KW_typedef: Int = 83
+global KW_extern: Int = 84
+global KW_static: Int = 85
+global KW_auto: Int = 86
+global KW_register: Int = 87
+global KW_inline: Int = 88
+global KW_UUinline: Int = 89
+global KW_UUinline__: Int = 90
+global KW_UNoreturn: Int = 91
+global KW_UThread_local: Int = 92
+global KW_UUthread: Int = 93
+global KW_thread_local: Int = 94
+global KW_constexpr: Int = 95
+global KW_const: Int = 96
+global KW_UUconst: Int = 97
+global KW_UUconst__: Int = 98
+global KW_volatile: Int = 99
+global KW_UUvolatile: Int = 100
+global KW_UUvolatile__: Int = 101
+global KW_restrict: Int = 102
+global KW_UUrestrict: Int = 103
+global KW_UUrestrict__: Int = 104
+global KW_UAtomic: Int = 105
+global KW_UNullable: Int = 106
+global KW_UNonnull: Int = 107
+global KW_UNull_unspecified: Int = 108
+global KW_UUauto_type: Int = 109
+global KW_void: Int = 110
+global KW_char: Int = 111
+global KW_short: Int = 112
+global KW_int: Int = 113
+global KW_long: Int = 114
+global KW_signed: Int = 115
+global KW_UUsigned: Int = 116
+global KW_UUsigned__: Int = 117
+global KW_unsigned: Int = 118
+global KW_float: Int = 119
+global KW_double: Int = 120
+global KW_UBool: Int = 121
+global KW_bool: Int = 122
+global KW_UUint128: Int = 123
+global KW_UUint128_t: Int = 124
+global KW_UUuint128_t: Int = 125
+global KW_UFloat128: Int = 126
+global KW_UUfloat128: Int = 127
+global KW_UFloat64x: Int = 128
+global KW_UFloat80: Int = 129
+global KW_UUfloat80: Int = 130
+global KW_UFloat128x: Int = 131
+global KW_UUibm128: Int = 132
+global KW_UFloat32: Int = 133
+global KW_UFloat64: Int = 134
+global KW_UFloat32x: Int = 135
+global KW_UFloat16: Int = 136
+global KW_UComplex: Int = 137
+global KW_UUcomplex__: Int = 138
+global KW_UUbuiltin_va_list: Int = 139
+global KW_struct: Int = 140
+global KW_union: Int = 141
+global KW_enum: Int = 142
+global KW_UUattribute__: Int = 143
+global KW_UUattribute: Int = 144
+global KW_UUextension__: Int = 145
+global KW_UUasm__: Int = 146
+global KW_UUasm: Int = 147
+global KW_asm: Int = 148
+global KW_UStatic_assert: Int = 149
+global KW_static_assert: Int = 150
+global KW_UUtypeof__: Int = 151
+global KW_UUtypeof: Int = 152
+global KW_typeof: Int = 153
+global KW_UUtypeof_unqual__: Int = 154
+global KW_typeof_unqual: Int = 155
+global KW_UAlignas: Int = 156
+global KW_alignas: Int = 157
+global KW_sizeof: Int = 158
+global KW_UAlignof: Int = 159
+global KW_UUalignof__: Int = 160
+global KW_alignof: Int = 161
+global KW_UUalignof: Int = 162
+global KW_packed: Int = 163
+global KW_UUpacked__: Int = 164
+global KW_aligned: Int = 165
+global KW_UUaligned__: Int = 166
+global KW_mode: Int = 167
+global KW_UUmode__: Int = 168
+global KW_UUbuiltin_offsetof: Int = 169
+global KW_true: Int = 170
+global KW_false: Int = 171
+global KW_nullptr: Int = 172
+global KW_UGeneric: Int = 173
+global KW_vector_size: Int = 174
+global KW_UUvector_size__: Int = 175
+global KW_QI: Int = 176
+global KW_HI: Int = 177
+global KW_SI: Int = 178
+global KW_DI: Int = 179
+global KW_TI: Int = 180
+global KW_word: Int = 181
+global KW_pointer: Int = 182
+global KW_UUQI__: Int = 183
+global KW_UUHI__: Int = 184
+global KW_UUSI__: Int = 185
+global KW_UUDI__: Int = 186
+global KW_UUTI__: Int = 187
+global KW_UUword__: Int = 188
+global KW_UUpointer__: Int = 189
+global KW_unused: Int = 190

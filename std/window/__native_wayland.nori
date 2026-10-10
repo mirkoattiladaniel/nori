@@ -1,0 +1,1482 @@
+// std/window/__native_wayland.nori: the Wayland backend of __native_linux.nori: an xdg-shell client that
+// speaks the wire protocol itself. It answers what window_wayland.c answers: a toplevel that tracks
+// resize and close, pointer and keyboard input off wl_seat, wl_shm presentation paced by frame
+// callbacks, the clipboard and drag-and-drop through wl_data_device, fractional scale through a
+// viewport, server-side decorations, cursor shapes, and the pointer lock.
+//
+// The wire. Every message is little-endian 32-bit words: the object id, then size<<16 | opcode, then
+// the arguments. A string is its length (including the NUL) and its bytes, padded to four; an array
+// is the same without the NUL; a file descriptor is not in the bytes at all but rides beside them as
+// SCM_RIGHTS on the same sendmsg/recvmsg. Object ids from 2 up are the client's to allocate, ids from
+// 0xff000000 up are the server's (a data offer); the server frees a client id with delete_id, and only
+// then may it be handed out again.
+//
+// Every object this client creates is tagged in a table by what it is, and an incoming event is
+// decoded by that tag: the role a proxy's interface pointer plays in libwayland.
+
+// what an object id is (NwlConn.kinds / skinds); 0 is an id nothing is listening to
+fn NWK_DISPLAY() -> Int { return 1 }
+fn NWK_REGISTRY() -> Int { return 2 }
+fn NWK_SYNC() -> Int { return 3 }
+fn NWK_COMPOSITOR() -> Int { return 4 }
+fn NWK_SURFACE() -> Int { return 5 }
+fn NWK_SHM() -> Int { return 6 }
+fn NWK_POOL() -> Int { return 7 }
+fn NWK_BUFFER() -> Int { return 8 }
+fn NWK_SEAT() -> Int { return 9 }
+fn NWK_POINTER() -> Int { return 10 }
+fn NWK_KEYBOARD() -> Int { return 11 }
+fn NWK_WMBASE() -> Int { return 12 }
+fn NWK_XSURFACE() -> Int { return 13 }
+fn NWK_TOPLEVEL() -> Int { return 14 }
+fn NWK_PASSIVE() -> Int { return 15 }       // bound, but sends nothing this client reads
+fn NWK_FSCALE() -> Int { return 18 }
+fn NWK_DDEVICE() -> Int { return 22 }
+fn NWK_DOFFER() -> Int { return 23 }
+fn NWK_CLIPSRC() -> Int { return 24 }
+fn NWK_DRAGSRC() -> Int { return 25 }
+fn NWK_RELPTR() -> Int { return 29 }
+fn NWK_FRAME() -> Int { return 32 }
+fn NWK_LSURF() -> Int { return 33 }        // zwlr_layer_surface_v1
+fn NWK_TLMGR() -> Int { return 34 }        // zwlr_foreign_toplevel_manager_v1
+fn NWK_TLHANDLE() -> Int { return 35 }     // zwlr_foreign_toplevel_handle_v1
+fn NWK_EXTLIST() -> Int { return 36 }      // ext_foreign_toplevel_list_v1
+fn NWK_EXTHANDLE() -> Int { return 37 }    // ext_foreign_toplevel_handle_v1
+fn NWK_WSMGR() -> Int { return 38 }        // ext_workspace_manager_v1
+fn NWK_WSGROUP() -> Int { return 39 }      // ext_workspace_group_handle_v1
+fn NWK_WSHANDLE() -> Int { return 40 }     // ext_workspace_handle_v1
+fn NWK_ACTTOKEN() -> Int { return 41 }     // xdg_activation_token_v1
+
+// event kinds on the window's queue: the codes window.nori's poll decodes
+fn NWE_CLOSED() -> Int { return 1 }
+fn NWE_RESIZED() -> Int { return 2 }
+fn NWE_KEYDOWN() -> Int { return 3 }
+fn NWE_KEYUP() -> Int { return 4 }
+fn NWE_DROP() -> Int { return 5 }
+fn NWE_SCROLL() -> Int { return 6 }
+fn NWE_MOUSEDOWN() -> Int { return 7 }
+fn NWE_MOUSEUP() -> Int { return 8 }
+
+// The connection: the socket, the outgoing bytes and fds not yet sent, the incoming bytes and fds not
+// yet consumed, and the id tables. `out` and `inb` are 65536 bytes each; the fd lists hold 32.
+cstruct NwlConn {
+    fd: Int, dead: Int,
+    out: Int, olen: Int, mstart: Int, mop: Int, ofds: Int, nofds: Int,
+    inb: Int, ihead: Int, ilen: Int, ifds: Int, nifds: Int, ifhead: Int,
+    nextid: Int, kinds: Int, kcap: Int, skinds: Int, scap: Int,
+    freel: Int, nfree: Int, freecap: Int
+}
+
+cstruct NwlWin {
+    c: Int, reg: Int, comp: Int, wm: Int, surf: Int, xsurf: Int, top: Int,
+    seat: Int, pointer: Int, kbd: Int, shm: Int,
+    vpr: Int, vp: Int, fsmgr: Int, fscale: Int, decomgr: Int, deco: Int,
+    ddm: Int, ddev: Int, sel_offer: Int, clip_src: Int, clip_text: Int,
+    pending_offer: Int, pending_uri: Int, pending_text: Int,
+    drag_offer: Int, drag_mime: Int, drop_offer: Int, drop_mime: Int, drop_text: Int, drop_pending: Int,
+    drag_src: Int, drag_src_text: Int, drag_src_plain: Int, drag_done: Int,
+    serial: Int, scale120: Int, closed: Int, w: Int, h: Int,
+    px: Int, py: Int, btn: Int, mid: Int, lx: Int, ly: Int, tap_latch: Int,
+    keymap: Int, kmods: Int, kgroup: Int, mods: Int,
+    rep_active: Int, rep_sym: Int, rep_key: Int, rep_next_ms: Int, rep_delay_ms: Int, rep_rate_ms: Int,
+    q: Int, qhead: Int, qtail: Int,
+    pool: Int, shm_fd: Int, shm_map: Int, shm_size: Int, shm_w: Int, shm_h: Int,
+    buf0: Int, buf1: Int, busy0: Int, busy1: Int,
+    frame_cb: Int, frame_pending: Int, sync_id: Int, sync_done: Int,
+    pcon: Int, rpmgr: Int, plock: Int, relptr: Int, shmgr: Int, shdev: Int,
+    ptr_serial: Int, shape_cur: Int, locked: Int, rel_dx: Int, rel_dy: Int,
+    lshell: Int, lsurf: Int,
+    argb: Int, kfocus: Int, xact: Int, tok_id: Int, tok_str: Int, tok_done: Int, seatv: Int,
+    kinhmgr: Int, kinh: Int
+}
+
+fn NWL_QN() -> Int { return 512 }
+fn NWL_BUFCAP() -> Int { return 65536 }
+
+// ---- the connection ----------------------------------------------------------------------------------
+
+fn nwl_conn_new(fd: Int) -> Int {
+    let c: NwlConn = calloc(1, sizeof(NwlConn))
+    c.fd = fd
+    c.out = malloc(NWL_BUFCAP())
+    c.ofds = malloc(32 * 8)
+    c.inb = malloc(NWL_BUFCAP())
+    c.ifds = malloc(32 * 8)
+    c.nextid = 2
+    c.kcap = 256
+    c.kinds = calloc(1, 256)
+    c.scap = 64
+    c.skinds = calloc(1, 64)
+    c.freecap = 64
+    c.freel = malloc(64 * 8)
+    poke8(c.kinds + 1, NWK_DISPLAY())
+    return c
+}
+
+fn nwl_conn_free(c: NwlConn) {
+    var i = c.ifhead
+    while i < c.nifds { close(peek(c.ifds + i * 8))  i = i + 1 }
+    if c.fd >= 0 { close(c.fd) }
+    free(c.out)  free(c.ofds)  free(c.inb)  free(c.ifds)  free(c.kinds)  free(c.skinds)  free(c.freel)
+    free(c)
+}
+
+fn nwl_kind(c: NwlConn, id: Int) -> Int {
+    if id >= 4278190080 {
+        let si = id - 4278190080
+        if si < c.scap { return peek8(c.skinds + si) }
+        return 0
+    }
+    if id < c.kcap { return peek8(c.kinds + id) }
+    return 0
+}
+
+fn nwl_setkind(c: NwlConn, id: Int, k: Int) {
+    if id >= 4278190080 {
+        let si = id - 4278190080
+        if si >= c.scap {
+            var ncap = c.scap * 2
+            while ncap <= si { ncap = ncap * 2 }
+            let nt = calloc(1, ncap)
+            memcpy(nt, c.skinds, c.scap)
+            free(c.skinds)
+            c.skinds = nt
+            c.scap = ncap
+        }
+        poke8(c.skinds + si, k)
+        return
+    }
+    if id >= c.kcap {
+        var kc = c.kcap * 2
+        while kc <= id { kc = kc * 2 }
+        let kt = calloc(1, kc)
+        memcpy(kt, c.kinds, c.kcap)
+        free(c.kinds)
+        c.kinds = kt
+        c.kcap = kc
+    }
+    poke8(c.kinds + id, k)
+}
+
+// a fresh client object id tagged `k`: one the server has released, or the next never used
+fn nwl_newid(c: NwlConn, k: Int) -> Int {
+    var id = 0
+    if c.nfree > 0 {
+        c.nfree = c.nfree - 1
+        id = peek(c.freel + c.nfree * 8)
+    } else {
+        id = c.nextid
+        c.nextid = c.nextid + 1
+    }
+    nwl_setkind(c, id, k)
+    return id
+}
+
+// wl_display.delete_id: the server has let go of `id`, so it may be allocated again
+fn nwl_release_id(c: NwlConn, id: Int) {
+    nwl_setkind(c, id, 0)
+    if id >= 4278190080 { return }
+    if c.nfree >= c.freecap {
+        let nl = malloc(c.freecap * 2 * 8)
+        memcpy(nl, c.freel, c.freecap * 8)
+        free(c.freel)
+        c.freel = nl
+        c.freecap = c.freecap * 2
+    }
+    poke(c.freel + c.nfree * 8, id)
+    c.nfree = c.nfree + 1
+}
+
+// ---- requests ----------------------------------------------------------------------------------------
+
+fn nwl_begin(c: NwlConn, obj: Int, op: Int) {
+    if c.olen > 49152 { nwl_flush(c) }
+    c.mstart = c.olen
+    c.mop = op
+    poke32(c.out + c.olen, obj)
+    poke32(c.out + c.olen + 4, 0)
+    c.olen = c.olen + 8
+}
+fn nwl_u(c: NwlConn, v: Int) {
+    poke32(c.out + c.olen, v & 4294967295)
+    c.olen = c.olen + 4
+}
+// a string argument from `n` bytes at `p`; p == 0 sends the null string
+fn nwl_str(c: NwlConn, p: Int, n: Int) {
+    if p == 0 { nwl_u(c, 0)  return }
+    var len = n
+    if len > 16000 { len = 16000 }
+    nwl_u(c, len + 1)
+    memcpy(c.out + c.olen, p, len)
+    var k = len
+    poke8(c.out + c.olen + k, 0)
+    k = k + 1
+    while (k & 3) != 0 { poke8(c.out + c.olen + k, 0)  k = k + 1 }
+    c.olen = c.olen + k
+}
+fn nwl_lit(c: NwlConn, s: Str) { nwl_str(c, nori_str_ptr(s), s.len()) }
+// a file-descriptor argument: it travels beside the bytes, so the message is sent at nwl_end
+fn nwl_fdarg(c: NwlConn, fd: Int) {
+    if c.nofds < 32 { poke(c.ofds + c.nofds * 8, fd)  c.nofds = c.nofds + 1 }
+}
+fn nwl_end(c: NwlConn) {
+    let size = c.olen - c.mstart
+    poke32(c.out + c.mstart + 4, size * 65536 + c.mop)
+    if c.nofds > 0 { nwl_flush(c) }
+}
+
+// send everything queued, with any fds attached to the first chunk. A connection the server has
+// closed is marked dead and swallows what is written to it from then on.
+fn nwl_flush(c: NwlConn) {
+    if c.dead == 1 { c.olen = 0  c.nofds = 0  return }
+    let msg = calloc(1, 56)
+    let iov = malloc(16)
+    let ctl = calloc(1, 16 + 32 * 4 + 8)
+    var sent = 0
+    while sent < c.olen && c.dead == 0 {
+        poke(iov, c.out + sent)
+        poke(iov + 8, c.olen - sent)
+        poke(msg + 16, iov)
+        poke(msg + 24, 1)
+        if c.nofds > 0 {
+            let clen = 16 + c.nofds * 4
+            poke(ctl, clen)
+            poke32(ctl + 8, 1)                                  // SOL_SOCKET
+            poke32(ctl + 12, 1)                                 // SCM_RIGHTS
+            var i = 0
+            while i < c.nofds { poke32(ctl + 16 + i * 4, peek(c.ofds + i * 8))  i = i + 1 }
+            poke(msg + 32, ctl)
+            poke(msg + 40, (clen + 7) & (0 - 8))
+        } else {
+            poke(msg + 32, 0)
+            poke(msg + 40, 0)
+        }
+        let r = sendmsg(c.fd, msg, 16384)                       // MSG_NOSIGNAL
+        if r > 0 {
+            sent = sent + r
+            c.nofds = 0
+        } else {
+            if r == 0 - 11 || r == 0 - 4 {                       // EAGAIN / EINTR: try again
+                usleep(1000)
+            } else {
+                c.dead = 1
+            }
+        }
+    }
+    free(msg)  free(iov)  free(ctl)
+    c.olen = 0
+    c.nofds = 0
+}
+
+// ---- events ------------------------------------------------------------------------------------------
+
+// read what the server has sent, waiting up to `ms` for the first byte. Returns the bytes read (0 when
+// nothing arrived). The fds that came with them join the incoming fd queue.
+fn nwl_read(c: NwlConn, ms: Int) -> Int {
+    if c.dead == 1 { return 0 }
+    if nwu_readable(c.fd, ms) == 0 { return 0 }
+    if c.ihead > 0 {
+        memmove(c.inb, c.inb + c.ihead, c.ilen - c.ihead)
+        c.ilen = c.ilen - c.ihead
+        c.ihead = 0
+    }
+    if c.ilen >= NWL_BUFCAP() { return 0 }
+    let msg = calloc(1, 56)
+    let iov = malloc(16)
+    let ctl = calloc(1, 512)
+    poke(iov, c.inb + c.ilen)
+    poke(iov + 8, NWL_BUFCAP() - c.ilen)
+    poke(msg + 16, iov)
+    poke(msg + 24, 1)
+    poke(msg + 32, ctl)
+    poke(msg + 40, 512)
+    let r = recvmsg(c.fd, msg, 1073741888)                      // MSG_CMSG_CLOEXEC | MSG_DONTWAIT
+    if r == 0 { c.dead = 1 }
+    if r > 0 {
+        c.ilen = c.ilen + r
+        let clen = peek(msg + 40)
+        var off = 0
+        while off + 16 <= clen {
+            let cl = peek(ctl + off)
+            if cl < 16 { off = clen } else {
+                if peek32(ctl + off + 8) == 1 && peek32(ctl + off + 12) == 1 {
+                    let nfd = (cl - 16) / 4
+                    var j = 0
+                    while j < nfd {
+                        if c.ifhead > 0 && c.nifds >= 32 {
+                            memmove(c.ifds, c.ifds + c.ifhead * 8, (c.nifds - c.ifhead) * 8)
+                            c.nifds = c.nifds - c.ifhead
+                            c.ifhead = 0
+                        }
+                        let got = peek32(ctl + off + 16 + j * 4)
+                        if c.nifds < 32 { poke(c.ifds + c.nifds * 8, got)  c.nifds = c.nifds + 1 } else { close(got) }
+                        j = j + 1
+                    }
+                }
+                off = off + ((cl + 7) & (0 - 8))
+            }
+        }
+    }
+    free(msg)  free(iov)  free(ctl)
+    if r < 0 {
+        if r != 0 - 11 && r != 0 - 4 { c.dead = 1 }
+        return 0
+    }
+    return r
+}
+
+// the next received fd, in the order the messages carrying them were sent (-1 if none arrived)
+fn nwl_take_fd(c: NwlConn) -> Int {
+    if c.ifhead >= c.nifds { return 0 - 1 }
+    let fd = peek(c.ifds + c.ifhead * 8)
+    c.ifhead = c.ifhead + 1
+    if c.ifhead == c.nifds { c.ifhead = 0  c.nifds = 0 }
+    return fd
+}
+
+// decode every complete message waiting in the input buffer
+fn nwl_dispatch(w: NwlWin) {
+    let c: NwlConn = w.c
+    var going = 1
+    while going == 1 && c.ilen - c.ihead >= 8 {
+        let p = c.inb + c.ihead
+        let obj = peek32(p)
+        let hw = peek32(p + 4)
+        let size = hw / 65536
+        let op = hw & 65535
+        if size < 8 || size > NWL_BUFCAP() {
+            c.dead = 1
+            going = 0
+        } else {
+            if c.ilen - c.ihead < size { going = 0 } else {
+                c.ihead = c.ihead + size
+                nwl_event(w, c, obj, op, p + 8)
+            }
+        }
+    }
+}
+
+// send what is queued, take whatever has arrived without waiting, and decode it
+fn nwl_pump(w: NwlWin) {
+    let c: NwlConn = w.c
+    nwl_flush(c)
+    var rounds = 0
+    while rounds < 8 && nwl_read(c, 0) > 0 { rounds = rounds + 1 }
+    nwl_dispatch(w)
+}
+
+// send, then wait up to `ms` for anything and decode it
+fn nwl_wait(w: NwlWin, ms: Int) {
+    let c: NwlConn = w.c
+    nwl_flush(c)
+    if nwl_read(c, ms) > 0 {
+        while nwl_read(c, 0) > 0 { }
+    }
+    nwl_dispatch(w)
+}
+
+// wl_display.sync and wait for its callback: everything the server had to say about the requests
+// before it has been decoded by then. Gives up after five quiet seconds.
+fn nwl_roundtrip(w: NwlWin) {
+    let c: NwlConn = w.c
+    let cb = nwl_newid(c, NWK_SYNC())
+    nwl_begin(c, 1, 0)  nwl_u(c, cb)  nwl_end(c)
+    w.sync_id = cb
+    w.sync_done = 0
+    var quiet = 0
+    nwl_flush(c)
+    nwl_dispatch(w)
+    while w.sync_done == 0 && c.dead == 0 && quiet < 50 {
+        if nwl_read(c, 100) > 0 { quiet = 0 } else { quiet = quiet + 1 }
+        nwl_dispatch(w)
+        nwl_flush(c)
+    }
+}
+
+fn nwl_push3(w: NwlWin, ty: Int, a: Int, b: Int, cc: Int) {
+    let n = (w.qtail + 1) % NWL_QN()
+    if n == w.qhead { return }
+    let e = w.q + w.qtail * 16
+    poke32(e, ty)  poke32(e + 4, a & 4294967295)  poke32(e + 8, b & 4294967295)  poke32(e + 12, cc & 4294967295)
+    w.qtail = n
+}
+fn nwl_push(w: NwlWin, ty: Int, a: Int, b: Int) { nwl_push3(w, ty, a, b, 0) }
+
+// the byte length of a string or array argument at `p`, padded as it is on the wire
+fn nwl_padded(p: Int) -> Int { return (peek32(p) + 3) & (0 - 4) }
+
+fn nwl_event(w: NwlWin, c: NwlConn, obj: Int, op: Int, a: Int) {
+    let k = nwl_kind(c, obj)
+    if k == 0 { return }
+    if k == NWK_DISPLAY() {
+        if op == 0 {
+            nwu_stderr("std/window: the Wayland compositor reported a protocol error: ")
+            let sl = peek32(a + 8)
+            if sl > 1 { write(2, a + 12, sl - 1) }
+            nwu_stderr("\n")
+            c.dead = 1
+        }
+        if op == 1 { nwl_release_id(c, peek32(a)) }
+        return
+    }
+    if k == NWK_REGISTRY() {
+        if op == 0 { nwl_global(w, c, peek32(a), a + 4, peek32(a + 8 + nwl_padded(a + 4))) }
+        return
+    }
+    if k == NWK_SYNC() {
+        if op == 0 { if obj == w.sync_id { w.sync_done = 1 }  nwl_setkind(c, obj, 0) }
+        return
+    }
+    if k == NWK_FRAME() {
+        if op == 0 {
+            if w.frame_cb == obj { w.frame_cb = 0 }
+            w.frame_pending = 0
+            nwl_setkind(c, obj, 0)
+        }
+        return
+    }
+    if k == NWK_ACTTOKEN() {
+        if op == 0 && obj == w.tok_id {                                           // done(token)
+            let tl = peek32(a)
+            if w.tok_str != 0 { free(w.tok_str) }
+            w.tok_str = malloc(tl + 1)
+            if tl > 0 { memcpy(w.tok_str, a + 4, tl) }
+            poke8(w.tok_str + tl, 0)
+            w.tok_done = 1
+        }
+        return
+    }
+    if k == NWK_BUFFER() {
+        if op == 0 {
+            if obj == w.buf0 { w.busy0 = 0 }
+            if obj == w.buf1 { w.busy1 = 0 }
+        }
+        return
+    }
+    if k == NWK_WMBASE() {
+        if op == 0 { nwl_begin(c, w.wm, 3)  nwl_u(c, peek32(a))  nwl_end(c) }      // ping -> pong
+        return
+    }
+    if k == NWK_XSURFACE() {
+        if op == 0 { nwl_begin(c, obj, 4)  nwl_u(c, peek32(a))  nwl_end(c) }       // configure -> ack
+        return
+    }
+    if k == NWK_TOPLEVEL() {
+        if op == 0 {
+            let cw = nwu_s32(peek32(a))
+            let ch = nwu_s32(peek32(a + 4))
+            if cw > 0 && ch > 0 && (cw != w.w || ch != w.h) {
+                w.w = cw
+                w.h = ch
+                nwl_push(w, NWE_RESIZED(), cw, ch)
+            }
+        }
+        if op == 1 { w.closed = 1  nwl_push(w, NWE_CLOSED(), 0, 0) }
+        return
+    }
+    if k == NWK_LSURF() {
+        if op == 0 {                                                              // configure(serial, width, height)
+            nwl_begin(c, obj, 6)  nwl_u(c, peek32(a))  nwl_end(c)                 // ack_configure
+            let lw = peek32(a + 4)
+            let lh = peek32(a + 8)
+            var nw = w.w
+            var nh = w.h
+            if lw > 0 { nw = lw }
+            if lh > 0 { nh = lh }
+            if nw != w.w || nh != w.h {
+                w.w = nw
+                w.h = nh
+                nwl_push(w, NWE_RESIZED(), nw, nh)
+            }
+        }
+        if op == 1 { w.closed = 1  nwl_push(w, NWE_CLOSED(), 0, 0) }              // closed: the output went away
+        return
+    }
+    if k == NWK_FSCALE() {
+        // a new preferred scale (the output's changed, or the surface moved to another): the program is told as it is
+        // of a new size (Resized with the same logical size), so it draws its buffer again at the new scale
+        if op == 0 {
+            let sc = peek32(a)
+            if sc > 0 && sc != w.scale120 {
+                let was = w.scale120
+                w.scale120 = sc
+                if was > 0 && w.w > 0 && w.h > 0 { nwl_push(w, NWE_RESIZED(), w.w, w.h) }
+            }
+        }
+        return
+    }
+    if k == NWK_SEAT() {
+        if op == 0 {
+            // A capability can go and come back (the last mouse unplugged, a keyboard plugged in): the
+            // object of one that went is released (it would never send anything again) and a new one
+            // is asked for when it returns.
+            let caps = peek32(a)
+            if (caps & 1) == 0 && w.pointer != 0 {
+                if w.seatv >= 3 { nwl_begin(c, w.pointer, 1)  nwl_end(c) }      // wl_pointer.release (v3)
+                nwl_setkind(c, w.pointer, 0)
+                w.pointer = 0
+                w.btn = 0
+            }
+            if (caps & 2) == 0 && w.kbd != 0 {
+                if w.seatv >= 3 { nwl_begin(c, w.kbd, 0)  nwl_end(c) }          // wl_keyboard.release (v3)
+                nwl_setkind(c, w.kbd, 0)
+                w.kbd = 0
+                w.kfocus = 0
+                w.rep_active = 0
+            }
+            if (caps & 1) != 0 && w.pointer == 0 {
+                w.pointer = nwl_newid(c, NWK_POINTER())
+                nwl_begin(c, w.seat, 0)  nwl_u(c, w.pointer)  nwl_end(c)
+            }
+            if (caps & 2) != 0 && w.kbd == 0 {
+                w.kbd = nwl_newid(c, NWK_KEYBOARD())
+                nwl_begin(c, w.seat, 1)  nwl_u(c, w.kbd)  nwl_end(c)
+            }
+        }
+        return
+    }
+    if k == NWK_POINTER() { nwl_pointer_event(w, op, a)  return }
+    if k == NWK_KEYBOARD() { nwl_keyboard_event(w, c, op, a)  return }
+    if k == NWK_DDEVICE() { nwl_ddev_event(w, c, op, a)  return }
+    if k == NWK_DOFFER() {
+        if op == 0 && obj == w.pending_offer {
+            let ml = peek32(a)
+            if ml > 0 {
+                if nwu_mem_eq(a + 4, ml - 1, "text/uri-list") == 1 { w.pending_uri = 1 }
+                else if nwu_mem_starts(a + 4, ml - 1, "text/plain") == 1 { w.pending_text = 1 }
+            }
+        }
+        return
+    }
+    if k == NWK_CLIPSRC() || k == NWK_DRAGSRC() {
+        if op == 1 {                                                              // send(mime, fd)
+            let sfd = nwl_take_fd(c)
+            var txt = w.clip_text
+            if k == NWK_DRAGSRC() {
+                txt = w.drag_src_text
+                // a drag of files (start_drag_files): its uri-list for text/uri-list, the plain paths for text
+                if w.drag_src_plain != 0 && nwu_mem_eq(a + 4, peek32(a) - 1, "text/uri-list") == 0 { txt = w.drag_src_plain }
+            }
+            if sfd >= 0 {
+                if txt != 0 { nwu_write_all(sfd, txt, strlen(txt)) }
+                close(sfd)
+            }
+        }
+        if op == 2 {                                                              // cancelled
+            nwl_begin(c, obj, 1)  nwl_end(c)
+            nwl_setkind(c, obj, 0)
+            if w.clip_src == obj { w.clip_src = 0 }
+            if w.drag_src == obj { w.drag_src = 0 }
+        }
+        if op == 4 && k == NWK_DRAGSRC() {                                       // dnd_finished
+            w.drag_done = 1
+            nwl_begin(c, obj, 1)  nwl_end(c)
+            nwl_setkind(c, obj, 0)
+            if w.drag_src == obj { w.drag_src = 0 }
+        }
+        return
+    }
+    if k == NWK_RELPTR() {
+        if op == 0 {
+            w.rel_dx = w.rel_dx + nwu_s32(peek32(a + 8))
+            w.rel_dy = w.rel_dy + nwu_s32(peek32(a + 12))
+        }
+        return
+    }
+}
+
+// a global the compositor advertises: bind the ones this client uses, at the versions it speaks
+fn nwl_global(w: NwlWin, c: NwlConn, name: Int, sp: Int, ver: Int) {
+    let sl = peek32(sp) - 1
+    let s = sp + 4
+    var id = 0
+    var bver = 1
+    if nwu_mem_eq(s, sl, "wl_compositor") == 1 { id = nwl_newid(c, NWK_COMPOSITOR())  bver = 4  w.comp = id }
+    else if nwu_mem_eq(s, sl, "xdg_wm_base") == 1 { id = nwl_newid(c, NWK_WMBASE())  w.wm = id }
+    else if nwu_mem_eq(s, sl, "wl_seat") == 1 {
+        id = nwl_newid(c, NWK_SEAT())
+        bver = ver
+        if bver > 4 { bver = 4 }
+        w.seat = id
+        w.seatv = bver
+    }
+    else if nwu_mem_eq(s, sl, "wl_shm") == 1 { id = nwl_newid(c, NWK_SHM())  w.shm = id }
+    else if nwu_mem_eq(s, sl, "wp_viewporter") == 1 { id = nwl_newid(c, NWK_PASSIVE())  w.vpr = id }
+    else if nwu_mem_eq(s, sl, "wp_fractional_scale_manager_v1") == 1 { id = nwl_newid(c, NWK_PASSIVE())  w.fsmgr = id }
+    else if nwu_mem_eq(s, sl, "zxdg_decoration_manager_v1") == 1 { id = nwl_newid(c, NWK_PASSIVE())  w.decomgr = id }
+    else if nwu_mem_eq(s, sl, "wl_data_device_manager") == 1 { id = nwl_newid(c, NWK_PASSIVE())  bver = 3  w.ddm = id }
+    else if nwu_mem_eq(s, sl, "zwp_pointer_constraints_v1") == 1 { id = nwl_newid(c, NWK_PASSIVE())  w.pcon = id }
+    else if nwu_mem_eq(s, sl, "wp_cursor_shape_manager_v1") == 1 { id = nwl_newid(c, NWK_PASSIVE())  w.shmgr = id }
+    else if nwu_mem_eq(s, sl, "zwp_relative_pointer_manager_v1") == 1 { id = nwl_newid(c, NWK_PASSIVE())  w.rpmgr = id }
+    else if nwu_mem_eq(s, sl, "xdg_activation_v1") == 1 { id = nwl_newid(c, NWK_PASSIVE())  w.xact = id }
+    else if nwu_mem_eq(s, sl, "zwp_keyboard_shortcuts_inhibit_manager_v1") == 1 { id = nwl_newid(c, NWK_PASSIVE())  w.kinhmgr = id }
+    else if nwu_mem_eq(s, sl, "zwlr_layer_shell_v1") == 1 {
+        id = nwl_newid(c, NWK_PASSIVE())                                          // its requests only: it sends no events
+        bver = ver
+        if bver > 4 { bver = 4 }                                                  // 4: on-demand keyboard focus
+        w.lshell = id
+    }
+    if id == 0 { return }
+    nwl_begin(c, w.reg, 0)
+    nwl_u(c, name)
+    nwl_str(c, s, sl)
+    nwl_u(c, bver)
+    nwl_u(c, id)
+    nwl_end(c)
+}
+
+// ---- pointer -----------------------------------------------------------------------------------------
+
+// A click is shorter than a frame: every press and release is queued as its own event with the
+// position it happened at, and a left press also sets the latch the polled state reports once.
+fn nwl_pointer_event(w: NwlWin, op: Int, a: Int) {
+    if op == 0 {                                                                  // enter
+        w.serial = peek32(a)
+        w.px = nwu_s32(peek32(a + 8)) / 256
+        w.py = nwu_s32(peek32(a + 12)) / 256
+        w.ptr_serial = peek32(a)
+        w.shape_cur = 0 - 1
+        return
+    }
+    if op == 1 {                                                                  // leave(serial, surface)
+        // the pointer is elsewhere: no position here (pointer_at says -1, -1, as before it entered). Keeping the
+        // last position would mean a program never saw it leave: a hover kept, a hint left up, a timer held
+        if peek32(a + 4) == w.surf { w.px = 0 - 1  w.py = 0 - 1 }
+        return
+    }
+    if op == 2 {                                                                  // motion
+        w.px = nwu_s32(peek32(a + 4)) / 256
+        w.py = nwu_s32(peek32(a + 8)) / 256
+        return
+    }
+    if op == 3 {                                                                  // button
+        w.serial = peek32(a)
+        let button = peek32(a + 8)
+        var pressed = 0
+        if peek32(a + 12) == 1 { pressed = 1 }
+        var id = 0
+        if button == 272 {                                                        // BTN_LEFT
+            w.btn = pressed
+            id = 1
+            if pressed == 1 { w.lx = w.px  w.ly = w.py  w.tap_latch = 1 }
+        } else if button == 274 {                                                 // BTN_MIDDLE
+            w.mid = pressed
+            id = 2
+        } else if button == 273 { id = 3 }                                       // BTN_RIGHT
+        if id != 0 {
+            if pressed == 1 { nwl_push3(w, NWE_MOUSEDOWN(), id, w.px, w.py) } else { nwl_push3(w, NWE_MOUSEUP(), id, w.px, w.py) }
+        }
+        return
+    }
+    if op == 4 {                                                                  // axis
+        if peek32(a + 4) == 0 {
+            let dv = nwu_s32(peek32(a + 8)) / 256
+            if dv != 0 { nwl_push(w, NWE_SCROLL(), dv, 0) }
+        }
+        return
+    }
+}
+
+// ---- keyboard ----------------------------------------------------------------------------------------
+
+// KeyDown/KeyUp carry (keysym, modmask). The keysym comes from the compositor's own keymap, decoded by
+// __native_xkb.nori; before a keymap has arrived the raw keycode is reported, as window_wayland.c does.
+fn nwl_keyboard_event(w: NwlWin, c: NwlConn, op: Int, a: Int) {
+    if op == 0 {                                                                  // keymap(format, fd, size)
+        let kfd = nwl_take_fd(c)
+        if kfd < 0 { return }
+        let fmt = peek32(a)
+        let ksize = peek32(a + 4)
+        if fmt == 1 && ksize > 0 {
+            let map = mmap(0, ksize, 1, 2, kfd, 0)                               // PROT_READ, MAP_PRIVATE
+            if map > 0 || map < 0 - 4095 {
+                let km = nxkb_parse(map, ksize)
+                munmap(map, ksize)
+                if km != 0 {
+                    if w.keymap != 0 { nxkb_free(w.keymap) }
+                    w.keymap = km
+                }
+            }
+        }
+        close(kfd)
+        return
+    }
+    if op == 1 { w.serial = peek32(a)  w.kfocus = 1  return }                     // enter
+    if op == 2 { w.rep_active = 0  w.kfocus = 0  return }                         // leave: stop repeating
+    if op == 3 {                                                                  // key(serial, time, key, state)
+        w.serial = peek32(a)
+        let code = peek32(a + 8) + 8                                              // xkb keycode = evdev + 8
+        var sym = code
+        if w.keymap != 0 { sym = nxkb_keysym_group(w.keymap, code, w.kmods, w.kgroup) }
+        if peek32(a + 12) == 1 {
+            nwl_push(w, NWE_KEYDOWN(), sym, w.mods)
+            if w.rep_rate_ms > 0 && w.keymap != 0 && nxkb_repeats(w.keymap, code) == 1 {
+                w.rep_active = 1
+                w.rep_sym = sym
+                w.rep_key = code
+                w.rep_next_ms = nwu_now_ms() + w.rep_delay_ms
+            } else { w.rep_active = 0 }
+        } else {
+            nwl_push(w, NWE_KEYUP(), sym, w.mods)
+            if w.rep_active == 1 && w.rep_key == code { w.rep_active = 0 }
+        }
+        return
+    }
+    if op == 4 {                                                                  // modifiers
+        let eff = peek32(a + 4) | peek32(a + 8) | peek32(a + 12)
+        w.kmods = eff
+        w.kgroup = nwu_s32(peek32(a + 16))                                        // the layout in use
+        var m = 0
+        if (eff & 1) != 0 { m = m | 1 }                                           // Shift
+        if (eff & 4) != 0 { m = m | 2 }                                           // Control
+        if (eff & 8) != 0 { m = m | 4 }                                           // Mod1 = Alt
+        if (eff & 64) != 0 { m = m | 8 }                                          // Mod4 = Logo
+        if w.keymap != 0 { w.mods = m }
+        return
+    }
+    if op == 5 {                                                                  // repeat_info(rate, delay)
+        let rate = nwu_s32(peek32(a))
+        w.rep_delay_ms = nwu_s32(peek32(a + 4))
+        if rate > 0 { w.rep_rate_ms = 1000 / rate } else { w.rep_rate_ms = 0 }
+        return
+    }
+}
+
+// ---- clipboard and drag-and-drop ---------------------------------------------------------------------
+
+fn nwl_mime_lit(c: NwlConn, which: Int) {
+    if which == 1 { nwl_lit(c, "text/uri-list") } else { nwl_lit(c, "text/plain;charset=utf-8") }
+}
+
+fn nwl_offer_destroy(c: NwlConn, offer: Int) {
+    nwl_begin(c, offer, 2)  nwl_end(c)
+    nwl_setkind(c, offer, 0)
+}
+
+fn nwl_ddev_event(w: NwlWin, c: NwlConn, op: Int, a: Int) {
+    if op == 0 {                                                                  // data_offer(new id)
+        let o = peek32(a)
+        nwl_setkind(c, o, NWK_DOFFER())
+        w.pending_offer = o
+        w.pending_uri = 0
+        w.pending_text = 0
+        return
+    }
+    if op == 1 {                                                                  // enter(serial, surface, x, y, offer)
+        let o = peek32(a + 16)
+        w.drag_offer = o
+        w.px = nwu_s32(peek32(a + 8)) / 256
+        w.py = nwu_s32(peek32(a + 12)) / 256
+        var mime = 0
+        if o == w.pending_offer {
+            if w.pending_uri == 1 { mime = 1 } else if w.pending_text == 1 { mime = 2 }
+        }
+        w.drag_mime = mime
+        if o != 0 {
+            nwl_begin(c, o, 4)  nwl_u(c, 3)  nwl_u(c, 2)  nwl_end(c)              // set_actions(move|copy, move)
+            nwl_begin(c, o, 0)  nwl_u(c, peek32(a))
+            if mime == 0 { nwl_u(c, 0) } else { nwl_mime_lit(c, mime) }
+            nwl_end(c)
+        }
+        return
+    }
+    if op == 2 {                                                                  // leave
+        if w.drag_offer != 0 { nwl_offer_destroy(c, w.drag_offer)  w.drag_offer = 0 }
+        w.drag_mime = 0
+        return
+    }
+    if op == 3 {                                                                  // motion(time, x, y)
+        w.px = nwu_s32(peek32(a + 4)) / 256
+        w.py = nwu_s32(peek32(a + 8)) / 256
+        return
+    }
+    // The drop is only flagged here: reading the offer needs a loop of its own that keeps decoding
+    // events, so it runs at the top of the next poll, outside this decoder.
+    if op == 4 {
+        if w.drag_offer != 0 && w.drag_mime != 0 {
+            w.drop_offer = w.drag_offer
+            w.drop_mime = w.drag_mime
+            w.drag_offer = 0
+            w.drag_mime = 0
+            w.drop_pending = 1
+        } else if w.drag_offer != 0 {
+            nwl_offer_destroy(c, w.drag_offer)
+            w.drag_offer = 0
+        }
+        return
+    }
+    if op == 5 {                                                                  // selection(offer)
+        let so = peek32(a)
+        if w.sel_offer != 0 && w.sel_offer != so { nwl_offer_destroy(c, w.sel_offer) }
+        w.sel_offer = so
+        return
+    }
+}
+
+// receive `offer` as `mime` (1 uri-list, 2 text) into a malloc'd NUL-terminated string. Events keep
+// being decoded while the source writes, and a source that stalls is abandoned after a few quiet
+// polls, so a stuck owner cannot hang the frame loop.
+fn nwl_offer_read(w: NwlWin, offer: Int, mime: Int) -> Int {
+    let c: NwlConn = w.c
+    if offer == 0 || mime == 0 { return nwu_strdup(0) }
+    let fds = malloc(8)
+    if pipe(fds) != 0 { free(fds)  return nwu_strdup(0) }
+    let rfd = peek32(fds)
+    let wfd = peek32(fds + 4)
+    free(fds)
+    nwl_begin(c, offer, 1)  nwl_mime_lit(c, mime)  nwl_fdarg(c, wfd)  nwl_end(c)
+    nwl_flush(c)
+    close(wfd)
+    var cap = 4096
+    var len = 0
+    var buf = malloc(cap)
+    let pfd: Pollfd = malloc(16)
+    let p2: Pollfd = pfd + 8
+    var done = 0
+    var idle = 0
+    var budget = 200
+    while done == 0 && budget > 0 {
+        budget = budget - 1
+        nwl_flush(c)
+        pfd.fd = c.fd  pfd.events = 1  pfd.revents = 0                // POLLIN
+        p2.fd = rfd  p2.events = 1  p2.revents = 0
+        let r = poll(pfd, 2, 50)
+        if r <= 0 {
+            idle = idle + 1
+            if idle > 3 { done = 1 }
+        } else {
+            idle = 0
+            if pfd.revents != 0 { nwl_read(c, 0)  nwl_dispatch(w) }
+            if p2.revents != 0 {
+                if len + 4096 > cap { cap = cap * 2  buf = realloc(buf, cap) }
+                let n = read(rfd, buf + len, cap - len)
+                if n > 0 { len = len + n } else { done = 1 }
+            }
+        }
+    }
+    free(pfd)
+    close(rfd)
+    buf = realloc(buf, len + 1)
+    poke8(buf + len, 0)
+    return buf
+}
+
+fn nwl_drain_drop(w: NwlWin) {
+    if w.drop_pending == 0 { return }
+    let c: NwlConn = w.c
+    w.drop_pending = 0
+    if w.drop_offer != 0 && w.drop_mime != 0 {
+        let txt = nwl_offer_read(w, w.drop_offer, w.drop_mime)
+        nwl_begin(c, w.drop_offer, 3)  nwl_end(c)                                 // finish
+        if w.drop_text != 0 { free(w.drop_text) }
+        w.drop_text = txt
+        nwl_push(w, NWE_DROP(), 0, 0)
+    }
+    if w.drop_offer != 0 { nwl_offer_destroy(c, w.drop_offer)  w.drop_offer = 0 }
+    w.drop_mime = 0
+}
+
+// ---- opening -----------------------------------------------------------------------------------------
+
+// the compositor socket, found the way wl_display_connect(NULL) finds it: WAYLAND_SOCKET is an fd
+// already connected; otherwise WAYLAND_DISPLAY (default wayland-0), relative to XDG_RUNTIME_DIR
+// unless it is an absolute path. -1 when none of that leads to a live socket.
+fn nwl_connect_socket() -> Int {
+    let ws = nwu_getenv("WAYLAND_SOCKET")
+    if ws != 0 && peek8(ws) >= 48 && peek8(ws) <= 57 {
+        var v = 0
+        var i = 0
+        while peek8(ws + i) >= 48 && peek8(ws + i) <= 57 { v = v * 10 + peek8(ws + i) - 48  i = i + 1 }
+        return v
+    }
+    var disp = nwu_getenv("WAYLAND_DISPLAY")
+    let path = malloc(256)
+    var n = 0
+    if disp != 0 && peek8(disp) == 47 {
+        n = strlen(disp)
+        if n > 200 { free(path)  return 0 - 1 }
+        memcpy(path, disp, n)
+    } else {
+        let rt = nwu_getenv("XDG_RUNTIME_DIR")
+        if rt == 0 { free(path)  return 0 - 1 }
+        let rl = strlen(rt)
+        if rl > 120 { free(path)  return 0 - 1 }
+        memcpy(path, rt, rl)
+        n = rl
+        poke8(path + n, 47)
+        n = n + 1
+        if disp == 0 || peek8(disp) == 0 {
+            let dflt = "wayland-0"
+            memcpy(path + n, nori_str_ptr(dflt), dflt.len())
+            n = n + dflt.len()
+        } else {
+            let dl = strlen(disp)
+            if dl > 100 { free(path)  return 0 - 1 }
+            memcpy(path + n, disp, dl)
+            n = n + dl
+        }
+    }
+    let fd = nwu_unix_connect(path, n, 0)
+    free(path)
+    return fd
+}
+
+// Connect and bind the globals, then the seat's devices and the data device: everything a surface of
+// either role (an xdg toplevel, a layer surface) needs before its role is given. 0 when no compositor
+// answers, or it lacks wl_compositor or the role's shell (`layer` 0 asks for xdg_wm_base, 1 for
+// zwlr_layer_shell_v1).
+fn nwl_start(width: Int, height: Int, layer: Int) -> Int {
+    // A broken pipe must not kill the process. Serving the clipboard writes into a pipe the reader may
+    // close at any moment; ignored, SIGPIPE turns that write into an error the senders already stop on.
+    signal(13, 1)
+    let fd = nwl_connect_socket()
+    if fd < 0 { return 0 }
+    let w: NwlWin = calloc(1, sizeof(NwlWin))
+    w.c = nwl_conn_new(fd)
+    let c: NwlConn = w.c
+    w.w = width
+    w.h = height
+    w.px = 0 - 1
+    w.py = 0 - 1
+    w.rep_delay_ms = 400
+    w.rep_rate_ms = 33
+    w.shape_cur = 0 - 1
+    w.q = malloc(NWL_QN() * 16)
+    w.reg = nwl_newid(c, NWK_REGISTRY())
+    nwl_begin(c, 1, 1)  nwl_u(c, w.reg)  nwl_end(c)                               // get_registry
+    nwl_roundtrip(w)                                                              // globals bound
+    var shell = w.wm
+    if layer == 1 { shell = w.lshell }
+    if w.comp == 0 || shell == 0 || c.dead == 1 {
+        nwl_conn_free(c)
+        free(w.q)
+        free(w)
+        return 0
+    }
+    nwl_roundtrip(w)                                                              // seat capabilities -> pointer, keyboard
+    if w.ddm != 0 && w.seat != 0 {
+        w.ddev = nwl_newid(c, NWK_DDEVICE())
+        nwl_begin(c, w.ddm, 1)  nwl_u(c, w.ddev)  nwl_u(c, w.seat)  nwl_end(c)
+    }
+    w.surf = nwl_newid(c, NWK_SURFACE())
+    nwl_begin(c, w.comp, 0)  nwl_u(c, w.surf)  nwl_end(c)
+    w.scale120 = 120
+    return w
+}
+
+// What the compositor's scale and the logical size need from any surface: a viewport (the buffer drawn
+// at scale, shown at the logical size) and the preferred fractional scale.
+fn nwl_scale_objects(w: NwlWin) {
+    let c: NwlConn = w.c
+    if w.vpr != 0 {                                                               // physical buffer -> logical size
+        w.vp = nwl_newid(c, NWK_PASSIVE())
+        nwl_begin(c, w.vpr, 1)  nwl_u(c, w.vp)  nwl_u(c, w.surf)  nwl_end(c)
+    }
+    if w.fsmgr != 0 {
+        w.fscale = nwl_newid(c, NWK_FSCALE())
+        nwl_begin(c, w.fsmgr, 1)  nwl_u(c, w.fscale)  nwl_u(c, w.surf)  nwl_end(c)
+    }
+}
+
+fn nwl_open(title: Int, width: Int, height: Int) -> Int {
+    let h = nwl_start(width, height, 0)
+    if h == 0 { return 0 }
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    w.xsurf = nwl_newid(c, NWK_XSURFACE())
+    nwl_begin(c, w.wm, 2)  nwl_u(c, w.xsurf)  nwl_u(c, w.surf)  nwl_end(c)
+    w.top = nwl_newid(c, NWK_TOPLEVEL())
+    nwl_begin(c, w.xsurf, 1)  nwl_u(c, w.top)  nwl_end(c)
+    nwl_begin(c, w.top, 2)
+    if title != 0 { nwl_str(c, title, strlen(title)) } else { nwl_lit(c, "") }
+    nwl_end(c)
+    nwl_scale_objects(w)
+    if w.decomgr != 0 {                                                           // ask the compositor to draw the frame
+        w.deco = nwl_newid(c, NWK_PASSIVE())
+        nwl_begin(c, w.decomgr, 1)  nwl_u(c, w.deco)  nwl_u(c, w.top)  nwl_end(c)
+        nwl_begin(c, w.deco, 1)  nwl_u(c, 2)  nwl_end(c)                          // set_mode(server_side)
+    }
+    nwl_begin(c, w.surf, 6)  nwl_end(c)                                           // commit
+    nwl_roundtrip(w)                                                              // the first configure (+ preferred scale)
+    return w
+}
+
+// ---- a layer surface (zwlr_layer_shell_v1) -----------------------------------------------------------
+//
+// A surface placed by the compositor at the screen's edges rather than managed as a window: a panel, a
+// dock, a wallpaper, a notification. `spec` points at ten words, as window.nori's open_layer lays them
+// out: the layer (0 background, 1 bottom, 2 top, 3 overlay), the anchor edges (1 top, 2 bottom, 4 left,
+// 8 right), the requested width and height (0 along an axis anchored on both sides: the compositor
+// stretches it), the exclusive zone (the strip of the edge it reserves; -1 asks to cover others' zones),
+// the keyboard interactivity (0 none, 1 exclusive, 2 on demand) and the margins top, right, bottom, left.
+//
+// The surface is committed without a buffer; the compositor answers with its first configure, which is
+// acked and decoded before this returns, so the size the window reports is the size it was given. The
+// output is the compositor's choice (the protocol's null output).
+fn nwl_open_layer(ns: Int, spec: Int) -> Int {
+    let h = nwl_start(peek(spec + 16), peek(spec + 24), 1)
+    if h == 0 { return 0 }
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    w.lsurf = nwl_newid(c, NWK_LSURF())
+    nwl_begin(c, w.lshell, 0)  nwl_u(c, w.lsurf)  nwl_u(c, w.surf)  nwl_u(c, 0)  nwl_u(c, peek(spec))
+    if ns != 0 { nwl_str(c, ns, strlen(ns)) } else { nwl_lit(c, "") }
+    nwl_end(c)                                                                    // get_layer_surface
+    nwl_begin(c, w.lsurf, 0)  nwl_u(c, peek(spec + 16))  nwl_u(c, peek(spec + 24))  nwl_end(c)   // set_size
+    nwl_begin(c, w.lsurf, 1)  nwl_u(c, peek(spec + 8))  nwl_end(c)                // set_anchor
+    nwl_begin(c, w.lsurf, 2)  nwl_u(c, peek(spec + 32))  nwl_end(c)               // set_exclusive_zone
+    nwl_begin(c, w.lsurf, 3)  nwl_u(c, peek(spec + 48))  nwl_u(c, peek(spec + 56))  nwl_u(c, peek(spec + 64))  nwl_u(c, peek(spec + 72))  nwl_end(c)   // set_margin
+    nwl_begin(c, w.lsurf, 4)  nwl_u(c, peek(spec + 40))  nwl_end(c)               // set_keyboard_interactivity
+    nwl_scale_objects(w)
+    nwl_begin(c, w.surf, 6)  nwl_end(c)                                           // commit, no buffer: asks for the configure
+    nwl_roundtrip(w)                                                              // the first configure, acked
+    if c.dead == 1 || w.closed == 1 { nwl_close(w)  return 0 }
+    return w
+}
+
+// the connection's socket, for a program that waits on it beside other descriptors
+fn nwl_fd(h: Int) -> Int { let w: NwlWin = h  let c: NwlConn = w.c  if c.dead == 1 { return 0 - 1 }  return c.fd }
+
+// flush, read what is readable without waiting, decode it: the events now queued for poll (-1: gone)
+fn nwl_dispatch_pending(h: Int) -> Int {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    nwl_pump(w)
+    while c.dead == 0 && nwl_read(c, 0) > 0 { nwl_dispatch(w) }
+    nwl_flush(c)
+    var n = (w.qtail - w.qhead + NWL_QN()) % NWL_QN()
+    if w.drop_pending == 1 { n = n + 1 }
+    if n == 0 && c.dead == 1 { return 0 - 1 }
+    return n
+}
+
+// ---- the polled surface ------------------------------------------------------------------------------
+
+fn nwl_poll_event(h: Int, out: Int) -> Int {
+    let w: NwlWin = h
+    poke32(out, 0)  poke32(out + 4, 0)  poke32(out + 8, 0)
+    if w.qhead == w.qtail { nwl_pump(w) }
+    if w.qhead == w.qtail && w.rep_active == 1 && w.rep_rate_ms > 0 {           // synthesize held-key repeats
+        let now = nwu_now_ms()
+        if now >= w.rep_next_ms {
+            nwl_push(w, NWE_KEYDOWN(), w.rep_sym, w.mods)
+            w.rep_next_ms = now + w.rep_rate_ms
+        }
+    }
+    nwl_drain_drop(w)
+    if w.qhead == w.qtail { return 0 }
+    let e = w.q + w.qhead * 16
+    w.qhead = (w.qhead + 1) % NWL_QN()
+    poke32(out, peek32(e + 4))  poke32(out + 4, peek32(e + 8))  poke32(out + 8, peek32(e + 12))
+    return peek32(e)
+}
+
+// A press no polled read has seen yet is latched: the first read after it reports the button down
+// and clears the latch, and until then the position is where the press landed.
+fn nwl_take_down(w: NwlWin) -> Int {
+    if w.btn == 1 { w.tap_latch = 0  return 1 }
+    if w.tap_latch == 1 { w.tap_latch = 0  return 1 }
+    return 0
+}
+fn nwl_mouse_x(h: Int) -> Int { let w: NwlWin = h  if w.tap_latch == 1 { return w.lx }  return w.px }
+fn nwl_mouse_y(h: Int) -> Int { let w: NwlWin = h  if w.tap_latch == 1 { return w.ly }  return w.py }
+fn nwl_mouse(h: Int, out: Int) -> Int {
+    poke32(out, nwl_mouse_x(h) & 4294967295)
+    poke32(out + 4, nwl_mouse_y(h) & 4294967295)
+    return nwl_take_down(h)
+}
+fn nwl_mouse_down(h: Int) -> Int { return nwl_take_down(h) }
+fn nwl_pointer_held(h: Int) -> Int { let w: NwlWin = h  return w.btn }
+fn nwl_mouse_middle(h: Int) -> Int { let w: NwlWin = h  return w.mid }
+fn nwl_closed(h: Int) -> Int { let w: NwlWin = h  return w.closed }
+fn nwl_w(h: Int) -> Int { let w: NwlWin = h  return w.w }
+fn nwl_h(h: Int) -> Int { let w: NwlWin = h  return w.h }
+fn nwl_scale120(h: Int) -> Int { let w: NwlWin = h  return w.scale120 }
+fn nwl_display(h: Int) -> Int { let w: NwlWin = h  return w.c }
+fn nwl_surface(h: Int) -> Int { let w: NwlWin = h  return w.surf }
+fn nwl_drag_finished(h: Int) -> Int { let w: NwlWin = h  return w.drag_done }
+
+// ---- wl_shm presentation -----------------------------------------------------------------------------
+
+fn nwl_shm_destroy(w: NwlWin) {
+    let c: NwlConn = w.c
+    if w.buf0 != 0 { nwl_begin(c, w.buf0, 0)  nwl_end(c)  nwl_setkind(c, w.buf0, 0) }
+    if w.buf1 != 0 { nwl_begin(c, w.buf1, 0)  nwl_end(c)  nwl_setkind(c, w.buf1, 0) }
+    w.buf0 = 0  w.buf1 = 0  w.busy0 = 0  w.busy1 = 0
+    if w.pool != 0 { nwl_begin(c, w.pool, 1)  nwl_end(c)  nwl_setkind(c, w.pool, 0)  w.pool = 0 }
+    if w.shm_map != 0 { munmap(w.shm_map, w.shm_size)  w.shm_map = 0 }
+    if w.shm_fd > 0 { close(w.shm_fd)  w.shm_fd = 0 }
+}
+
+// two buffers back to back in one memfd, so a frame can be drawn while the other is still on screen
+fn nwl_shm_make(w: NwlWin, ww: Int, hh: Int) -> Int {
+    let c: NwlConn = w.c
+    if w.shm == 0 { return 0 }
+    let stride = ww * 4
+    let bsz = stride * hh
+    let total = bsz * 2
+    let nm = "nori-wl-shm"
+    let cname = nori_cstr(nm)
+    let fd = memfd_create(cname, 1)                                               // MFD_CLOEXEC
+    free(cname)
+    if fd < 0 { return 0 }
+    if ftruncate(fd, total) < 0 { close(fd)  return 0 }
+    let map = mmap(0, total, 3, 1, fd, 0)                                        // PROT_READ|WRITE, MAP_SHARED
+    if map < 0 && map > 0 - 4096 { close(fd)  return 0 }
+    w.pool = nwl_newid(c, NWK_POOL())
+    nwl_begin(c, w.shm, 0)  nwl_u(c, w.pool)  nwl_fdarg(c, fd)  nwl_u(c, total)  nwl_end(c)
+    w.shm_fd = fd
+    w.shm_map = map
+    w.shm_size = total
+    w.shm_w = ww
+    w.shm_h = hh
+    var fmt = 1                                                                   // WL_SHM_FORMAT_XRGB8888
+    if w.argb == 1 { fmt = 0 }                                                    // ARGB8888, premultiplied
+    w.buf0 = nwl_newid(c, NWK_BUFFER())
+    nwl_begin(c, w.pool, 0)  nwl_u(c, w.buf0)  nwl_u(c, 0)  nwl_u(c, ww)  nwl_u(c, hh)  nwl_u(c, stride)  nwl_u(c, fmt)  nwl_end(c)
+    w.buf1 = nwl_newid(c, NWK_BUFFER())
+    nwl_begin(c, w.pool, 0)  nwl_u(c, w.buf1)  nwl_u(c, bsz)  nwl_u(c, ww)  nwl_u(c, hh)  nwl_u(c, stride)  nwl_u(c, fmt)  nwl_end(c)
+    return 1
+}
+
+// present `pixels` (ww*hh 0x00RRGGBB, which is WL_SHM_FORMAT_XRGB8888 byte for byte) and ask for a
+// frame callback to pace the next one
+fn nwl_shm_present(h: Int, pixels: Int, ww: Int, hh: Int) {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    if w.shm == 0 || ww <= 0 || hh <= 0 { return }
+    if w.pool == 0 || ww != w.shm_w || hh != w.shm_h {
+        nwl_shm_destroy(w)
+        if nwl_shm_make(w, ww, hh) == 0 { return }
+    }
+    var idx = 0 - 1
+    if w.busy0 == 0 { idx = 0 } else if w.busy1 == 0 { idx = 1 }
+    var tries = 0
+    while idx < 0 && tries < 50 && c.dead == 0 {                                 // both on screen: wait for a release
+        nwl_wait(w, 20)
+        if w.busy0 == 0 { idx = 0 } else if w.busy1 == 0 { idx = 1 }
+        tries = tries + 1
+    }
+    if idx < 0 { idx = 0 }
+    let bsz = ww * hh * 4
+    var buf = w.buf0
+    if idx == 1 { buf = w.buf1 }
+    memcpy(w.shm_map + idx * bsz, pixels, bsz)
+    nwl_begin(c, w.surf, 1)  nwl_u(c, buf)  nwl_u(c, 0)  nwl_u(c, 0)  nwl_end(c)            // attach
+    if w.vp != 0 { nwl_begin(c, w.vp, 2)  nwl_u(c, w.w)  nwl_u(c, w.h)  nwl_end(c) }       // set_destination
+    nwl_begin(c, w.surf, 9)  nwl_u(c, 0)  nwl_u(c, 0)  nwl_u(c, ww)  nwl_u(c, hh)  nwl_end(c)  // damage_buffer
+    if w.frame_cb != 0 { nwl_setkind(c, w.frame_cb, 0) }
+    w.frame_cb = nwl_newid(c, NWK_FRAME())
+    nwl_begin(c, w.surf, 3)  nwl_u(c, w.frame_cb)  nwl_end(c)                    // frame
+    w.frame_pending = 1
+    nwl_begin(c, w.surf, 6)  nwl_end(c)                                           // commit
+    nwl_flush(c)
+    if idx == 0 { w.busy0 = 1 } else { w.busy1 = 1 }
+}
+
+// present with alpha (ARGB8888, premultiplied) or without (XRGB8888); the buffers are remade at the next present
+fn nwl_set_alpha(h: Int, on: Int) {
+    let w: NwlWin = h
+    var v = 0
+    if on != 0 { v = 1 }
+    if w.argb == v { return }
+    w.argb = v
+    nwl_shm_destroy(w)
+}
+// xdg_toplevel.set_title and set_app_id (a toplevel's only: a layer surface has no toplevel). Sent at once: they
+// are double-buffered by nothing, and the compositor takes them for the window from now on.
+fn nwl_set_title(h: Int, title: Int) {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    if w.top == 0 || c.dead == 1 { return }
+    nwl_begin(c, w.top, 2)
+    if title != 0 { nwl_str(c, title, strlen(title)) } else { nwl_lit(c, "") }
+    nwl_end(c)
+    nwl_flush(c)
+}
+fn nwl_set_app_id(h: Int, id: Int) {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    if w.top == 0 || c.dead == 1 { return }
+    nwl_begin(c, w.top, 3)
+    if id != 0 { nwl_str(c, id, strlen(id)) } else { nwl_lit(c, "") }
+    nwl_end(c)
+    nwl_flush(c)
+}
+// a layer surface's keyboard interactivity, changed while it is mapped (and committed)
+fn nwl_layer_keyboard(h: Int, mode: Int) {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    if w.lsurf == 0 || c.dead == 1 { return }
+    nwl_begin(c, w.lsurf, 4)  nwl_u(c, mode)  nwl_end(c)                         // set_keyboard_interactivity
+    nwl_begin(c, w.surf, 6)  nwl_end(c)                                           // commit
+    nwl_flush(c)
+}
+// a shown layer surface asks for another size (set_size and a commit): the compositor answers with a configure, which
+// poll reports as Resized once acked; the next buffer is presented at that size
+fn nwl_layer_size(h: Int, width: Int, height: Int) {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    if w.lsurf == 0 || c.dead == 1 { return }
+    nwl_begin(c, w.lsurf, 0)  nwl_u(c, width)  nwl_u(c, height)  nwl_end(c)          // set_size
+    nwl_begin(c, w.surf, 6)  nwl_end(c)                                           // commit
+    nwl_flush(c)
+}
+// whether the surface takes the pointer: `none` 1 gives it an empty input region (clicks and the pointer go to what is
+// under it — a surface on its way out), 0 the whole surface again (wl_surface.set_input_region with no region)
+fn nwl_input_none(h: Int, none: Int) {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    if w.comp == 0 || c.dead == 1 { return }
+    if none == 1 {
+        let r = nwl_newid(c, NWK_PASSIVE())
+        nwl_begin(c, w.comp, 1)  nwl_u(c, r)  nwl_end(c)                          // create_region: empty
+        nwl_begin(c, w.surf, 5)  nwl_u(c, r)  nwl_end(c)                          // set_input_region
+        nwl_begin(c, r, 0)  nwl_end(c)                                            // the region destroyed (the surface keeps a copy)
+    } else {
+        nwl_begin(c, w.surf, 5)  nwl_u(c, 0)  nwl_end(c)                          // set_input_region(null): all of it
+    }
+    nwl_begin(c, w.surf, 6)  nwl_end(c)                                           // commit
+    nwl_flush(c)
+}
+// 1 when no frame callback is outstanding: the compositor has shown the last frame (or none was presented)
+fn nwl_frame_done(h: Int) -> Int { let w: NwlWin = h  if w.frame_pending == 1 { return 0 }  return 1 }
+// 1 while the window has the keyboard focus
+fn nwl_has_keyboard(h: Int) -> Int { let w: NwlWin = h  return w.kfocus }
+// ms until nwl_poll_event synthesizes the held key's next repeat (-1: no key held, or repeat off)
+fn nwl_next_timeout_ms(h: Int) -> Int {
+    let w: NwlWin = h
+    if w.rep_active != 1 || w.rep_rate_ms <= 0 { return 0 - 1 }
+    let d = w.rep_next_ms - nwu_now_ms()
+    if d < 0 { return 0 }
+    return d
+}
+
+// An xdg_activation_v1 token for a program this one starts (its XDG_ACTIVATION_TOKEN), made from the
+// last input this window received (the click or key that asked for the launch) and this window's
+// surface, so the compositor can hand the new window the focus. `app_id` may be 0. Waits for the
+// compositor's answer (a roundtrip). A malloc'd string; empty when the compositor has no xdg_activation.
+fn nwl_activation_token(h: Int, app_id: Int) -> Int {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    if w.xact == 0 || c.dead == 1 { return nwu_strdup(0) }
+    let tok = nwl_newid(c, NWK_ACTTOKEN())
+    nwl_begin(c, w.xact, 1)  nwl_u(c, tok)  nwl_end(c)                            // get_activation_token
+    if w.seat != 0 && w.serial != 0 { nwl_begin(c, tok, 0)  nwl_u(c, w.serial)  nwl_u(c, w.seat)  nwl_end(c) }   // set_serial
+    if app_id != 0 && strlen(app_id) > 0 { nwl_begin(c, tok, 1)  nwl_str(c, app_id, strlen(app_id))  nwl_end(c) } // set_app_id
+    nwl_begin(c, tok, 2)  nwl_u(c, w.surf)  nwl_end(c)                            // set_surface
+    nwl_begin(c, tok, 3)  nwl_end(c)                                              // commit
+    w.tok_id = tok
+    w.tok_done = 0
+    nwl_flush(c)
+    var budget = 100
+    while w.tok_done == 0 && c.dead == 0 && budget > 0 { nwl_wait(w, 10)  budget = budget - 1 }
+    nwl_begin(c, tok, 4)  nwl_end(c)                                              // destroy
+    nwl_setkind(c, tok, 0)
+    nwl_flush(c)
+    w.tok_id = 0
+    if w.tok_done == 0 || w.tok_str == 0 { return nwu_strdup(0) }
+    let r = nwu_strdup(w.tok_str)
+    free(w.tok_str)
+    w.tok_str = 0
+    return r
+}
+
+// block until the frame callback fires or `timeout_ms` passes. With nothing presented, wait for input
+// instead, so an idle loop sleeps rather than spinning.
+fn nwl_frame_wait(h: Int, timeout_ms: Int) {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    if w.frame_pending == 0 {
+        nwl_wait(w, timeout_ms)
+        return
+    }
+    var budget = timeout_ms / 4 + 1
+    while w.frame_pending == 1 && budget > 0 && c.dead == 0 {
+        budget = budget - 1
+        nwl_wait(w, 4)
+    }
+}
+
+fn nwl_apply_viewport(h: Int) {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    if w.vp == 0 { return }
+    nwl_begin(c, w.vp, 2)  nwl_u(c, w.w)  nwl_u(c, w.h)  nwl_end(c)
+    nwl_begin(c, w.surf, 6)  nwl_end(c)
+    nwl_flush(c)
+}
+
+// ---- clipboard, drag source --------------------------------------------------------------------------
+
+fn nwl_offer_text_mimes(c: NwlConn, src: Int) {
+    nwl_begin(c, src, 0)  nwl_lit(c, "text/plain;charset=utf-8")  nwl_end(c)
+    nwl_begin(c, src, 0)  nwl_lit(c, "text/plain")  nwl_end(c)
+}
+
+// start a drag carrying `text` as text/plain; it needs a recent input serial (a press)
+fn nwl_start_drag(h: Int, text: Int) {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    if w.ddm == 0 || w.ddev == 0 || w.serial == 0 { return }
+    if w.drag_src_text != 0 { free(w.drag_src_text) }
+    if w.drag_src_plain != 0 { free(w.drag_src_plain)  w.drag_src_plain = 0 }
+    w.drag_src_text = nwu_strdup(text)
+    w.drag_done = 0
+    w.drag_src = nwl_newid(c, NWK_DRAGSRC())
+    nwl_begin(c, w.ddm, 0)  nwl_u(c, w.drag_src)  nwl_end(c)
+    nwl_offer_text_mimes(c, w.drag_src)
+    nwl_begin(c, w.drag_src, 2)  nwl_u(c, 3)  nwl_end(c)
+    nwl_begin(c, w.ddev, 0)  nwl_u(c, w.drag_src)  nwl_u(c, w.surf)  nwl_u(c, 0)  nwl_u(c, w.serial)  nwl_end(c)
+    nwl_flush(c)
+}
+
+// start a drag of files: `uris` (a text/uri-list: file:// URIs, each ending CRLF) offered as text/uri-list, `plain`
+// (their paths, a line each) as text: a terminal takes the paths, a file manager the list
+fn nwl_start_drag_files(h: Int, uris: Int, plain: Int) {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    if w.ddm == 0 || w.ddev == 0 || w.serial == 0 { return }
+    if w.drag_src_text != 0 { free(w.drag_src_text) }
+    if w.drag_src_plain != 0 { free(w.drag_src_plain) }
+    w.drag_src_text = nwu_strdup(uris)
+    w.drag_src_plain = nwu_strdup(plain)
+    w.drag_done = 0
+    w.drag_src = nwl_newid(c, NWK_DRAGSRC())
+    nwl_begin(c, w.ddm, 0)  nwl_u(c, w.drag_src)  nwl_end(c)
+    nwl_begin(c, w.drag_src, 0)  nwl_lit(c, "text/uri-list")  nwl_end(c)
+    nwl_offer_text_mimes(c, w.drag_src)
+    nwl_begin(c, w.drag_src, 2)  nwl_u(c, 3)  nwl_end(c)                          // set_actions(copy | move)
+    nwl_begin(c, w.ddev, 0)  nwl_u(c, w.drag_src)  nwl_u(c, w.surf)  nwl_u(c, 0)  nwl_u(c, w.serial)  nwl_end(c)
+    nwl_flush(c)
+}
+
+fn nwl_clipboard_set(h: Int, text: Int) {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    if w.ddm == 0 || w.ddev == 0 { return }
+    if w.clip_text != 0 { free(w.clip_text) }
+    w.clip_text = nwu_strdup(text)
+    w.clip_src = nwl_newid(c, NWK_CLIPSRC())
+    nwl_begin(c, w.ddm, 0)  nwl_u(c, w.clip_src)  nwl_end(c)
+    nwl_offer_text_mimes(c, w.clip_src)
+    nwl_begin(c, w.ddev, 1)  nwl_u(c, w.clip_src)  nwl_u(c, w.serial)  nwl_end(c)
+    nwl_flush(c)
+}
+
+fn nwl_clipboard_get(h: Int) -> Int {
+    let w: NwlWin = h
+    if w.sel_offer == 0 { return nwu_strdup(0) }
+    return nwl_offer_read(w, w.sel_offer, 2)
+}
+
+// the last drop's text, handed to the caller to free ("" if none)
+fn nwl_drop_text(h: Int) -> Int {
+    let w: NwlWin = h
+    let t = w.drop_text
+    w.drop_text = 0
+    if t == 0 { return nwu_strdup(0) }
+    return t
+}
+
+// ---- pointer lock and shape --------------------------------------------------------------------------
+
+// Lock the pointer (pointer-constraints, persistent, so an alt-tab does not break it for good), take
+// relative motion from relative-pointer, and hide the cursor. 1 if the request was made.
+fn nwl_lock_pointer(h: Int, on: Int) -> Int {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    if w.pointer == 0 || w.surf == 0 { return 0 }
+    if on != 0 {
+        if w.pcon == 0 || w.rpmgr == 0 { return 0 }
+        if w.plock == 0 {
+            w.plock = nwl_newid(c, NWK_PASSIVE())
+            nwl_begin(c, w.pcon, 1)  nwl_u(c, w.plock)  nwl_u(c, w.surf)  nwl_u(c, w.pointer)  nwl_u(c, 0)  nwl_u(c, 2)  nwl_end(c)
+        }
+        if w.relptr == 0 {
+            w.relptr = nwl_newid(c, NWK_RELPTR())
+            nwl_begin(c, w.rpmgr, 1)  nwl_u(c, w.relptr)  nwl_u(c, w.pointer)  nwl_end(c)
+        }
+        nwl_begin(c, w.pointer, 0)  nwl_u(c, w.serial)  nwl_u(c, 0)  nwl_u(c, 0)  nwl_u(c, 0)  nwl_end(c)
+        nwl_flush(c)
+        w.locked = 1
+        w.rel_dx = 0
+        w.rel_dy = 0
+        return 1
+    }
+    if w.plock != 0 { nwl_begin(c, w.plock, 0)  nwl_end(c)  nwl_setkind(c, w.plock, 0)  w.plock = 0 }
+    if w.relptr != 0 { nwl_begin(c, w.relptr, 0)  nwl_end(c)  nwl_setkind(c, w.relptr, 0)  w.relptr = 0 }
+    nwl_flush(c)
+    w.locked = 0
+    w.shape_cur = 0 - 1
+    return 1
+}
+fn nwl_pointer_locked(h: Int) -> Int { let w: NwlWin = h  return w.locked }
+
+// The compositor's key bindings held off while this window has the keyboard (keyboard-shortcuts-inhibit): every key
+// reaches it, as one a settings page records a new combination with needs. 1 if the request was made (or undone).
+fn nwl_inhibit_shortcuts(h: Int, on: Int) -> Int {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    if on != 0 {
+        if w.kinhmgr == 0 || w.surf == 0 || w.seat == 0 { return 0 }
+        if w.kinh == 0 {
+            w.kinh = nwl_newid(c, NWK_PASSIVE())
+            nwl_begin(c, w.kinhmgr, 1)  nwl_u(c, w.kinh)  nwl_u(c, w.surf)  nwl_u(c, w.seat)  nwl_end(c)
+            nwl_flush(c)
+        }
+        return 1
+    }
+    if w.kinh != 0 { nwl_begin(c, w.kinh, 0)  nwl_end(c)  nwl_setkind(c, w.kinh, 0)  w.kinh = 0  nwl_flush(c) }
+    return 1
+}
+
+// relative motion since the last call in 1/256 px (wl_fixed units are exactly that), then cleared
+fn nwl_pointer_delta(h: Int, out: Int) -> Int {
+    let w: NwlWin = h
+    poke32(out, w.rel_dx & 4294967295)
+    poke32(out + 4, w.rel_dy & 4294967295)
+    w.rel_dx = 0
+    w.rel_dy = 0
+    return w.locked
+}
+
+// cursor-shape-v1: the compositor draws the named shape; set_shape wants the pointer's enter serial
+fn nwl_set_cursor(h: Int, shape: Int) -> Int {
+    let w: NwlWin = h
+    let c: NwlConn = w.c
+    if w.shmgr == 0 || w.pointer == 0 || w.ptr_serial == 0 { return 0 }
+    if w.locked == 1 { return 0 }
+    var sh = shape
+    if sh < 0 || sh > 5 { sh = 0 }
+    if w.shape_cur == sh { return 1 }
+    if w.shdev == 0 {
+        w.shdev = nwl_newid(c, NWK_PASSIVE())
+        nwl_begin(c, w.shmgr, 1)  nwl_u(c, w.shdev)  nwl_u(c, w.pointer)  nwl_end(c)
+    }
+    var named = 1                                                                 // default
+    if sh == 1 { named = 9 }                                                      // text
+    if sh == 2 { named = 4 }                                                      // pointer
+    if sh == 3 { named = 26 }                                                     // ew-resize
+    if sh == 4 { named = 27 }                                                     // ns-resize
+    if sh == 5 { named = 17 }                                                     // grabbing
+    nwl_begin(c, w.shdev, 1)  nwl_u(c, w.ptr_serial)  nwl_u(c, named)  nwl_end(c)
+    nwl_flush(c)
+    w.shape_cur = sh
+    return 1
+}
+
+fn nwl_close(h: Int) {
+    let w: NwlWin = h
+    if w.clip_text != 0 { free(w.clip_text) }
+    if w.drop_text != 0 { free(w.drop_text) }
+    if w.drag_src_text != 0 { free(w.drag_src_text) }
+    if w.drag_src_plain != 0 { free(w.drag_src_plain) }
+    nwl_shm_destroy(w)
+    let c: NwlConn = w.c
+    nwl_flush(c)
+    if w.keymap != 0 { nxkb_free(w.keymap) }
+    nwl_conn_free(c)
+    free(w.q)
+    free(w)
+}

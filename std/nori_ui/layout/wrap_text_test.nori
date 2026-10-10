@@ -1,0 +1,83 @@
+// Native .nori tests for the wrapping helpers in layout/runtime_document.nori, run with
+//   noric --test std/nori_ui/layout/wrap_text_test.nori compiler/runtime.nori --import-root .
+//
+// `wrap_text` returns one string; `wrap_text_lines` is the shape a panel needs, and these are
+// the properties a panel depends on: the pieces are the original text with the breaks moved, the
+// count matches what `wrap_line_count` promises, hard newlines survive, and a word too long for the
+// line is broken rather than left to run off the edge.
+import "std/nori_ui" as ui
+
+fn wt_join(lines: Vec<Str>, sep: Str) -> Str {
+    var o = ""
+    var i = 0
+    while i < lines.len() {
+        if i > 0 { o = o + sep }
+        o = o + lines[i]
+        i = i + 1
+    }
+    return o
+}
+
+fn wt_widest(lines: Vec<Str>, size_px: Float) -> Float {
+    var w = 0.0
+    var i = 0
+    while i < lines.len() {
+        let lw = ui::layout::text_measure_width(lines[i], ui::layout::text_measure_style(size_px))
+        if lw > w { w = lw }
+        i = i + 1
+    }
+    return w
+}
+
+fn test_wrapped_lines_are_the_text_with_the_breaks_moved() {
+    let src = "the quick brown fox jumps over the lazy dog"
+    var lines = ui::layout::wrap_text_lines(src, 90.0, 13.0, false)
+    assert_true(lines.len() > 1)
+    // nothing added, nothing dropped: the words come back in order, one space between them
+    assert_streq(wt_join(lines, " "), src)
+}
+
+fn test_no_line_is_wider_than_asked_for() {
+    let src = "the quick brown fox jumps over the lazy dog and keeps on running"
+    let cap = 120.0
+    var lines = ui::layout::wrap_text_lines(src, cap, 13.0, false)
+    // a little slack: the wrapper measures whole words, so the last word that fits may end within a
+    // fraction of the cap rather than exactly on it
+    assert_true(wt_widest(lines, 13.0) <= cap + 1.0)
+}
+
+fn test_the_count_agrees_with_wrap_line_count() {
+    let src = "one two three four five six seven eight nine ten eleven twelve"
+    var lines = ui::layout::wrap_text_lines(src, 100.0, 13.0, false)
+    assert_eq(lines.len(), ui::layout::wrap_line_count(src, 100.0, 13.0, false))
+}
+
+fn test_a_hard_newline_is_a_line_of_its_own() {
+    var lines = ui::layout::wrap_text_lines("alpha\nbeta", 400.0, 13.0, false)
+    assert_eq(lines.len(), 2)
+    assert_streq(lines[0], "alpha")
+    assert_streq(lines[1], "beta")
+}
+
+fn test_an_empty_line_between_paragraphs_survives() {
+    // A transcript is paragraphs. The blank line between two turns is the only thing separating
+    // them; a wrapper that swallowed it would run the speakers together.
+    var lines = ui::layout::wrap_text_lines("alpha\n\nbeta", 400.0, 13.0, false)
+    assert_eq(lines.len(), 3)
+    assert_eq(lines[1].len(), 0)
+}
+
+fn test_a_word_longer_than_the_line_is_broken_only_when_asked() {
+    let long = "supercalifragilisticexpialidocious"
+    var soft = ui::layout::wrap_text_lines(long, 40.0, 13.0, false)
+    assert_eq(soft.len(), 1)                       // left whole, to overflow
+    var hard = ui::layout::wrap_text_lines(long, 40.0, 13.0, true)
+    assert_true(hard.len() > 1)                    // split mid-word
+    assert_streq(wt_join(hard, ""), long)          // and no character is lost in the split
+}
+
+fn test_an_empty_text_is_one_empty_line() {
+    var lines = ui::layout::wrap_text_lines("", 100.0, 13.0, false)
+    assert_eq(lines.len(), 1)
+    assert_eq(lines[0].len(), 0)
+}

@@ -1,0 +1,169 @@
+// Native .nori tests for layout/caret_blink.nori, run with
+//   noric --test std/nori_ui/layout/caret_blink_test.nori compiler/runtime.nori --import-root .
+//
+// The phase is a global, so every test here puts it back before it returns. A test that left it off
+// would take the caret out of whatever test ran next, in a file it has never heard of.
+import "std/nori_ui" as ui
+
+/// a double-quote, for building `.ui` source with string attributes in it.
+fn cb_q() -> Str { return ("" + chr(34)) }
+
+/// lay `src` out alone in a 400x200 viewport and return the overlay.
+fn cb_layout(src: Str) -> ui::layout::ComputedOverlay {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(400.0, 200.0))
+    return ui::layout::layout_overlay(r.doc.tree, vp)
+}
+
+/// how many prims in `ov` are the 1.5px-wide bar a code editor paints for its caret.
+fn cb_bars(ov: ui::layout::ComputedOverlay) -> Int {
+    var n = 0
+    var i = 0
+    while i < ov.prims.len() {
+        var p = ov.prims[i]
+        if p.kind == 0 && p.rect.width() > 1.4 && p.rect.width() < 1.6 && p.color.a > 0 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+/// how many text prims in `ov` end in the `|` a text field uses for its caret.
+fn cb_bar_chars(ov: ui::layout::ComputedOverlay) -> Int {
+    var n = 0
+    var i = 0
+    while i < ov.prims.len() {
+        var p = ov.prims[i]
+        if p.kind == 2 && p.text.len() > 0 && (p.text.slice(p.text.len() - 1, p.text.len()) == "|") { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+/// how many prims in `ov` are exactly the `|` glyph: the picker's caret, which is a character
+/// rather than a bar. Over `prims`: the picker stages into `pop_prims` and flushes before returning.
+fn cb_pop_bar_chars(ov: ui::layout::ComputedOverlay) -> Int {
+    var n = 0
+    var i = 0
+    while i < ov.prims.len() {
+        var p = ov.prims[i]
+        if p.kind == 2 && p.text == "|" { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn test_caret_blink_phase_starts_on_and_alternates() {
+    let p = ui::layout::caret_blink_period_ms()
+    // Phase zero is on. This is why the host measures from the last keystroke: type a
+    // character and the caret is solid, for a full period, every time.
+    assert_true(ui::layout::caret_blink_on(0))
+    assert_true(ui::layout::caret_blink_on(p - 1))
+    assert_false(ui::layout::caret_blink_on(p))
+    assert_false(ui::layout::caret_blink_on(p + p - 1))
+    assert_true(ui::layout::caret_blink_on(p + p))
+    assert_false(ui::layout::caret_blink_on(p * 5))
+    // a clock that went backwards is still a visible caret, not a division into nonsense
+    assert_true(ui::layout::caret_blink_on(0 - 40))
+}
+
+fn test_code_editor_caret_follows_the_phase() {
+    let q = cb_q()
+    var src = "code_editor { id: source h: 180 value: " + (q + ("fn main() {}" + (q + " caret: 4 classes: [focused] }")))
+    var on = cb_layout(src)
+    assert_eq(cb_bars(on), 1)
+    ui::layout::set_caret_on(false)
+    var off = cb_layout(src)
+    ui::layout::set_caret_on(true)
+    // Only the caret goes. The text, the gutter and the background are not part of the blink, so
+    // the frame is otherwise unchanged.
+    assert_eq(cb_bars(off), 0)
+    assert_eq(off.prims.len(), on.prims.len() - 1)
+    var back = cb_layout(src)
+    assert_eq(cb_bars(back), 1)
+}
+
+fn test_text_field_caret_follows_the_phase() {
+    let q = cb_q()
+    var src = "text_input { id: find value: " + (q + ("needle" + (q + " classes: [focused] }")))
+    var on = cb_layout(src)
+    assert_eq(cb_bars(on), 1)
+    ui::layout::set_caret_on(false)
+    var off = cb_layout(src)
+    ui::layout::set_caret_on(true)
+    assert_eq(cb_bars(off), 0)
+    // Only the caret goes: it is a rect of its own, there but clear, so blinking it away moves no text and
+    // keeps the paint list's length (a retained document repaints the caret's pixels, not the field)
+    assert_eq(off.prims.len(), on.prims.len())
+}
+
+fn test_an_unfocused_widget_has_no_caret_in_either_phase() {
+    let q = cb_q()
+    var src = "text_input { id: find value: " + (q + ("needle" + (q + " }")))
+    assert_eq(cb_bars(cb_layout(src)), 0)
+    ui::layout::set_caret_on(false)
+    var off = cb_bars(cb_layout(src))
+    ui::layout::set_caret_on(true)
+    assert_eq(off, 0)
+}
+
+/// the x of the one caret bar in `ov`.
+fn cb_bar_x(ov: ui::layout::ComputedOverlay) -> Float {
+    var i = 0
+    while i < ov.prims.len() {
+        var p = ov.prims[i]
+        if p.kind == 0 && p.rect.width() > 1.4 && p.rect.width() < 1.6 { return p.rect.min.x }
+        i = i + 1
+    }
+    return 0.0 - 1.0
+}
+
+fn test_text_field_caret_sits_where_it_is_told() {
+    let q = cb_q()
+    // No `caret` at all means after the last character, which is where every caller that predates a
+    // positionable caret has always seen it.
+    let ends = cb_bar_x(cb_layout("text_input { id: f value: " + (q + ("needle" + (q + " classes: [focused] }")))))
+    let at0  = cb_bar_x(cb_layout("text_input { id: f caret: 0 value: " + (q + ("needle" + (q + " classes: [focused] }")))))
+    let at3  = cb_bar_x(cb_layout("text_input { id: f caret: 3 value: " + (q + ("needle" + (q + " classes: [focused] }")))))
+    let at6  = cb_bar_x(cb_layout("text_input { id: f caret: 6 value: " + (q + ("needle" + (q + " classes: [focused] }")))))
+    assert_true(at0 < at3)
+    assert_true(at3 < at6)
+    assert_feq(at6, ends, 0.001)
+    // Past the end is the end, because a caret attribute is a number a caller keeps between frames
+    // and a shorter value can arrive under a stale one.
+    let past = cb_bar_x(cb_layout("text_input { id: f caret: 99 value: " + (q + ("needle" + (q + " classes: [focused] }")))))
+    assert_feq(past, ends, 0.001)
+    // and the middle of a six-character run is near enough half its width
+    assert_true(at3 - at0 > 0.0)
+    assert_true(at6 - at3 > 0.0)
+}
+
+fn test_text_area_caret_follows_the_phase() {
+    // the plain multiline widget paints its own caret, in its own file, so it gets its own check
+    let q = cb_q()
+    var src = "text_area { id: notes h: 120 value: " + (q + ("two\nlines" + (q + " classes: [focused] }")))
+    assert_eq(cb_bars(cb_layout(src)), 1)
+    ui::layout::set_caret_on(false)
+    var off = cb_bars(cb_layout(src))
+    ui::layout::set_caret_on(true)
+    assert_eq(off, 0)
+}
+
+fn test_picker_prompt_caret_follows_the_phase() {
+    // the picker's caret is a `|` glyph, not a bar: its prompt is one run of plain text and a drawn
+    // rect would need a measurement of its own. Counted as its own prim because it is one.
+    var items: Vec<ui::layout::PickerItem> = vec()
+    items.push(ui::layout::picker_item("lib.nori", "plugins/code_editor/src", "", "open:x"))
+    var p = ui::layout::picker_none()
+    ui::layout::picker_open(p, "files", items)
+    ui::layout::picker_type(p, "lib")
+    var th = ui::core::theme_default_dark()
+    var at = ui::core::vec2(0.0 - 9999.0, 0.0 - 9999.0)
+    var on = ui::layout::picker_overlay(p, th, 900.0, 600.0, false, at)
+    ui::layout::set_caret_on(false)
+    var off = ui::layout::picker_overlay(p, th, 900.0, 600.0, false, at)
+    ui::layout::set_caret_on(true)
+    assert_streq(p.query, "lib")
+    assert_eq(cb_pop_bar_chars(on), 1)
+    assert_eq(cb_pop_bar_chars(off), 0)
+}

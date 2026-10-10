@@ -1,0 +1,1093 @@
+// The declaration parser: reads the preprocessed tokens (s.xt) into the unit's functions, records,
+// enums, typedefs and variables. It tracks typedef names so `T * x;` parses as a declaration, skips
+// function bodies and initializers by bracket matching, and on anything it cannot read, notes the
+// declaration and resumes after it.
+
+fn cps_tok(s: St) -> Int { return s.xt[s.xp] }
+fn cps_id(s: St) -> Int { return ctk_id(s.xt[s.xp]) }
+fn cps_at_punct(s: St, id: Int) -> Bool {
+    let t = s.xt[s.xp]
+    return ctk_kind(t) == TK_PUNCT && ctk_id(t) == id
+}
+fn cps_at_ident(s: St) -> Bool { return ctk_kind(s.xt[s.xp]) == TK_IDENT }
+fn cps_at_eof(s: St) -> Bool { return ctk_kind(s.xt[s.xp]) == TK_EOF }
+
+fn cps_error(inout s: St, msg: Str) {
+    if !s.perr {
+        s.perr = true
+        s.perr_msg = copy msg
+    }
+}
+
+fn cps_loc_file(s: St, i: Int) -> Int { return s.xl[i] >> 24 }
+fn cps_loc_line(s: St, i: Int) -> Int { return s.xl[i] & 0xFFFFFF }
+
+// the spelling at the cursor, for messages
+fn cps_near(s: St) -> Str {
+    if cps_at_eof(s) { return "end of input" }
+    return "`" + s.names[cps_id(s)] + "`"
+}
+
+// the index just past the bracket matching the one at `i`
+fn cps_match(s: St, i: Int) -> Int {
+    var depth = 0
+    var k = i
+    let n = s.xt.len()
+    while k < n {
+        let t = s.xt[k]
+        let kind = ctk_kind(t)
+        if kind == TK_EOF { return k }
+        if kind == TK_PUNCT {
+            let id = ctk_id(t)
+            if id == P_LPAREN || id == P_LBRACE || id == P_LBRACK { depth = depth + 1 }
+            if id == P_RPAREN || id == P_RBRACE || id == P_RBRACK {
+                depth = depth - 1
+                if depth == 0 { return k + 1 }
+            }
+        }
+        k = k + 1
+    }
+    return k
+}
+
+// ── types ────────────────────────────────────────────────────────────────────────────────────────
+
+fn cps_new_type(inout s: St, kind: Int, base: Int, len: Int, ref: Int) -> Int {
+    let n = s.unit.types.len()
+    s.unit.types.push(Type { kind: kind, base: base, len: len, ref: ref, params: vec() })
+    return n
+}
+
+fn cps_ptr(inout s: St, base: Int) -> Int {
+    let c = s.ptr_cache[base] else (0 - 1)
+    if c >= 0 { return c }
+    let n = cps_new_type(s, K_POINTER, base, 0, 0)
+    s.ptr_cache.put(base, n)
+    return n
+}
+
+// `ty` with the qualifiers `q` added
+fn cps_qualify(inout s: St, ty: Int, q: Int) -> Int {
+    if q == 0 { return ty }
+    let old = s.unit.types[ty].quals
+    if (old | q) == old { return ty }
+    var ps: Vec<Param> = vec()
+    foreach p in s.unit.types[ty].params { ps.push(Param { name: copy p.name, ty: p.ty }) }
+    let n = s.unit.types.len()
+    let t = s.unit.types[ty]
+    let nt = Type { kind: t.kind, quals: old | q, base: t.base, len: t.len, ref: t.ref, params: sink ps, variadic: t.variadic, align: t.align }
+    s.unit.types.push(nt)
+    return n
+}
+
+// `ty` with an explicit alignment
+fn cps_with_align(inout s: St, ty: Int, a: Int) -> Int {
+    var ps: Vec<Param> = vec()
+    foreach p in s.unit.types[ty].params { ps.push(Param { name: copy p.name, ty: p.ty }) }
+    let n = s.unit.types.len()
+    let t = s.unit.types[ty]
+    let nt = Type { kind: t.kind, quals: t.quals, base: t.base, len: t.len, ref: t.ref, params: sink ps, variadic: t.variadic, align: a }
+    s.unit.types.push(nt)
+    return n
+}
+
+// the builtin `__builtin_va_list`: an array of one `struct __va_list_tag` (a `char *` on Windows)
+fn cps_va_list(inout s: St) -> Int {
+    if s.va_list_ty >= 0 { return s.va_list_ty }
+    // the Windows x64 ABI passes variadic arguments in 8-byte stack slots walked by a `char *`
+    if s.win {
+        s.va_list_ty = cps_ptr(s, K_CHAR)
+        return s.va_list_ty
+    }
+    let r = s.unit.records.len()
+    var fs: Vec<Field> = vec()
+    fs.push(Field { name: "gp_offset", ty: K_UINT, offset: 0 })
+    fs.push(Field { name: "fp_offset", ty: K_UINT, offset: 32 })
+    let vp = cps_ptr(s, K_VOID)
+    fs.push(Field { name: "overflow_arg_area", ty: vp, offset: 64 })
+    fs.push(Field { name: "reg_save_area", ty: vp, offset: 128 })
+    s.unit.records.push(Record { name: "__va_list_tag", is_union: false, anonymous: false, complete: true, fields: sink fs, size: 24, align: 8, packed: false, file: 0, line: 0 })
+    let rt = cps_new_type(s, K_RECORD, 0, 0, r)
+    s.rec_ty.push(rt)
+    s.tag_rec.put(cst_intern(s, "__va_list_tag"), r)
+    s.va_list_ty = cps_new_type(s, K_ARRAY, rt, 1, 0)
+    return s.va_list_ty
+}
+
+// ── attributes ───────────────────────────────────────────────────────────────────────────────────
+
+// Is the token at the cursor the start of an attribute-like decoration? Consumes it if so, folding
+// `packed`, `aligned(N)` and `mode(M)` into s.at_packed / s.at_align / s.at_mode.
+fn cps_decoration(inout s: St) -> Bool {
+    let t = s.xt[s.xp]
+    if ctk_kind(t) == TK_PUNCT && ctk_id(t) == P_LBRACK && ctk_id(s.xt[s.xp + 1]) == P_LBRACK {
+        s.xp = cps_match(s, s.xp)
+        return true
+    }
+    if ctk_kind(t) != TK_IDENT { return false }
+    let id = ctk_id(t)
+    if id == KW_UUattribute__ || id == KW_UUattribute {
+        s.xp = s.xp + 1
+        if !cps_at_punct(s, P_LPAREN) { return true }
+        let end = cps_match(s, s.xp)
+        cps_attribute_list(s, s.xp + 1, end - 1)
+        s.xp = end
+        return true
+    }
+    if id == KW_UUasm__ || id == KW_UUasm || id == KW_asm {
+        s.xp = s.xp + 1
+        if cps_at_punct(s, P_LPAREN) { s.xp = cps_match(s, s.xp) }
+        return true
+    }
+    if id == KW_UUextension__ || id == KW_UNullable || id == KW_UNonnull || id == KW_UNull_unspecified {
+        s.xp = s.xp + 1
+        return true
+    }
+    if id == KW_UAlignas || id == KW_alignas {
+        s.xp = s.xp + 1
+        if cps_at_punct(s, P_LPAREN) {
+            let end2 = cps_match(s, s.xp)
+            var a = 0
+            if cps_is_type_start(s, s.xp + 1) {
+                let save = s.xp
+                s.xp = s.xp + 1
+                let ty = cps_type_name(s)
+                if !s.perr { a = alignof(s.unit, ty) }
+                s.perr = false
+                s.xp = save
+            } else {
+                a = cps_eval_range(s, s.xp + 1, end2 - 1)
+            }
+            if a > s.at_align { s.at_align = a }
+            s.xp = end2
+        }
+        return true
+    }
+    return false
+}
+
+// skip any decorations at the cursor
+fn cps_decorations(inout s: St) {
+    while cps_decoration(s) { }
+}
+
+// the attribute list between the parentheses of `__attribute__((...))`, tokens [lo, hi)
+fn cps_attribute_list(inout s: St, lo: Int, hi: Int) {
+    var i = lo
+    if i < hi && ctk_id(s.xt[i]) == P_LPAREN { i = i + 1 }
+    while i < hi {
+        let t = s.xt[i]
+        let id = ctk_id(t)
+        if ctk_kind(t) == TK_IDENT {
+            var args_end = i + 1
+            let has_args = i + 1 < hi && ctk_id(s.xt[i + 1]) == P_LPAREN
+            if has_args { args_end = cps_match(s, i + 1) }
+            if id == KW_packed || id == KW_UUpacked__ { s.at_packed = true }
+            if id == KW_aligned || id == KW_UUaligned__ {
+                var a = 16
+                if has_args { a = cps_eval_range(s, i + 2, args_end - 1) }
+                if a > s.at_align { s.at_align = a }
+            }
+            if (id == KW_vector_size || id == KW_UUvector_size__) && has_args {
+                s.at_vector = cps_eval_range(s, i + 2, args_end - 1)
+            }
+            if (id == KW_mode || id == KW_UUmode__) && has_args {
+                let m = ctk_id(s.xt[i + 2])
+                if m == KW_QI || m == KW_UUQI__ { s.at_mode = 1 }
+                else if m == KW_HI || m == KW_UUHI__ { s.at_mode = 2 }
+                else if m == KW_SI || m == KW_UUSI__ { s.at_mode = 4 }
+                else if m == KW_DI || m == KW_UUDI__ || m == KW_word || m == KW_UUword__ || m == KW_pointer || m == KW_UUpointer__ { s.at_mode = 8 }
+                else if m == KW_TI || m == KW_UUTI__ { s.at_mode = 16 }
+                else { s.at_mode = 0 - 1 }
+            }
+            i = args_end
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+// evaluate tokens [lo, hi) as a constant expression; 0 when they are not one
+fn cps_eval_range(inout s: St, lo: Int, hi: Int) -> Int {
+    let save = s.xp
+    let sfail = s.ev_fail
+    s.xp = lo
+    s.ev_fail = false
+    let v = cev_cond(s)
+    var r = v
+    if s.ev_fail || s.xp != hi || s.ev_isf { r = 0 }
+    s.ev_fail = sfail
+    s.xp = save
+    return r
+}
+
+// ── declaration specifiers ───────────────────────────────────────────────────────────────────────
+
+// Can a type name start at token index `i`?
+fn cps_is_type_start(s: St, i: Int) -> Bool {
+    let t = s.xt[i]
+    if ctk_kind(t) != TK_IDENT { return false }
+    let id = ctk_id(t)
+    if id >= KW_const && id <= KW_UUbuiltin_va_list { return true }
+    if id == KW_struct || id == KW_union || id == KW_enum { return true }
+    if id == KW_UUtypeof__ || id == KW_UUtypeof || id == KW_typeof || id == KW_UUtypeof_unqual__ || id == KW_typeof_unqual { return true }
+    if id == KW_UAtomic || id == KW_UUextension__ && cps_is_type_start(s, i + 1) { return true }
+    return s.typedef_of.has(id)
+}
+
+// Parse declaration specifiers at the cursor. Sets s.ds_ty (the base type, qualified) and s.ds_st
+// (storage bits); attributes met here accumulate into s.at_*.
+fn cps_decl_specs(inout s: St) {
+    var st = 0
+    var quals = 0
+    var nvoid = 0
+    var nbool = 0
+    var nchar = 0
+    var nshort = 0
+    var nint = 0
+    var nlong = 0
+    var nsigned = 0
+    var nunsigned = 0
+    var nfloat = 0
+    var ndouble = 0
+    var n128 = 0
+    var nf128 = 0
+    var nf16 = 0
+    var ncomplex = 0
+    var explicit = 0 - 1
+    var seen = false
+    var go = true
+    let start = s.xp
+    while go {
+        let t = s.xt[s.xp]
+        if ctk_kind(t) != TK_IDENT {
+            if !cps_decoration(s) { go = false }
+            continue
+        }
+        let id = ctk_id(t)
+        if id == KW_typedef { st = st | ST_TYPEDEF  s.xp = s.xp + 1 }
+        else if id == KW_extern { st = st | ST_EXTERN  s.xp = s.xp + 1 }
+        else if id == KW_static { st = st | ST_STATIC  s.xp = s.xp + 1 }
+        else if id == KW_inline || id == KW_UUinline || id == KW_UUinline__ { st = st | ST_INLINE  s.xp = s.xp + 1 }
+        else if id == KW_auto || id == KW_register || id == KW_UNoreturn || id == KW_UThread_local || id == KW_UUthread || id == KW_thread_local || id == KW_constexpr { s.xp = s.xp + 1 }
+        else if id == KW_const || id == KW_UUconst || id == KW_UUconst__ { quals = quals | Q_CONST  s.xp = s.xp + 1 }
+        else if id == KW_volatile || id == KW_UUvolatile || id == KW_UUvolatile__ { quals = quals | Q_VOLATILE  s.xp = s.xp + 1 }
+        else if id == KW_restrict || id == KW_UUrestrict || id == KW_UUrestrict__ { quals = quals | Q_RESTRICT  s.xp = s.xp + 1 }
+        else if id == KW_UAtomic {
+            s.xp = s.xp + 1
+            if cps_at_punct(s, P_LPAREN) && !seen {
+                s.xp = s.xp + 1
+                explicit = cps_type_name(s)
+                if !cps_at_punct(s, P_RPAREN) { cps_error(s, "expected `)` after _Atomic(type")  return }
+                s.xp = s.xp + 1
+                seen = true
+            }
+            quals = quals | Q_ATOMIC
+        }
+        else if id == KW_void { nvoid = nvoid + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_UBool || id == KW_bool { nbool = nbool + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_char { nchar = nchar + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_short { nshort = nshort + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_int { nint = nint + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_long { nlong = nlong + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_signed || id == KW_UUsigned || id == KW_UUsigned__ { nsigned = nsigned + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_unsigned { nunsigned = nunsigned + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_float || id == KW_UFloat32 { nfloat = nfloat + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_double || id == KW_UFloat64 || id == KW_UFloat32x { ndouble = ndouble + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_UFloat64x || id == KW_UFloat80 || id == KW_UUfloat80 { ndouble = ndouble + 1  nlong = nlong + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_UFloat128 || id == KW_UUfloat128 || id == KW_UFloat128x || id == KW_UUibm128 { nf128 = nf128 + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_UFloat16 { nf16 = nf16 + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_UComplex || id == KW_UUcomplex__ { ncomplex = ncomplex + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_UUint128 { n128 = n128 + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_UUint128_t { n128 = n128 + 1  nsigned = nsigned + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_UUuint128_t { n128 = n128 + 1  nunsigned = nunsigned + 1  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_UUbuiltin_va_list { explicit = cps_va_list(s)  seen = true  s.xp = s.xp + 1 }
+        else if id == KW_struct || id == KW_union { explicit = cps_record_spec(s)  seen = true  if s.perr { return } }
+        else if id == KW_enum { explicit = cps_enum_spec(s)  seen = true  if s.perr { return } }
+        else if id == KW_UUtypeof__ || id == KW_UUtypeof || id == KW_typeof || id == KW_UUtypeof_unqual__ || id == KW_typeof_unqual { explicit = cps_typeof(s)  seen = true  if s.perr { return } }
+        else if id == KW_UUauto_type { cps_error(s, "__auto_type declaration")  return }
+        else if !seen && s.typedef_of.has(id) {
+            let td = s.typedef_of[id] else 0
+            explicit = s.td_ty[td]
+            seen = true
+            s.xp = s.xp + 1
+        }
+        else if !cps_decoration(s) { go = false }
+    }
+    var base = K_INT
+    if explicit >= 0 { base = explicit }
+    else if nvoid > 0 { base = K_VOID }
+    else if nbool > 0 { base = K_BOOL }
+    else if nchar > 0 {
+        base = K_CHAR
+        if nsigned > 0 { base = K_SCHAR }
+        if nunsigned > 0 { base = K_UCHAR }
+    }
+    else if nf16 > 0 { base = K_FLOAT16 }
+    else if nf128 > 0 { base = K_FLOAT128 }
+    else if nfloat > 0 { base = K_FLOAT  if ncomplex > 0 { base = K_CFLOAT } }
+    else if ndouble > 0 {
+        base = K_DOUBLE
+        if nlong > 0 { base = K_LDOUBLE }
+        if ncomplex > 0 { if nlong > 0 { base = K_CLDOUBLE } else { base = K_CDOUBLE } }
+    }
+    else if ncomplex > 0 { base = K_CDOUBLE }
+    else if n128 > 0 { base = K_INT128  if nunsigned > 0 { base = K_UINT128 } }
+    else if nshort > 0 { base = K_SHORT  if nunsigned > 0 { base = K_USHORT } }
+    else if nlong >= 2 { base = K_LLONG  if nunsigned > 0 { base = K_ULLONG } }
+    else if nlong == 1 { base = K_LONG  if nunsigned > 0 { base = K_ULONG } }
+    else if nint > 0 || nsigned > 0 || nunsigned > 0 { base = K_INT  if nunsigned > 0 { base = K_UINT } }
+    else if st == 0 && quals == 0 {
+        cps_error(s, "expected a declaration, found " + cps_near(s))
+        return
+    }
+    base = cps_apply_mode(s, base, start)
+    s.ds_ty = cps_qualify(s, base, quals)
+    s.ds_st = st
+}
+
+// `ty` made a vector by a pending `vector_size(N)` attribute: N bytes of `ty` elements, aligned to
+// its size up to the 16 bytes of an SSE register
+fn cps_apply_vector(inout s: St, ty: Int) -> Int {
+    let n = s.at_vector
+    s.at_vector = 0
+    if n <= 0 { return ty }
+    let es = sizeof(s.unit, ty)
+    if es <= 0 { return ty }
+    let arr = cps_new_type(s, K_ARRAY, ty, n / es, 0)
+    var a = n
+    if a > 16 { a = 16 }
+    return cps_with_align(s, arr, a)
+}
+
+// `ty` changed by a pending `mode` attribute (QI/HI/SI/DI/TI pick an integer of that width)
+fn cps_apply_mode(inout s: St, ty: Int, loc_i: Int) -> Int {
+    if s.at_mode == 0 { return ty }
+    var base = ty
+        if s.at_mode < 0 { cst_note_loc(s, s.xl[loc_i], "unknown mode attribute ignored") }
+        else if is_integer(s.unit, base) {
+            let uns = is_unsigned(s.unit, base)
+            if s.at_mode == 1 { if uns { base = K_UCHAR } else { base = K_SCHAR } }
+            if s.at_mode == 2 { if uns { base = K_USHORT } else { base = K_SHORT } }
+            if s.at_mode == 4 { if uns { base = K_UINT } else { base = K_INT } }
+            if s.at_mode == 8 {
+                if s.unit.long_size == 8 { if uns { base = K_ULONG } else { base = K_LONG } }
+                else { if uns { base = K_ULLONG } else { base = K_LLONG } }
+            }
+            if s.at_mode == 16 { if uns { base = K_UINT128 } else { base = K_INT128 } }
+        } else {
+            cst_note_loc(s, s.xl[loc_i], "mode attribute on a non-integer type ignored")
+        }
+        s.at_mode = 0
+    s.at_mode = 0
+    return base
+}
+
+// `__typeof__(type-name)` or `__typeof__(expression)`
+fn cps_typeof(inout s: St) -> Int {
+    let loc = s.xl[s.xp]
+    s.xp = s.xp + 1
+    if !cps_at_punct(s, P_LPAREN) { cps_error(s, "expected `(` after typeof")  return K_INT }
+    let end = cps_match(s, s.xp)
+    if cps_is_type_start(s, s.xp + 1) {
+        s.xp = s.xp + 1
+        let ty = cps_type_name(s)
+        if s.perr { return K_INT }
+        s.xp = end
+        return ty
+    }
+    // an expression: a declared name, or a constant whose type the evaluator can tell
+    let first = s.xt[s.xp + 1]
+    if end == s.xp + 3 && ctk_kind(first) == TK_IDENT {
+        let id = ctk_id(first)
+        let vi = s.var_of[id] else (0 - 1)
+        if vi >= 0 { s.xp = end  return s.unit.variables[vi].ty }
+        let fi = s.fn_of[id] else (0 - 1)
+        if fi >= 0 { s.xp = end  return s.unit.functions[fi].ty }
+    }
+    let save = s.xp
+    s.xp = s.xp + 1
+    s.ev_fail = false
+    cev_comma(s)
+    let ok = !s.ev_fail && s.xp == end - 1
+    let sz = s.ev_sz
+    let uns = s.ev_uns
+    let isf = s.ev_isf
+    s.ev_fail = false
+    s.xp = end
+    if ok {
+        if isf { return K_DOUBLE }
+        if sz == 8 && s.unit.long_size == 4 { if uns { return K_ULLONG }  return K_LLONG }
+        if sz == 8 { if uns { return K_ULONG }  return K_LONG }
+        if uns { return K_UINT }
+        return K_INT
+    }
+    s.xp = save
+    s.xp = end
+    cst_note_loc(s, loc, "__typeof__ of an expression read as int")
+    return K_INT
+}
+
+// a type name: specifiers and an abstract declarator
+fn cps_type_name(inout s: St) -> Int {
+    let sp = s.at_packed
+    let sa = s.at_align
+    let sd = s.ds_st
+    let sn = s.dn_name
+    cps_decl_specs(s)
+    if s.perr { return K_INT }
+    cps_declarator(s, s.ds_ty)
+    let ty = s.dn_ty
+    s.at_packed = sp
+    s.at_align = sa
+    s.ds_st = sd
+    s.dn_name = sn
+    return ty
+}
+
+// ── declarators ──────────────────────────────────────────────────────────────────────────────────
+
+// Does the `(` at the cursor open a nested declarator rather than a parameter list?
+fn cps_nested_paren(s: St) -> Bool {
+    let t = s.xt[s.xp + 1]
+    let k = ctk_kind(t)
+    let id = ctk_id(t)
+    if k == TK_PUNCT { return id == P_STAR || id == P_LPAREN || id == P_LBRACK || id == P_CARET }
+    if k != TK_IDENT { return false }
+    if id == KW_UUattribute__ || id == KW_UUattribute { return true }
+    if cps_is_type_start(s, s.xp + 1) { return false }
+    return true
+}
+
+// Parse a declarator applied to `base`; sets s.dn_name (a name id, 0 for an abstract declarator)
+// and s.dn_ty.
+fn cps_declarator(inout s: St, base: Int) {
+    var t = base
+    cps_decorations(s)                                 // `(__attribute__((__stdcall__)) *name)`
+    while cps_at_punct(s, P_STAR) || cps_at_punct(s, P_CARET) {
+        s.xp = s.xp + 1
+        var q = 0
+        var go = true
+        while go {
+            let id = cps_id(s)
+            if !cps_at_ident(s) { go = false }
+            else if id == KW_const || id == KW_UUconst || id == KW_UUconst__ { q = q | Q_CONST  s.xp = s.xp + 1 }
+            else if id == KW_volatile || id == KW_UUvolatile || id == KW_UUvolatile__ { q = q | Q_VOLATILE  s.xp = s.xp + 1 }
+            else if id == KW_restrict || id == KW_UUrestrict || id == KW_UUrestrict__ { q = q | Q_RESTRICT  s.xp = s.xp + 1 }
+            else if id == KW_UAtomic { q = q | Q_ATOMIC  s.xp = s.xp + 1 }
+            else if !cps_decoration(s) { go = false }
+        }
+        t = cps_qualify(s, cps_ptr(s, t), q)
+    }
+    cps_decorations(s)
+    if cps_at_punct(s, P_LPAREN) && cps_nested_paren(s) {
+        let inner = s.xp + 1
+        let close = cps_match(s, s.xp)
+        s.xp = close
+        let outer = cps_suffixes(s, t)
+        if s.perr { return }
+        let after = s.xp
+        s.xp = inner
+        cps_declarator(s, outer)
+        if s.perr { return }
+        cps_decorations(s)
+        if s.xp != close - 1 || !cps_at_punct(s, P_RPAREN) { cps_error(s, "unexpected " + cps_near(s) + " in a declarator")  return }
+        s.xp = after
+        return
+    }
+    var name = 0
+    if cps_at_ident(s) {
+        let id = cps_id(s)
+        if !(id >= KW_typedef && id <= KW_UUalignof) || id == KW_bool {
+            name = id
+            s.xp = s.xp + 1
+        }
+    }
+    cps_decorations(s)
+    let ty = cps_suffixes(s, t)
+    s.dn_name = name
+    s.dn_ty = ty
+}
+
+// array and function suffixes applied to `base`
+fn cps_suffixes(inout s: St, base: Int) -> Int {
+    if cps_at_punct(s, P_LBRACK) {
+        let loc = s.xl[s.xp]
+        let close = cps_match(s, s.xp)
+        s.xp = s.xp + 1
+        var go = true
+        while go {
+            let id = cps_id(s)
+            if cps_at_ident(s) && (id == KW_static || id == KW_const || id == KW_UUconst || id == KW_restrict || id == KW_UUrestrict || id == KW_UUrestrict__ || id == KW_volatile) { s.xp = s.xp + 1 }
+            else { go = false }
+        }
+        var len = 0 - 1
+        if s.xp == close - 1 { }
+        else if cps_at_punct(s, P_STAR) && s.xp + 1 == close - 1 { }
+        else {
+            s.ev_fail = false
+            let v = cev_comma(s)
+            if s.ev_fail || s.xp != close - 1 || s.ev_isf {
+                // a parameter's length may name another parameter (`int n, char buf[n]`): not a note
+                if s.in_params == 0 { cst_note_loc(s, loc, "array length is not a constant; read as unsized") }
+            } else {
+                len = v
+            }
+            s.ev_fail = false
+        }
+        s.xp = close
+        let elem = cps_suffixes(s, base)
+        return cps_new_type(s, K_ARRAY, elem, len, 0)
+    }
+    if cps_at_punct(s, P_LPAREN) {
+        let ft = cps_params(s, base)
+        return ft
+    }
+    return base
+}
+
+// a parameter list at the cursor; answers the function type returning `ret`
+fn cps_params(inout s: St, ret: Int) -> Int {
+    s.in_params = s.in_params + 1
+    let t = cps_params_in(s, ret)
+    s.in_params = s.in_params - 1
+    return t
+}
+
+fn cps_params_in(inout s: St, ret: Int) -> Int {
+    let close = cps_match(s, s.xp)
+    s.xp = s.xp + 1
+    var ps: Vec<Param> = vec()
+    var variadic = false
+    if cps_at_punct(s, P_RPAREN) {
+        s.xp = close
+    } else if cps_at_ident(s) && cps_id(s) == KW_void && ctk_kind(s.xt[s.xp + 1]) == TK_PUNCT && ctk_id(s.xt[s.xp + 1]) == P_RPAREN {
+        s.xp = close
+    } else if cps_at_ident(s) && !cps_is_type_start(s, s.xp) && ctk_kind(s.xt[s.xp + 1]) == TK_PUNCT && (ctk_id(s.xt[s.xp + 1]) == P_COMMA || ctk_id(s.xt[s.xp + 1]) == P_RPAREN) {
+        // an old-style identifier list: the parameters' types follow the declarator
+        s.knr = true
+        s.xp = close
+    } else {
+        let sd = s.ds_st
+        var go = true
+        while go {
+            if cps_at_punct(s, P_ELLIPSIS) {
+                variadic = true
+                s.xp = s.xp + 1
+                go = false
+            } else {
+                cps_decl_specs(s)
+                if s.perr { return K_INT }
+                cps_declarator(s, s.ds_ty)
+                if s.perr { return K_INT }
+                cps_decorations(s)
+                var pt = s.dn_ty
+                let rt = resolve(s.unit, pt)
+                let rk = s.unit.types[rt].kind
+                if rk == K_ARRAY { pt = cps_qualify(s, cps_ptr(s, s.unit.types[rt].base), s.unit.types[pt].quals) }
+                else if rk == K_FUNCTION { pt = cps_ptr(s, pt) }
+                var pname = ""
+                if s.dn_name > 0 { pname = copy s.names[s.dn_name] }
+                ps.push(Param { name: pname, ty: pt })
+                if cps_at_punct(s, P_COMMA) { s.xp = s.xp + 1 } else { go = false }
+            }
+        }
+        s.ds_st = sd
+        if s.xp != close - 1 {
+            cps_error(s, "unexpected " + cps_near(s) + " in a parameter list")
+            return K_INT
+        }
+        s.xp = close
+    }
+    let n = s.unit.types.len()
+    s.unit.types.push(Type { kind: K_FUNCTION, base: ret, params: sink ps, variadic: variadic })
+    return n
+}
+
+// ── struct / union ───────────────────────────────────────────────────────────────────────────────
+
+fn cps_add_record(inout s: St, name: Str, is_union: Bool, anon: Bool, loc_i: Int) -> Int {
+    let r = s.unit.records.len()
+    s.unit.records.push(Record { name: copy name, is_union: is_union, anonymous: anon, complete: false, fields: vec(), size: 0, align: 0, packed: false, file: cps_loc_file(s, loc_i), line: cps_loc_line(s, loc_i) })
+    let t = cps_new_type(s, K_RECORD, 0, 0, r)
+    s.rec_ty.push(t)
+    return r
+}
+
+// the #pragma pack value in effect at output token `i`
+fn cps_pack_at(s: St, i: Int) -> Int {
+    var v = 0
+    var k = 0
+    while k < s.pack_at.len() && s.pack_at[k] <= i { v = s.pack_val[k]  k = k + 1 }
+    return v
+}
+
+fn cps_record_spec(inout s: St) -> Int {
+    let kw_i = s.xp
+    let is_union = cps_id(s) == KW_union
+    s.xp = s.xp + 1
+    let outer_packed = s.at_packed
+    let outer_align = s.at_align
+    s.at_packed = false
+    s.at_align = 0
+    cps_decorations(s)
+    var tag = 0 - 1
+    if cps_at_ident(s) { tag = cps_id(s)  s.xp = s.xp + 1 }
+    cps_decorations(s)
+    if !cps_at_punct(s, P_LBRACE) {
+        s.at_packed = outer_packed
+        s.at_align = outer_align
+        if tag < 0 { cps_error(s, "expected a tag or `{` after struct")  return K_INT }
+        var r0 = s.tag_rec[tag] else (0 - 1)
+        if r0 < 0 {
+            r0 = cps_add_record(s, copy s.names[tag], is_union, false, kw_i)
+            s.tag_rec.put(tag, r0)
+        }
+        return s.rec_ty[r0]
+    }
+    var r = 0 - 1
+    if tag >= 0 {
+        r = s.tag_rec[tag] else (0 - 1)
+        if r >= 0 && s.unit.records[r].complete {
+            // a second definition of the same tag: keep the first
+            s.xp = cps_match(s, s.xp)
+            s.at_packed = false
+            cps_decorations(s)
+            s.at_packed = outer_packed
+            s.at_align = outer_align
+            return s.rec_ty[r]
+        }
+        if r < 0 {
+            r = cps_add_record(s, copy s.names[tag], is_union, false, kw_i)
+            s.tag_rec.put(tag, r)
+        } else {
+            s.unit.records[r].file = cps_loc_file(s, kw_i)
+            s.unit.records[r].line = cps_loc_line(s, kw_i)
+        }
+    } else {
+        var kind_name = "struct"
+        if is_union { kind_name = "union" }
+        r = cps_add_record(s, "__anon_" + kind_name + "_" + to_str(s.n_anon), is_union, true, kw_i)
+        s.n_anon = s.n_anon + 1
+    }
+    let head_packed = s.at_packed
+    let head_align = s.at_align
+    let body_start = s.xp
+    let close = cps_match(s, s.xp)
+    s.xp = s.xp + 1
+    // members, laid out once the closing brace and any trailing attributes are read
+    var mnames: Vec<Str> = vec()
+    var mtys: Vec<Int> = vec()
+    var mwidths: Vec<Int> = vec()
+    var maligns: Vec<Int> = vec()
+    var mpacked: Vec<Bool> = vec()
+    while s.xp < close - 1 && !cps_at_eof(s) {
+        let mstart = s.xp
+        if cps_at_punct(s, P_SEMI) { s.xp = s.xp + 1  continue }
+        if cps_at_ident(s) && (cps_id(s) == KW_UStatic_assert || cps_id(s) == KW_static_assert) {
+            cps_skip_to_semi(s, close - 1)
+            continue
+        }
+        s.perr = false
+        s.at_packed = false
+        s.at_align = 0
+        cps_decl_specs(s)
+        if !s.perr {
+            let mbase = s.ds_ty
+            let spec_packed = s.at_packed
+            let spec_align = s.at_align
+            if cps_at_punct(s, P_SEMI) {
+                let rb = s.unit.types[mbase]
+                // an untagged record with no declarator is an anonymous member; for Windows, as with
+                // GCC's -fms-extensions there, a tagged or typedef'd complete record is one too
+                let rw = s.unit.types[resolve(s.unit, mbase)]
+                let ms_member = s.win && rw.kind == K_RECORD && s.unit.records[rw.ref].complete
+                if (rb.kind == K_RECORD && s.unit.records[rb.ref].anonymous) || ms_member {
+                    mnames.push("")
+                    mtys.push(mbase)
+                    mwidths.push(0 - 1)
+                    maligns.push(spec_align)
+                    mpacked.push(spec_packed)
+                }
+                s.xp = s.xp + 1
+            } else {
+                var go = true
+                while go && !s.perr {
+                    s.at_packed = false
+                    s.at_align = 0
+                    var mname = 0
+                    var mty = mbase
+                    if !cps_at_punct(s, P_COLON) {
+                        cps_declarator(s, mbase)
+                        mname = s.dn_name
+                        mty = s.dn_ty
+                    }
+                    var width = 0 - 1
+                    if !s.perr && cps_at_punct(s, P_COLON) {
+                        s.xp = s.xp + 1
+                        s.ev_fail = false
+                        width = cev_cond(s)
+                        if s.ev_fail { cps_error(s, "bitfield width is not a constant") }
+                    }
+                    cps_decorations(s)
+                    if !s.perr {
+                        var nm = ""
+                        if mname > 0 { nm = copy s.names[mname] }
+                        mnames.push(nm)
+                        mtys.push(mty)
+                        mwidths.push(width)
+                        var al = spec_align
+                        if s.at_align > al { al = s.at_align }
+                        maligns.push(al)
+                        mpacked.push(spec_packed || s.at_packed)
+                        if cps_at_punct(s, P_COMMA) { s.xp = s.xp + 1 }
+                        else if cps_at_punct(s, P_SEMI) { s.xp = s.xp + 1  go = false }
+                        else { cps_error(s, "expected `;` after a member, found " + cps_near(s)) }
+                    }
+                }
+            }
+        }
+        if s.perr {
+            cst_note_loc(s, s.xl[mstart], "member of " + s.unit.records[r].name + " skipped: " + s.perr_msg + "; its layout is unreliable")
+            s.perr = false
+            s.xp = mstart
+            cps_skip_to_semi(s, close - 1)
+        }
+    }
+    s.xp = close
+    s.at_packed = false
+    s.at_align = 0
+    cps_decorations(s)
+    let packed = head_packed || s.at_packed
+    var ralign = head_align
+    if s.at_align > ralign { ralign = s.at_align }
+    s.at_packed = outer_packed
+    s.at_align = outer_align
+    cly_layout(s, r, mnames, mtys, mwidths, maligns, mpacked, packed, ralign, cps_pack_at(s, body_start))
+    return s.rec_ty[r]
+}
+
+// skip to just past the next `;` at bracket depth 0, stopping at index `limit`
+fn cps_skip_to_semi(inout s: St, limit: Int) {
+    while s.xp < limit && !cps_at_eof(s) {
+        let t = s.xt[s.xp]
+        if ctk_kind(t) == TK_PUNCT {
+            let id = ctk_id(t)
+            if id == P_SEMI { s.xp = s.xp + 1  return }
+            if id == P_LPAREN || id == P_LBRACE || id == P_LBRACK { s.xp = cps_match(s, s.xp)  continue }
+        }
+        s.xp = s.xp + 1
+    }
+}
+
+// ── enum ─────────────────────────────────────────────────────────────────────────────────────────
+
+fn cps_add_enum(inout s: St, name: Str, anon: Bool, loc_i: Int) -> Int {
+    let e = s.unit.enums.len()
+    s.unit.enums.push(Enum { name: copy name, anonymous: anon, complete: false, consts: vec(), size: 4, unsigned: true, file: cps_loc_file(s, loc_i), line: cps_loc_line(s, loc_i) })
+    let t = cps_new_type(s, K_ENUM, 0, 0, e)
+    s.enum_ty.push(t)
+    return e
+}
+
+fn cps_enum_spec(inout s: St) -> Int {
+    let kw_i = s.xp
+    s.xp = s.xp + 1
+    let outer_packed = s.at_packed
+    s.at_packed = false
+    cps_decorations(s)
+    var tag = 0 - 1
+    if cps_at_ident(s) { tag = cps_id(s)  s.xp = s.xp + 1 }
+    cps_decorations(s)
+    var fixed = 0 - 1
+    if cps_at_punct(s, P_COLON) {
+        s.xp = s.xp + 1
+        fixed = cps_type_name(s)
+        if s.perr { return K_INT }
+    }
+    if !cps_at_punct(s, P_LBRACE) {
+        s.at_packed = outer_packed
+        if tag < 0 { cps_error(s, "expected a tag or `{` after enum")  return K_INT }
+        var e0 = s.tag_enum[tag] else (0 - 1)
+        if e0 < 0 {
+            e0 = cps_add_enum(s, copy s.names[tag], false, kw_i)
+            s.tag_enum.put(tag, e0)
+        }
+        return s.enum_ty[e0]
+    }
+    var e = 0 - 1
+    if tag >= 0 {
+        e = s.tag_enum[tag] else (0 - 1)
+        if e >= 0 && s.unit.enums[e].complete {
+            s.xp = cps_match(s, s.xp)
+            cps_decorations(s)
+            s.at_packed = outer_packed
+            return s.enum_ty[e]
+        }
+        if e < 0 {
+            e = cps_add_enum(s, copy s.names[tag], false, kw_i)
+            s.tag_enum.put(tag, e)
+        }
+    } else {
+        e = cps_add_enum(s, "__anon_enum_" + to_str(s.n_anon), true, kw_i)
+        s.n_anon = s.n_anon + 1
+    }
+    let close = cps_match(s, s.xp)
+    s.xp = s.xp + 1
+    var consts: Vec<EnumConst> = vec()
+    var next = 0
+    var any_neg = false
+    var minv = 0
+    var maxv = 0
+    var maxu_over = false
+    while s.xp < close - 1 && !cps_at_eof(s) {
+        if !cps_at_ident(s) {
+            cst_note_loc(s, s.xl[s.xp], "enum " + s.unit.enums[e].name + ": unexpected " + cps_near(s) + "; rest of the enumerators skipped")
+            s.xp = close - 1
+            break
+        }
+        let nid = cps_id(s)
+        let cloc = s.xp
+        s.xp = s.xp + 1
+        cps_decorations(s)
+        var v = next
+        if cps_at_punct(s, P_ASSIGN) {
+            s.xp = s.xp + 1
+            s.ev_fail = false
+            let x = cev_cond(s)
+            let big_unsigned = s.ev_uns && s.ev_sz == 8 && x < 0
+            if s.ev_fail || s.ev_isf {
+                cst_note_loc(s, s.xl[cloc], "enumerator " + s.names[nid] + " has no constant value; counted on from the previous one")
+                // resume at the next enumerator
+                while s.xp < close - 1 && !cps_at_punct(s, P_COMMA) {
+                    if cps_at_punct(s, P_LPAREN) { s.xp = cps_match(s, s.xp) } else { s.xp = s.xp + 1 }
+                }
+            } else {
+                v = x
+                if big_unsigned { maxu_over = true }
+            }
+            s.ev_fail = false
+        }
+        s.econst.put(nid, v)
+        consts.push(EnumConst { name: copy s.names[nid], value: v })
+        if v < 0 && !maxu_over { any_neg = true }
+        if v < minv { minv = v }
+        if v > maxv { maxv = v }
+        next = v + 1
+        if cps_at_punct(s, P_COMMA) { s.xp = s.xp + 1 }
+        else if s.xp < close - 1 {
+            cst_note_loc(s, s.xl[s.xp], "enum " + s.unit.enums[e].name + ": unexpected " + cps_near(s) + "; rest of the enumerators skipped")
+            s.xp = close - 1
+        }
+    }
+    s.xp = close
+    s.at_packed = false
+    cps_decorations(s)
+    let packed = s.at_packed
+    s.at_packed = outer_packed
+    var size = 4
+    var uns = !any_neg
+    if fixed >= 0 {
+        size = sizeof(s.unit, fixed)
+        uns = is_unsigned(s.unit, fixed)
+    } else if maxu_over {
+        size = 8
+        uns = true
+    } else if any_neg {
+        if minv < 0 - 2147483648 || maxv > 2147483647 { size = 8 }
+        if packed {
+            if minv >= 0 - 128 && maxv <= 127 { size = 1 } else if minv >= 0 - 32768 && maxv <= 32767 { size = 2 }
+        }
+    } else {
+        if maxv > 4294967295 { size = 8 }
+        if packed {
+            if maxv <= 255 { size = 1 } else if maxv <= 65535 { size = 2 }
+        }
+    }
+    s.unit.enums[e].consts = sink consts
+    s.unit.enums[e].complete = true
+    s.unit.enums[e].size = size
+    s.unit.enums[e].unsigned = uns
+    return s.enum_ty[e]
+}
+
+// ── external declarations ────────────────────────────────────────────────────────────────────────
+
+fn cps_unit(inout s: St) {
+    while !cps_at_eof(s) {
+        cps_external(s)
+    }
+}
+
+// Skip a declaration that could not be read, from its first token: to just past its `;`, or past
+// the closing brace of a function body.
+fn cps_recover(inout s: St, start: Int) {
+    s.xp = start
+    while !cps_at_eof(s) {
+        let t = s.xt[s.xp]
+        if ctk_kind(t) == TK_PUNCT {
+            let id = ctk_id(t)
+            if id == P_SEMI { s.xp = s.xp + 1  return }
+            if id == P_LBRACE {
+                let prev = s.xt[s.xp - 1]
+                let body = s.xp > start && ctk_kind(prev) == TK_PUNCT && ctk_id(prev) == P_RPAREN
+                s.xp = cps_match(s, s.xp)
+                if body { return }
+                continue
+            }
+            if id == P_LPAREN || id == P_LBRACK { s.xp = cps_match(s, s.xp)  continue }
+            if id == P_RBRACE || id == P_RPAREN || id == P_RBRACK { s.xp = s.xp + 1  return }
+        }
+        s.xp = s.xp + 1
+    }
+}
+
+fn cps_external(inout s: St) {
+    let start = s.xp
+    if cps_at_punct(s, P_SEMI) { s.xp = s.xp + 1  return }
+    let id0 = cps_id(s)
+    if cps_at_ident(s) && (id0 == KW_UStatic_assert || id0 == KW_static_assert) {
+        cps_skip_to_semi(s, s.xt.len())
+        return
+    }
+    s.perr = false
+    s.at_packed = false
+    s.at_align = 0
+    s.at_mode = 0
+    s.at_vector = 0
+    cps_decl_specs(s)
+    if s.perr { cps_fail_decl(s, start)  return }
+    let base = s.ds_ty
+    let st = s.ds_st
+    let spec_align = s.at_align
+    if cps_at_punct(s, P_SEMI) { s.xp = s.xp + 1  return }
+    // declarators are entered into the unit only once the whole declaration has been read
+    var d_kind: Vec<Int> = vec()
+    var d_name: Vec<Int> = vec()
+    var d_ty: Vec<Int> = vec()
+    var d_fty: Vec<Int> = vec()
+    var d_at: Vec<Int> = vec()
+    while true {
+        let decl_i = s.xp
+        s.at_align = 0
+        s.knr = false
+        cps_declarator(s, base)
+        if s.perr { cps_fail_decl(s, start)  return }
+        cps_decorations(s)
+        let name = s.dn_name
+        var ty = cps_apply_vector(s, cps_apply_mode(s, s.dn_ty, decl_i))
+        var align = spec_align
+        if s.at_align > align { align = s.at_align }
+        let rt = resolve(s.unit, ty)
+        let is_fn = s.unit.types[rt].kind == K_FUNCTION
+        if name == 0 {
+            cps_error(s, "declaration without a name")
+            cps_fail_decl(s, start)
+            return
+        }
+        var kind = 2
+        if (st & ST_TYPEDEF) != 0 {
+            if align > 0 { ty = cps_with_align(s, ty, align) }
+            kind = 0
+        } else if is_fn {
+            kind = 1
+            // an old-style definition: `int f(a, b) int a; char *b; { ... }`
+            if s.knr && d_kind.len() == 0 && !cps_at_punct(s, P_SEMI) && !cps_at_punct(s, P_COMMA) {
+                while !cps_at_eof(s) && !cps_at_punct(s, P_LBRACE) {
+                    if cps_at_punct(s, P_LPAREN) || cps_at_punct(s, P_LBRACK) { s.xp = cps_match(s, s.xp) } else { s.xp = s.xp + 1 }
+                }
+            }
+            if cps_at_punct(s, P_LBRACE) {
+                cps_commit(s, d_kind, d_name, d_ty, d_fty, d_at, st)
+                cps_add_function(s, name, ty, rt, st, true, decl_i)
+                s.xp = cps_match(s, s.xp)
+                return
+            }
+        }
+        d_kind.push(kind)
+        d_name.push(name)
+        d_ty.push(ty)
+        d_fty.push(rt)
+        d_at.push(decl_i)
+        if cps_at_punct(s, P_ASSIGN) {
+            s.xp = s.xp + 1
+            var go = true
+            while go && !cps_at_eof(s) {
+                let t = s.xt[s.xp]
+                let tid = ctk_id(t)
+                if ctk_kind(t) == TK_PUNCT && (tid == P_COMMA || tid == P_SEMI) { go = false }
+                else if ctk_kind(t) == TK_PUNCT && (tid == P_LPAREN || tid == P_LBRACE || tid == P_LBRACK) { s.xp = cps_match(s, s.xp) }
+                else { s.xp = s.xp + 1 }
+            }
+        }
+        if cps_at_punct(s, P_COMMA) { s.xp = s.xp + 1 }
+        else if cps_at_punct(s, P_SEMI) {
+            s.xp = s.xp + 1
+            cps_commit(s, d_kind, d_name, d_ty, d_fty, d_at, st)
+            return
+        }
+        else {
+            cps_error(s, "expected `;` or `,` after a declarator, found " + cps_near(s))
+            cps_fail_decl(s, start)
+            return
+        }
+    }
+}
+
+// enter the declarators of one declaration: kind 0 typedef, 1 function, 2 object
+fn cps_commit(inout s: St, kinds: Vec<Int>, names: Vec<Int>, tys: Vec<Int>, ftys: Vec<Int>, ats: Vec<Int>, st: Int) {
+    var i = 0
+    while i < kinds.len() {
+        if kinds[i] == 0 { cps_add_typedef(s, names[i], tys[i], ats[i]) }
+        else if kinds[i] == 1 { cps_add_function(s, names[i], tys[i], ftys[i], st, false, ats[i]) }
+        else { cps_add_variable(s, names[i], tys[i], st, ats[i]) }
+        i = i + 1
+    }
+}
+
+fn cps_fail_decl(inout s: St, start: Int) {
+    let msg = copy s.perr_msg
+    s.perr = false
+    s.unit.notes.push(Note { file: cps_loc_file(s, start), line: cps_loc_line(s, start), reason: "declaration skipped: " + msg })
+    cps_recover(s, start)
+    if s.xp <= start { s.xp = start + 1 }
+}
+
+fn cps_add_typedef(inout s: St, name: Int, ty: Int, i: Int) {
+    if s.typedef_of.has(name) { return }
+    let td = s.unit.typedefs.len()
+    s.unit.typedefs.push(Typedef { name: copy s.names[name], ty: ty, file: cps_loc_file(s, i), line: cps_loc_line(s, i) })
+    let t = cps_new_type(s, K_TYPEDEF, 0, 0, td)
+    s.td_ty.push(t)
+    s.typedef_of.put(name, td)
+}
+
+fn cps_add_function(inout s: St, name: Int, ty: Int, fty: Int, st: Int, body: Bool, i: Int) {
+    let prev = s.fn_of[name] else (0 - 1)
+    if prev >= 0 {
+        if body { s.unit.functions[prev].definition = true }
+        return
+    }
+    var ps: Vec<Param> = vec()
+    foreach p in s.unit.types[fty].params { ps.push(Param { name: copy p.name, ty: p.ty }) }
+    let f = s.unit.functions.len()
+    s.unit.functions.push(Function {
+        name: copy s.names[name], ty: ty, ret: s.unit.types[fty].base, params: sink ps,
+        variadic: s.unit.types[fty].variadic, definition: body, is_static: (st & ST_STATIC) != 0,
+        file: cps_loc_file(s, i), line: cps_loc_line(s, i),
+    })
+    s.fn_of.put(name, f)
+}
+
+fn cps_add_variable(inout s: St, name: Int, ty: Int, st: Int, i: Int) {
+    let prev = s.var_of[name] else (0 - 1)
+    if prev >= 0 {
+        // a later declaration may complete an array's length
+        let pt = s.unit.variables[prev].ty
+        if s.unit.types[pt].kind == K_ARRAY && s.unit.types[pt].len < 0 { s.unit.variables[prev].ty = ty }
+        return
+    }
+    let v = s.unit.variables.len()
+    s.unit.variables.push(Variable { name: copy s.names[name], ty: ty, is_extern: (st & ST_EXTERN) != 0, is_static: (st & ST_STATIC) != 0, file: cps_loc_file(s, i), line: cps_loc_line(s, i) })
+    s.var_of.put(name, v)
+}

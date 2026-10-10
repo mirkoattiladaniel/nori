@@ -1,0 +1,11 @@
+// Memory safety: an out-of-bounds read is a deterministic trap, not undefined behaviour.
+//
+// THIS PROGRAM FAILS ON PURPOSE. It reads index 5 of a three-element array. In C that is a silent
+// read of whatever sits next to the array (a bug that may show up months later, or as a
+// vulnerability); in Nori the access is bounds-checked, so the program stops at once with
+// "trap: index out of bounds" and a non-zero exit code. A program that is wrong stops where it
+// is wrong.
+fn main() -> Int {
+    var a = fill(3, 0)
+    return a[5]          // index 5 into a length-3 array  ->  trap
+}

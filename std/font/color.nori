@@ -1,0 +1,473 @@
+// std/font: color glyphs: CBDT/CBLC bitmap strikes (NotoColorEmoji's PNGs) and COLR/CPAL v0
+// layered glyphs.
+//
+//   if font::glyph_is_color(f, gid) {
+//       let cb = font::rasterize_color(f, gid, 32.0, 0x000000FF)    // fg color for COLR's "foreground"
+//       // cb.w x cb.h premultiplied RGBA pixels (packed 0xRRGGBBAA), placed like a GlyphBitmap
+//   }
+//
+// A CBDT glyph is a PNG at a fixed strike size (109 ppem in Noto Color Emoji); the strike nearest
+// above the requested size is decoded (std/image) and scaled by area averaging in premultiplied
+// space. A COLR v0 glyph is a stack of outline glyphs each filled with a palette color (or the
+// caller's foreground); each layer is rasterized unhinted (hinting each layer on its own would pull
+// layers of one glyph apart) and composited source-over.
+
+import "std/image" as image
+
+/// a color glyph: `w` x `h` pixels of premultiplied RGBA packed as 0xRRGGBBAA (row-major), placed
+/// like a GlyphBitmap: `left` px right of the pen, `top` px above the baseline.
+pub struct ColorBitmap { w: Int, h: Int, left: Int, top: Int, rgba: Vec<Int> }
+fn color_bitmap_empty() -> ColorBitmap { var v: Vec<Int> = vec()  return ColorBitmap { w: 0, h: 0, left: 0, top: 0, rgba: v } }
+
+/// does the face carry color glyphs (CBDT/CBLC or COLR/CPAL)?
+pub fn font_has_color(f: Font) -> Bool { return (f.cbdt_off >= 0 && f.cblc_off >= 0) || (f.colr_off >= 0 && f.cpal_off >= 0) }
+
+/// is glyph `gid` a color glyph (a CBDT bitmap or a COLR base glyph)?
+pub fn glyph_is_color(f: Font, gid: Int) -> Bool {
+    if colr_base(f, gid) >= 0 { return true }
+    return cbdt_find(f, gid, 0, true) >= 0
+}
+
+// ── CBLC / CBDT ──────────────────────────────────────────────────────────────────────────────────
+// CBLC: version u32, numSizes u32, then 48-byte BitmapSize records: indexSubtableListOffset u32,
+// indexSubtableListSize u32, numberOfIndexSubtables u32, colorRef u32, hori/vert SbitLineMetrics
+// (12 bytes each), startGlyphIndex u16 @40, endGlyphIndex u16 @42, ppemX u8 @44, ppemY u8 @45,
+// bitDepth u8, flags.
+
+// the BitmapSize record to draw `gid` at `px` with: the smallest strike at least `px`, else the
+// largest. With `any`, just whether some strike has the glyph. Returns the record offset or -1.
+fn cbdt_find(f: Font, gid: Int, px: Int, any: Bool) -> Int {
+    if f.cblc_off < 0 || f.cbdt_off < 0 { return 0 - 1 }
+    let d = f.d
+    let c = f.cblc_off
+    let n = rd_u32(d, c + 4)
+    var best = 0 - 1
+    var best_ppem = 0
+    var i = 0
+    while i < n && i < 256 {
+        let bs = c + 8 + i * 48
+        let s = rd_u16(d, bs + 40)
+        let e = rd_u16(d, bs + 42)
+        if gid >= s && gid <= e && cblc_index(f, bs, gid, 0) >= 0 {
+            if any { return bs }
+            let ppem = rd_u8(d, bs + 45)
+            if best < 0 { best = bs  best_ppem = ppem }
+            else if best_ppem < px { if ppem > best_ppem { best = bs  best_ppem = ppem } }
+            else if ppem >= px && ppem < best_ppem { best = bs  best_ppem = ppem }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// locate `gid` in strike `bs`: when `want` is 0 returns the CBDT offset of its image (or -1); when 1,
+// the image format; 2, the image length (-1 when not bounded by the index); 3, the offset of
+// bigMetrics held in the index (formats 2/5), or -1
+fn cblc_index(f: Font, bs: Int, gid: Int, want: Int) -> Int {
+    let d = f.d
+    let c = f.cblc_off
+    let arr = c + rd_u32(d, bs)
+    let nsub = rd_u32(d, bs + 8)
+    var i = 0
+    while i < nsub && i < 4096 {
+        let r = arr + i * 8
+        let first = rd_u16(d, r)
+        let last = rd_u16(d, r + 2)
+        if gid >= first && gid <= last {
+            let st = arr + rd_u32(d, r + 4)
+            let ifmt = rd_u16(d, st)
+            let imgfmt = rd_u16(d, st + 2)
+            let base = f.cbdt_off + rd_u32(d, st + 4)
+            if want == 1 { return imgfmt }
+            var off = 0 - 1
+            var len = 0 - 1
+            var metrics = 0 - 1
+            if ifmt == 1 {
+                let a = rd_u32(d, st + 8 + (gid - first) * 4)
+                let b = rd_u32(d, st + 8 + (gid - first + 1) * 4)
+                if b > a { off = base + a  len = b - a }
+            } else if ifmt == 2 {
+                let sz = rd_u32(d, st + 8)
+                off = base + (gid - first) * sz
+                len = sz
+                metrics = st + 12
+            } else if ifmt == 3 {
+                let a = rd_u16(d, st + 8 + (gid - first) * 2)
+                let b = rd_u16(d, st + 8 + (gid - first + 1) * 2)
+                if b > a { off = base + a  len = b - a }
+            } else if ifmt == 4 {
+                let ng = rd_u32(d, st + 8)
+                var k = 0
+                while k < ng {
+                    if rd_u16(d, st + 12 + k * 4) == gid {
+                        let a = rd_u16(d, st + 14 + k * 4)
+                        let b = rd_u16(d, st + 14 + (k + 1) * 4)
+                        if b > a { off = base + a  len = b - a }
+                        k = ng
+                    }
+                    k = k + 1
+                }
+            } else if ifmt == 5 {
+                let sz = rd_u32(d, st + 8)
+                let ng = rd_u32(d, st + 20)
+                var k = 0
+                while k < ng {
+                    if rd_u16(d, st + 24 + k * 2) == gid { off = base + k * sz  len = sz  k = ng }
+                    k = k + 1
+                }
+                metrics = st + 12
+            }
+            if want == 0 { return off }
+            if want == 2 { return len }
+            return metrics
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// PNG premultiplication, the way FreeType does it (so the two agree to the bit)
+fn mul_alpha(a: Int, c: Int) -> Int { let t = a * c + 128  return (t + (t >> 8)) >> 8 }
+
+// decode the strike image of `gid`: fills `rgba` (premultiplied, packed) and `geo` with
+// [w, h, bearingX, bearingY, ppem]; false when it is not a PNG glyph or does not decode.
+fn cbdt_decode(f: Font, gid: Int, px: Int, inout rgba: Vec<Int>, inout geo: Vec<Int>) -> Bool {
+    let d = f.d
+    let bs = cbdt_find(f, gid, px, false)
+    if bs < 0 { return false }
+    let off = cblc_index(f, bs, gid, 0)
+    let fmt = cblc_index(f, bs, gid, 1)
+    if off < 0 { return false }
+    var bx = 0  var by = 0
+    var png = 0 - 1
+    var plen = 0
+    if fmt == 17 { bx = rd_u8(d, off + 2)  by = rd_u8(d, off + 3)  plen = rd_u32(d, off + 5)  png = off + 9 }
+    else if fmt == 18 { bx = rd_u8(d, off + 2)  by = rd_u8(d, off + 3)  plen = rd_u32(d, off + 8)  png = off + 12 }
+    else if fmt == 19 {
+        let m = cblc_index(f, bs, gid, 3)
+        if m >= 0 { bx = rd_u8(d, m + 2)  by = rd_u8(d, m + 3) }
+        plen = rd_u32(d, off)
+        png = off + 4
+    } else { return false }
+    if bx >= 128 { bx = bx - 256 }
+    if by >= 128 { by = by - 256 }
+    if plen <= 0 || png + plen > d.len() { return false }
+    var im = image::load_png(d.slice(png, png + plen))
+    if !image::ok(im) { image::dispose(im)  return false }
+    let w = image::width(im)
+    let h = image::height(im)
+    while rgba.len() > 0 { rgba.pop() }
+    var y = 0
+    while y < h {
+        var x = 0
+        while x < w {
+            let p = image::pixel_rgba(im, x, y)
+            let a = p & 255
+            var r = (p >> 24) & 255
+            var g = (p >> 16) & 255
+            var b = (p >> 8) & 255
+            if a == 0 { r = 0  g = 0  b = 0 }
+            else if a != 255 { r = mul_alpha(a, r)  g = mul_alpha(a, g)  b = mul_alpha(a, b) }
+            rgba.push((r << 24) | (g << 16) | (b << 8) | a)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    image::dispose(im)
+    while geo.len() > 0 { geo.pop() }
+    geo.push(w)  geo.push(h)  geo.push(bx)  geo.push(by)  geo.push(rd_u8(d, bs + 45))
+    return true
+}
+
+// area-averaging resample of premultiplied RGBA (w x h) by `s` (< 1 shrinks); out gets the pixels,
+// returns [nw, nh] in dims
+fn resample(src: Vec<Int>, w: Int, h: Int, s: Float, inout out: Vec<Int>, inout dims: Vec<Int>) {
+    var nw = ceil_int(to_float(w) * s)
+    var nh = ceil_int(to_float(h) * s)
+    if nw < 1 { nw = 1 }
+    if nh < 1 { nh = 1 }
+    while dims.len() > 0 { dims.pop() }
+    dims.push(nw)
+    dims.push(nh)
+    // horizontal pass into 4 float channels
+    var tmp: Vec<Float> = vec()
+    let inv = 1.0 / s
+    var y = 0
+    while y < h {
+        var dx = 0
+        while dx < nw {
+            let x0 = to_float(dx) * inv
+            let x1 = to_float(dx + 1) * inv
+            var acc_r = 0.0  var acc_g = 0.0  var acc_b = 0.0  var acc_a = 0.0
+            var sx = floor_int(x0)
+            while to_float(sx) < x1 && sx < w {
+                if sx >= 0 {
+                    let lo = fmax(x0, to_float(sx))
+                    let hi = fmin(x1, to_float(sx + 1))
+                    let wgt = hi - lo
+                    if wgt > 0.0 {
+                        let p = src[y * w + sx]
+                        acc_r = acc_r + wgt * to_float((p >> 24) & 255)
+                        acc_g = acc_g + wgt * to_float((p >> 16) & 255)
+                        acc_b = acc_b + wgt * to_float((p >> 8) & 255)
+                        acc_a = acc_a + wgt * to_float(p & 255)
+                    }
+                }
+                sx = sx + 1
+            }
+            tmp.push(acc_r * s)  tmp.push(acc_g * s)  tmp.push(acc_b * s)  tmp.push(acc_a * s)
+            dx = dx + 1
+        }
+        y = y + 1
+    }
+    while out.len() > 0 { out.pop() }
+    var dy = 0
+    while dy < nh {
+        let y0 = to_float(dy) * inv
+        let y1 = to_float(dy + 1) * inv
+        var dx = 0
+        while dx < nw {
+            var r = 0.0  var g = 0.0  var b = 0.0  var a = 0.0
+            var sy = floor_int(y0)
+            while to_float(sy) < y1 && sy < h {
+                if sy >= 0 {
+                    let lo = fmax(y0, to_float(sy))
+                    let hi = fmin(y1, to_float(sy + 1))
+                    let wgt = hi - lo
+                    if wgt > 0.0 {
+                        let t = (sy * nw + dx) * 4
+                        r = r + wgt * tmp[t]  g = g + wgt * tmp[t + 1]  b = b + wgt * tmp[t + 2]  a = a + wgt * tmp[t + 3]
+                    }
+                }
+                sy = sy + 1
+            }
+            out.push((clamp255(r * s) << 24) | (clamp255(g * s) << 16) | (clamp255(b * s) << 8) | clamp255(a * s))
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+}
+fn clamp255(v: Float) -> Int {
+    var i = to_int(v + 0.5)
+    if i < 0 { i = 0 }
+    if i > 255 { i = 255 }
+    return i
+}
+
+// ── COLR / CPAL v0 ───────────────────────────────────────────────────────────────────────────────
+// COLR: version u16, numBaseGlyphRecords u16, baseGlyphRecordsOffset u32, layerRecordsOffset u32,
+// numLayerRecords u16. BaseGlyphRecord: glyphID, firstLayerIndex, numLayers (u16 each, sorted by
+// glyph). LayerRecord: glyphID u16, paletteIndex u16 (0xFFFF: the foreground color).
+
+// the base glyph record of `gid`, or -1
+fn colr_base(f: Font, gid: Int) -> Int {
+    if f.colr_off < 0 || f.cpal_off < 0 { return 0 - 1 }
+    let d = f.d
+    let c = f.colr_off
+    let n = rd_u16(d, c + 2)
+    let base = c + rd_u32(d, c + 4)
+    var lo = 0
+    var hi = n - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        let g = rd_u16(d, base + mid * 6)
+        if g == gid { return base + mid * 6 }
+        if g < gid { lo = mid + 1 } else { hi = mid - 1 }
+    }
+    return 0 - 1
+}
+/// palette entry `idx` of palette 0 as packed straight RGBA (0xRRGGBBAA); CPAL stores BGRA.
+pub fn cpal_color(f: Font, idx: Int) -> Int {
+    let d = f.d
+    let p = f.cpal_off
+    if p < 0 { return 255 }
+    let nentries = rd_u16(d, p + 2)
+    if idx < 0 || idx >= nentries { return 255 }
+    let rec0 = rd_u16(d, p + 12)                                          // palette 0's first color record
+    let at = p + rd_u32(d, p + 8) + (rec0 + idx) * 4
+    let b = rd_u8(d, at)
+    let g = rd_u8(d, at + 1)
+    let r = rd_u8(d, at + 2)
+    let a = rd_u8(d, at + 3)
+    return (r << 24) | (g << 16) | (b << 8) | a
+}
+
+/// the COLR v0 layers of `gid` as (glyph, packed straight RGBA) pairs, bottom first; `fg` is the
+/// color for layers that ask for the foreground. Empty for a glyph that is not a COLR base glyph.
+pub fn colr_layers(f: Font, gid: Int, fg: Int) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    let r = colr_base(f, gid)
+    if r < 0 { return out }
+    let d = f.d
+    let c = f.colr_off
+    let first = rd_u16(d, r + 2)
+    let n = rd_u16(d, r + 4)
+    let layers = c + rd_u32(d, c + 8)
+    let total = rd_u16(d, c + 12)
+    var i = 0
+    while i < n && first + i < total {
+        let lr = layers + (first + i) * 4
+        out.push(rd_u16(d, lr))
+        let pi = rd_u16(d, lr + 2)
+        if pi == 65535 { out.push(fg) } else { out.push(cpal_color(f, pi)) }
+        i = i + 1
+    }
+    return out
+}
+
+// composite one coverage layer in straight color `col` over `dst` (premultiplied), at an offset
+fn composite_layer(inout dst: Vec<Int>, dw: Int, dh: Int, g: GlyphBitmap, ox: Int, oy: Int, col: Int) {
+    let cr = (col >> 24) & 255
+    let cg = (col >> 16) & 255
+    let cb = (col >> 8) & 255
+    let ca = col & 255
+    var y = 0
+    while y < g.h {
+        var x = 0
+        while x < g.w {
+            let cov = g.cov[y * g.w + x]
+            let tx = x + ox
+            let ty = y + oy
+            if cov > 0 && tx >= 0 && ty >= 0 && tx < dw && ty < dh {
+                let sa = (ca * cov + 127) / 255                           // source alpha
+                let sr = (cr * sa + 127) / 255
+                let sg = (cg * sa + 127) / 255
+                let sb = (cb * sa + 127) / 255
+                let p = dst[ty * dw + tx]
+                let inv = 255 - sa
+                let nr = sr + (((p >> 24) & 255) * inv + 127) / 255
+                let ng = sg + (((p >> 16) & 255) * inv + 127) / 255
+                let nb = sb + (((p >> 8) & 255) * inv + 127) / 255
+                let na = sa + ((p & 255) * inv + 127) / 255
+                dst[ty * dw + tx] = (nr << 24) | (ng << 16) | (nb << 8) | na
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+/// draw color glyph `gid` at `px` pixels per em: a CBDT bitmap scaled from its strike, or COLR v0
+/// layers composited (`fg` is the packed straight RGBA for foreground layers). A 0x0 bitmap when
+/// the glyph has no color form.
+pub fn rasterize_color(f: Font, gid: Int, px_size: Float, fg: Int) -> ColorBitmap {
+    let layers = colr_layers(f, gid, fg)
+    if layers.len() > 0 {
+        // rasterize every layer unhinted, find the union box, composite
+        let was = hinting()
+        set_hinting(false)
+        var bms: Vec<GlyphBitmap> = vec()
+        var x0 = 1000000  var y1 = 0 - 1000000  var x1 = 0 - 1000000  var y0 = 1000000
+        var i = 0
+        while i < layers.len() {
+            let g = rasterize(f, layers[i], px_size)
+            if g.w > 0 {
+                if g.left < x0 { x0 = g.left }
+                if g.left + g.w > x1 { x1 = g.left + g.w }
+                if g.top > y1 { y1 = g.top }
+                if g.top - g.h < y0 { y0 = g.top - g.h }
+            }
+            bms.push(g)
+            i = i + 2
+        }
+        set_hinting(was)
+        if x1 <= x0 { return color_bitmap_empty() }
+        let w = x1 - x0
+        let h = y1 - y0
+        var rgba: Vec<Int> = vec()
+        var k = 0
+        while k < w * h { rgba.push(0)  k = k + 1 }
+        i = 0
+        while i < bms.len() {
+            let g = bms[i]
+            if g.w > 0 { composite_layer(rgba, w, h, g, g.left - x0, y1 - g.top, layers[i * 2 + 1]) }
+            i = i + 1
+        }
+        return ColorBitmap { w: w, h: h, left: x0, top: y1, rgba: rgba }
+    }
+    var src: Vec<Int> = vec()
+    var geo: Vec<Int> = vec()
+    if !cbdt_decode(f, gid, to_int(px_size + 0.5), src, geo) { return color_bitmap_empty() }
+    let ppem = geo[4]
+    if ppem <= 0 { return color_bitmap_empty() }
+    let s = px_size / to_float(ppem)
+    if s > 0.999 && s < 1.001 {
+        return ColorBitmap { w: geo[0], h: geo[1], left: geo[2], top: geo[3], rgba: src }
+    }
+    var out: Vec<Int> = vec()
+    var dims: Vec<Int> = vec()
+    resample(src, geo[0], geo[1], s, out, dims)
+    return ColorBitmap { w: dims[0], h: dims[1], left: floor_int(to_float(geo[2]) * s + 0.5), top: floor_int(to_float(geo[3]) * s + 0.5), rgba: out }
+}
+/// the premultiplied RGBA (packed 0xRRGGBBAA) at (x, y) of a color bitmap; 0 outside it.
+pub fn color_at(cb: ColorBitmap, x: Int, y: Int) -> Int {
+    if x < 0 || y < 0 || x >= cb.w || y >= cb.h { return 0 }
+    return cb.rgba[y * cb.w + x]
+}
+
+// ── the color glyph cache ────────────────────────────────────────────────────────────────────────
+// Decoding a PNG strike and resampling it is far too slow to do per frame; like rasterize_span,
+// color glyphs are made once per (face, glyph, size, foreground) and handed back as a span into flat
+// global storage. A desktop that runs for days shows many emoji at many sizes, so the store is given a
+// budget like the shaped-run cache (textrun.nori): when the stored pixels would pass it the whole cache
+// is dropped and refilled. The hit path stays a single map lookup with no bookkeeping, and it is safe because
+// no caller keeps a ColorSpan across calls (ui_cpu's painter consumes each span in the same frame it
+// fetches it, and color_span_at bounds-checks against the current store).
+global g_ccc_on: Int = 0
+global g_ccc_idx: Map<Str, Int>
+global g_ccc_w: Vec<Int>
+global g_ccc_h: Vec<Int>
+global g_ccc_left: Vec<Int>
+global g_ccc_top: Vec<Int>
+global g_ccc_off: Vec<Int>
+global g_ccc_px: Vec<Int>
+global g_ccc_hits: Int = 0
+global g_ccc_misses: Int = 0
+global g_ccc_resets: Int = 0
+global g_ccc_budget: Int = 2097152            // packed-RGBA Ints kept in the store: ~16 MB at 8 bytes/Int
+/// a cached color glyph addressed in the cache: read pixels with color_span_at.
+pub struct ColorSpan { w: Int, h: Int, left: Int, top: Int, off: Int }
+
+fn ccc_reset() {
+    var m: Map<Str, Int> = map()
+    g_ccc_idx = m
+    g_ccc_w = vec()  g_ccc_h = vec()  g_ccc_left = vec()  g_ccc_top = vec()  g_ccc_off = vec()  g_ccc_px = vec()
+    g_ccc_on = 1
+    g_ccc_resets = g_ccc_resets + 1
+}
+/// `rasterize_color`, memoized per (face, glyph, size, foreground), as a span.
+pub fn rasterize_color_span(f: Font, gid: Int, px_size: Float, fg: Int) -> ColorSpan {
+    if g_ccc_on == 0 { ccc_reset() }
+    let key = to_str(font_disc(f)) + "/" + to_str(gid) + "/" + to_str(to_int(px_size * 4.0 + 0.5)) + "/" + to_str(fg)
+    if g_ccc_idx.has(key) {
+        let s = g_ccc_idx.get(key)
+        g_ccc_hits = g_ccc_hits + 1
+        return ColorSpan { w: g_ccc_w[s], h: g_ccc_h[s], left: g_ccc_left[s], top: g_ccc_top[s], off: g_ccc_off[s] }
+    }
+    g_ccc_misses = g_ccc_misses + 1
+    let cb = rasterize_color(f, gid, px_size, fg)
+    if g_ccc_px.len() + cb.w * cb.h > g_ccc_budget { ccc_reset() }
+    let slot = g_ccc_w.len()
+    let off = g_ccc_px.len()
+    g_ccc_w.push(cb.w)  g_ccc_h.push(cb.h)  g_ccc_left.push(cb.left)  g_ccc_top.push(cb.top)  g_ccc_off.push(off)
+    var i = 0
+    while i < cb.w * cb.h { g_ccc_px.push(cb.rgba[i])  i = i + 1 }
+    g_ccc_idx.put(key, slot)
+    return ColorSpan { w: cb.w, h: cb.h, left: cb.left, top: cb.top, off: off }
+}
+/// premultiplied RGBA pixel `i` (row-major) of a cached color glyph.
+pub fn color_span_at(s: ColorSpan, i: Int) -> Int {
+    let at = s.off + i
+    if i < 0 || i >= s.w * s.h || at >= g_ccc_px.len() { return 0 }
+    return g_ccc_px[at]
+}
+/// the color cache's hit, miss, reset and held-pixel counts so far (for measuring).
+pub fn color_cache_stats() -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    v.push(g_ccc_hits)  v.push(g_ccc_misses)  v.push(g_ccc_resets)  v.push(g_ccc_px.len())
+    return v
+}
+/// drop every cached color glyph span.
+pub fn color_cache_clear() { ccc_reset() }
+/// the pixel budget for the color glyph cache (a smaller value makes budget resets observable in tests).
+pub fn color_cache_set_budget(b: Int) { g_ccc_budget = b }

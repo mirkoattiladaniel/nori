@@ -1,0 +1,460 @@
+use core::*
+import "std/font" as font
+
+// ===========================================================================
+// layout/text_engine: the fonts layout measures with, and the text questions layout asks them.
+//
+// Why this lives in layout and is not a hook. What layout needs from text is more than a width:
+// where a line may break (UAX #14), where a caret may stand (grapheme clusters), which way a
+// paragraph runs (UAX #9), and, once `.style` can say `font-family`, which faces a name means. A
+// hook would have to carry all of that across, and a Nori function reference cannot capture state,
+// so the faces would live in a global anyway. They live here, next to the code that asks: one pool
+// of faces, font stacks that name faces in it, and a width cache. The painters draw a stack's faces
+// out of the same pool, so what is measured is what is drawn.
+//
+// Layout without a font still works. Nothing is installed until a painter's `use_font_metrics` (or a
+// host) installs a face; until then measurement is the per-character advance table / heuristic in
+// text_measure.nori, while breaking, clusters and direction, which need only
+// Unicode's tables and not a font, work the same either way. Tests that want real widths install a
+// face; the rest run without one.
+//
+// Like every other global in this library, the engine belongs to one image: a plugin `.so` has its
+// own, empty one, and measures with the heuristic unless its host lends it a face.
+// ===========================================================================
+
+/// paragraph directions, as std/font numbers them.
+pub fn dir_ltr() -> Int { return 0 }
+pub fn dir_rtl() -> Int { return 1 }
+pub fn dir_auto() -> Int { return 2 }
+
+// ---- the face pool ---------------------------------------------------------------------------
+// Faces are held once and named by index. The default stack is the face a painter installed plus
+// any fallbacks; a `font-family` stack (text_engine_stack) names pool faces by index too.
+global g_te_faces: Vec<font::Font>
+global g_te_fkey: Vec<Str>              // what each face was loaded from ("" for an installed one)
+global g_te_def: Vec<Int>               // the default stack: pool indices, in fallback order
+global g_te_def_main: Int = 0           // 1 + the pool slot the default primary face occupies (0: none)
+global g_te_gen: Int = 0                // bumped whenever a stack's faces change; caches key on it
+// stacks other than the default: flat (offset, count) into g_te_sk_data, and the key each was made for
+global g_te_sk_key: Vec<Str>
+global g_te_sk_off: Vec<Int>
+global g_te_sk_n: Vec<Int>
+global g_te_sk_data: Vec<Int>
+
+/// does layout have a real face to measure with?
+pub fn text_engine_on() -> Bool { return g_te_def.len() > 0 }
+/// how many faces the pool holds.
+pub fn text_engine_face_count() -> Int { return g_te_faces.len() }
+/// pool face `i`.
+pub fn text_engine_face(i: Int) -> view font::Font { return g_te_faces[i] }
+/// the pool, for shaping through a stack (std/font's shape_line_pool takes it whole).
+pub fn text_engine_pool() -> view Vec<font::Font> { return g_te_faces }
+/// a number that changes whenever any stack's faces change (painters key their own caches on it).
+pub fn text_engine_generation() -> Int { return g_te_gen }
+
+fn te_changed() {
+    g_te_gen = g_te_gen + 1
+    te_wc_reset()
+}
+
+/// make `f` the face layout measures the default stack with (a copy is kept). Installing another
+/// face later replaces it: a host that switches the UI font calls this again, and every width
+/// measured with the old face is forgotten. A face equal to the installed one changes nothing.
+pub fn text_engine_set_font(inout f: font::Font) {
+    if g_te_def_main > 0 {
+        let k = g_te_def_main - 1
+        if font::font_identity(g_te_faces[k]) == font::font_identity(f) && g_te_faces[k].d.len() == f.d.len() { return }
+        g_te_faces[k] = copy f
+    } else {
+        g_te_faces.push(copy f)
+        g_te_fkey.push("")
+        g_te_def_main = g_te_faces.len()
+        var nd: Vec<Int> = vec()
+        nd.push(g_te_def_main - 1)
+        var i = 0
+        while i < g_te_def.len() { nd.push(g_te_def[i])  i = i + 1 }
+        g_te_def = sink nd
+    }
+    te_changed()
+}
+/// add `f` behind the default stack's faces: a cluster none of them has is drawn and measured from
+/// it. Adding a face that is already in the stack changes nothing.
+pub fn text_engine_add_fallback(inout f: font::Font) {
+    let id = font::font_identity(f)
+    var i = 0
+    while i < g_te_def.len() {
+        if font::font_identity(g_te_faces[g_te_def[i]]) == id { return }
+        i = i + 1
+    }
+    g_te_faces.push(copy f)
+    g_te_fkey.push("")
+    g_te_def.push(g_te_faces.len() - 1)
+    te_changed()
+}
+/// forget every face and stack (layout falls back to the heuristic measure).
+pub fn text_engine_reset() {
+    g_te_faces = vec()
+    g_te_fkey = vec()
+    g_te_def = vec()
+    g_te_def_main = 0
+    g_te_sk_key = vec()
+    g_te_sk_off = vec()
+    g_te_sk_n = vec()
+    g_te_sk_data = vec()
+    g_te_sys = vec()
+    g_te_sys_scanned = 0
+    te_fam_reset()
+    te_changed()
+}
+/// put `f` in the pool (taking it) under `key` and return its index; a key already pooled is not
+/// added again. Stacks name faces by these indices.
+pub fn text_engine_pool_face(sink f: font::Font, key: Str) -> Int {
+    if key.len() > 0 {
+        var i = 0
+        while i < g_te_fkey.len() { if g_te_fkey[i] == key { return i }  i = i + 1 }
+    }
+    g_te_faces.push(sink f)
+    g_te_fkey.push(copy key)
+    return g_te_faces.len() - 1
+}
+/// the pool index of the face loaded from `key`, or -1.
+pub fn text_engine_pooled(key: Str) -> Int {
+    var i = 0
+    while i < g_te_fkey.len() { if g_te_fkey[i] == key { return i }  i = i + 1 }
+    return 0 - 1
+}
+/// register a stack of pool faces under `key` (tried in order, then the default stack behind them)
+/// and return its id (> 0). The same key returns the same id.
+pub fn text_engine_stack(key: Str, faces: Vec<Int>) -> Int {
+    var i = 0
+    while i < g_te_sk_key.len() { if g_te_sk_key[i] == key { return i + 1 }  i = i + 1 }
+    g_te_sk_key.push(copy key)
+    g_te_sk_off.push(g_te_sk_data.len())
+    g_te_sk_n.push(faces.len())
+    var k = 0
+    while k < faces.len() { g_te_sk_data.push(faces[k])  k = k + 1 }
+    te_changed()
+    return g_te_sk_key.len()
+}
+/// the stack id registered under `key`, or 0 (the default stack) when there is none.
+pub fn text_engine_stack_id(key: Str) -> Int {
+    var i = 0
+    while i < g_te_sk_key.len() { if g_te_sk_key[i] == key { return i + 1 }  i = i + 1 }
+    return 0
+}
+/// the pool faces stack `stack` tries, in order: its own, then the default stack's (a family that
+/// lacks a character falls back to the UI font, then to its fallbacks). Stack 0 is the default.
+pub fn text_engine_stack_faces(stack: Int) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    if stack > 0 && stack <= g_te_sk_key.len() {
+        let o = g_te_sk_off[stack - 1]
+        var k = 0
+        while k < g_te_sk_n[stack - 1] { out.push(g_te_sk_data[o + k])  k = k + 1 }
+    }
+    var i = 0
+    while i < g_te_def.len() {
+        var dup = false
+        var j = 0
+        while j < out.len() { if out[j] == g_te_def[i] { dup = true }  j = j + 1 }
+        if !dup { out.push(g_te_def[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- shaping a line --------------------------------------------------------------------------
+
+/// shape one line of `text` at `px` through stack `stack`, laid out in visual order with paragraph
+/// direction `dir` (dir_ltr/dir_rtl/dir_auto). A glyph's `font` is a pool index (not a position in
+/// the stack). Empty when no face is installed.
+pub fn text_engine_shape(text: Str, px: Float, stack: Int, dir: Int, lang: Str) -> font::ShapedLine {
+    let idx = text_engine_stack_faces(stack)
+    var line = font::shape_line_pool(g_te_faces, idx, text, px, dir, lang, "")
+    var i = 0
+    while i < line.glyphs.len() { line.glyphs[i].font = idx[line.glyphs[i].font]  i = i + 1 }
+    return line
+}
+
+// ---- widths, cached --------------------------------------------------------------------------
+// Layout measures the same strings over and over (every label every relayout; every candidate line
+// of a paragraph). A width is cached per (stack, direction, language, text) in ems (shaping does not
+// depend on the size, so one entry serves every size) as fixed point (a global Vec<Float> reads
+// back wrong; see text_measure.nori). The whole cache is dropped when it grows past its budget or a
+// stack's faces change.
+global g_te_wc: Map<Str, Int>
+global g_te_wc_n: Int = 0
+global g_te_wc_hits: Int = 0
+global g_te_wc_misses: Int = 0
+fn te_wc_reset() {
+    var m: Map<Str, Int> = map()
+    g_te_wc = sink m
+    g_te_wc_n = 0
+}
+fn TE_WC_BUDGET() -> Int { return 20000 }
+fn TE_FIX() -> Float { return 1073741824.0 }       // 2^30 per em
+
+/// the advance width of one line of `text` at `px`, shaped through stack `stack`.
+pub fn text_engine_width(text: Str, px: Float, stack: Int, dir: Int, lang: Str) -> Float {
+    if text.len() == 0 { return 0.0 }
+    // the common key (the default stack, no language) is one concatenation: this runs for every
+    // label of every layout, and building the general key was a measurable share of one
+    var key = ""
+    if stack == 0 && lang.len() == 0 {
+        if dir == 0 { key = "L|" + text } else if dir == 1 { key = "R|" + text } else { key = "A|" + text }
+    } else { key = to_str(stack) + "/" + to_str(dir) + "/" + lang + "/" + text }
+    if g_te_wc_n > 0 && g_te_wc.has(key) {
+        g_te_wc_hits = g_te_wc_hits + 1
+        return to_float(g_te_wc.get(key)) / TE_FIX() * px
+    }
+    g_te_wc_misses = g_te_wc_misses + 1
+    let line = text_engine_shape(text, 1.0, stack, dir, lang)
+    if g_te_wc_n >= TE_WC_BUDGET() { te_wc_reset() }
+    if g_te_wc_n == 0 { te_wc_reset() }
+    let fx = to_int(line.width * TE_FIX() + 0.5)
+    g_te_wc.put(key, fx)
+    g_te_wc_n = g_te_wc_n + 1
+    return to_float(fx) / TE_FIX() * px
+}
+/// the width cache's hits and misses so far (for measuring).
+pub fn text_engine_width_stats() -> Vec<Int> { var v: Vec<Int> = vec()  v.push(g_te_wc_hits)  v.push(g_te_wc_misses)  return v }
+
+/// the caret x of every byte offset of `text` (`text.len() + 1` entries) in logical order: entry `i`
+/// is the advance of everything before byte `i` (the line's own reading order, not its visual one).
+/// A cluster's advance is shared out evenly over the grapheme clusters inside it, so a caret between
+/// the letters of a ligature ("ffi") lands proportionally inside the glyph; a byte inside a grapheme
+/// cluster gets the x of the cluster's start.
+pub fn text_engine_logical_x(text: Str, px: Float, stack: Int, dir: Int, lang: Str) -> Vec<Float> {
+    let n = text.len()
+    var adv: Vec<Float> = vec()
+    var has: Vec<Int> = vec()
+    var i = 0
+    while i <= n { adv.push(0.0)  has.push(0)  i = i + 1 }
+    let line = text_engine_shape(text, px, stack, dir, lang)
+    i = 0
+    while i < line.glyphs.len() {
+        let c = line.glyphs[i].cluster
+        if c >= 0 && c < n { adv[c] = adv[c] + line.glyphs[i].advance  has[c] = 1 }
+        i = i + 1
+    }
+    return te_spread(text, adv, has)
+}
+// turn per-cluster advances (indexed by the cluster's first byte; `has` marks cluster starts) into a
+// logical caret table, sharing a cluster's advance over the grapheme clusters it holds
+fn te_spread(text: Str, adv: Vec<Float>, has: Vec<Int>) -> Vec<Float> {
+    let n = text.len()
+    let gs = font::grapheme_offsets(text)            // grapheme starts, then n
+    var isg: Vec<Int> = vec()
+    var i = 0
+    while i <= n { isg.push(0)  i = i + 1 }
+    i = 0
+    while i < gs.len() { isg[gs[i]] = 1  i = i + 1 }
+    var out: Vec<Float> = vec()
+    var x = 0.0
+    var b = 0
+    while b < n {
+        if has[b] == 1 {
+            // the cluster [b, e): its advance over the grapheme starts inside it
+            var e = b + 1
+            while e < n && has[e] == 0 { e = e + 1 }
+            var k = 0
+            var q = b
+            while q < e { if isg[q] == 1 { k = k + 1 }  q = q + 1 }
+            if k < 1 { k = 1 }
+            let share = adv[b] / to_float(k)
+            q = b
+            var cur = x
+            while q < e {
+                if isg[q] == 1 && q > b { cur = cur + share }
+                out.push(cur)
+                q = q + 1
+            }
+            x = x + adv[b]
+            b = e
+        } else {
+            out.push(x)
+            b = b + 1
+        }
+    }
+    out.push(x)
+    return out
+}
+
+// ---- direction -------------------------------------------------------------------------------
+
+/// the direction a paragraph of `text` runs when its `dir` is `dir`: dir_ltr/dir_rtl as given, and
+/// for dir_auto the first strong character's (UAX #9 P2/P3; left to right when there is none).
+pub fn text_para_dir(text: Str, dir: Int) -> Int {
+    if dir == 0 || dir == 1 { return dir }
+    // nothing below U+0590 is strong right-to-left: an ASCII/Latin paragraph needs no decoding
+    var i = 0
+    var hi = false
+    while i < text.len() && !hi { if ord(text.at(i)) >= 214 { hi = true }  i = i + 1 }   // 0xD6 leads U+0580..
+    if !hi { return 0 }
+    return font::bidi_paragraph_level(font::utf8_codepoints(text))
+}
+
+// ---- font families (`font_family` / `font_weight` / `font_style` in .style and .ui) -----------
+// A family list ("Noto Sans, Noto Sans Arabic, sans-serif") is resolved through std/font's
+// discovery to faces in the pool, which become a stack: the named faces in order, then the default
+// stack behind them. A family that is not installed is skipped without a word (a theme written on one
+// machine is read on another); a list that names nothing installed is the default stack.
+//
+// Where faces are looked for: directories a host adds (text_engine_add_font_dir), then, the first
+// time a family is asked for that none of those has, the system's own (/usr/share/fonts and the
+// rest; std/font scans them by ranged reads, 18-30 ms for ~900 faces, once).
+global g_te_sys: Vec<font::FontFaceInfo>
+global g_te_sys_scanned: Int = 0
+global g_te_sys_off: Int = 0             // 1: never scan the system (tests, sandboxed hosts)
+global g_te_fam_key: Map<Str, Int>
+global g_te_fam_on: Int = 0
+
+/// add every face under `dir` to the faces families are resolved against.
+pub fn text_engine_add_font_dir(dir: Str) {
+    var ds: Vec<Str> = vec()
+    ds.push(copy dir)
+    let found = font::scan_font_dirs(ds)
+    var i = 0
+    while i < found.len() { g_te_sys.push(copy found[i])  i = i + 1 }
+    te_fam_reset()
+}
+/// whether a family none of the added directories has may be looked for in the system's fonts
+/// (on by default).
+pub fn text_engine_use_system_fonts(on: Bool) {
+    if on { g_te_sys_off = 0 } else { g_te_sys_off = 1 }
+    te_fam_reset()
+}
+fn te_fam_reset() {
+    var m: Map<Str, Int> = map()
+    g_te_fam_key = sink m
+    g_te_fam_on = 1
+}
+fn te_scan_system() {
+    if g_te_sys_scanned == 1 || g_te_sys_off == 1 { return }
+    g_te_sys_scanned = 1
+    let found = font::scan_font_dirs(font::system_font_dirs())
+    var i = 0
+    while i < found.len() { g_te_sys.push(copy found[i])  i = i + 1 }
+}
+fn te_lower(s: Str) -> Str {
+    var o = ""
+    var i = 0
+    while i < s.len() { let c = ord(s.at(i))  if c >= 65 && c <= 90 { o = o + chr(c + 32) } else { o = o + s.at(i) }  i = i + 1 }
+    return o
+}
+fn te_trim(s: Str) -> Str {
+    var a = 0
+    var b = s.len()
+    while a < b && (ord(s.at(a)) == 32 || ord(s.at(a)) == 34 || ord(s.at(a)) == 39) { a = a + 1 }
+    while b > a && (ord(s.at(b - 1)) == 32 || ord(s.at(b - 1)) == 34 || ord(s.at(b - 1)) == 39) { b = b - 1 }
+    return s.slice(a, b)
+}
+/// the families of a comma-separated list, trimmed of spaces and quotes.
+pub fn text_family_list(families: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var start = 0
+    var i = 0
+    while i <= families.len() {
+        if i == families.len() || ord(families.at(i)) == 44 {
+            let f = te_trim(families.slice(start, i))
+            if f.len() > 0 { out.push(f) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+// the face in `faces` best matching a family (or a generic family) at weight/slant, or -1
+fn te_match(family: Str, weight: Int, italic: Bool) -> Int {
+    let lf = te_lower(family)
+    if lf == "monospace" || lf == "ui-monospace" || lf == "serif" || lf == "ui-serif" || lf == "emoji" {
+        var best = 0 - 1
+        var bc = 1000000
+        var i = 0
+        while i < g_te_sys.len() {
+            let fi = g_te_sys[i]
+            let fam = te_lower(fi.family)
+            var ok = false
+            if lf == "monospace" || lf == "ui-monospace" { ok = fi.monospace && !fi.color }
+            else if lf == "emoji" { ok = fi.color }
+            else { ok = fam.len() > 0 && te_has(fam, "serif") && !te_has(fam, "sans") && !fi.monospace }
+            if ok {
+                var c = fi.weight - weight
+                if c < 0 { c = 0 - c }
+                if fi.italic != italic { c = c + 10000 }
+                if c < bc { bc = c  best = i }
+            }
+            i = i + 1
+        }
+        return best
+    }
+    return font::match_face(g_te_sys, family, weight, italic)
+}
+fn te_has(s: Str, sub: Str) -> Bool {
+    var i = 0
+    while i + sub.len() <= s.len() { if s.slice(i, i + sub.len()) == sub { return true }  i = i + 1 }
+    return false
+}
+// the pool index of discovered face `i`, loading it the first time; -1 when it does not load
+fn te_load(i: Int) -> Int {
+    let fi = g_te_sys[i]
+    let key = fi.path + "#" + to_str(fi.index)
+    let have = text_engine_pooled(key)
+    if have >= 0 { return have }
+    let fr = font::load_face(fi)
+    if !fr.ok { return 0 - 1 }
+    // the same face already pooled under another name (the UI font a painter installed): share it
+    let id = font::font_identity(fr.font)
+    var k = 0
+    while k < g_te_faces.len() {
+        if font::font_identity(g_te_faces[k]) == id && g_te_faces[k].d.len() == fr.font.d.len() { return k }
+        k = k + 1
+    }
+    return text_engine_pool_face(copy fr.font, key)
+}
+// a generic family that means "the UI font": the default stack, which every stack ends with
+fn te_is_default_generic(lf: Str) -> Bool {
+    return lf == "sans-serif" || lf == "system-ui" || lf == "ui-sans-serif" || lf == "-apple-system" || lf == "default"
+}
+
+/// the font stack for a family list at `weight` (100-900; 0 = 400) and `italic`: the faces the list
+/// names, best match first, then the default stack. 0 (the default stack) when nothing in the
+/// list is installed and no weight or slant is asked for that the default face lacks.
+pub fn text_engine_family_stack(families: Str, weight: Int, italic: Bool) -> Int {
+    var w = weight
+    if w <= 0 { w = 400 }
+    if families.len() == 0 && w == 400 && !italic { return 0 }
+    if g_te_fam_on == 0 { te_fam_reset() }
+    var it = 0
+    if italic { it = 1 }
+    let key = families + "|" + to_str(w) + "|" + to_str(it)
+    if g_te_fam_key.has(key) { return g_te_fam_key.get(key) }
+    var names = text_family_list(families)
+    // no family named: the default face's own family, at this weight and slant
+    if names.len() == 0 && g_te_def_main > 0 {
+        let fi = font::font_face_info(g_te_faces[g_te_def_main - 1])
+        if fi.family.len() > 0 { names.push(copy fi.family) }
+    }
+    var faces: Vec<Int> = vec()
+    var i = 0
+    while i < names.len() {
+        let lf = te_lower(names[i])
+        if te_is_default_generic(lf) { i = names.len() }       // the default stack follows anyway
+        else {
+            var m = te_match(names[i], w, italic)
+            if m < 0 && g_te_sys_scanned == 0 && g_te_sys_off == 0 { te_scan_system()  m = te_match(names[i], w, italic) }
+            if m >= 0 {
+                let p = te_load(m)
+                var dup = false
+                var k = 0
+                while k < faces.len() { if faces[k] == p { dup = true }  k = k + 1 }
+                // the default face itself at the default weight adds nothing
+                if p >= 0 && !dup && !(g_te_def_main > 0 && p == g_te_def_main - 1) { faces.push(p) }
+            }
+            i = i + 1
+        }
+    }
+    var id = 0
+    if faces.len() > 0 { id = text_engine_stack(key, faces) }
+    g_te_fam_key.put(key, id)
+    return id
+}

@@ -1,0 +1,24 @@
+// Threads without data races. The only shared mutable state is a `mutex` (the mediator);
+// everything else is copied across threads (value semantics). So 4 threads each adding
+// 100000 must total exactly 400000: no lost updates and no data races, by construction.
+
+fn worker(m: Mutex, n: Int) {
+    foreach i in 0..n {
+        lock m as x { x = x + 1 }      // exclusive access for the block
+    }
+}
+
+fn launch(m: Mutex) {
+    spawn worker(copy m, 100000)
+    spawn worker(copy m, 100000)
+    spawn worker(copy m, 100000)
+    spawn worker(copy m, 100000)
+    sync()                              // join all four threads
+}
+
+fn main() -> Int {
+    var counter = mutex(0)
+    launch(counter)
+    lock counter as x { printl("total: ${x}") }      // 400000
+    return 0
+}

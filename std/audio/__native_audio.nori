@@ -1,0 +1,323 @@
+// std/audio/__native_audio.nori: the `nori_c_naud_*` seam of std/audio/alsa.nori, in Nori, for a program
+// built with `noric --build --native`. That build has no C compiler and no dynamic loader, so the
+// inline C block that dlopens libasound cannot exist in it; this module answers the same calls
+// instead, and alsa.nori's Nori wrappers above the seam run unchanged.
+//
+// The `__` prefix keeps these files out of what `import "std/audio"` gathers from the directory. It is
+// a runtime-floor module, compiled with `--runtime --cfg native` like the native build's libc layer and
+// linked beside it. Everything is raw memory and every syscall goes through that layer's wrappers.
+//
+// A handle is a NauDev record, and the device name decides what stands behind it. These are the same
+// names libasound resolves on a desktop, reached without libasound:
+//
+//   "default", "pipewire", "pulse", "sysdefault"
+//         the sound server, spoken to over the PulseAudio native protocol on its Unix socket
+//         (__native_audio_pulse.nori). pipewire-pulse and PulseAudio both serve it.
+//   "hw:C,D", "plughw:C,D"
+//         the kernel PCM device /dev/snd/pcmC{C}D{D}p, driven by ioctls (__native_audio_alsa.nori).
+//         `hw:` takes the requested parameters as given or refuses with -EINVAL; `plughw:` converts
+//         the sample format, the channel count and the rate to what the card takes.
+//   "null"
+//         accepts any sane parameters and discards what is written, immediately: libasound's null
+//         PCM has no clock either, so a write returns at once.
+//
+// Any other name answers -ENOENT, which is what libasound says of a PCM it has no definition for.
+// Errors are negated errno values throughout, and `naud_strerror` gives the C library's text for them.
+import "__native_audio_pulse.nori"
+import "__native_audio_alsa.nori"
+
+extern fn malloc(Int) -> Int
+extern fn calloc(Int, Int) -> Int
+extern fn realloc(Int, Int) -> Int
+extern fn free(Int)
+extern fn memcpy(Int, Int, Int) -> Int
+extern fn memmove(Int, Int, Int) -> Int
+extern fn memset(Int, Int, Int) -> Int
+extern fn strlen(Int) -> Int
+extern fn getenv(Int) -> Int
+extern fn socket(Int, Int, Int) -> Int
+extern fn connect(Int, Int, Int) -> Int
+extern fn close(Int) -> Int
+extern fn read(Int, Int, Int) -> Int
+extern fn open(Int, Int) -> Int
+extern fn send(Int, Int, Int, Int) -> Int
+extern fn recv(Int, Int, Int, Int) -> Int
+extern fn poll(Int, Int, Int) -> Int
+extern fn ioctl(Int, Int, Int) -> Int
+extern fn fcntl(Int, Int, Int) -> Int
+extern fn clock_gettime(Int, Int) -> Int
+extern fn usleep(Int) -> Int
+extern fn nori_cstr(Int) -> Int
+extern fn nori_str_ptr(Int) -> Int
+
+// ---- helpers shared by the backends ----------------------------------------------------------------
+
+fn nau_now_ms() -> Int {
+    let ts = malloc(16)
+    clock_gettime(1, ts)                                        // CLOCK_MONOTONIC
+    let ms = peek(ts) * 1000 + peek(ts + 8) / 1000000
+    free(ts)
+    return ms
+}
+
+// the value of environment variable `name` as a C string owned by the environment (0 when unset)
+fn nau_getenv(name: Str) -> Int {
+    let cn = malloc(name.len() + 1)
+    memcpy(cn, nori_str_ptr(name), name.len())
+    poke8(cn + name.len(), 0)
+    let v = getenv(cn)
+    free(cn)
+    return v
+}
+
+// do the bytes of the C string `p` begin with `lit`?
+fn nau_starts(p: Int, lit: Str) -> Int {
+    let q = nori_str_ptr(lit)
+    var i = 0
+    while i < lit.len() {
+        if peek8(p + i) != peek8(q + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+fn nau_eq(p: Int, lit: Str) -> Int {
+    if strlen(p) != lit.len() { return 0 }
+    return nau_starts(p, lit)
+}
+
+// Wait up to `ms` for `fd` to report `events`: 1 when it did (or hung up), 0 not. A negative `ms`
+// waits one second: the poll underneath is ppoll on some architectures, whose timespec cannot say
+// "forever", and every caller that waits indefinitely does so in a loop.
+fn nau_wait(fd: Int, events: Int, ms: Int) -> Int {
+    let pfd = malloc(8)
+    poke32(pfd, fd)  poke16(pfd + 4, events)  poke16(pfd + 6, 0)
+    var t = ms
+    if t < 0 { t = 1000 }
+    let r = poll(pfd, 1, t)
+    let rev = peek16(pfd + 6)
+    free(pfd)
+    if r > 0 && rev != 0 { return 1 }
+    return 0
+}
+
+// ---- the handle ------------------------------------------------------------------------------------
+
+// kind: 1 = null, 2 = sound server, 3 = kernel PCM. `back` is the backend's own record; `bufsz` is the
+// null device's writable window in frames.
+cstruct NauDev { kind: Int, back: Int, rate: Int, ch: Int, fmt: Int, bufsz: Int }
+
+fn NAU_NULL() -> Int { return 1 }
+fn NAU_PULSE() -> Int { return 2 }
+fn NAU_KERNEL() -> Int { return 3 }
+
+fn nau_dev_new(kind: Int, back: Int, rate: Int, ch: Int, fmt: Int) -> Int {
+    let d: NauDev = calloc(1, sizeof(NauDev))
+    d.kind = kind
+    d.back = back
+    d.rate = rate
+    d.ch = ch
+    d.fmt = fmt
+    return d
+}
+
+// Parse the decimal at `p`, storing where it stopped in `endp`: -1 when there is no digit.
+fn nau_num(p: Int, endp: Int) -> Int {
+    var i = 0
+    var v = 0
+    while peek8(p + i) >= 48 && peek8(p + i) <= 57 && i < 9 { v = v * 10 + peek8(p + i) - 48  i = i + 1 }
+    poke(endp, p + i)
+    if i == 0 { return 0 - 1 }
+    return v
+}
+
+// Open the PCM named by the C string `name`: the handle, or a negated errno.
+fn nau_open_c(name: Int, rate: Int, channels: Int, fmt: Int, latency_us: Int) -> Int {
+    var f = 0
+    if fmt == 1 { f = 1 }
+    if nau_eq(name, "null") == 1 {
+        if channels < 1 || channels > 1024 || rate < 1 || rate > 4000000 { return 0 - 22 }
+        let d: NauDev = nau_dev_new(NAU_NULL(), 0, rate, channels, f)
+        var lat = latency_us
+        if lat < 0 { lat = 0 }
+        d.bufsz = rate * lat / 1000000
+        if d.bufsz < 1 { d.bufsz = 1 }
+        return d
+    }
+    if nau_eq(name, "default") == 1 || nau_eq(name, "pipewire") == 1 || nau_eq(name, "pulse") == 1
+       || nau_eq(name, "sysdefault") == 1 {
+        if channels < 1 || rate < 1 { return 0 - 22 }
+        let c = npa_open(rate, channels, f, latency_us)
+        if c < 0 { return c }
+        return nau_dev_new(NAU_PULSE(), c, rate, channels, f)
+    }
+    var plug = 0 - 1
+    var rest = 0
+    if nau_starts(name, "hw:") == 1 { plug = 0  rest = name + 3 }
+    if nau_starts(name, "plughw:") == 1 { plug = 1  rest = name + 7 }
+    if plug < 0 { return 0 - 2 }
+    let endp = malloc(8)
+    let card = nau_num(rest, endp)
+    var pos = peek(endp)
+    var device = 0
+    if card >= 0 && peek8(pos) == 44 {                          // ','
+        device = nau_num(pos + 1, endp)
+        pos = peek(endp)
+    }
+    free(endp)
+    if card < 0 || device < 0 { return 0 - 2 }
+    if peek8(pos) != 0 && peek8(pos) != 44 { return 0 - 2 }
+    if channels < 1 || rate < 1 { return 0 - 22 }
+    let k = nka_open(card, device, plug, rate, channels, f, latency_us)
+    if k < 0 { return k }
+    return nau_dev_new(NAU_KERNEL(), k, rate, channels, f)
+}
+
+// ---- the seam --------------------------------------------------------------------------------------
+
+fn nori_c_naud_load() -> Int { return 1 }
+fn nori_c_naud_ready() -> Int { return 1 }
+
+global g_nau_version: Int = 0
+fn nori_c_naud_version() -> Int {
+    if g_nau_version == 0 {
+        let msg = "nori-native 1 (pulse protocol 35, alsa kernel 2.0.x)"
+        let n = msg.len()
+        g_nau_version = malloc(n + 1)
+        memcpy(g_nau_version, nori_str_ptr(msg), n)
+        poke8(g_nau_version + n, 0)
+    }
+    return g_nau_version
+}
+
+fn nori_c_naud_open(dev: Int, rate: Int, channels: Int, fmt: Int, latency_us: Int) -> Int {
+    let name = nori_cstr(dev)
+    let h = nau_open_c(name, rate, channels, fmt, latency_us)
+    free(name)
+    return h
+}
+
+fn nori_c_naud_write(h: Int, buf: Int, frames: Int) -> Int {
+    if h == 0 || frames <= 0 { return 0 }
+    let d: NauDev = h
+    if d.kind == NAU_PULSE() { return npa_write(d.back, buf, frames) }
+    if d.kind == NAU_KERNEL() { return nka_write(d.back, buf, frames) }
+    return frames
+}
+
+fn nori_c_naud_avail(h: Int) -> Int {
+    if h == 0 { return 0 }
+    let d: NauDev = h
+    if d.kind == NAU_PULSE() { return npa_avail(d.back) }
+    if d.kind == NAU_KERNEL() { return nka_avail(d.back) }
+    return d.bufsz
+}
+
+fn nori_c_naud_drain(h: Int) -> Int {
+    if h == 0 { return 0 }
+    let d: NauDev = h
+    if d.kind == NAU_PULSE() { return npa_drain(d.back) }
+    if d.kind == NAU_KERNEL() { return nka_drain(d.back) }
+    return 0
+}
+
+fn nori_c_naud_drop(h: Int) -> Int {
+    if h == 0 { return 0 }
+    let d: NauDev = h
+    if d.kind == NAU_PULSE() { return npa_drop(d.back) }
+    if d.kind == NAU_KERNEL() { return nka_drop(d.back) }
+    return 0
+}
+
+fn nori_c_naud_close(h: Int) -> Int {
+    if h == 0 { return 0 }
+    let d: NauDev = h
+    var r = 0
+    if d.kind == NAU_PULSE() { r = npa_close(d.back) }
+    if d.kind == NAU_KERNEL() { r = nka_close(d.back) }
+    free(h)
+    return r
+}
+
+// the C library's text for an errno value, as one C string per code made on first use (codes past 255
+// share one string, remade on each call)
+global g_nau_errs: Int = 0
+fn nau_errtext(e: Int) -> Str {
+    if e == 0 { return "Success" }
+    if e == 1 { return "Operation not permitted" }
+    if e == 2 { return "No such file or directory" }
+    if e == 4 { return "Interrupted system call" }
+    if e == 5 { return "Input/output error" }
+    if e == 6 { return "No such device or address" }
+    if e == 7 { return "Argument list too long" }
+    if e == 9 { return "Bad file descriptor" }
+    if e == 11 { return "Resource temporarily unavailable" }
+    if e == 12 { return "Cannot allocate memory" }
+    if e == 13 { return "Permission denied" }
+    if e == 16 { return "Device or resource busy" }
+    if e == 17 { return "File exists" }
+    if e == 19 { return "No such device" }
+    if e == 22 { return "Invalid argument" }
+    if e == 32 { return "Broken pipe" }
+    if e == 38 { return "Function not implemented" }
+    if e == 61 { return "No data available" }
+    if e == 71 { return "Protocol error" }
+    if e == 77 { return "File descriptor in bad state" }
+    if e == 86 { return "Streams pipe error" }
+    if e == 95 { return "Operation not supported" }
+    if e == 104 { return "Connection reset by peer" }
+    if e == 110 { return "Connection timed out" }
+    if e == 111 { return "Connection refused" }
+    return ""
+}
+
+fn nori_c_naud_strerror(code: Int) -> Int {
+    var e = code
+    if e < 0 { e = 0 - e }
+    var slot = e
+    if slot > 255 { slot = 256 }                                // any larger code shares the last slot
+    if g_nau_errs == 0 { g_nau_errs = calloc(257, 8) }
+    let cached = peek(g_nau_errs + slot * 8)
+    if cached != 0 && slot < 256 { return cached }
+    if cached != 0 { free(cached) }
+    let msg = nau_errtext(e)
+    var p = 0
+    if msg.len() > 0 {
+        p = malloc(msg.len() + 1)
+        memcpy(p, nori_str_ptr(msg), msg.len())
+        poke8(p + msg.len(), 0)
+    } else {
+        // "Unknown error N"
+        let pre = "Unknown error "
+        p = malloc(pre.len() + 24)
+        memcpy(p, nori_str_ptr(pre), pre.len())
+        let digits = malloc(24)
+        var nd = 0
+        var v = e
+        while v > 0 || nd == 0 { poke8(digits + nd, 48 + v % 10)  v = v / 10  nd = nd + 1 }
+        var i = 0
+        while i < nd { poke8(p + pre.len() + i, peek8(digits + nd - 1 - i))  i = i + 1 }
+        poke8(p + pre.len() + nd, 0)
+        free(digits)
+    }
+    poke(g_nau_errs + slot * 8, p)
+    return p
+}
+
+// nothing here narrates failures to stderr, so there is nothing to silence
+fn nori_c_naud_noop_err(a: Int, b: Int, c: Int, d: Int, e: Int) { }
+fn nori_c_naud_quiet(on: Int) -> Int { return 0 }
+
+fn nori_c_naud_can(dev: Int, rate: Int, channels: Int, fmt: Int) -> Int {
+    let h = nori_c_naud_open(dev, rate, channels, fmt, 100000)
+    if h < 0 { return h }
+    nori_c_naud_close(h)
+    return 0
+}
+
+// SND_PCM_STREAM_PLAYBACK, SND_PCM_ACCESS_RW_INTERLEAVED, SND_PCM_FORMAT_S16_LE, SND_PCM_FORMAT_FLOAT_LE
+fn nori_c_naud_const(which: Int) -> Int {
+    if which == 0 { return 0 }
+    if which == 1 { return 3 }
+    if which == 2 { return 2 }
+    return 14
+}

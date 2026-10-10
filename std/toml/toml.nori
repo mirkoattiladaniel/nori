@@ -1,0 +1,158 @@
+//! std/toml: a practical TOML reader for the common config subset (the shape roll's `nori.manifest`
+//! uses): `[section]` / `[a.b]` tables, `key = value` pairs, `#` comments, `"..."` strings, ints, floats,
+//! and bools. The API queries the document by (section, key) rather than building a value tree, which fits
+//! Nori's types and matches how manifests are read. The root (before any `[section]`) is section "".
+//!   import "std/toml" as toml
+//!   toml::get_str(src, "package", "name")     // the string value, or "" if absent
+//!   toml::get_int(src, "build", "opt")
+//!   toml::sections(src)                       // every [section] name
+//!
+//! Not `get`/`has`/`keys`: those are built-ins' names, and a top-level function wearing one is a
+//! function nothing can call. The reader is stateless (it queries the text), so there is no document
+//! type to hang methods on the way std/ordmap does.
+import "std/result" as result
+import "std/strutil" as su
+
+/// index of the first byte equal to `ch` in `s` at/after `from`, or -1.
+fn idx_from(s: Str, ch: Int, from: Int) -> Int {
+    var i = from
+    while i < s.len() { if ord(s.at(i)) == ch { return i }  i = i + 1 }
+    return 0 - 1
+}
+fn idx(s: Str, ch: Int) -> Int { return idx_from(s, ch, 0) }
+
+/// clean a raw value: trim, unquote a `"..."` string, else drop any trailing `# comment`.
+fn clean_value(raw: Str) -> Str {
+    let v = su::trim(raw)
+    if v.len() == 0 { return "" }
+    if ord(v.at(0)) == 34 {                                  // "string"
+        let cb = idx_from(v, 34, 1)
+        if cb > 0 { return v.slice(1, cb) }
+        return v.slice(1, v.len())
+    }
+    var j = 0
+    while j < v.len() { if ord(v.at(j)) == 35 { return su::trim(v.slice(0, j)) }  j = j + 1 }   // # inline comment
+    return v
+}
+
+/// the value of `key` in `[section]` ("" for the root), or "" if not present.
+pub fn get_str(text: Str, section: Str, key: Str) -> Str {
+    var cur = ""
+    var start = 0
+    var i = 0
+    let n = text.len()
+    while i <= n {
+        if i == n || ord(text.at(i)) == 10 {
+            let line = su::trim(text.slice(start, i))
+            if !(line == "") {
+                let c0 = ord(line.at(0))
+                if c0 == 35 {                                       // # comment
+                } else if c0 == 91 {                                // [section]
+                    let cb = idx(line, 93)
+                    if cb > 0 { cur = su::trim(line.slice(1, cb)) }
+                } else {
+                    let eq = idx(line, 61)                          // key = value
+                    if eq > 0 {
+                        let k = su::trim(line.slice(0, eq))
+                        if (cur == section) && (k == key) { return clean_value(line.slice(eq + 1, line.len())) }
+                    }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+/// does `[section]` define `key`?
+pub fn has_key(text: Str, section: Str, key: Str) -> Bool {
+    var cur = ""
+    var start = 0
+    var i = 0
+    let n = text.len()
+    while i <= n {
+        if i == n || ord(text.at(i)) == 10 {
+            let line = su::trim(text.slice(start, i))
+            if !(line == "") {
+                let c0 = ord(line.at(0))
+                if c0 == 91 { let cb = idx(line, 93)  if cb > 0 { cur = su::trim(line.slice(1, cb)) } }
+                else if c0 != 35 {
+                    let eq = idx(line, 61)
+                    if eq > 0 { if (cur == section) && (su::trim(line.slice(0, eq)) == key) { return true } }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// the value of `key` in `[section]`, or `dflt` if absent.
+pub fn get_or(text: Str, section: Str, key: Str, dflt: Str) -> Str {
+    if has_key(text, section, key) { return get_str(text, section, key) }
+    return copy dflt
+}
+/// the value as an Int. Traps when the key is absent or its value is not an integer. A
+/// configuration file is data, and a typo in one is not a reason to abort a program, so prefer
+/// `get_int_or` for a default or `try_get_int` to report it.
+pub fn get_int(text: Str, section: Str, key: Str) -> Int { return parse_int(get_str(text, section, key)) }
+
+/// the value as an Int, or `dflt` when the key is absent or is not an integer. Does not trap.
+pub fn get_int_or(text: Str, section: Str, key: Str, dflt: Int) -> Int {
+    if !has_key(text, section, key) { return dflt }
+    return parse_int_or(get_str(text, section, key), dflt)
+}
+
+/// the value as an Int, or Err naming what was wrong with it. Does not trap.
+pub fn try_get_int(text: Str, section: Str, key: Str) -> Result<Int> {
+    if !has_key(text, section, key) { return Result::Err(("no key " + key + " in section [" + section + "]")) }
+    let raw = get_str(text, section, key)
+    if !result::is_int(raw) { return Result::Err(("the value of " + key + " is not an integer: " + raw)) }
+    return Result::Ok(parse_int(raw))
+}
+/// the value as a bool (`true` only when the value is exactly "true").
+pub fn get_bool(text: Str, section: Str, key: Str) -> Bool { return (get_str(text, section, key) == "true") }
+
+/// every `[section]` name declared in the document (in order; the root "" is not listed).
+pub fn sections(text: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var start = 0
+    var i = 0
+    let n = text.len()
+    while i <= n {
+        if i == n || ord(text.at(i)) == 10 {
+            let line = su::trim(text.slice(start, i))
+            if !(line == "") { if ord(line.at(0)) == 91 { let cb = idx(line, 93)  if cb > 0 { out.push(su::trim(line.slice(1, cb))) } } }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// every key defined directly under `[section]` ("" for the root).
+pub fn section_keys(text: Str, section: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var cur = ""
+    var start = 0
+    var i = 0
+    let n = text.len()
+    while i <= n {
+        if i == n || ord(text.at(i)) == 10 {
+            let line = su::trim(text.slice(start, i))
+            if !(line == "") {
+                let c0 = ord(line.at(0))
+                if c0 == 91 { let cb = idx(line, 93)  if cb > 0 { cur = su::trim(line.slice(1, cb)) } }
+                else if c0 != 35 {
+                    let eq = idx(line, 61)
+                    if eq > 0 { if (cur == section) { out.push(su::trim(line.slice(0, eq))) } }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}

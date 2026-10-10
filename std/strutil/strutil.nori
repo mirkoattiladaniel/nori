@@ -1,0 +1,135 @@
+//! std/strutil: string helpers built on the string builtins (slen/char_at/substr/chr/eq_str/`+`).
+//! Strings are immutable; every transforming helper returns a fresh Str.
+//!
+//!   import "std/strutil" as s
+//!   s::split("a,b,c", ",")        // Vec<Str> ["a","b","c"]
+//!   s::join(parts, "-")           // "a-b-c"
+//!   s::trim("  hi \n")            // "hi"
+//!   s::replace("aXbXc", "X", "_") // "a_b_c"
+/// does `p` occur in `s` exactly at index `at`?
+pub fn match_at(s: Str, p: Str, at: Int) -> Bool {
+    if at < 0 { return false }
+    if at + p.len() > s.len() { return false }
+    return (s.slice(at, at + p.len()) == p)
+}
+
+/// does `s` begin with prefix `p`?
+pub fn starts_with(s: Str, p: Str) -> Bool {
+    if p.len() > s.len() { return false }
+    return (s.slice(0, p.len()) == p)
+}
+/// does `s` end with suffix `p`?
+pub fn ends_with(s: Str, p: Str) -> Bool {
+    if p.len() > s.len() { return false }
+    return match_at(s, p, s.len() - p.len())
+}
+
+/// first index of `sub` in `s`, or -1. Empty needle matches at 0.
+pub fn index_of(s: Str, sub: Str) -> Int {
+    if sub.len() == 0 { return 0 }
+    var last = s.len() - sub.len()
+    var i = 0
+    while i <= last { if match_at(s, sub, i) { return i }  i = i + 1 }
+    return -1
+}
+/// does substring `sub` occur anywhere in `s`?
+pub fn contains(s: Str, sub: Str) -> Bool { return index_of(s, sub) >= 0 }
+
+/// number of times character `c` appears in `s`.
+pub fn count_char(s: Str, c: Byte) -> Int {
+    var n = 0
+    var i = 0
+    while i < s.len() {
+        if s.at(i) == c { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+/// is `c` whitespace (space, tab, newline, or carriage return)?
+pub fn is_space(c: Byte) -> Bool { return c == ' ' || ord(c) == 9 || ord(c) == 10 || ord(c) == 13 }
+
+/// ASCII uppercase of `s` (non-letters pass through unchanged). `sink` + in-place, like to_lower.
+pub fn to_upper(sink s: Str) -> Str {
+    var i = 0
+    while i < s.len() {
+        let c = s.at(i)
+        if c >= 'a' && c <= 'z' { s.set_at(i, ord(c) - 32) }
+        i = i + 1
+    }
+    return s
+}
+/// ASCII lowercase of `s` (non-letters pass through unchanged).
+///
+/// Takes its argument by `sink` and rewrites the bytes in place, so a case fold costs no allocation:
+/// building a second string is proportional to the input, which dominates on large text. Callers that
+/// still need the original spell `to_lower(copy s)`.
+pub fn to_lower(sink s: Str) -> Str {
+    var i = 0
+    while i < s.len() {
+        let c = s.at(i)
+        if c >= 'A' && c <= 'Z' { s.set_at(i, ord(c) + 32) }
+        i = i + 1
+    }
+    return s
+}
+
+/// strip leading/trailing whitespace (space, tab, newline, carriage return).
+pub fn trim(s: Str) -> Str {
+    var a = 0
+    var b = s.len()
+    while a < b && is_space(s.at(a)) { a = a + 1 }
+    while b > a && is_space(s.at(b - 1)) { b = b - 1 }
+    return s.slice(a, b)
+}
+
+/// `s` concatenated `n` times.
+pub fn repeat(s: Str, n: Int) -> Str {
+    var out = ""
+    var i = 0
+    while i < n { out = out + s  i = i + 1 }
+    return out
+}
+
+/// replace every (non-overlapping) occurrence of `from` with `to`.
+pub fn replace(s: Str, from: Str, to: Str) -> Str {
+    if from.len() == 0 { return copy s }
+    var out = ""
+    var i = 0
+    var n = s.len()
+    while i < n {
+        if match_at(s, from, i) { out = out + to  i = i + from.len() }
+        else { out = out + chr(s.at(i))  i = i + 1 }
+    }
+    return out
+}
+
+/// split on a (non-empty) separator into a Vec<Str>; an empty separator yields the whole string.
+pub fn split(s: Str, sep: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    if sep.len() == 0 { out.push(copy s)  return out }
+    var n = s.len()
+    var start = 0
+    var i = 0
+    while i <= n - sep.len() {
+        if match_at(s, sep, i) {
+            out.push(s.slice(start, i))
+            i = i + sep.len()
+            start = i
+        } else { i = i + 1 }
+    }
+    out.push(s.slice(start, n))
+    return out
+}
+
+/// join the parts with `sep` between each.
+pub fn join(parts: Vec<Str>, sep: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < parts.len() {
+        if i > 0 { out = out + sep }
+        out = out + parts[i]
+        i = i + 1
+    }
+    return out
+}

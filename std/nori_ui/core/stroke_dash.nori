@@ -1,0 +1,85 @@
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// dashed rectangle stroke approximation (emits fill rects)
+// ===========================================================================
+
+/// floored modulo: the result is in [0, m) for positive m.
+pub fn rem_euclid(x: Float, m: Float) -> Float {
+    var r = math::fmod(x, m)
+    if r < 0.0 { r = r + m }
+    return r
+}
+
+/// push the four solid edge rects of a `stroke_w`-thick border around `rect` into `out`.
+pub fn push_solid_rect_stroke(rect: Rect, stroke_w: Float, inout out: Vec<Rect>) {
+    var w = math::fmax(stroke_w, 1.0)
+    out.push(rect_min_max(rect.min, vec2(rect.max.x, rect.min.y + w)))
+    out.push(rect_min_max(vec2(rect.min.x, rect.max.y - w), rect.max))
+    out.push(rect_min_max(rect.min, vec2(rect.min.x + w, rect.max.y)))
+    out.push(rect_min_max(vec2(rect.max.x - w, rect.min.y), rect.max))
+}
+
+/// bounding rect of a stroked segment from (x0,y0)-(x1,y1) with unit dir (ux,uy) and half-width hw.
+pub fn stroke_segment_bounds(x0: Float, y0: Float, x1: Float, y1: Float, ux: Float, uy: Float, hw: Float) -> Rect {
+    var px = -uy * hw
+    var py = ux * hw
+    var ax = x0 + px  var ay = y0 + py
+    var bx = x0 - px  var by = y0 - py
+    var cx = x1 + px  var cy = y1 + py
+    var dx2 = x1 - px  var dy2 = y1 - py
+    var min_x = math::fmin(math::fmin(ax, bx), math::fmin(cx, dx2))
+    var min_y = math::fmin(math::fmin(ay, by), math::fmin(cy, dy2))
+    var max_x = math::fmax(math::fmax(ax, bx), math::fmax(cx, dx2))
+    var max_y = math::fmax(math::fmax(ay, by), math::fmax(cy, dy2))
+    return rect_min_max(vec2(min_x, min_y), vec2(max_x, max_y))
+}
+
+/// emit dash-segment fill rects along one edge into `out`.
+pub fn emit_dashed_edge(x0: Float, y0: Float, x1: Float, y1: Float, stroke_w: Float, dash: BorderDash, edge_start: Float, inout out: Vec<Rect>) {
+    var dx = x1 - x0
+    var dy = y1 - y0
+    var len = sqrt(dx * dx + dy * dy)
+    if len <= 0.001 { return }
+    var ux = dx / len
+    var uy = dy / len
+    var hw = stroke_w * 0.5
+    var period = dash.dash + dash.gap
+    var t = 0.0
+    while t < len {
+        var s = edge_start + t
+        var phase = rem_euclid(s + dash.offset, period)
+        if phase < dash.dash {
+            var seg = math::fmin(dash.dash - phase, len - t)
+            var px0 = x0 + ux * t
+            var py0 = y0 + uy * t
+            var px1 = x0 + ux * (t + seg)
+            var py1 = y0 + uy * (t + seg)
+            out.push(stroke_segment_bounds(px0, py0, px1, py1, ux, uy, hw))
+            t = t + seg
+        } else {
+            var skip = math::fmin(period - phase, len - t)
+            t = t + math::fmax(skip, 0.0)
+        }
+    }
+}
+
+/// push fill rects approximating a dashed border around `rect`'s perimeter into `out`.
+/// Falls back to a solid stroke when the dash pattern is degenerate.
+pub fn push_dashed_rect_stroke(rect: Rect, stroke_w: Float, dash: BorderDash, inout out: Vec<Rect>) {
+    var w = rect.width()
+    var h = rect.height()
+    if w <= 0.0 || h <= 0.0 || stroke_w <= 0.0 { return }
+    var period = dash.dash + dash.gap
+    if dash.dash <= 0.0 || period <= 0.0 { push_solid_rect_stroke(rect, stroke_w, out)  return }
+    var s0 = 0.0
+    emit_dashed_edge(rect.min.x, rect.min.y, rect.max.x, rect.min.y, stroke_w, dash, s0, out)
+    s0 = s0 + w
+    emit_dashed_edge(rect.max.x, rect.min.y, rect.max.x, rect.max.y, stroke_w, dash, s0, out)
+    s0 = s0 + h
+    emit_dashed_edge(rect.max.x, rect.max.y, rect.min.x, rect.max.y, stroke_w, dash, s0, out)
+    s0 = s0 + w
+    emit_dashed_edge(rect.min.x, rect.max.y, rect.min.x, rect.min.y, stroke_w, dash, s0, out)
+}
+

@@ -1,0 +1,11 @@
+// Tests for std/strutil. Run with
+//   noric --test std/strutil/strutil_test.nori compiler/runtime.nori --import-root .
+import "std/strutil" as s
+
+fn test_strutil() {
+    assert_streq(s::to_upper("nori"), "NORI")
+    assert_streq(s::trim("  hi  "), "hi")
+    assert_streq(s::replace("a.b.c", ".", "-"), "a-b-c")
+    assert_true(s::contains("hello", "ell"))
+    assert_eq(s::index_of("hello", "lo"), 3)
+}

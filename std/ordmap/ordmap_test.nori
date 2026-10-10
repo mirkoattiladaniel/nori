@@ -1,0 +1,43 @@
+import "std/ordmap" as ordmap
+fn test_ordmap() {
+    var m = ordmap::new()
+    m.insert("a", 1)
+    m.insert("b", 2)
+    m.insert("a", 10)
+    assert_eq(m.size(), 2)
+    assert_eq(m.get("a"), 10)
+    assert_true(m.contains("b"))
+    assert_false(m.contains("z"))
+    assert_eq(m.get_or("z", 99), 99)
+    let ks = m.keys()
+    assert_streq(ks[0], "a")
+    assert_streq(ks[1], "b")
+    let vs = m.values()
+    assert_eq(vs[0], 10)
+    assert_eq(vs[1], 2)
+}
+
+// ---- laws: ordered-map invariants (fuzzed by `noric --fuzz-laws` / `roll law`) ----
+law ordmap_insert_then_get(k: Str, val: Int) {
+    var om = ordmap::new()
+    om.insert(k, val)
+    assert(om.contains(k))
+    assert(om.get(k) == val)
+    assert(om.size() == 1)
+}
+law ordmap_last_write_wins(k: Str, first: Int, second: Int) {
+    var om = ordmap::new()
+    om.insert(k, first)
+    om.insert(k, second)
+    assert(om.get(k) == second)
+    assert(om.size() == 1)                        // re-inserting a key does not grow the map
+}
+law ordmap_all_inserted_keys_present(ks: Vec<Str>, vs: Vec<Int>) {
+    var om = ordmap::new()
+    var n = ks.len()
+    if vs.len() < n { n = vs.len() }
+    var i = 0
+    while i < n { om.insert(ks[i], vs[i])  i = i + 1 }
+    i = 0
+    while i < n { assert(om.contains(ks[i]))  i = i + 1 }
+}

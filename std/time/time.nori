@@ -1,0 +1,350 @@
+//! std/time: monotonic + wall clocks and a UTC calendar breakdown. No C shim: each platform
+//! reads its OS clock through `extern fn` into the system libc (linked automatically by clang).
+//! Platform-specific code lives in `cfg(...)` blocks selected by the build target (`--os`, set by roll from
+//! the host); everything below the blocks is shared.
+
+cfg(linux) {
+    extern fn clock_gettime(Int, Int) -> Int        // (clockid, *timespec{ i64 tv_sec; i64 tv_nsec })
+    extern fn malloc(Int) -> Int
+    extern fn free(Int)
+    extern fn usleep(Int) -> Int
+    /// internal: read POSIX clock `id` as nanoseconds (per-OS).
+    pub fn clock_raw(id: Int) -> Int {                   // Linux: CLOCK_REALTIME=0, CLOCK_MONOTONIC=1
+        var r = 0
+        unsafe {
+            let b = malloc(16)
+            clock_gettime(id, b)
+            r = peek(b) * 1000000000 + peek(b + 8)
+            free(b)
+        }
+        return r
+    }
+    /// internal: monotonic clock in ns (per-OS); public `now_ns`/`now_ms` wrap it.
+    pub fn os_mono_ns() -> Int { return clock_raw(1) }
+    /// internal: wall-clock ns since the Unix epoch (per-OS).
+    pub fn os_wall_ns() -> Int { return clock_raw(0) }
+    /// internal: sleep for `ms` milliseconds (per-OS).
+    pub fn os_sleep_ms(ms: Int) -> Int { var r = 0  unsafe { r = usleep(ms * 1000) }  return r }
+}
+
+cfg(macos) {
+    extern fn clock_gettime(Int, Int) -> Int
+    extern fn malloc(Int) -> Int
+    extern fn free(Int)
+    extern fn usleep(Int) -> Int
+    /// internal: read POSIX clock `id` as nanoseconds (per-OS).
+    pub fn clock_raw(id: Int) -> Int {                   // macOS: CLOCK_REALTIME=0, CLOCK_MONOTONIC_RAW=4
+        var r = 0
+        unsafe {
+            let b = malloc(16)
+            clock_gettime(id, b)
+            r = peek(b) * 1000000000 + peek(b + 8)
+            free(b)
+        }
+        return r
+    }
+    /// internal: monotonic clock in ns (per-OS); public `now_ns`/`now_ms` wrap it.
+    pub fn os_mono_ns() -> Int { return clock_raw(4) }
+    /// internal: wall-clock ns since the Unix epoch (per-OS).
+    pub fn os_wall_ns() -> Int { return clock_raw(0) }
+    /// internal: sleep for `ms` milliseconds (per-OS).
+    pub fn os_sleep_ms(ms: Int) -> Int { var r = 0  unsafe { r = usleep(ms * 1000) }  return r }
+}
+
+cfg(windows) {
+    extern fn QueryPerformanceCounter(Int) -> Int    // -> *LARGE_INTEGER (i64 tick count)
+    extern fn QueryPerformanceFrequency(Int) -> Int  // -> *LARGE_INTEGER (ticks/sec)
+    extern fn GetSystemTimePreciseAsFileTime(Int)    // -> *FILETIME (i64, 100ns units since 1601-01-01)
+    extern fn malloc(Int) -> Int
+    extern fn free(Int)
+    extern fn Sleep(Int)
+    /// internal: monotonic clock in ns (per-OS); public `now_ns`/`now_ms` wrap it.
+    pub fn os_mono_ns() -> Int {
+        var r = 0
+        unsafe {
+            let c = malloc(8)
+            let f = malloc(8)
+            QueryPerformanceCounter(c)
+            QueryPerformanceFrequency(f)
+            let cnt = peek(c)
+            let frq = peek(f)
+            r = cnt / frq * 1000000000 + (cnt - cnt / frq * frq) * 1000000000 / frq
+            free(c)
+            free(f)
+        }
+        return r
+    }
+    /// internal: wall-clock ns since the Unix epoch (per-OS).
+    pub fn os_wall_ns() -> Int {
+        var r = 0
+        unsafe {
+            let b = malloc(8)
+            GetSystemTimePreciseAsFileTime(b)
+            let ticks = peek(b)
+            free(b)
+            r = (ticks - 116444736000000000) * 100   // 100ns-since-1601 -> ns-since-1970 (Unix epoch)
+        }
+        return r
+    }
+    /// internal: sleep for `ms` milliseconds (per-OS).
+    pub fn os_sleep_ms(ms: Int) -> Int { unsafe { Sleep(ms) }  return 0 }
+}
+
+// ---- platform-independent API ----
+/// monotonic time in nanoseconds, for measuring durations (not affected by clock changes).
+pub fn now_ns() -> Int { return os_mono_ns() }
+/// monotonic time in milliseconds.
+pub fn now_ms() -> Int { return os_mono_ns() / 1000000 }
+/// wall-clock time in nanoseconds since the Unix epoch (1970-01-01 UTC).
+pub fn unix_ns() -> Int { return os_wall_ns() }
+/// wall-clock time in milliseconds since the Unix epoch.
+pub fn unix_ms() -> Int { return os_wall_ns() / 1000000 }
+/// wall-clock time in whole seconds since the Unix epoch.
+pub fn unix_secs() -> Int { return os_wall_ns() / 1000000000 }
+/// sleep for `ms` milliseconds.
+pub fn sleep_ms(ms: Int) -> Int { return os_sleep_ms(ms) }
+
+// ---- UTC calendar breakdown (pure integer math; identical on every platform) ----
+struct DateTime { year: Int, month: Int, day: Int, hour: Int, minute: Int, second: Int, weekday: Int }
+/// the UTC civil date/time for a Unix timestamp (seconds), via Howard Hinnant's days<->civil algorithm
+/// (valid for any date; weekday 0=Sunday). Assumes secs >= 0.
+pub fn breakdown(secs: Int) -> DateTime {
+    let days = secs / 86400
+    let rem = secs - days * 86400
+    let hour = rem / 3600
+    let minute = (rem - hour * 3600) / 60
+    let second = rem - hour * 3600 - minute * 60
+    let weekday = (days + 4) % 7                          // 1970-01-01 was a Thursday
+    let z = days + 719468
+    let era = z / 146097
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y0 = yoe + era * 400
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let day = doy - (153 * mp + 2) / 5 + 1
+    var month = mp + 3
+    if mp >= 10 { month = mp - 9 }
+    var year = y0
+    if month <= 2 { year = y0 + 1 }
+    return DateTime { year: year, month: month, day: day, hour: hour, minute: minute, second: second, weekday: weekday }
+}
+/// the current UTC date/time.
+pub fn now() -> DateTime { return breakdown(unix_secs()) }
+
+// ---- formatting + parsing (pure integer math; identical on every platform) ----
+/// internal: render `n` (assumed 0..99) as a 2-digit zero-padded string ("%02d").
+pub fn time_pad2(n: Int) -> Str {
+    if n < 10 {
+        let s = "" + n
+        return "0" + s
+    }
+    return "" + n
+}
+/// days since the Unix epoch (1970-01-01) for a UTC civil date y/m/d, the exact inverse of `breakdown`
+/// (Howard Hinnant's days_from_civil; valid for any date).
+pub fn days_from_civil(y: Int, m: Int, d: Int) -> Int {
+    var yy = y
+    if m <= 2 { yy = y - 1 }
+    var era = yy / 400
+    if yy < 0 { era = (yy - 399) / 400 }
+    let yoe = yy - era * 400
+    var mc = m + 9
+    if m > 2 { mc = m - 3 }
+    let doy = (153 * mc + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+/// UTC DateTime -> Unix seconds (inverse of `breakdown`).
+pub fn time_to_unix(dt: DateTime) -> Int {
+    let days = days_from_civil(dt.year, dt.month, dt.day)
+    return days * 86400 + dt.hour * 3600 + dt.minute * 60 + dt.second
+}
+/// weekday name for `w` (0=Sunday..6=Saturday, matching `breakdown`); out of range -> "".
+pub fn weekday_name(w: Int) -> Str {
+    if w == 0 { return "Sunday" }
+    if w == 1 { return "Monday" }
+    if w == 2 { return "Tuesday" }
+    if w == 3 { return "Wednesday" }
+    if w == 4 { return "Thursday" }
+    if w == 5 { return "Friday" }
+    if w == 6 { return "Saturday" }
+    return ""
+}
+/// how many days month `m` has in year `y` (Gregorian; February follows the leap rule).
+pub fn days_in_month(y: Int, m: Int) -> Int {
+    if m == 2 {
+        var leap = false
+        if y % 4 == 0 { leap = true }
+        if y % 100 == 0 { leap = false }
+        if y % 400 == 0 { leap = true }
+        if leap { return 29 }
+        return 28
+    }
+    if m == 4 { return 30 }
+    if m == 6 { return 30 }
+    if m == 9 { return 30 }
+    if m == 11 { return 30 }
+    return 31
+}
+
+/// month name for `m` (1=January..12=December); out of range -> "".
+pub fn month_name(m: Int) -> Str {
+    if m == 1 { return "January" }
+    if m == 2 { return "February" }
+    if m == 3 { return "March" }
+    if m == 4 { return "April" }
+    if m == 5 { return "May" }
+    if m == 6 { return "June" }
+    if m == 7 { return "July" }
+    if m == 8 { return "August" }
+    if m == 9 { return "September" }
+    if m == 10 { return "October" }
+    if m == 11 { return "November" }
+    if m == 12 { return "December" }
+    return ""
+}
+/// ISO-8601 UTC string "YYYY-MM-DDTHH:MM:SSZ".
+pub fn iso8601(dt: DateTime) -> Str {
+    let y = "" + dt.year
+    let mo = time_pad2(dt.month)
+    let d = time_pad2(dt.day)
+    let h = time_pad2(dt.hour)
+    let mi = time_pad2(dt.minute)
+    let se = time_pad2(dt.second)
+    return y + "-" + mo + "-" + d + "T" + h + ":" + mi + ":" + se + "Z"
+}
+/// the date part "YYYY-MM-DD".
+pub fn date_string(dt: DateTime) -> Str {
+    let y = "" + dt.year
+    let mo = time_pad2(dt.month)
+    let d = time_pad2(dt.day)
+    return y + "-" + mo + "-" + d
+}
+/// the time part "HH:MM:SS".
+pub fn time_string(dt: DateTime) -> Str {
+    let h = time_pad2(dt.hour)
+    let mi = time_pad2(dt.minute)
+    let se = time_pad2(dt.second)
+    return h + ":" + mi + ":" + se
+}
+/// strftime subset: %Y %m %d %H %M %S %y %A %a %B %b %%; any other char is copied literally.
+pub fn format_dt(dt: DateTime, fmt: Str) -> Str {
+    var out = ""
+    let n = fmt.len()
+    var i = 0
+    while i < n {
+        let c = fmt.at(i)
+        if ord(c) == 37 {            // '%'
+            if i + 1 < n {
+                let k = fmt.at(i + 1)
+                let kc = ord(k)
+                if kc == 89 {                          // Y
+                    let v = "" + dt.year
+                    out = out + v
+                } else if kc == 109 {                  // m
+                    let v = time_pad2(dt.month)
+                    out = out + v
+                } else if kc == 100 {                  // d
+                    let v = time_pad2(dt.day)
+                    out = out + v
+                } else if kc == 72 {                   // H
+                    let v = time_pad2(dt.hour)
+                    out = out + v
+                } else if kc == 77 {                   // M
+                    let v = time_pad2(dt.minute)
+                    out = out + v
+                } else if kc == 83 {                   // S
+                    let v = time_pad2(dt.second)
+                    out = out + v
+                } else if kc == 121 {                  // y
+                    let v = time_pad2(dt.year % 100)
+                    out = out + v
+                } else if kc == 65 {                   // A
+                    let v = weekday_name(dt.weekday)
+                    out = out + v
+                } else if kc == 97 {                   // a
+                    let full = weekday_name(dt.weekday)
+                    let v = full.slice(0, 3)
+                    out = out + v
+                } else if kc == 66 {                   // B
+                    let v = month_name(dt.month)
+                    out = out + v
+                } else if kc == 98 {                   // b
+                    let full = month_name(dt.month)
+                    let v = full.slice(0, 3)
+                    out = out + v
+                } else if kc == 37 {                   // %
+                    out = out + "%"
+                } else {
+                    let v = fmt.slice(i + 1, i + 2)
+                    out = out + v
+                }
+                i = i + 2
+            } else {
+                out = out + "%"
+                i = i + 1
+            }
+        } else {
+            let v = fmt.slice(i, i + 1)
+            out = out + v
+            i = i + 1
+        }
+    }
+    return out
+}
+/// internal: true if every char of `s` over [lo,hi) is an ASCII digit.
+pub fn time_all_digits(s: Str, lo: Int, hi: Int) -> Bool {
+    var i = lo
+    while i < hi {
+        let d = ord(s.at(i))
+        if d < 48 { return false }
+        if d > 57 { return false }
+        i = i + 1
+    }
+    return true
+}
+/// parse "YYYY-MM-DDTHH:MM:SSZ" (a space may replace 'T'; trailing 'Z' optional) -> Unix seconds; -1 if
+/// it does not look well-formed.
+pub fn parse_iso8601(s: Str) -> Int {
+    let n = s.len()
+    if n < 19 { return -1 }
+    // separators
+    if ord(s.at(4)) != 45 { return -1 }      // '-'
+    if ord(s.at(7)) != 45 { return -1 }
+    if ord(s.at(10)) != 84 {                 // 'T'
+        if ord(s.at(10)) != 32 { return -1 } // ' '
+    }
+    if ord(s.at(13)) != 58 { return -1 }     // ':'
+    if ord(s.at(16)) != 58 { return -1 }
+    let dy = time_all_digits(s, 0, 4)
+    let dm = time_all_digits(s, 5, 7)
+    let dd = time_all_digits(s, 8, 10)
+    let dh = time_all_digits(s, 11, 13)
+    let dmi = time_all_digits(s, 14, 16)
+    let ds = time_all_digits(s, 17, 19)
+    if dy == false { return -1 }
+    if dm == false { return -1 }
+    if dd == false { return -1 }
+    if dh == false { return -1 }
+    if dmi == false { return -1 }
+    if ds == false { return -1 }
+    let year = parse_int(s.slice(0, 4))
+    let month = parse_int(s.slice(5, 7))
+    let day = parse_int(s.slice(8, 10))
+    let hour = parse_int(s.slice(11, 13))
+    let minute = parse_int(s.slice(14, 16))
+    let second = parse_int(s.slice(17, 19))
+    // Digits in the right places are not a date. Without a range check "9999-99-99T99:99:99" would
+    // come back as a plausible Unix time instead of the -1 this promises. Second allows 60 for a
+    // leap second.
+    if month < 1 { return -1 }
+    if month > 12 { return -1 }
+    if day < 1 { return -1 }
+    if day > days_in_month(year, month) { return -1 }
+    if hour > 23 { return -1 }
+    if minute > 59 { return -1 }
+    if second > 60 { return -1 }
+    let dt = DateTime { year: year, month: month, day: day, hour: hour, minute: minute, second: second, weekday: 0 }
+    return time_to_unix(dt)
+}

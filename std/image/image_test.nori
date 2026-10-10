@@ -1,0 +1,366 @@
+// std/image native tests: PNG decode (RGB / RGBA / palette) + the CPU blit path.
+//   noric --test std/image/image_test.nori compiler/runtime.nori --import-root .
+import "std/image" as image
+import "std/nori_ui" as ui
+
+// corner colors used by all three vendored testdata images (R<<24|G<<16|B<<8|A):
+//   TL red(255,0,0,255)=4278190335  TR green(0,255,0,255)=16711935
+//   BL blue(0,0,255,255)=65535      BR white(255,255,255,255)=4294967295
+
+fn test_decode_rgb() {
+    var im = image::load_png(read_file("std/image/testdata/corners_rgb.png"))
+    assert_eq(bool_int(image::ok(im)), 1)
+    assert_eq(image::width(im), 4)
+    assert_eq(image::height(im), 2)
+    assert_eq(image::pixel_rgba(im, 0, 0), 4278190335)   // TL red
+    assert_eq(image::pixel_rgba(im, 3, 0), 16711935)     // TR green
+    assert_eq(image::pixel_rgba(im, 0, 1), 65535)        // BL blue
+    assert_eq(image::pixel_rgba(im, 3, 1), 4294967295)   // BR white
+    image::dispose(im)
+}
+
+fn test_decode_rgba_alpha() {
+    var im = image::load_png(read_file("std/image/testdata/corners_rgba.png"))
+    assert_eq(bool_int(image::ok(im)), 1)
+    // BR is white at 50% alpha -> R=G=B=255, A=128 -> 0xFFFFFF80 = 4294967168
+    assert_eq(image::pixel_rgba(im, 3, 1), 4294967168)
+    assert_eq(image::pixel_rgba(im, 0, 0), 4278190335)   // TL still opaque red
+    image::dispose(im)
+}
+
+fn test_decode_palette() {
+    var im = image::load_png(read_file("std/image/testdata/corners_pal.png"))
+    assert_eq(bool_int(image::ok(im)), 1)
+    assert_eq(image::pixel_rgba(im, 0, 0), 4278190335)   // TL red
+    assert_eq(image::pixel_rgba(im, 3, 1), 4294967295)   // BR white
+    image::dispose(im)
+}
+
+fn test_decode_16bit() {
+    // 16-bit RGBA is downsampled to 8-bit (high byte); corner colors survive.
+    var im = image::load_png(read_file("std/image/testdata/corners_rgba16.png"))
+    assert_eq(bool_int(image::ok(im)), 1)
+    assert_eq(image::width(im), 4)
+    assert_eq(image::pixel_rgba(im, 0, 0), 4278190335)   // TL red
+    assert_eq(image::pixel_rgba(im, 3, 1), 4294967295)   // BR white (opaque)
+    image::dispose(im)
+}
+
+fn test_reject_garbage() {
+    var im = image::load_png("not a png at all")
+    assert_eq(bool_int(image::ok(im)), 0)
+}
+
+fn test_cpu_blit_scaled() {
+    var im = image::load_png(read_file("std/image/testdata/corners_rgb.png"))
+    assert_eq(bool_int(image::ok(im)), 1)
+    var c = ui::paint_cpu::canvas_new_nofont(40, 20)
+    ui::paint_cpu::clear(c, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::blit_rgba(c, ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(40.0, 20.0)),
+                     image::pixels(im), image::width(im), image::height(im))
+    // nearest-scaled 4x2 -> 40x20; corners keep their colors (canvas is 0x00RRGGBB)
+    assert_eq(ui::paint_cpu::pixel_at(c, 2, 2), 16711680)     // red
+    assert_eq(ui::paint_cpu::pixel_at(c, 37, 2), 65280)       // green
+    assert_eq(ui::paint_cpu::pixel_at(c, 2, 17), 255)         // blue
+    assert_eq(ui::paint_cpu::pixel_at(c, 37, 17), 16777215)   // white
+    ui::paint_cpu::canvas_free(c)
+    image::dispose(im)
+}
+
+fn test_gif_quadrants() {
+    var im = image::load(read_file("std/image/testdata/quad.gif"))
+    assert_eq(bool_int(image::ok(im)), 1)
+    assert_eq(image::width(im), 8)
+    assert_eq(image::pixel_rgba(im, 1, 1), 0xFF0000FF)
+    assert_eq(image::pixel_rgba(im, 6, 1), 0x00FF00FF)
+    assert_eq(image::pixel_rgba(im, 1, 6), 0x0000FFFF)
+    image::dispose(im)
+}
+
+fn test_gif_interlaced() {
+    var im = image::load(read_file("std/image/testdata/quad_i.gif"))
+    assert_eq(bool_int(image::ok(im)), 1)
+    assert_eq(image::pixel_rgba(im, 1, 1), 0xFF0000FF)
+    assert_eq(image::pixel_rgba(im, 6, 6), 0x000000FF)
+    image::dispose(im)
+}
+
+fn test_gif_transparent_and_anim() {
+    var it = image::load(read_file("std/image/testdata/quad_t.gif"))
+    assert_eq(image::pixel_rgba(it, 6, 6), 0)                 // transparent index -> alpha 0
+    assert_eq(image::pixel_rgba(it, 1, 1), 0xFF0000FF)
+    image::dispose(it)
+    var ia = image::load(read_file("std/image/testdata/quad_anim.gif"))
+    assert_eq(bool_int(image::ok(ia)), 1)                     // animated: first frame decodes
+    image::dispose(ia)
+    var ibad = image::load("GIF8 not really")
+    assert_eq(bool_int(image::ok(ibad)), 0)
+}
+
+fn bool_int(b: Bool) -> Int { if b { return 1 }  return 0 }
+
+// ── PNG encoding ────────────────────────────────────────────────────────────────────────────────
+// The property is the same one that makes std/archive's deflate testable: load_png is already
+// trusted, so anything save_png writes must decode back through it to the pixels that went in.
+
+fn e_set(im: image::Image, x: Int, y: Int, r: Int, g: Int, b: Int, a: Int) {
+    let o = (y * image::width(im) + x) * 4
+    unsafe { poke8(image::pixels(im) + o, r)  poke8(image::pixels(im) + o + 1, g)  poke8(image::pixels(im) + o + 2, b)  poke8(image::pixels(im) + o + 3, a) }
+}
+// a deterministic w*h test image: a smooth gradient with a few hard edges, which is the shape that
+// makes filter selection matter.
+fn e_make(w: Int, h: Int) -> image::Image {
+    var im = image::image_new(w, h)
+    var y = 0
+    while y < h {
+        var x = 0
+        while x < w {
+            var r = (x * 7 + y * 3) & 255
+            let g = (x * 2) & 255
+            let b = (y * 5) & 255
+            if ((x / 8) + (y / 8)) % 2 == 0 { r = 250 }
+            e_set(im, x, y, r, g, b, 255 - ((x + y) & 127))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return im
+}
+// encode `src` at `ctype`, decode it back, and hand the decoded image to the caller.
+fn e_roundtrip(src: image::Image, ctype: Int) -> image::Image {
+    let d = image::encode_png(src, ctype)
+    assert_true(d.len() > 0)
+    var got = image::load_png(d)
+    assert_eq(bool_int(image::ok(got)), 1)
+    assert_eq(image::width(got), image::width(src))
+    assert_eq(image::height(got), image::height(src))
+    return got
+}
+
+// colour type 6: every channel survives, so the two buffers must be identical
+fn test_encode_rgba_exact() {
+    var src = e_make(37, 23)
+    var got = e_roundtrip(src, image::png_rgba())
+    var y = 0
+    while y < 23 {
+        var x = 0
+        while x < 37 { assert_eq(image::pixel_rgba(got, x, y), image::pixel_rgba(src, x, y))  x = x + 1 }
+        y = y + 1
+    }
+    image::dispose(got)
+    image::dispose(src)
+}
+
+// colour type 2: RGB survives, alpha is dropped and comes back opaque
+fn test_encode_rgb_drops_alpha() {
+    var src = e_make(20, 14)
+    var got = e_roundtrip(src, image::png_rgb())
+    var y = 0
+    while y < 14 {
+        var x = 0
+        while x < 20 {
+            assert_eq(image::pixel_rgba(got, x, y), (image::pixel_rgba(src, x, y) - (image::pixel_rgba(src, x, y) & 255)) + 255)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    image::dispose(got)
+    image::dispose(src)
+}
+
+// colour type 0: a greyscale image (R=G=B) round-trips exactly
+fn test_encode_gray_exact() {
+    var src = image::image_new(16, 9)
+    var y = 0
+    while y < 9 {
+        var x = 0
+        while x < 16 { let v = (x * 16 + y) & 255  e_set(src, x, y, v, v, v, 255)  x = x + 1 }
+        y = y + 1
+    }
+    var got = e_roundtrip(src, image::png_gray())
+    y = 0
+    while y < 9 {
+        var x = 0
+        while x < 16 { assert_eq(image::pixel_rgba(got, x, y), image::pixel_rgba(src, x, y))  x = x + 1 }
+        y = y + 1
+    }
+    image::dispose(got)
+    image::dispose(src)
+}
+
+// colour type 4: greyscale + alpha, both survive
+fn test_encode_gray_alpha_exact() {
+    var src = image::image_new(12, 12)
+    var y = 0
+    while y < 12 {
+        var x = 0
+        while x < 12 { let v = (x * 20) & 255  e_set(src, x, y, v, v, v, (y * 21) & 255)  x = x + 1 }
+        y = y + 1
+    }
+    var got = e_roundtrip(src, image::png_gray_alpha())
+    y = 0
+    while y < 12 {
+        var x = 0
+        while x < 12 { assert_eq(image::pixel_rgba(got, x, y), image::pixel_rgba(src, x, y))  x = x + 1 }
+        y = y + 1
+    }
+    image::dispose(got)
+    image::dispose(src)
+}
+
+// colour type 3: the caller's palette, including a non-opaque entry -> tRNS
+fn test_encode_palette_exact() {
+    var pal: Vec<Int> = vec()
+    pal.push(0xFF0000FF)  pal.push(0x00FF00FF)  pal.push(0x0000FFFF)  pal.push(0xFFFFFF40)
+    var src = image::image_new(10, 6)
+    var y = 0
+    while y < 6 {
+        var x = 0
+        while x < 10 {
+            let p = pal[(x + y) % 4]
+            e_set(src, x, y, (p >> 24) & 255, (p >> 16) & 255, (p >> 8) & 255, p & 255)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let d = image::encode_png_paletted(src, pal)
+    assert_true(d.len() > 0)
+    var got = image::load_png(d)
+    assert_eq(bool_int(image::ok(got)), 1)
+    y = 0
+    while y < 6 {
+        var x = 0
+        while x < 10 { assert_eq(image::pixel_rgba(got, x, y), pal[(x + y) % 4])  x = x + 1 }
+        y = y + 1
+    }
+    image::dispose(got)
+    image::dispose(src)
+}
+
+// a pixel that is not in the palette is an error, not a nearest-colour guess
+fn test_palette_refuses_unknown_colour() {
+    var pal: Vec<Int> = vec()
+    pal.push(0xFF0000FF)
+    var src = image::image_new(2, 2)
+    e_set(src, 0, 0, 255, 0, 0, 255)  e_set(src, 1, 0, 255, 0, 0, 255)
+    e_set(src, 0, 1, 255, 0, 0, 255)  e_set(src, 1, 1, 1, 2, 3, 255)
+    assert_eq(image::encode_png_paletted(src, pal).len(), 0)
+    image::dispose(src)
+}
+
+// the readback door: 0x00RRGGBB little-endian words in, truecolour PNG out
+fn test_encode_readback_words() {
+    let w = 11
+    let h = 7
+    var buf = 0
+    unsafe { buf = malloc(w * h * 4) }
+    var y = 0
+    while y < h {
+        var x = 0
+        while x < w { unsafe { poke32(buf + (y * w + x) * 4, (x * 7) * 65536 + (y * 30) * 256 + 200) }  x = x + 1 }
+        y = y + 1
+    }
+    let d = image::encode_png_readback(buf, w, h)
+    assert_true(d.len() > 0)
+    var got = image::load_png(d)
+    assert_eq(bool_int(image::ok(got)), 1)
+    assert_eq(image::width(got), w)
+    y = 0
+    while y < h {
+        var x = 0
+        while x < w { assert_eq(image::pixel_rgba(got, x, y), (((x * 7) * 65536 + (y * 30) * 256) + 200) * 256 + 255)  x = x + 1 }
+        y = y + 1
+    }
+    image::dispose(got)
+    unsafe { free(buf) }
+}
+
+// a vendored PNG decoded and re-encoded must decode to the same pixels
+fn test_reencode_vendored_png() {
+    var src = image::load_png(read_file("std/image/testdata/corners_rgba.png"))
+    assert_eq(bool_int(image::ok(src)), 1)
+    var got = e_roundtrip(src, image::png_rgba())
+    assert_eq(image::pixel_rgba(got, 0, 0), 4278190335)
+    assert_eq(image::pixel_rgba(got, 3, 1), 4294967168)
+    image::dispose(got)
+    image::dispose(src)
+}
+
+// A one-pixel image, and a one-row image: the filter loop's y-1 / x-bpp edges.
+fn test_encode_degenerate_sizes() {
+    var a = image::image_new(1, 1)
+    e_set(a, 0, 0, 9, 8, 7, 6)
+    var ga = e_roundtrip(a, image::png_rgba())
+    assert_eq(image::pixel_rgba(ga, 0, 0), 151521030)          // 0x09080706
+    image::dispose(ga)
+    image::dispose(a)
+    var b = image::image_new(64, 1)
+    var x = 0
+    while x < 64 { e_set(b, x, 0, x * 4, 0, 255 - x * 4, 255)  x = x + 1 }
+    var gb = e_roundtrip(b, image::png_rgb())
+    x = 0
+    while x < 64 { assert_eq(image::pixel_rgba(gb, x, 0), image::pixel_rgba(b, x, 0))  x = x + 1 }
+    image::dispose(gb)
+    image::dispose(b)
+}
+
+// encoding a bad image, or asking for a colour type this does not write, is "", not a crash
+fn test_encode_rejects_bad_input() {
+    var bad = image::load_png("not a png")
+    assert_eq(image::encode_png(bad, image::png_rgba()).len(), 0)
+    var ok2 = image::image_new(4, 4)
+    assert_eq(image::encode_png(ok2, 3).len(), 0)               // palette needs encode_png_paletted
+    assert_eq(image::encode_png(ok2, 7).len(), 0)               // 7 is not a PNG colour type
+    image::dispose(ok2)
+}
+
+// The point of per-scanline filter selection: a smooth gradient must come out far smaller than the
+// same pixels would with filter 0 everywhere. A gradient's paeth/sub residuals are near zero.
+fn test_filtering_beats_flat_bytes() {
+    var im = image::image_new(200, 200)
+    var y = 0
+    while y < 200 {
+        var x = 0
+        while x < 200 { e_set(im, x, y, (x + y) / 2, x, y, 255)  x = x + 1 }
+        y = y + 1
+    }
+    let d = image::encode_png(im, image::png_rgb())
+    assert_true(d.len() > 0)
+    assert_true(d.len() * 40 < 200 * 200 * 3)                   // better than 40:1 on a pure gradient
+    image::dispose(im)
+}
+
+// The fast readback encoder writes the same pixels as the compressing one. Unfiltered and stored, so
+// it is several times larger and must decode identically: including across a stored block boundary
+// (a 300x230 RGB image is 207,230 raw bytes: four 65,535-byte blocks).
+extern fn malloc(Int) -> Int
+extern fn free(Int)
+fn test_fast_readback_matches() {
+    let w = 300
+    let h = 230
+    var buf = 0
+    unsafe { buf = malloc(w * h * 4) }
+    var i = 0
+    while i < w * h {
+        let x = i % w
+        let y = i / w
+        let rgb = (((x * 7) & 255) << 16) | (((y * 3) & 255) << 8) | ((x + y) & 255)
+        unsafe { poke32(buf + i * 4, rgb) }
+        i = i + 1
+    }
+    let slow = image::encode_png_readback(buf, w, h)
+    let fast = image::encode_png_readback_fast(buf, w, h)
+    unsafe { free(buf) }
+    assert_true(fast.len() > slow.len())
+    var a = image::load_png(slow)
+    var b = image::load_png(fast)
+    assert_eq(bool_int(image::ok(b)), 1)
+    var y = 0
+    while y < h {
+        var x = 0
+        while x < w { assert_eq(image::pixel_rgba(a, x, y), image::pixel_rgba(b, x, y))  x = x + (7 + y % 5) }
+        y = y + 1
+    }
+    image::dispose(a)
+    image::dispose(b)
+}

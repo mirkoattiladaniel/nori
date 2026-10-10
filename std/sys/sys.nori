@@ -1,0 +1,58 @@
+//! std/sys: host facts (the target triple "<arch>-<os>"). No C
+//! shim: reads the OS `uname(2)` through `extern fn` into a buffer and pulls the machine + sysname strings
+//! out with `unsafe` peek (libc linked automatically). The `struct utsname` field width differs per OS
+//! (Linux 65, macOS 256), so the layout lives in `cfg(...)` blocks; the formatting is shared.
+
+/// a NUL-terminated C string at address `p` -> a Nori Str.
+pub fn read_cstr(p: Int) -> Str {
+    var s = ""
+    unsafe { var i = 0  while peek8(p + i) != 0 { s = (s + chr(peek8(p + i)))  i = i + 1 } }
+    return s
+}
+/// ASCII-lowercase (uname's sysname is "Linux"/"Darwin"; the triple is lowercased).
+pub fn lower(s: Str) -> Str {
+    var o = ""
+    var i = 0
+    while i < s.len() { var c = ord(s.at(i))  if c >= 65 && c <= 90 { c = c + 32 }  o = (o + chr(c))  i = i + 1 }
+    return o
+}
+
+cfg(linux) {
+    extern fn uname(Int) -> Int                      // uname(struct utsname*): 6 × char[65] fields
+    extern fn malloc(Int) -> Int
+    extern fn free(Int)
+    /// internal: the host target triple (per-OS); public `target()` wraps it.
+    pub fn os_target() -> Str {
+        var t = "unknown-unknown"
+        unsafe {
+            let b = malloc(390)                      // 6 * 65 (_UTSNAME_LENGTH)
+            if uname(b) == 0 { t = (read_cstr(b + 260) + ("-" + lower(read_cstr(b)))) }   // machine (field 5) + sysname
+            free(b)
+        }
+        return t
+    }
+}
+
+cfg(macos) {
+    extern fn uname(Int) -> Int                      // 5 × char[256] fields (_SYS_NAMELEN)
+    extern fn malloc(Int) -> Int
+    extern fn free(Int)
+    /// internal: the host target triple (per-OS); public `target()` wraps it.
+    pub fn os_target() -> Str {
+        var t = "unknown-unknown"
+        unsafe {
+            let b = malloc(1280)                     // 5 * 256
+            if uname(b) == 0 { t = (read_cstr(b + 1024) + ("-" + lower(read_cstr(b)))) }   // machine (offset 4*256) + sysname
+            free(b)
+        }
+        return t
+    }
+}
+
+cfg(windows) {
+    /// internal: the host target triple (per-OS); public `target()` wraps it.
+    pub fn os_target() -> Str { return "x86_64-windows" }   // best-effort: Windows has no uname
+}
+
+/// the host target triple, "<arch>-<os>" lowercased, e.g. "x86_64-linux", "aarch64-darwin".
+pub fn target() -> Str { return os_target() }

@@ -1,0 +1,434 @@
+// Native tests for std/nori_ui/layout/sheet (the .style language) and its cascade, transitions and
+// animations in a retained document. Run with
+//   noric --test std/nori_ui/layout/sheet_test.nori compiler/runtime.nori --import-root .
+import "std/nori_ui" as ui
+
+fn doc_with(ui_src: Str, style_src: Str) -> ui::layout::RDoc {
+    var d = ui::layout::rdoc_new()
+    var r = ui::layout::dsl_parse_document(ui_src)
+    assert_true(r.ok)
+    ui::layout::rdoc_set_tree(d, sink r.doc.tree)
+    if style_src.len() > 0 {
+        let sp = ui::layout::style_parse(style_src, "test.style")
+        if !sp.ok { printl(ui::layout::ui_error_text(sp.err)) }
+        assert_true(sp.ok)
+        let e = ui::layout::rdoc_set_styles(d, "style", sp.styles)
+        if e.msg.len() > 0 { printl(ui::layout::ui_error_text(e)) }
+        assert_streq(e.msg, "")
+    }
+    ui::layout::rdoc_set_viewport(d, 400.0, 100.0)
+    return d
+}
+/// the drawn node with id `id` (a copy).
+fn node_of(d: ui::layout::RDoc, id: Str) -> ui::layout::UiNode {
+    assert_true(d.tree.len() == 1)
+    return find(d.tree[0], id)
+}
+fn find(rn: ui::layout::RNode, id: Str) -> ui::layout::UiNode {
+    if rn.cur.id == id { return ui::layout::ui_node_dup_shallow(rn.cur) }
+    var i = 0
+    while i < rn.kids.len() {
+        let n = find(rn.kids[i], id)
+        if n.id == id { return n }
+        i = i + 1
+    }
+    return ui::layout::ui_node_blank(ui::layout::nk_spacer())
+}
+fn bg_r(d: ui::layout::RDoc, id: Str) -> Int { let n = node_of(d, id)  if !n.has_bg { return 0 - 1 }  return ui::core::rgba_color(n.bg).r }
+
+// ---- parsing --------------------------------------------------------------------------------------------
+
+fn test_parse_the_language() {
+    let src = "vars { --accent: #3b82f6  --r: 6  --w: 50% }\n" +
+        ".tb, row.bar > .tb:hover { bg: --accent radius: --r transition: bg 200ms ease_out, opacity 0.15s linear 20ms }\n" +
+        "keyframes pulse { from { opacity: 1 } 50% { opacity: 0.4 } to { opacity: 1 } }\n" +
+        "column .x.y:focus { animation: pulse 1200ms ease_in_out infinite alternate  w: --w }\n" +
+        "tag text { size_px: 13 }\nclass legacy { color: #fff }\n* { gap: 2 }"
+    let sp = ui::layout::style_parse(src, "t.style")
+    if !sp.ok { printl(ui::layout::ui_error_text(sp.err)) }
+    assert_true(sp.ok)
+    assert_eq(sp.styles.vars.len(), 3)
+    assert_eq(sp.styles.rules.len(), 5)
+    assert_eq(sp.styles.rules[0].sels.len(), 2)
+    let s1 = sp.styles.rules[0].sels[1]
+    assert_eq(s1.parts.len(), 2)
+    assert_eq(s1.combs[0], 1)                                      // child
+    assert_streq(s1.parts[0].tag, "row")
+    assert_streq(s1.parts[0].classes[0], "bar")
+    assert_true(s1.parts[1].hover)
+    assert_eq(s1.spec, 3001)                                       // .bar .tb :hover + row
+    let s2 = sp.styles.rules[1].sels[0]
+    assert_eq(s2.combs[0], 0)                                      // descendant
+    assert_eq(s2.parts[1].classes.len(), 2)
+    assert_true(s2.parts[1].focus)
+    assert_eq(sp.styles.kfs.len(), 1)
+    assert_eq(sp.styles.kfs[0].stops.len(), 3)
+    // transitions and the animation
+    let tr = sp.styles.rules[0].decls[2]
+    assert_eq(tr.kind, 1)
+    assert_eq(tr.trans.len(), 2)
+    assert_feq(tr.trans[0].dur, 200.0, 0.001)
+    assert_feq(tr.trans[1].dur, 150.0, 0.001)
+    assert_feq(tr.trans[1].delay, 20.0, 0.001)
+    let an = sp.styles.rules[1].decls[0].anim
+    assert_streq(an.name, "pulse")
+    assert_feq(an.dur, 1200.0, 0.001)
+    assert_true(an.count < 0.0)
+    assert_eq(an.dir, 2)
+    // it compiles: tokens resolve, rules order by specificity then source order
+    let c = ui::layout::style_compile(sp.styles)
+    if !c.ok { printl(ui::layout::ui_error_text(c.err)) }
+    assert_true(c.ok)
+    assert_eq(c.sheet.rules.len(), 6)
+    var i = 1
+    while i < c.sheet.rules.len() {
+        let a = c.sheet.rules[i - 1]
+        let b = c.sheet.rules[i]
+        assert_true(a.sel.spec < b.sel.spec || (a.sel.spec == b.sel.spec && a.order < b.order))
+        i = i + 1
+    }
+    assert_true(c.sheet.state)
+    assert_true(c.sheet.comb)
+    assert_false(c.sheet.state_anc)
+    // the token reached the rule
+    var found = false
+    var k = 0
+    while k < c.sheet.rules.len() {
+        if c.sheet.rules[k].style.has_radius { assert_feq(c.sheet.rules[k].style.radius, 6.0, 0.001)  assert_eq(ui::core::rgba_color(c.sheet.rules[k].style.bg).b, 246)  found = true }
+        if c.sheet.rules[k].style.has_w { assert_eq(c.sheet.rules[k].style.w_unit, 1)  assert_feq(c.sheet.rules[k].style.w_val, 50.0, 0.001) }
+        k = k + 1
+    }
+    assert_true(found)
+}
+
+fn test_errors_carry_file_line_and_column() {
+    let a = ui::layout::style_parse(".tb {\n  bg: #fff\n  bogus: 3\n}", "theme.style")
+    assert_false(a.ok)
+    assert_streq(a.err.file, "theme.style")
+    assert_eq(a.err.line, 3)
+    assert_true(ui::layout::nui_contains(a.err.msg, "bogus"))
+    assert_true(ui::layout::nui_contains(ui::layout::ui_error_text(a.err), "theme.style:3:"))
+    let b = ui::layout::style_parse(".tb:hoover { bg: #fff }", "x.style")
+    assert_false(b.ok)
+    assert_true(ui::layout::nui_contains(b.err.msg, "hoover"))
+    let c = ui::layout::style_parse(".tb { transition: bg fast }", "x.style")
+    assert_false(c.ok)
+    assert_true(ui::layout::nui_contains(c.err.msg, "duration"))
+    // an undefined token is found when the sheet is compiled, at the place it is used
+    let d = ui::layout::style_parse("vars { --a: 1 }\n.tb {\n  radius: --nope\n}", "y.style")
+    assert_true(d.ok)
+    let cd = ui::layout::style_compile(d.styles)
+    assert_false(cd.ok)
+    assert_streq(cd.err.file, "y.style")
+    assert_eq(cd.err.line, 3)
+    assert_true(ui::layout::nui_contains(cd.err.msg, "--nope"))
+    // and a loop
+    let e = ui::layout::style_parse("vars { --a: --b  --b: --a }\n.tb { radius: --a }", "z.style")
+    assert_false(ui::layout::style_compile(e.styles).ok)
+    // a token of the wrong kind for the property says what the property wanted
+    let f = ui::layout::style_parse("vars { --c: #fff }\n.tb { radius: --c }", "z.style")
+    let cf = ui::layout::style_compile(f.styles)
+    assert_false(cf.ok)
+    assert_true(ui::layout::nui_contains(cf.err.msg, "radius"))
+}
+
+fn test_legacy_sources_parse_as_before() {
+    // the duplicate tag rule replaces (the immediate path's semantics), and the new syntax beside it
+    let r = ui::layout::dsl_parse_stylesheet("tag t { bold: true } tag t { radius: 2 } .c { radius: 3 } .c { bold: true } .c:hover { radius: 9 }")
+    assert_true(r.ok)
+    assert_eq(r.sheet.tag_keys.len(), 1)
+    assert_false(r.sheet.tag_styles[0].has_font_bold)
+    assert_eq(r.sheet.class_keys.len(), 1)
+    assert_true(r.sheet.class_styles[0].has_font_bold)              // merged, not replaced
+    assert_feq(r.sheet.class_styles[0].radius, 3.0, 0.001)         // the :hover rule is not in it
+    assert_eq(r.styles.rules.len(), 5)
+    // tokens work in a document's own stylesheet block, for both paths
+    var dr = ui::layout::dsl_parse_document("stylesheet { vars { --a: #102030 } class p { bg: --a } } column { class: p }")
+    assert_true(dr.ok)
+    assert_eq(ui::core::rgba_color(dr.doc.sheet.class_styles[0].bg).g, 32)
+}
+
+// ---- the cascade ---------------------------------------------------------------------------------------
+
+fn bar_ui() -> Str {
+    return "row { id: bar classes: [bar] column { id: a classes: [tb] text { id: at text: A } } column { id: b classes: [tb, on] text { id: bt text: B } } column { id: c text { id: ct text: C } } }"
+}
+
+fn test_specificity_and_source_order() {
+    let st = "column { bg: #010000 }\n" +                  // (0,1)
+        ".tb { bg: #020000 }\n" +                           // (1,0) beats the type
+        "column.tb { bg: #030000 }\n" +                     // (1,1) beats the class
+        ".tb.on { bg: #040000 }\n" +                        // (2,0)
+        ".on.tb { bg: #050000 }\n" +                        // (2,0) again: later wins
+        "column { radius: 7 }"                              // a type rule still sets what nobody else does
+    var d = doc_with(bar_ui(), st)
+    let _f = ui::layout::rdoc_frame(d, 0.0)
+    assert_eq(bg_r(d, "a"), 3)
+    assert_eq(bg_r(d, "b"), 5)
+    assert_eq(bg_r(d, "c"), 1)
+    assert_feq(node_of(d, "b").radius, 7.0, 0.001)
+}
+
+fn test_combinators() {
+    let st = ".bar text { size_px: 20 }\n" +                // descendant: every text in the bar
+        ".bar > text { size_px: 30 }\n" +                    // child: none (the texts are grandchildren)
+        ".bar > .tb > text { color: #ff0000 }\n" +           // child chain
+        "row column.on text { color: #00ff00 }"             // (1,3) beats (2,1)? no: (2,1)=2001 > 1003
+    var d = doc_with(bar_ui(), st)
+    let _f = ui::layout::rdoc_frame(d, 0.0)
+    assert_feq(node_of(d, "at").size_px, 20.0, 0.001)
+    assert_eq(ui::core::rgba_color(node_of(d, "at").color).r, 255)
+    assert_eq(ui::core::rgba_color(node_of(d, "bt").color).r, 255)                // the child chain is more specific
+    assert_feq(node_of(d, "ct").size_px, 20.0, 0.001)
+    assert_eq(ui::core::rgba_color(node_of(d, "ct").color).r, 255)                 // ct is not in a .tb: white (no rule)
+    assert_eq(ui::core::rgba_color(node_of(d, "ct").color).g, 255)
+}
+
+fn test_tokens_restyle_everything_that_uses_them() {
+    var d = doc_with(bar_ui(), "")
+    let theme = ui::layout::style_parse("vars { --accent: #3b82f6 --surface: #101010 }", "theme.style")
+    let _e0 = ui::layout::rdoc_set_styles(d, "theme", theme.styles)
+    let mine = ui::layout::style_parse(".tb { bg: --accent }  .bar { bg: --surface }", "panel.style")
+    let e1 = ui::layout::rdoc_set_styles(d, "panel", mine.styles)
+    assert_streq(e1.msg, "")
+    let _f = ui::layout::rdoc_frame(d, 0.0)
+    assert_eq(bg_r(d, "a"), 59)
+    assert_eq(bg_r(d, "b"), 59)
+    assert_eq(bg_r(d, "bar"), 16)
+    // a new theme: one token changes, everything that uses it follows, nothing else is touched
+    let theme2 = ui::layout::style_parse("vars { --accent: #ef4444 --surface: #101010 }", "theme.style")
+    let _e2 = ui::layout::rdoc_set_styles(d, "theme", theme2.styles)
+    let f = ui::layout::rdoc_frame(d, 1.0)
+    assert_true(f.changed)
+    assert_eq(bg_r(d, "a"), 239)
+    assert_eq(bg_r(d, "b"), 239)
+    assert_eq(bg_r(d, "bar"), 16)
+    assert_eq(f.laid, 2)                                    // the two buttons; the bar did not change
+    // the panel overrides a token by defining it again (later layer wins)
+    let mine2 = ui::layout::style_parse("vars { --accent: #00ff00 } .tb { bg: --accent }  .bar { bg: --surface }", "panel.style")
+    let _e3 = ui::layout::rdoc_set_styles(d, "panel", mine2.styles)
+    let _g = ui::layout::rdoc_frame(d, 2.0)
+    assert_eq(bg_r(d, "a"), 0)
+    assert_eq(ui::core::rgba_color(node_of(d, "a").bg).g, 255)
+}
+
+fn test_a_broken_theme_is_refused_and_the_old_one_stays() {
+    var d = doc_with(bar_ui(), ".tb { bg: #808080 }")
+    let _f = ui::layout::rdoc_frame(d, 0.0)
+    assert_eq(bg_r(d, "a"), 128)
+    let bad = ui::layout::style_parse(".tb { bg: --missing }", "broken.style")
+    assert_true(bad.ok)                                     // it parses; the token is undefined
+    let e = ui::layout::rdoc_set_styles(d, "style", bad.styles)
+    assert_streq(e.file, "broken.style")
+    assert_eq(e.line, 1)
+    assert_true(ui::layout::nui_contains(e.msg, "--missing"))
+    assert_true(ui::layout::nui_contains(ui::layout::rdoc_style_error(d).msg, "--missing"))
+    let g = ui::layout::rdoc_frame(d, 1.0)
+    assert_false(g.changed)
+    assert_eq(bg_r(d, "a"), 128)
+}
+
+fn test_state_classes_and_pseudo_classes() {
+    let st = ".tb { bg: #101010 }  .tb:hover { bg: #202020 }  .tb:active { bg: #303030 }  .tb.urgent { bg: #f00000 }  .tb:focus { radius: 9 }  .tb:disabled { bg: #050505 }  .tb:hover text { size_px: 22 }"
+    var d = doc_with(bar_ui(), st)
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    assert_eq(bg_r(d, "a"), 16)
+    // a state the host sets
+    ui::layout::rdoc_add_class(d, "a", "urgent")
+    let f1 = ui::layout::rdoc_frame(d, 1.0)
+    assert_true(f1.changed)
+    assert_eq(bg_r(d, "a"), 240)
+    ui::layout::rdoc_remove_class(d, "a", "urgent")
+    let _f2 = ui::layout::rdoc_frame(d, 2.0)
+    assert_eq(bg_r(d, "a"), 16)
+    // the class from the .ui can be taken off too
+    ui::layout::rdoc_remove_class(d, "b", "tb")
+    let _f3 = ui::layout::rdoc_frame(d, 3.0)
+    assert_eq(bg_r(d, "b"), 0 - 1)
+    // :hover and :active, and a state tested on an ancestor restyling a descendant
+    let ov = ui::layout::rdoc_overlay(d)
+    var ar = ui::core::rect_copy(ov.prims[0].rect)
+    var k = 0
+    while k < ov.prims.len() { if ov.prims[k].color.r == 16 { ar = ui::core::rect_copy(ov.prims[k].rect) }  k = k + 1 }
+    ui::layout::rdoc_pointer(d, ar.center().x, ar.center().y, false)
+    let _f4 = ui::layout::rdoc_frame(d, 4.0)
+    assert_eq(bg_r(d, "a"), 32)
+    assert_feq(node_of(d, "at").size_px, 22.0, 0.001)
+    ui::layout::rdoc_pointer(d, ar.center().x, ar.center().y, true)
+    let _f5 = ui::layout::rdoc_frame(d, 5.0)
+    assert_eq(bg_r(d, "a"), 48)
+    ui::layout::rdoc_pointer_leave(d)
+    let _f6 = ui::layout::rdoc_frame(d, 6.0)
+    assert_eq(bg_r(d, "a"), 16)
+    assert_feq(node_of(d, "at").size_px, 14.0, 0.001)
+    // :focus
+    ui::layout::rdoc_set_focus(d, "a")
+    let _f7 = ui::layout::rdoc_frame(d, 7.0)
+    assert_feq(node_of(d, "a").radius, 9.0, 0.001)
+    ui::layout::rdoc_set_focus(d, "")
+    let _f8 = ui::layout::rdoc_frame(d, 8.0)
+    assert_feq(node_of(d, "a").radius, 0.0, 0.001)
+}
+
+fn test_disabled_pseudo_class() {
+    var d = doc_with("row { column { id: a classes: [tb] bind_disabled: can } }", ".tb { bg: #101010 }  .tb:disabled { bg: #050505 }")
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    assert_eq(bg_r(d, "a"), 5)
+    ui::layout::rdoc_set_bind(d, "can", "true")
+    let _f1 = ui::layout::rdoc_frame(d, 1.0)
+    assert_eq(bg_r(d, "a"), 16)
+}
+
+// ---- transitions and animations ---------------------------------------------------------------------
+
+fn test_a_transition_runs_on_the_callers_clock_then_settles() {
+    var d = doc_with(bar_ui(), ".tb { bg: #000000 transition: bg 100ms linear }  .tb.lit { bg: #c80000 }")
+    let f0 = ui::layout::rdoc_frame(d, 1000.0)
+    assert_false(f0.animating)
+    assert_eq(bg_r(d, "a"), 0)
+    ui::layout::rdoc_add_class(d, "a", "lit")
+    let f1 = ui::layout::rdoc_frame(d, 1000.0)                // the change lands at t = 1000
+    assert_true(f1.animating)
+    assert_eq(bg_r(d, "a"), 0)
+    let f2 = ui::layout::rdoc_frame(d, 1050.0)
+    assert_true(f2.changed)
+    assert_true(f2.animating)
+    assert_eq(bg_r(d, "a"), 100)
+    // the frame only touched the button that moves
+    // (advancing a transition re-runs no cascade: `styled` counts cascades)
+    assert_eq(f2.styled, 0)
+    assert_eq(f2.laid, 1)
+    let _f3 = ui::layout::rdoc_frame(d, 1075.0)
+    assert_eq(bg_r(d, "a"), 150)
+    let f4 = ui::layout::rdoc_frame(d, 1100.0)
+    assert_true(f4.changed)
+    assert_false(f4.animating)
+    assert_eq(bg_r(d, "a"), 200)
+    // settled: idle again, frame after frame
+    var i = 0
+    while i < 3 {
+        let g = ui::layout::rdoc_frame(d, 1200.0 + to_float(i) * 16.0)
+        assert_false(g.changed)
+        assert_false(g.animating)
+        assert_eq(g.styled, 0)
+        i = i + 1
+    }
+    // reversing half way turns round from where it is drawn
+    ui::layout::rdoc_remove_class(d, "a", "lit")
+    let _r0 = ui::layout::rdoc_frame(d, 2000.0)
+    let _r1 = ui::layout::rdoc_frame(d, 2050.0)
+    assert_eq(bg_r(d, "a"), 100)
+    ui::layout::rdoc_add_class(d, "a", "lit")
+    let _r2 = ui::layout::rdoc_frame(d, 2050.0)
+    let _r3 = ui::layout::rdoc_frame(d, 2100.0)
+    assert_eq(bg_r(d, "a"), 150)                             // from 100 to 200, half way
+    let _r4 = ui::layout::rdoc_frame(d, 2150.0)
+    assert_eq(bg_r(d, "a"), 200)
+}
+
+fn test_transition_delay_and_easing() {
+    var d = doc_with(bar_ui(), ".tb { opacity: 1 transition: opacity 100ms ease_in 50ms }  .tb.gone { opacity: 0 }")
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    ui::layout::rdoc_add_class(d, "a", "gone")
+    let _f1 = ui::layout::rdoc_frame(d, 0.0)
+    let _f2 = ui::layout::rdoc_frame(d, 40.0)
+    assert_feq(node_of(d, "a").opacity, 1.0, 0.0001)          // still in its delay
+    let _f3 = ui::layout::rdoc_frame(d, 100.0)
+    let op = node_of(d, "a").opacity
+    // ease_in at t = 0.5 is well under half way: more than half the opacity is left
+    assert_true(op > 0.6 && op < 0.95)
+    let f4 = ui::layout::rdoc_frame(d, 150.0)
+    assert_feq(node_of(d, "a").opacity, 0.0, 0.0001)
+    assert_false(f4.animating)
+}
+
+fn ease_of(src: Str) -> ui::layout::Ease {
+    let sp = ui::layout::style_parse(src, "e")
+    assert_true(sp.ok)
+    return ui::layout::ease_dup(sp.styles.rules[0].decls[0].trans[0].ease)
+}
+fn test_easing_curves() {
+    let lin = ease_of(".x { transition: bg 1s linear }")
+    assert_feq(ui::layout::ease_at(lin, 0.3), 0.3, 0.000001)
+    let io = ease_of(".x { transition: bg 1s ease-in-out }")
+    assert_feq(ui::layout::ease_at(io, 0.5), 0.5, 0.001)
+    assert_feq(ui::layout::ease_at(io, 0.25) + ui::layout::ease_at(io, 0.75), 1.0, 0.001)
+    assert_true(ui::layout::ease_at(io, 0.1) < 0.1)
+    let bz = ease_of(".x { transition: bg 1s cubic_bezier(0, 0, 1, 1) }")
+    assert_feq(ui::layout::ease_at(bz, 0.4), 0.4, 0.001)
+    let ovs = ease_of(".x { transition: bg 1s cubic_bezier(0.3, 1.6, 0.6, 1) }")
+    assert_true(ui::layout::ease_at(ovs, 0.6) > 1.0)          // an overshoot curve overshoots
+}
+
+fn test_keyframe_animation_with_count_and_direction() {
+    let st = "keyframes pulse { from { radius: 0 } to { radius: 10 } }  .tb { animation: pulse 100ms linear 2 alternate }"
+    var d = doc_with(bar_ui(), st)
+    let f0 = ui::layout::rdoc_frame(d, 0.0)
+    assert_true(f0.animating)
+    assert_feq(node_of(d, "a").radius, 0.0, 0.001)
+    let _f1 = ui::layout::rdoc_frame(d, 25.0)
+    assert_feq(node_of(d, "a").radius, 2.5, 0.001)
+    let _f2 = ui::layout::rdoc_frame(d, 150.0)                // the second iteration runs backwards
+    assert_feq(node_of(d, "a").radius, 5.0, 0.001)
+    let f3 = ui::layout::rdoc_frame(d, 200.0)                 // done, and no fill: back to the rule's value
+    assert_false(f3.animating)
+    assert_feq(node_of(d, "a").radius, 0.0, 0.001)
+    let g = ui::layout::rdoc_frame(d, 300.0)
+    assert_false(g.changed)
+    assert_false(g.animating)
+}
+
+fn test_animation_fill_and_infinite() {
+    let st = "keyframes slide { from { translate_y: 40 opacity: 0 } to { translate_y: 0 opacity: 1 } }  .menu { animation: slide 200ms ease_out forwards }  .spin { animation: slide 50ms infinite }"
+    var d = doc_with("column { column { id: m classes: [menu] text { text: Apps } } column { id: s text { text: x } } }", st)
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    assert_feq(node_of(d, "m").translate_y, 40.0, 0.001)
+    assert_feq(node_of(d, "m").opacity, 0.0, 0.001)
+    let _f1 = ui::layout::rdoc_frame(d, 100.0)
+    let ty = node_of(d, "m").translate_y
+    assert_true(ty > 0.0 && ty < 20.0)                         // ease_out: past half way at half time
+    let f2 = ui::layout::rdoc_frame(d, 250.0)
+    assert_false(f2.animating)
+    assert_feq(node_of(d, "m").translate_y, 0.0, 0.001)
+    assert_feq(node_of(d, "m").opacity, 1.0, 0.001)
+    // an infinite one never settles
+    ui::layout::rdoc_add_class(d, "s", "spin")
+    var i = 0
+    while i < 5 {
+        let f = ui::layout::rdoc_frame(d, 300.0 + to_float(i) * 17.0)
+        assert_true(f.animating)
+        i = i + 1
+    }
+    ui::layout::rdoc_remove_class(d, "s", "spin")
+    let _g0 = ui::layout::rdoc_frame(d, 500.0)
+    let g = ui::layout::rdoc_frame(d, 520.0)
+    assert_false(g.animating)
+}
+
+fn test_animation_damage_is_the_moving_box() {
+    // a start menu sliding up over a bar: each frame damages the menu's old and new place only
+    let st = "keyframes up { from { translate_y: 30 } to { translate_y: 0 } }  .menu { bg: #202020 animation: up 100ms linear }"
+    var d = ui::layout::rdoc_new()
+    var r = ui::layout::dsl_parse_document("column { padding: 0 gap: 0 rect { w: 400 h: 60 color: #000000 } row { padding: 0 column { id: m classes: [menu] w: 100 padding: 4 text { text: Apps } } } }")
+    ui::layout::rdoc_set_tree(d, sink r.doc.tree)
+    let _e = ui::layout::rdoc_set_styles(d, "s", ui::layout::style_parse(st, "s").styles)
+    ui::layout::rdoc_set_viewport(d, 400.0, 100.0)
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    let f1 = ui::layout::rdoc_frame(d, 50.0)
+    assert_true(f1.changed)
+    var area = 0.0
+    var i = 0
+    while i < f1.damage.len() { area = area + f1.damage[i].width() * f1.damage[i].height()  i = i + 1 }
+    assert_true(area < 400.0 * 100.0 * 0.5)
+    assert_true(area > 0.0)
+}
+
+fn test_style_props_in_the_immediate_path() {
+    // opacity / translate / w from a stylesheet reach layout_overlay too
+    var r = ui::layout::dsl_parse_document("stylesheet { class m { opacity: 0.5 translate: [10, 0] } class r { w: 50% } } column { padding: 0 column { class: m bg: #ffffff } row { padding: 0 rect { class: r h: 10 color: #ff0000 } } }")
+    assert_true(r.ok)
+    let ov = ui::layout::doc_layout(r.doc, ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(200.0, 100.0)))
+    assert_eq(ov.prims[0].color.a, 128)
+    assert_feq(ov.prims[0].rect.min.x, 10.0, 0.001)
+    assert_feq(ov.prims[1].rect.width(), 100.0, 0.001)
+}

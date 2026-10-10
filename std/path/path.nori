@@ -1,0 +1,264 @@
+//! std/path: path manipulation that already knows which platform it is on. String work only:
+//! operates on the path text (no filesystem access; that's std/os): join/split components, take the
+//! dir or file part, the extension, and normalize `.`/`..`. All functions are total and return fresh
+//! strings.
+//!   import "std/path" as path
+//!   path::join("src", "main.nori")     // "src/main.nori", or "src\\main.nori" on Windows
+//!   path::basename("D:\\src\\a.nori")  // "a.nori", on every platform
+//!   path::ext("a/b.tar.gz")            // "gz"
+//!   path::normalize("a/./b/../c")      // "a/c"
+//!
+//! Reading accepts both separators, writing uses the native one. A path you are handed comes from
+//! somewhere you do not control: an argument, an environment variable, a recent-files list written
+//! on another machine, a manifest someone checked in. On Windows it is spelled with `\`, and a
+//! `/`-only reader answers nonsense for it rather than failing: `basename("D:\src\thing")` gives
+//! back the whole string, `dirname` gives ".". A path you build is yours, so it gets the separator
+//! the platform actually uses.
+
+/// the platform's separator, as a string. `join` uses it; nothing else needs to.
+/// (The per-platform bodies are private because a `cfg` block takes no `pub`.)
+cfg(windows) { fn native_sep() -> Str { return "\\" } }
+cfg(linux)   { fn native_sep() -> Str { return "/" } }
+cfg(macos)   { fn native_sep() -> Str { return "/" } }
+cfg(bare)    { fn native_sep() -> Str { return "/" } }
+pub fn sep() -> Str { return native_sep() }
+
+/// the separator `p` is written with (its first one), or the platform's when it has none.
+///
+/// `normalize` re-emits components and has to choose. Choosing the native one turns
+/// `normalize("D:\\a\\.\\b")` on Linux into `D:\\a/b`, which is neither spelling and is what a
+/// tool would then print at someone. A path that says how it is spelled gets to keep saying it.
+pub fn sep_of(p: Str) -> Str {
+    var i = 0
+    while i < p.len() { let c = ord(p.at(i))  if is_sep(c) { if c == 92 { return "\\" }  return "/" }  i = i + 1 }
+    return native_sep()
+}
+
+/// is `c` a path separator? Both of them, everywhere. A Windows path read on Linux (a manifest, a
+/// log, a recent list) is still a Windows path, and a `/` inside a Windows path is accepted by every
+/// Win32 call there is.
+pub fn is_sep(c: Int) -> Bool { return (c == 47) || (c == 92) }
+
+/// the index of the last separator in `p`, or -1 if there is none.
+fn last_slash(p: Str) -> Int {
+    var i = p.len() - 1
+    while i >= 0 { if is_sep(ord(p.at(i))) { return i }  i = i - 1 }
+    return 0 - 1
+}
+
+/// how many leading characters of `p` are its root: the part `..` can never climb above and that a
+/// relative path does not have. 0 when `p` is relative.
+///   "/usr/lib"        -> 1   ("/")
+///   "C:\\src"          -> 3   ("C:\\")
+///   "C:"              -> 2   (the drive, with no directory said)
+///   "\\\\server\\share"  -> the whole share prefix
+pub fn root_len(p: Str) -> Int {
+    if p.len() == 0 { return 0 }
+    // UNC: two separators, a host, a separator, a share.
+    if p.len() >= 2 { if is_sep(ord(p.at(0))) && is_sep(ord(p.at(1))) {
+        var i = 2
+        var seen = 0
+        while i < p.len() {
+            if is_sep(ord(p.at(i))) { seen = seen + 1  if seen == 2 { return i } }
+            i = i + 1
+        }
+        return p.len()
+    } }
+    // a drive letter, with or without a directory after it
+    if p.len() >= 2 { if ord(p.at(1)) == 58 {
+        let c = ord(p.at(0))
+        if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) {
+            if p.len() >= 3 { if is_sep(ord(p.at(2))) { return 3 } }
+            return 2
+        }
+    } }
+    if is_sep(ord(p.at(0))) { return 1 }
+    return 0
+}
+
+/// is `p` absolute, i.e. rooted, so that resolving it does not depend on where you are standing?
+///
+/// `C:\foo` is. `C:foo` is not: it names a path relative to the current directory on drive C, which
+/// is a thing Windows keeps per drive, and treating it as absolute is how a file lands somewhere
+/// nobody asked for.
+pub fn is_abs(p: Str) -> Bool {
+    let r = root_len(p)
+    if r == 0 { return false }
+    if r == 2 { return false }                              // "C:" is a drive, not a place
+    return true
+}
+
+/// `p` with every separator replaced by the platform's own. What to call just before handing a path
+/// to something outside this program that might be fussy about it.
+pub fn to_native(p: Str) -> Str { return to_sep(p, sep()) }
+/// `p` with every separator replaced by `/`. Config files, manifests and anything else meant to be
+/// read on a machine other than this one want this spelling.
+pub fn to_slash(p: Str) -> Str { return to_sep(p, "/") }
+fn to_sep(p: Str, s: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < p.len() {
+        if is_sep(ord(p.at(i))) { out = (out + s) } else { out = (out + p.at(i)) }
+        i = i + 1
+    }
+    return out
+}
+
+/// join two path segments with exactly one separator, the platform's. An empty side is dropped; an
+/// absolute `b` wins. `a`'s own spelling is left alone: only the separator this inserts is native, so
+/// joining onto a path someone handed you does not rewrite the half they gave.
+pub fn join(a: Str, b: Str) -> Str {
+    if (a == "") { return copy b }
+    if (b == "") { return copy a }
+    if is_abs(b) { return copy b }
+    let aend = is_sep(ord(a.at(a.len() - 1)))
+    let bstart = is_sep(ord(b.at(0)))
+    if aend && bstart { return (a + b.slice(1, b.len())) }   // both have one -> collapse to one
+    if aend || bstart { return (a + b) }                     // exactly one present
+    return (a + (sep() + b))                                 // neither -> insert the native one
+}
+
+/// join a list of segments left-to-right (`join_all(["a","b","c"])` -> "a/b/c").
+pub fn join_all(parts: Vec<Str>) -> Str {
+    // Folding `join` over the list would be shorter, but `join` hands an argument back (for an empty
+    // accumulator or an absolute segment the answer is `parts[i]`), so the accumulator would spend the
+    // loop alternating between a string this frame allocated and one the caller's vector still owns,
+    // and nothing may free it. Appending instead keeps `out` a value this frame made on every path.
+    var out = ""
+    var i = 0
+    while i < parts.len() {
+        let seg = parts[i]
+        if !(seg == "") {
+            if is_abs(seg) { out = "" }                      // an absolute segment restarts the path
+            // exactly one `/` between them: add the separator unless `out` already ends in one...
+            if out.len() > 0 { if !(ord(out.at(out.len() - 1)) == 47) { out = out + "/" } }
+            var st = 0
+            if out.len() > 0 { if ord(seg.at(0)) == 47 { st = 1 } }   // ...and drop `seg`'s own leading one
+            out = out + seg.slice(st, seg.len())
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// strip trailing `/`s from `p` (but keep a lone root `/`).
+fn drop_trailing(p: Str) -> Str {
+    var q = copy p
+    let r = root_len(q)
+    while q.len() > r && q.len() > 1 && is_sep(ord(q.at(q.len() - 1))) { q = q.slice(0, q.len() - 1) }
+    return q
+}
+
+/// the directory part of `p`: everything before the last separator; "." when there is none, and the
+/// root itself at the root ("/", "C:\\", a UNC share), which is where climbing stops.
+pub fn dirname(p: Str) -> Str {
+    let q = drop_trailing(p)
+    let r = root_len(q)
+    let s = last_slash(q)
+    if s < 0 { if r > 0 { return q.slice(0, r) }  return "." }
+    if s < r { return q.slice(0, r) }
+    if s == 0 { return q.slice(0, 1) }                       // "/x" -> "/", keeping its spelling
+    return q.slice(0, s)
+}
+
+/// the final component of `p`, after the last separator.
+///
+/// The root is its own name, and a path that is nothing but root has no last component: "/" answers
+/// "/", "C:\\" answers "C:\\". The result is never "", including for anything ending in a
+/// separator, since callers tend to put the name straight into a label or a log line.
+pub fn basename(p: Str) -> Str {
+    let q = drop_trailing(p)
+    let r = root_len(q)
+    if q.len() <= r { return copy q }                        // nothing but root
+    let s = last_slash(q)
+    if s < r { return q.slice(r, q.len()) }
+    let b = q.slice(s + 1, q.len())
+    if b.len() == 0 { return copy q }
+    return b
+}
+
+/// the extension of `p` without the dot ("a/b.tar.gz" -> "gz"); "" if none. A leading dot is not an
+/// extension (".bashrc" -> "").
+pub fn ext(p: Str) -> Str {
+    let b = basename(p)
+    var i = b.len() - 1
+    while i > 0 {
+        if ord(b.at(i)) == 46 { return b.slice(i + 1, b.len()) }
+        i = i - 1
+    }
+    return ""
+}
+
+/// the filename of `p` without its extension ("a/b.txt" -> "b"; ".bashrc" -> ".bashrc").
+pub fn stem(p: Str) -> Str {
+    let b = basename(p)
+    let e = ext(p)
+    if (e == "") { return b }
+    return b.slice(0, b.len() - (e.len() + 1))
+}
+
+/// `p` with its extension replaced by `e` (no dot in `e`); an empty `e` removes the extension.
+pub fn with_ext(p: Str, e: Str) -> Str {
+    let d = dirname(p)
+    var name = stem(p)
+    if !(e == "") { name = (name + ("." + e)) }
+    if (d == ".") { return name }
+    return join(d, name)
+}
+
+/// split `p` into its non-empty components ("/a//b/" -> ["a", "b"]).
+pub fn split(p: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var start = 0
+    var i = 0
+    let n = p.len()
+    while i <= n {
+        if i == n || is_sep(ord(p.at(i))) {
+            if i > start { out.push(p.slice(start, i)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// lexically normalize `p`: drop `.`, resolve `..` against earlier components, and collapse repeated `/`.
+/// Absolute-ness is preserved; an empty result is "." (relative) or "/" (absolute).
+pub fn normalize(p: Str) -> Str {
+    let r = root_len(p)
+    let abs = r > 0
+    let head = p.slice(0, r)
+    let parts = split(p.slice(r, p.len()))
+    var stack: Vec<Str> = vec()
+    var i = 0
+    while i < parts.len() {
+        let seg = parts[i]
+        if (seg == ".") {
+        } else if (seg == "..") {
+            if stack.len() > 0 {
+                if (stack[stack.len() - 1] == "..") { stack.push("..") } else { stack.pop() }
+            } else {
+                if !abs { stack.push("..") }                  // a relative path keeps a leading ..
+            }
+        } else { stack.push(copy seg) }
+        i = i + 1
+    }
+    // The root is put back as written, not rebuilt. "C:\\" and "//host/share" are not one separator and
+    // a component list; re-emitting them from parts is how a drive letter turns into a directory name.
+    let js = sep_of(p)
+    var out = ""
+    var j = 0
+    while j < stack.len() {
+        if j > 0 { out = (out + js) }
+        out = (out + stack[j])
+        j = j + 1
+    }
+    if abs {
+        if (out == "") { return copy head }
+        var h = head
+        if !is_sep(ord(h.at(h.len() - 1))) { h = (h + js) }   // "C:" + "x" needs one
+        return (h + out)
+    }
+    if (out == "") { return "." }
+    return out
+}

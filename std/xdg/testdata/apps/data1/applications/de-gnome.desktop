@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Gnomeish
+Exec=gnomeish-app
+OnlyShowIn=GNOME;KDE;

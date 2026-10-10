@@ -1,0 +1,294 @@
+// ===========================================================================
+// A single-line text field you can select in.
+//
+// `text_area` and `code_editor` have selection, select-all, word motion and
+// copy through `multiline_edit.nori`. `text_input` used none of it, so every
+// panel that wanted an editable line ended up writing its own caret
+// arithmetic, none of which could select a character, and so none of which
+// could copy one either.
+//
+// A plugin re-emits its whole document every frame and keeps nothing, so "the
+// state of the field" has to live in the plugin, and it is easy to write the
+// four lines that move a caret and stop there. This file is those four lines,
+// plus the twenty that are usually skipped, in one place.
+//
+// It is `MultilineEditState` underneath, with newlines never inserted:
+// selection, word bounds, undo and the rest are the code the code editor uses.
+// What this adds is the single-line parts: hit testing against one run of
+// text, and the horizontal scroll that keeps the caret in a field narrower
+// than its value.
+// ===========================================================================
+
+/// how far a field's text is inset from its box, each side.
+pub fn field_pad() -> Float { return 8.0 }
+
+/// how far the value is scrolled left, in pixels, so that `caret` is inside a field `field_w` wide.
+///
+/// The paint and the hit test both call this. A click has to land on the character it is over, so
+/// turning an x back into an index must undo the shift the drawing applied. Two copies of
+/// this would put the caret a few characters off, which reads as an inaccurate pointer rather than
+/// as a bug.
+///
+/// An unfocused field is never scrolled: it shows its beginning, which is what identifies it, rather
+/// than wherever its caret was left.
+///
+/// (Left-to-right text. field_origin is the general form: a value in a right-to-left paragraph
+/// starts at the field's right edge and scrolls the other way.)
+pub fn field_scroll_x(text: Str, caret: Int, field_w: Float, size_px: Float, focused: Bool) -> Float {
+    return 0.0 - field_origin(text, caret, field_w, size_px, focused, 0)
+}
+
+/// where the value's line starts, in pixels right of the field's inner left edge (negative when it
+/// is scrolled), for a value whose paragraph runs `dir` (dir_ltr / dir_rtl / dir_auto) with the
+/// caret at byte `caret`.
+///
+/// A left-to-right value starts at the left and scrolls left to keep the caret in view. A
+/// right-to-left one starts at the right (its first character is the rightmost) and when it is
+/// wider than the field shows its end at the right and scrolls right as the caret goes left.
+pub fn field_origin(text: Str, caret: Int, field_w: Float, size_px: Float, focused: Bool, dir: Int) -> Float {
+    return field_origin_st(text, caret, field_w, text_measure_style(size_px), focused, dir)
+}
+/// field_origin for a value measured with `sty` (its size and its font stack: a field in its own face)
+pub fn field_origin_st(text: Str, caret: Int, field_w: Float, sty: TextMeasureStyle, focused: Bool, dir: Int) -> Float {
+    var inner_w = field_w - field_pad() * 2.0
+    if inner_w < 1.0 { inner_w = 1.0 }
+    var ci = caret
+    if ci < 0 { ci = 0 }
+    if ci > text.len() { ci = text.len() }
+    let tc = text_carets(text, sty, dir, false)
+    let width = tc.width
+    // the caret's own width stays inside. Scrolling so it sits exactly on the right edge puts a
+    // 1.5px bar on the clip boundary, where it is trimmed to nothing: the field scrolls correctly
+    // and looks like it has lost its caret.
+    var usable = inner_w - 3.0
+    if usable < 1.0 { usable = 1.0 }
+    if !tc.para_rtl {
+        if !focused { return 0.0 }
+        let cw = text_carets_x(tc, ci)
+        var off = 0.0
+        if cw > usable { off = cw - usable }
+        // …and never past the end of the text, or a field just emptied of a long value shows a blank
+        // window a screen to the right of it.
+        var maxoff = width - inner_w
+        if maxoff < 0.0 { maxoff = 0.0 }
+        if off > maxoff { off = maxoff }
+        return 0.0 - off
+    }
+    // right to left: flush right while it fits; wider than the field, its start (the right end) shows
+    if width <= inner_w { return inner_w - width }
+    var origin = inner_w - width
+    if !focused { return origin }
+    let cx = text_carets_x(tc, ci)
+    if origin + cx < 3.0 { origin = 3.0 - cx }
+    if origin > 0.0 { origin = 0.0 }
+    return origin
+}
+
+/// the byte offset nearest to `x`, measured from the field's left edge, which is what a press
+/// event carries, so a caller never has to know where its panel is on the screen.
+pub fn field_hit(text: Str, caret: Int, x: Float, field_w: Float, size_px: Float) -> Int {
+    return field_hit_dir(text, caret, x, field_w, size_px, 2)
+}
+/// field_hit for a value whose paragraph runs `dir`: the nearest caret stop on screen, always
+/// between grapheme clusters, and through mixed directions to the cluster drawn under the pointer.
+pub fn field_hit_dir(text: Str, caret: Int, x: Float, field_w: Float, size_px: Float, dir: Int) -> Int {
+    return field_hit_st(text, caret, x, field_w, text_measure_style(size_px), dir)
+}
+/// field_hit_dir for a value measured with `sty`: the field's own face, as its paint measures it
+pub fn field_hit_st(text: Str, caret: Int, x: Float, field_w: Float, sty: TextMeasureStyle, dir: Int) -> Int {
+    let tc = text_carets(text, sty, dir, false)
+    let want = x - field_pad() - field_origin_st(text, caret, field_w, sty, true, dir)
+    return text_carets_hit(tc, want)
+}
+
+/// a single-line editor's state: the value, the caret, and where a selection started.
+///
+/// `anchor == caret` means no selection, which is what a field that has never been dragged in
+/// holds, so the common case costs nothing to represent and nothing to draw.
+pub struct FieldEdit { text: Str, caret: Int, anchor: Int, dir: Int = 2 }
+
+pub fn field_new(text: Str, caret: Int) -> FieldEdit {
+    var c = caret
+    if c < 0 { c = 0 }
+    if c > text.len() { c = text.len() }
+    return FieldEdit { text: copy text, caret: c, anchor: c }
+}
+
+fn field_state(f: FieldEdit) -> MultilineEditState {
+    var st = multiline_edit_new(copy f.text)
+    st.caret = f.caret
+    st.sel_anchor = f.anchor
+    st.dir = f.dir
+    return st
+}
+fn field_take(inout f: FieldEdit, st: MultilineEditState) {
+    f.text = copy st.text
+    f.caret = st.caret
+    f.anchor = st.sel_anchor
+}
+
+pub fn field_has_sel(f: FieldEdit) -> Bool { return !(f.caret == f.anchor) }
+pub fn field_sel_text(f: FieldEdit) -> Str { return me_selected_text(field_state(f)) }
+
+/// replace the whole value, putting the caret at the end and dropping any selection.
+pub fn field_set(inout f: FieldEdit, text: Str) {
+    f.text = copy text
+    f.caret = f.text.len()
+    f.anchor = f.caret
+}
+
+/// One line, always. A paste can carry newlines and a single-line field cannot hold one: it would
+/// be stored, written to a config, and read back as two of something. They become spaces, which is
+/// what the text looked like anyway.
+fn field_flatten(s: Str) -> Str {
+    var o = ""
+    var i = 0
+    while i < s.len() {
+        let b = ord(s.at(i))
+        if b == 10 || b == 13 || b == 9 { o = o + " " } else { o = o + s.at(i) }
+        i = i + 1
+    }
+    return o
+}
+
+/// insert `s`, replacing the selection if there is one.
+pub fn field_insert(inout f: FieldEdit, s: Str) {
+    var st = field_state(f)
+    me_insert(st, field_flatten(s))
+    field_take(f, st)
+}
+
+pub fn field_backspace(inout f: FieldEdit) { var st = field_state(f)  me_backspace(st)  field_take(f, st) }
+pub fn field_delete(inout f: FieldEdit) { var st = field_state(f)  me_delete(st)  field_take(f, st) }
+pub fn field_select_all(inout f: FieldEdit) { var st = field_state(f)  me_select_all(st)  field_take(f, st) }
+
+/// the caret at `i`, extending the selection or dropping it.
+pub fn field_place(inout f: FieldEdit, i: Int, sel: Bool) {
+    var c = i
+    if c < 0 { c = 0 }
+    if c > f.text.len() { c = f.text.len() }
+    c = text_snap_cluster(f.text, c)                  // never inside a character or a cluster
+    f.caret = c
+    if !sel { f.anchor = c }
+}
+
+/// select the word under `i`, which is what a double-click means everywhere.
+pub fn field_select_word(inout f: FieldEdit, i: Int) {
+    field_place(f, i, false)
+    var st = field_state(f)
+    me_select_word(st)
+    field_take(f, st)
+}
+
+/// would `field_key` act on this keystroke?
+///
+/// A field is not always the only thing listening. A file tree's search box can share its keyboard
+/// with the tree: typing a few letters and pressing Down to walk the matches is the point of
+/// it, so Up, Down and Enter have to fall through while Left, Right, Home, End, Backspace and
+/// Delete do not. A caller that cannot ask which is which ends up hard-coding the list a second
+/// time, and the second copy is the one that goes stale.
+pub fn field_takes(sym: Int, mods: Int) -> Bool {
+    if (mods & 2) != 0 {
+        if sym == 97 || sym == 99 || sym == 120 { return true }
+        if sym == 65361 || sym == 65363 { return true }
+    }
+    if sym == 65361 || sym == 65363 { return true }        // Left / Right
+    if sym == 65360 || sym == 65367 { return true }        // Home / End
+    if sym == 65288 || sym == 65535 { return true }        // Backspace / Delete
+    return false
+}
+
+/// a keystroke. Returns "" for most, "copy" or "cut" when the caller should put `field_sel_text` on
+/// the clipboard (this module cannot reach it: the clipboard belongs to whatever
+/// owns the window).
+///
+/// `mods` is the shell's mask: 1 shift, 2 ctrl, 4 alt.
+pub fn field_key(inout f: FieldEdit, sym: Int, mods: Int) -> Str {
+    let shift = (mods & 1) != 0
+    let ctrl = (mods & 2) != 0
+    var st = field_state(f)
+    if ctrl {
+        if sym == 97 { me_select_all(st)  field_take(f, st)  return "" }               // Ctrl+A
+        if sym == 99 { return "copy" }                                                  // Ctrl+C
+        if sym == 120 {                                                                 // Ctrl+X
+            if field_has_sel(f) { me_insert(st, "")  field_take(f, st)  return "cut" }
+            return ""
+        }
+        if sym == 65361 { me_move_word_left(st, shift)  field_take(f, st)  return "" }
+        if sym == 65363 { me_move_word_right(st, shift)  field_take(f, st)  return "" }
+    }
+    if sym == 65361 { me_move_left(st, shift)  field_take(f, st)  return "" }           // Left
+    if sym == 65363 { me_move_right(st, shift)  field_take(f, st)  return "" }          // Right
+    if sym == 65360 { me_move_home(st, shift)  field_take(f, st)  return "" }           // Home
+    if sym == 65367 { me_move_end(st, shift)  field_take(f, st)  return "" }            // End
+    if sym == 65288 { me_backspace(st)  field_take(f, st)  return "" }                  // Backspace
+    if sym == 65535 { me_delete(st)  field_take(f, st)  return "" }                     // Delete
+    return ""
+}
+
+/// `caret: N sel_anchor: N` for this field, as a `.ui` fragment. A panel needs both of these
+/// attributes and they are easy to emit inconsistently, so they are produced together here.
+pub fn field_attrs(f: FieldEdit) -> Str {
+    var o = " caret: "
+    o = o + to_str(f.caret)
+    o = o + " sel_anchor: "
+    o = o + to_str(f.anchor)
+    return o
+}
+
+/// split `s` on ':' into at most `n` pieces, the last taking the rest.
+fn fe_split(s: Str, n: Int) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var cur = ""
+    var i = 0
+    while i < s.len() {
+        if ord(s.at(i)) == 58 && out.len() < n - 1 { out.push(cur)  cur = "" } else { cur = cur + s.at(i) }
+        i = i + 1
+    }
+    out.push(cur)
+    return out
+}
+fn fe_int(s: Str) -> Int {
+    var neg = false
+    var i = 0
+    if s.len() > 0 { if ord(s.at(0)) == 45 { neg = true  i = 1 } }
+    var v = 0
+    while i < s.len() {
+        let c = ord(s.at(i))
+        if c < 48 || c > 57 { return 0 }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    if neg { return 0 - v }
+    return v
+}
+
+/// apply a pointer action the shell addressed to a text widget: `press:<id>:<x>:<y>:<w>:<h>:<clicks>:<mods>`
+/// or `dragto:` in the same shape. True when it was one of those, for this `id`, and it was applied.
+///
+/// The shell sends these for any text widget, and a panel that ignores them leaves the pointer
+/// unable to select text. The code editor reads the same two events.
+///
+/// A double click selects the word and a triple selects the line, which here is everything. Shift
+/// with a press extends from where the caret already is, the way it does in every other field.
+pub fn field_pointer(inout f: FieldEdit, action: Str, id: Str, size_px: Float) -> Bool {
+    var kind = ""
+    if action.len() > 6 { if action.slice(0, 6) == "press:" { kind = "press" } }
+    if action.len() > 7 { if action.slice(0, 7) == "dragto:" { kind = "drag" } }
+    if kind.len() == 0 { return false }
+    var rest = action.slice(6, action.len())
+    if kind == "drag" { rest = action.slice(7, action.len()) }
+    let fs = fe_split(rest, 7)
+    if fs.len() < 7 { return false }
+    if !(fs[0] == id) { return false }
+    let x = to_float(fe_int(fs[1]))
+    let w = to_float(fe_int(fs[3]))
+    let clicks = fe_int(fs[5])
+    let mods = fe_int(fs[6])
+    let at = field_hit_dir(copy f.text, f.caret, x, w, size_px, f.dir)
+    if kind == "drag" { field_place(f, at, true)  return true }
+    if clicks >= 3 { field_select_all(f)  return true }
+    if clicks == 2 { field_select_word(f, at)  return true }
+    field_place(f, at, (mods & 1) != 0)
+    return true
+}

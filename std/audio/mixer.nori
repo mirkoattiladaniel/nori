@@ -1,0 +1,201 @@
+//! std/audio/mixer: N simultaneous voices summed into one S16 buffer.
+//!
+//!   var m = audio::mixer_new(44100, 2)
+//!   let v = audio::mix_play(m, boing, 800, false)   // -> a voice id;  800 = 0.8 gain
+//!   audio::mix_set_volume(m, v, 400)
+//!   audio::mix_stop(m, v)
+//!   let pcm = audio::mix_render(m, 1024)            // 1024 frames of S16 interleaved
+//!   audio::write(dev, pcm)
+//!
+//! This is the whole of what a game's `audio.play` / `audio.stop` / `audio.set_volume` needs.
+//! There are no buses, no effects, no send/return graph and no per-voice panning.
+//!
+//! **Gain is an integer per mille** (1000 = unity), not a Float. That keeps the mixing
+//! loop in integer arithmetic, where clipping is exact. Gain above 1000 is allowed and will clip;
+//! there is no limiter.
+//!
+//! Rate mismatch between a Sound and the mixer is handled by nearest-neighbour stepping (position
+//! advances by `sound.rate / mixer.rate` per output frame, in fixed point). That is audibly rough
+//! for a large ratio; the better fix is to decode at the device rate, and `mix_play` accepts a Sound that
+//! already matches. Channel mismatch is handled properly: mono fans out to every output channel and
+//! stereo folds down by averaging.
+
+/// One playing sound. `pos_q16` is the read cursor in source frames, 16.16 fixed point.
+pub struct Voice { id: Int, snd: Sound, pos_q16: Int, step_q16: Int, gain: Int, looping: Bool, active: Bool }
+
+/// A fixed set of voice slots summed into one output format.
+pub struct Mixer { rate: Int, channels: Int, voices: Vec<Voice>, next_id: Int, master: Int }
+
+/// A mixer producing `channels`-channel S16 at `rate` Hz. Voices are added and removed freely; the
+/// slot vector only grows, and a stopped voice's slot is reused.
+pub fn mixer_new(rate: Int, channels: Int) -> Mixer {
+    var v: Vec<Voice> = vec()
+    return Mixer { rate: rate, channels: channels, voices: v, next_id: 1, master: 1000 }
+}
+
+fn dead_voice() -> Voice {
+    return Voice { id: 0, snd: Sound { rate: 0, channels: 0, data: "" }, pos_q16: 0, step_q16: 0, gain: 0, looping: false, active: false }
+}
+
+/// Start `s` at `gain` per mille. Returns a voice id (> 0) to pass to `mix_stop` /
+/// `mix_set_volume`, or 0 if the Sound is empty. A `looping` voice never finishes on its own.
+pub fn mix_play(inout m: Mixer, s: Sound, gain: Int, looping: Bool) -> Int {
+    if s.rate <= 0 || s.channels <= 0 || s.data.len() < 2 { return 0 }
+    let id = m.next_id
+    m.next_id = m.next_id + 1
+    var step = 65536
+    if m.rate > 0 { step = s.rate * 65536 / m.rate }
+    // the first inactive slot takes the voice; none free, it is appended. The record is built in the
+    // branch that keeps it, so each path hands over exactly one value.
+    var slot = 0 - 1
+    var i = 0
+    while i < m.voices.len() {
+        if slot < 0 { if !m.voices[i].active { slot = i } }
+        i = i + 1
+    }
+    if slot >= 0 { m.voices[slot] = Voice { id: id, snd: copy s, pos_q16: 0, step_q16: step, gain: gain, looping: looping, active: true } }
+    else { m.voices.push(Voice { id: id, snd: copy s, pos_q16: 0, step_q16: step, gain: gain, looping: looping, active: true }) }
+    return id
+}
+
+/// Stop one voice. Returns true if it was playing.
+pub fn mix_stop(inout m: Mixer, id: Int) -> Bool {
+    var i = 0
+    var hit = false
+    while i < m.voices.len() {
+        if m.voices[i].active && m.voices[i].id == id { m.voices[i] = dead_voice()  hit = true }
+        i = i + 1
+    }
+    return hit
+}
+
+/// Stop everything.
+pub fn mix_stop_all(inout m: Mixer) {
+    var i = 0
+    while i < m.voices.len() { m.voices[i] = dead_voice()  i = i + 1 }
+}
+
+/// Set one voice's gain in per mille. Returns true if the voice is playing.
+pub fn mix_set_volume(inout m: Mixer, id: Int, gain: Int) -> Bool {
+    var i = 0
+    var hit = false
+    while i < m.voices.len() {
+        if m.voices[i].active && m.voices[i].id == id { m.voices[i].gain = gain  hit = true }
+        i = i + 1
+    }
+    return hit
+}
+
+/// One voice's gain in per mille, or -1 if it is not playing.
+pub fn mix_volume(m: Mixer, id: Int) -> Int {
+    var i = 0
+    var g = 0 - 1
+    while i < m.voices.len() {
+        if m.voices[i].active && m.voices[i].id == id { g = m.voices[i].gain }
+        i = i + 1
+    }
+    return g
+}
+
+/// Set the gain applied to the whole mix, in per mille.
+pub fn mix_master(inout m: Mixer, gain: Int) { m.master = gain }
+
+/// Is this voice still playing?
+pub fn mix_playing(m: Mixer, id: Int) -> Bool {
+    var i = 0
+    var hit = false
+    while i < m.voices.len() {
+        if m.voices[i].active && m.voices[i].id == id { hit = true }
+        i = i + 1
+    }
+    return hit
+}
+
+/// How many voices are playing.
+pub fn mix_active(m: Mixer) -> Int {
+    var i = 0
+    var n = 0
+    while i < m.voices.len() { if m.voices[i].active { n = n + 1 }  i = i + 1 }
+    return n
+}
+
+// Read source channel `c` of a voice at its current whole-frame position, fanning mono out and
+// folding extra channels down. Out of range reads as silence, which is what ends a voice.
+fn voice_sample(v: Voice, frame: Int, c: Int, nch: Int) -> Int {
+    let sc = v.snd.channels
+    if sc == nch { return sample_at(v.snd, frame, c) }
+    if sc == 1 { return sample_at(v.snd, frame, 0) }              // mono -> every output channel
+    if c < sc { return sample_at(v.snd, frame, c) }
+    // more output channels than the source has: fold the source down to a mono sum for the extras
+    var acc = 0
+    var k = 0
+    while k < sc { acc = acc + sample_at(v.snd, frame, k)  k = k + 1 }
+    return acc / sc
+}
+
+/// Render `n` frames of the mix as S16 interleaved bytes (`n * channels * 2` of them). Voices that
+/// run off the end of their Sound are retired (or wrapped, if looping). Sums are accumulated in
+/// full-width Int and clamped once at the end, so many loud voices distort rather than wrap.
+pub fn mix_render(inout m: Mixer, n: Int) -> Str {
+    var out = by_new(n * m.channels * 2 + 1)
+    var nv = m.voices.len()
+    var f = 0
+    while f < n {
+        var c = 0
+        while c < m.channels {
+            var acc = 0
+            var i = 0
+            while i < nv {
+                if m.voices[i].active {
+                    let sf = m.voices[i].pos_q16 >> 16
+                    acc = acc + voice_sample(m.voices[i], sf, c, m.channels) * m.voices[i].gain / 1000
+                }
+                i = i + 1
+            }
+            by_s16(out, acc * m.master / 1000)
+            c = c + 1
+        }
+        // advance every voice by one output frame and retire whatever ran out
+        var i2 = 0
+        while i2 < nv {
+            if m.voices[i2].active {
+                m.voices[i2].pos_q16 = m.voices[i2].pos_q16 + m.voices[i2].step_q16
+                let total = frames(m.voices[i2].snd)
+                if (m.voices[i2].pos_q16 >> 16) >= total {
+                    if m.voices[i2].looping && total > 0 { m.voices[i2].pos_q16 = m.voices[i2].pos_q16 - total * 65536 }
+                    else { m.voices[i2] = dead_voice() }
+                }
+            }
+            i2 = i2 + 1
+        }
+        f = f + 1
+    }
+    return by_take(out)
+}
+
+/// Render `n` frames and write them straight to a device. Blocks if `n` is more than the device's
+/// ring buffer can take — see `mix_pump_ready` for the call a game loop wants instead.
+pub fn mix_pump(inout m: Mixer, d: Device, n: Int) -> Int {
+    let pcm = mix_render(m, n)
+    return write(d, pcm)
+}
+
+/// Top the device up with as much as it can take right now and no more, so the call
+/// returns promptly and the game loop keeps running. Call this one every frame:
+///
+///     while running {
+///         update_world()
+///         audio::mix_pump_ready(mixer, dev, 0)
+///         draw()
+///     }
+///
+/// `max` caps how much is written in one call (0 = no cap), which bounds the work when the device
+/// has drained a lot, after a long frame for example. Returns frames written; 0 means the buffer was
+/// already full, which is the normal case and not an error. A negative value is an ALSA error.
+pub fn mix_pump_ready(inout m: Mixer, d: Device, max: Int) -> Int {
+    if !ok(d) { return 0 }
+    var n = writable(d)
+    if n <= 0 { return 0 }                       // buffer full (or an error, which write will report)
+    if max > 0 && n > max { n = max }
+    return mix_pump(m, d, n)
+}

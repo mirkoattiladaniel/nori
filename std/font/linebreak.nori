@@ -1,0 +1,250 @@
+// std/font: line breaking (UAX #14, Unicode 16): where a line of any script may wrap.
+//
+//   let b = font::line_breaks(font::utf8_codepoints(text))
+//   // b[i] for 0 <= i <= n: LB_NONE() no break before character i, LB_ALLOWED() a break
+//   // opportunity, LB_MANDATORY() a hard break (after a newline, and at the end)
+//
+// The rules are UAX #14's LB1-LB31 in order, as of Unicode 16: hard breaks, spaces and ZW, the
+// combining-sequence rule (LB9/LB10) that keeps marks and ZWJ with their base, glue and word joiner,
+// quotation marks by their Pi/Pf category and East Asian context (LB15a/b, LB19a), the number rule
+// (LB25), Korean syllable blocks, the Brahmic aksara rule (LB28a), regional-indicator pairs and
+// emoji modifiers. Class data is Unicode 16's LineBreak.txt, with LB1's resolution of AI/SG/XX/SA/CJ.
+// Tested against LineBreakTest.txt.
+
+/// no break before this position
+pub fn LBK_NONE() -> Int { return 0 }
+/// a break opportunity before this position
+pub fn LBK_ALLOWED() -> Int { return 1 }
+/// a mandatory break before this position (after a hard line break, and at the end of text)
+pub fn LBK_MANDATORY() -> Int { return 2 }
+
+// LB1: the resolved class of a code point
+fn lb_class(cp: Int) -> Int {
+    let c = ucd_line_break(cp)
+    if c == LB_AI() || c == LB_SG() || c == LB_XX() { return LB_AL() }
+    if c == LB_SA() {
+        let gc = ucd_gc(cp)
+        if gc == GC_Mn() || gc == GC_Mc() { return LB_CM() }
+        return LB_AL()
+    }
+    if c == LB_CJ() { return LB_NS() }
+    return c
+}
+fn is_ea(cp: Int) -> Bool {
+    let e = ucd_east_asian_width(cp)
+    return e == EA_F() || e == EA_W() || e == EA_H()
+}
+
+/// the break opportunities of `cps`: n + 1 entries, entry i for the position before character i
+/// (entry 0 is the start of text, never a break; entry n the end, always mandatory).
+pub fn line_breaks(cps: Vec<Int>) -> Vec<Int> {
+    let n = cps.len()
+    var out: Vec<Int> = vec()
+    var i = 0
+    while i <= n { out.push(LBK_NONE())  i = i + 1 }
+    if n == 0 { return out }
+    // build the units (LB9: X (CM|ZWJ)* -> X unless X is BK CR LF NL SP ZW; LB10: lone CM/ZWJ -> AL)
+    var u_cls: Vec<Int> = vec()
+    var u_base: Vec<Int> = vec()
+    var u_last: Vec<Int> = vec()
+    var u_start: Vec<Int> = vec()
+    i = 0
+    while i < n {
+        var c = lb_class(cps[i])
+        let absorbable = c == LB_CM() || c == LB_ZWJ()
+        if absorbable && u_cls.len() > 0 {
+            let pc = u_cls[u_cls.len() - 1]
+            if pc != LB_BK() && pc != LB_CR() && pc != LB_LF() && pc != LB_NL() && pc != LB_SP() && pc != LB_ZW() {
+                u_last[u_last.len() - 1] = cps[i]
+                out[i] = LBK_NONE()
+                i = i + 1
+                continue
+            }
+        }
+        if absorbable { c = LB_AL() }
+        u_cls.push(c)
+        u_base.push(cps[i])
+        u_last.push(cps[i])
+        u_start.push(i)
+        i = i + 1
+    }
+    let m = u_cls.len()
+    var j = 1
+    while j < m {
+        out[u_start[j]] = lb_rule(u_cls, u_base, u_last, j)
+        j = j + 1
+    }
+    out[n] = LBK_MANDATORY()
+    return out
+}
+
+fn lb_cls_at(cls: Vec<Int>, k: Int) -> Int { if k < 0 || k >= cls.len() { return 0 - 1 }  return cls[k] }
+fn is_qu_pi(cls: Vec<Int>, base: Vec<Int>, k: Int) -> Bool { return lb_cls_at(cls, k) == LB_QU() && ucd_gc(base[k]) == GC_Pi() }
+fn is_qu_pf(cls: Vec<Int>, base: Vec<Int>, k: Int) -> Bool { return lb_cls_at(cls, k) == LB_QU() && ucd_gc(base[k]) == GC_Pf() }
+// skip back over SP units from k; the first non-SP unit index (or -1)
+fn back_over_sp(cls: Vec<Int>, k: Int) -> Int {
+    var q = k
+    while q >= 0 && cls[q] == LB_SP() { q = q - 1 }
+    return q
+}
+
+// the break before unit j (between unit j-1 and unit j)
+fn lb_rule(cls: Vec<Int>, base: Vec<Int>, last: Vec<Int>, j: Int) -> Int {
+    let a = cls[j - 1]
+    let b = cls[j]
+    let none = LBK_NONE()
+    let allow = LBK_ALLOWED()
+    let must = LBK_MANDATORY()
+    // LB4, LB5
+    if a == LB_BK() { return must }
+    if a == LB_CR() && b == LB_LF() { return none }
+    if a == LB_CR() || a == LB_LF() || a == LB_NL() { return must }
+    // LB6
+    if b == LB_BK() || b == LB_CR() || b == LB_LF() || b == LB_NL() { return none }
+    // LB7
+    if b == LB_SP() || b == LB_ZW() { return none }
+    // LB8: ZW SP* ÷
+    let q8 = back_over_sp(cls, j - 1)
+    if q8 >= 0 && cls[q8] == LB_ZW() { return allow }
+    // LB8a: ZWJ ×
+    if last[j - 1] == 8205 { return none }
+    // LB11
+    if b == LB_WJ() || a == LB_WJ() { return none }
+    // LB12, LB12a
+    if a == LB_GL() { return none }
+    if b == LB_GL() && a != LB_SP() && a != LB_BA() && a != LB_HY() { return none }
+    // LB13
+    if b == LB_CL() || b == LB_CP() || b == LB_EX() || b == LB_SY() { return none }
+    // LB14: OP SP* ×
+    if q8 >= 0 && cls[q8] == LB_OP() { return none }
+    // LB15a: (sot | BK | CR | LF | NL | OP | QU | GL | SP | ZW) [Pi&QU] SP* ×
+    if q8 >= 0 && is_qu_pi(cls, base, q8) {
+        let p = q8 - 1
+        if p < 0 { return none }
+        let pc = cls[p]
+        if pc == LB_BK() || pc == LB_CR() || pc == LB_LF() || pc == LB_NL() || pc == LB_OP() || pc == LB_QU() || pc == LB_GL() || pc == LB_SP() || pc == LB_ZW() { return none }
+    }
+    // LB15b: × [Pf&QU] ( SP | GL | WJ | CL | QU | CP | EX | IS | SY | BK | CR | LF | NL | ZW | eot )
+    if is_qu_pf(cls, base, j) {
+        if j + 1 >= cls.len() { return none }
+        let nc = cls[j + 1]
+        if nc == LB_SP() || nc == LB_GL() || nc == LB_WJ() || nc == LB_CL() || nc == LB_QU() || nc == LB_CP() || nc == LB_EX()
+            || nc == LB_IS() || nc == LB_SY() || nc == LB_BK() || nc == LB_CR() || nc == LB_LF() || nc == LB_NL() || nc == LB_ZW() { return none }
+    }
+    // LB15c: SP ÷ IS NU
+    if a == LB_SP() && b == LB_IS() && lb_cls_at(cls, j + 1) == LB_NU() { return allow }
+    // LB15d: × IS
+    if b == LB_IS() { return none }
+    // LB16: (CL | CP) SP* × NS
+    if b == LB_NS() && q8 >= 0 && (cls[q8] == LB_CL() || cls[q8] == LB_CP()) { return none }
+    // LB17: B2 SP* × B2
+    if b == LB_B2() && q8 >= 0 && cls[q8] == LB_B2() { return none }
+    // LB18: SP ÷
+    if a == LB_SP() { return allow }
+    // LB19: × [QU - Pi]; [QU - Pf] ×
+    if b == LB_QU() && ucd_gc(base[j]) != GC_Pi() { return none }
+    if a == LB_QU() && ucd_gc(base[j - 1]) != GC_Pf() { return none }
+    // LB19a
+    if b == LB_QU() {
+        if !is_ea(base[j - 1]) { return none }
+        if j + 1 >= cls.len() || !is_ea(base[j + 1]) { return none }
+    }
+    if a == LB_QU() {
+        if !is_ea(base[j]) { return none }
+        if j - 2 < 0 || !is_ea(base[j - 2]) { return none }
+    }
+    // LB20
+    if b == LB_CB() || a == LB_CB() { return allow }
+    // LB20a: ( sot | BK | CR | LF | NL | SP | ZW | CB | GL ) ( HY | U+2010 ) × AL
+    if (a == LB_HY() || base[j - 1] == 8208) && b == LB_AL() {
+        if j - 2 < 0 { return none }
+        let pc = cls[j - 2]
+        if pc == LB_BK() || pc == LB_CR() || pc == LB_LF() || pc == LB_NL() || pc == LB_SP() || pc == LB_ZW() || pc == LB_CB() || pc == LB_GL() { return none }
+    }
+    // LB21
+    if b == LB_BA() || b == LB_HY() || b == LB_NS() || a == LB_BB() { return none }
+    // LB21a: HL (HY | [BA - $EastAsian]) × [^HL]
+    if (a == LB_HY() || (a == LB_BA() && !is_ea(base[j - 1]))) && lb_cls_at(cls, j - 2) == LB_HL() && b != LB_HL() { return none }
+    // LB21b
+    if a == LB_SY() && b == LB_HL() { return none }
+    // LB22
+    if b == LB_IN() { return none }
+    // LB23
+    if (a == LB_AL() || a == LB_HL()) && b == LB_NU() { return none }
+    if a == LB_NU() && (b == LB_AL() || b == LB_HL()) { return none }
+    // LB23a
+    if a == LB_PR() && (b == LB_ID() || b == LB_EB() || b == LB_EM()) { return none }
+    if (a == LB_ID() || a == LB_EB() || a == LB_EM()) && b == LB_PO() { return none }
+    // LB24
+    if (a == LB_PR() || a == LB_PO()) && (b == LB_AL() || b == LB_HL()) { return none }
+    if (a == LB_AL() || a == LB_HL()) && (b == LB_PR() || b == LB_PO()) { return none }
+    // LB25
+    if b == LB_PO() || b == LB_PR() {
+        var q = j - 1
+        if cls[q] == LB_CL() || cls[q] == LB_CP() { q = q - 1 }
+        while q >= 0 && (cls[q] == LB_SY() || cls[q] == LB_IS()) { q = q - 1 }
+        if q >= 0 && cls[q] == LB_NU() { return none }
+    }
+    if a == LB_PO() || a == LB_PR() {
+        if b == LB_NU() { return none }
+        if b == LB_OP() && lb_cls_at(cls, j + 1) == LB_NU() { return none }
+        if b == LB_OP() && lb_cls_at(cls, j + 1) == LB_IS() && lb_cls_at(cls, j + 2) == LB_NU() { return none }
+    }
+    if (a == LB_HY() || a == LB_IS()) && b == LB_NU() { return none }
+    if b == LB_NU() {
+        var q = j - 1
+        while q >= 0 && (cls[q] == LB_SY() || cls[q] == LB_IS()) { q = q - 1 }
+        if q >= 0 && cls[q] == LB_NU() { return none }
+    }
+    // LB26
+    if a == LB_JL() && (b == LB_JL() || b == LB_JV() || b == LB_H2() || b == LB_H3()) { return none }
+    if (a == LB_JV() || a == LB_H2()) && (b == LB_JV() || b == LB_JT()) { return none }
+    if (a == LB_JT() || a == LB_H3()) && b == LB_JT() { return none }
+    // LB27
+    let ak = a == LB_JL() || a == LB_JV() || a == LB_JT() || a == LB_H2() || a == LB_H3()
+    let bk = b == LB_JL() || b == LB_JV() || b == LB_JT() || b == LB_H2() || b == LB_H3()
+    if ak && b == LB_PO() { return none }
+    if a == LB_PR() && bk { return none }
+    // LB28
+    if (a == LB_AL() || a == LB_HL()) && (b == LB_AL() || b == LB_HL()) { return none }
+    // LB28a
+    let a_ak = a == LB_AK() || base[j - 1] == 9676 || a == LB_AS()
+    let b_ak = b == LB_AK() || base[j] == 9676 || b == LB_AS()
+    if a == LB_AP() && b_ak { return none }
+    if a_ak && (b == LB_VF() || b == LB_VI()) { return none }
+    if a == LB_VI() && j - 2 >= 0 && (cls[j - 2] == LB_AK() || base[j - 2] == 9676 || cls[j - 2] == LB_AS()) && (b == LB_AK() || base[j] == 9676) { return none }
+    if a_ak && b_ak && lb_cls_at(cls, j + 1) == LB_VF() { return none }
+    // LB29
+    if a == LB_IS() && (b == LB_AL() || b == LB_HL()) { return none }
+    // LB30
+    if (a == LB_AL() || a == LB_HL() || a == LB_NU()) && b == LB_OP() && !is_ea(base[j]) { return none }
+    if a == LB_CP() && !is_ea(base[j - 1]) && (b == LB_AL() || b == LB_HL() || b == LB_NU()) { return none }
+    // LB30a: an odd number of RIs before
+    if a == LB_RI() && b == LB_RI() {
+        var cnt = 0
+        var q = j - 1
+        while q >= 0 && cls[q] == LB_RI() { cnt = cnt + 1  q = q - 1 }
+        if (cnt & 1) == 1 { return none }
+    }
+    // LB30b
+    if b == LB_EM() {
+        if a == LB_EB() { return none }
+        if ucd_is_extended_pictographic(base[j - 1]) && ucd_gc(base[j - 1]) == GC_Cn() { return none }
+    }
+    // LB31
+    return allow
+}
+
+/// the break opportunities of UTF-8 `text` as byte offsets: every offset where a line may wrap
+/// (allowed or mandatory), excluding 0, including text.len().
+pub fn line_break_offsets(text: Str) -> Vec<Int> {
+    var cps: Vec<Int> = vec()
+    var offs: Vec<Int> = vec()
+    utf8_decode_offsets(text, cps, offs)
+    let br = line_breaks(cps)
+    var out: Vec<Int> = vec()
+    var i = 1
+    while i < cps.len() { if br[i] != LBK_NONE() { out.push(offs[i]) }  i = i + 1 }
+    if cps.len() > 0 { out.push(text.len()) }
+    return out
+}

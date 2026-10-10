@@ -1,0 +1,1080 @@
+//! std/svg: an SVG rasterizer. Parses an SVG document (XML) and rasterizes it to an
+//! `image::Image` (straight RGBA8) at a caller-chosen pixel size, so the same `<img>` blit path used
+//! for PNG/JPEG renders vector art too. Reuses std/font's signed-area path rasterizer (raster_*).
+//!
+//!   import "std/svg" as svg
+//!   var im = svg::rasterize(read_file("logo.svg"), 128, 128)          // shapes, no <text>
+//!   var im = svg::rasterize_font(bytes, 128, 128, myFont)            // + <text> via std/font
+//!
+//! Supports: <path> (M/L/H/V/C/S/Q/T/A + Z, abs+rel), rect (rx/ry), circle, ellipse, line, polygon,
+//! polyline, <g>; presentation via attributes and style=""; fill (nonzero), stroke (width/caps/joins
+//! approximated), opacity/fill-opacity/stroke-opacity; solid colors (#rgb/#rrggbb/rgb()/names/none);
+//! linear & radial gradients (objectBoundingBox + userSpaceOnUse, href stop inheritance); transform
+//! (matrix/translate/scale/rotate/skewX/skewY); viewBox + xMidYMid-meet scaling; <text>/<tspan>.
+//! Out of scope: CSS selectors, filters, clipPath/mask, patterns, <use>, <image>, animation.
+import "std/image" as image
+import "std/font" as font
+
+// ── trig (local; avoids a libm link dep) ────────────────────────────────────────────────────────────
+fn ssin(x: Float) -> Float {
+    let tau = 6.283185307179586
+    let pi = 3.141592653589793
+    var t = x - to_float(to_int(x / tau)) * tau
+    if t > pi { t = t - tau }
+    if t < 0.0 - pi { t = t + tau }
+    let x2 = t * t
+    var term = t
+    var sum = t
+    var i = 1
+    while i < 9 { term = term * (0.0 - x2) / to_float((2 * i) * (2 * i + 1))  sum = sum + term  i = i + 1 }
+    return sum
+}
+fn scos(x: Float) -> Float { return ssin(x + 1.5707963267948966) }
+fn fabs(x: Float) -> Float { if x < 0.0 { return 0.0 - x }  return x }
+fn fmin(a: Float, b: Float) -> Float { if a < b { return a }  return b }
+fn fmax(a: Float, b: Float) -> Float { if a > b { return a }  return b }
+fn fsqrt(x: Float) -> Float { if x <= 0.0 { return 0.0 }  return sqrt(x) }
+
+// ── XML document (parallel-array tree) ──────────────────────────────────────────────────────────────
+struct Xml { tag: Vec<Str>, kind: Vec<Int>, text: Vec<Str>, parent: Vec<Int>, akey: Vec<Vec<Str>>, aval: Vec<Vec<Str>>, kids: Vec<Vec<Int>>, root: Int }
+
+fn xml_new(inout x: Xml, kind: Int, sink tag: Str, sink text: Str, parent: Int) -> Int {
+    let id = x.tag.len()
+    x.tag.push(tag)  x.kind.push(kind)  x.text.push(text)  x.parent.push(parent)
+    var ak: Vec<Str> = vec()  var av: Vec<Str> = vec()  var kd: Vec<Int> = vec()
+    x.akey.push(ak)  x.aval.push(av)  x.kids.push(kd)
+    if parent >= 0 { x.kids[parent].push(id) }
+    return id
+}
+fn is_ws(c: Int) -> Bool { return c == 32 || c == 9 || c == 10 || c == 13 }
+fn is_name_c(c: Int) -> Bool { return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 45 || c == 95 || c == 58 || c == 46 }
+
+fn xml_decode_ent(s: Str) -> Str {
+    if !contains_amp(s) { return copy s }
+    var out = ""
+    let n = s.len()
+    var i = 0
+    while i < n {
+        if ord(s.at(i)) == 38 {                                          // '&'
+            var j = i + 1
+            while j < n && ord(s.at(j)) != 59 && j - i < 12 { j = j + 1 }
+            if j < n && ord(s.at(j)) == 59 {
+                let ent = s.slice(i + 1, j)
+                if ent == "amp" { out = out + "&" } else if ent == "lt" { out = out + "<" } else if ent == "gt" { out = out + ">" }
+                else if ent == "quot" { out = out + chr(34) } else if ent == "apos" { out = out + chr(39) }
+                else if ent.len() > 1 && ord(ent.at(0)) == 35 {           // &#...
+                    var cp = 0
+                    if ord(ent.at(1)) == 120 || ord(ent.at(1)) == 88 { cp = hex_val(ent.slice(2, ent.len())) }
+                    else { cp = dec_val(ent.slice(1, ent.len())) }
+                    out = out + cp_utf8(cp)
+                } else { out = out + "&" + ent + ";" }
+                i = j + 1
+            } else { out = out + "&"  i = i + 1 }
+        } else { out = out + s.slice(i, i + 1)  i = i + 1 }
+    }
+    return out
+}
+fn contains_amp(s: Str) -> Bool { var i = 0  while i < s.len() { if ord(s.at(i)) == 38 { return true }  i = i + 1 }  return false }
+fn hex_val(s: Str) -> Int { var v = 0  var i = 0  while i < s.len() { let c = ord(s.at(i))  var d = 0  if c >= 48 && c <= 57 { d = c - 48 } else if c >= 97 && c <= 102 { d = c - 87 } else if c >= 65 && c <= 70 { d = c - 55 } else { return v }  v = v * 16 + d  i = i + 1 }  return v }
+fn dec_val(s: Str) -> Int { var v = 0  var i = 0  while i < s.len() { let c = ord(s.at(i))  if c < 48 || c > 57 { return v }  v = v * 10 + (c - 48)  i = i + 1 }  return v }
+fn cp_utf8(cp: Int) -> Str {
+    if cp < 128 { return "" + chr(cp) }
+    if cp < 2048 { return "" + chr(192 + cp / 64) + chr(128 + cp % 64) }
+    if cp < 65536 { return "" + chr(224 + cp / 4096) + chr(128 + cp / 64 % 64) + chr(128 + cp % 64) }
+    return "" + chr(240 + cp / 262144) + chr(128 + cp / 4096 % 64) + chr(128 + cp / 64 % 64) + chr(128 + cp % 64)
+}
+
+// parse the whole document; pos[0] is the scan cursor.
+fn xml_parse(src: Str) -> Xml {
+    var x = Xml { tag: vec(), kind: vec(), text: vec(), parent: vec(), akey: vec(), aval: vec(), kids: vec(), root: 0 - 1 }
+    var pos: Vec<Int> = vec()  pos.push(0)
+    let n = src.len()
+    // find the first real element start (skip <?xml?>, <!DOCTYPE>, comments, whitespace)
+    while pos[0] < n {
+        skip_misc(src, pos, n)
+        if pos[0] < n && ord(src.at(pos[0])) == 60 { x.root = xml_elem(x, src, pos, n, 0 - 1)  pos[0] = n }
+        else { pos[0] = pos[0] + 1 }
+    }
+    return x
+}
+fn skip_misc(src: Str, inout pos: Vec<Int>, n: Int) {
+    var go = true
+    while go {
+        go = false
+        while pos[0] < n && is_ws(ord(src.at(pos[0]))) { pos[0] = pos[0] + 1 }
+        if pos[0] + 3 < n && ord(src.at(pos[0])) == 60 && ord(src.at(pos[0] + 1)) == 33 && ord(src.at(pos[0] + 2)) == 45 && ord(src.at(pos[0] + 3)) == 45 {
+            var j = pos[0] + 4
+            while j + 2 < n && !(ord(src.at(j)) == 45 && ord(src.at(j + 1)) == 45 && ord(src.at(j + 2)) == 62) { j = j + 1 }
+            pos[0] = j + 3  go = true
+        } else if pos[0] + 1 < n && ord(src.at(pos[0])) == 60 && (ord(src.at(pos[0] + 1)) == 63 || ord(src.at(pos[0] + 1)) == 33) {
+            var j = pos[0] + 2
+            while j < n && ord(src.at(j)) != 62 { j = j + 1 }
+            pos[0] = j + 1  go = true
+        }
+    }
+}
+// parse an element starting at '<'; returns node id. Recurses for children.
+fn xml_elem(inout x: Xml, src: Str, inout pos: Vec<Int>, n: Int, parent: Int) -> Int {
+    pos[0] = pos[0] + 1                                                    // consume '<'
+    let ns = pos[0]
+    while pos[0] < n && is_name_c(ord(src.at(pos[0]))) { pos[0] = pos[0] + 1 }
+    let tag = local_name(src.slice(ns, pos[0]))
+    let id = xml_new(x, 0, tag, "", parent)
+    // attributes
+    var selfclose = false
+    var done = false
+    while !done && pos[0] < n {
+        while pos[0] < n && is_ws(ord(src.at(pos[0]))) { pos[0] = pos[0] + 1 }
+        if pos[0] >= n { done = true }
+        else {
+            let c = ord(src.at(pos[0]))
+            if c == 62 { pos[0] = pos[0] + 1  done = true }                // '>'
+            else if c == 47 { selfclose = true  pos[0] = pos[0] + 1 }      // '/'
+            else {
+                let as0 = pos[0]
+                while pos[0] < n && is_name_c(ord(src.at(pos[0]))) { pos[0] = pos[0] + 1 }
+                let akey = src.slice(as0, pos[0])
+                while pos[0] < n && is_ws(ord(src.at(pos[0]))) { pos[0] = pos[0] + 1 }
+                var aval = ""
+                if pos[0] < n && ord(src.at(pos[0])) == 61 {              // '='
+                    pos[0] = pos[0] + 1
+                    while pos[0] < n && is_ws(ord(src.at(pos[0]))) { pos[0] = pos[0] + 1 }
+                    if pos[0] < n {
+                        let q = ord(src.at(pos[0]))
+                        if q == 34 || q == 39 {
+                            pos[0] = pos[0] + 1
+                            let vs = pos[0]
+                            while pos[0] < n && ord(src.at(pos[0])) != q { pos[0] = pos[0] + 1 }
+                            aval = xml_decode_ent(src.slice(vs, pos[0]))
+                            pos[0] = pos[0] + 1
+                        }
+                    }
+                }
+                if akey.len() > 0 { x.akey[id].push(local_name(akey))  x.aval[id].push(aval) }
+            }
+        }
+    }
+    if selfclose { return id }
+    // children until matching end tag
+    var stop = false
+    while !stop && pos[0] < n {
+        if ord(src.at(pos[0])) == 60 {
+            if pos[0] + 1 < n && ord(src.at(pos[0] + 1)) == 47 {          // '</' end tag
+                var j = pos[0] + 2
+                while j < n && ord(src.at(j)) != 62 { j = j + 1 }
+                pos[0] = j + 1
+                stop = true
+            } else if pos[0] + 1 < n && (ord(src.at(pos[0] + 1)) == 33 || ord(src.at(pos[0] + 1)) == 63) {
+                skip_misc(src, pos, n)
+            } else {
+                let cid = xml_elem(x, src, pos, n, id)
+                if cid < 0 { stop = true }
+            }
+        } else {
+            let ts = pos[0]
+            while pos[0] < n && ord(src.at(pos[0])) != 60 { pos[0] = pos[0] + 1 }
+            let txt = xml_decode_ent(src.slice(ts, pos[0]))
+            if trim_ws(txt).len() > 0 { xml_new(x, 1, "", txt, id) }
+        }
+    }
+    return id
+}
+fn local_name(s: Str) -> Str { var i = 0  while i < s.len() { if ord(s.at(i)) == 58 { return s.slice(i + 1, s.len()) }  i = i + 1 }  return copy s }   // strip xml namespace prefix
+fn trim_ws(s: Str) -> Str { var a = 0  var b = s.len()  while a < b && is_ws(ord(s.at(a))) { a = a + 1 }  while b > a && is_ws(ord(s.at(b - 1))) { b = b - 1 }  return s.slice(a, b) }
+
+fn attr(x: Xml, id: Int, key: Str) -> Str {
+    let ks = x.akey[id]
+    var i = 0
+    while i < ks.len() { if ks[i] == key { return copy x.aval[id][i] }  i = i + 1 }
+    return ""
+}
+// read a property from the element's presentation attribute or its style="" (style wins).
+fn prop(x: Xml, id: Int, key: Str) -> Str {
+    let st = attr(x, id, "style")
+    if st.len() > 0 { let v = style_get(st, key)  if v.len() > 0 { return v } }
+    return attr(x, id, key)
+}
+fn style_get(style: Str, key: Str) -> Str {
+    let n = style.len()
+    var i = 0
+    while i < n {
+        var j = i
+        while j < n && ord(style.at(j)) != 58 && ord(style.at(j)) != 59 { j = j + 1 }
+        if j < n && ord(style.at(j)) == 58 {
+            let name = trim_ws(style.slice(i, j))
+            var k = j + 1
+            while k < n && ord(style.at(k)) != 59 { k = k + 1 }
+            if name == key { return trim_ws(style.slice(j + 1, k)) }
+            i = k + 1
+        } else { i = j + 1 }
+    }
+    return ""
+}
+
+// ── numbers / matrices ──────────────────────────────────────────────────────────────────────────────
+fn to_f(s: Str) -> Float {
+    let t = trim_ws(s)
+    let n = t.len()
+    if n == 0 { return 0.0 }
+    var i = 0
+    var neg = false
+    if ord(t.at(0)) == 45 { neg = true  i = 1 } else if ord(t.at(0)) == 43 { i = 1 }
+    var ip = 0.0
+    while i < n && ord(t.at(i)) >= 48 && ord(t.at(i)) <= 57 { ip = ip * 10.0 + to_float(ord(t.at(i)) - 48)  i = i + 1 }
+    var frac = 0.0  var scale = 1.0
+    if i < n && ord(t.at(i)) == 46 { i = i + 1  while i < n && ord(t.at(i)) >= 48 && ord(t.at(i)) <= 57 { scale = scale * 0.1  frac = frac + to_float(ord(t.at(i)) - 48) * scale  i = i + 1 } }
+    var v = ip + frac
+    if i < n && (ord(t.at(i)) == 101 || ord(t.at(i)) == 69) {       // exponent e/E
+        i = i + 1
+        var eneg = false
+        if i < n && ord(t.at(i)) == 45 { eneg = true  i = i + 1 } else if i < n && ord(t.at(i)) == 43 { i = i + 1 }
+        var ex = 0
+        while i < n && ord(t.at(i)) >= 48 && ord(t.at(i)) <= 57 { ex = ex * 10 + (ord(t.at(i)) - 48)  i = i + 1 }
+        var p = 1.0  var k = 0
+        while k < ex { p = p * 10.0  k = k + 1 }
+        if eneg { v = v / p } else { v = v * p }
+    }
+    if neg { return 0.0 - v }
+    return v
+}
+fn mat_id() -> Vec<Float> { var m: Vec<Float> = vec()  m.push(1.0)  m.push(0.0)  m.push(0.0)  m.push(1.0)  m.push(0.0)  m.push(0.0)  return m }
+fn mat_new(a: Float, b: Float, c: Float, d: Float, e: Float, f: Float) -> Vec<Float> { var m: Vec<Float> = vec()  m.push(a)  m.push(b)  m.push(c)  m.push(d)  m.push(e)  m.push(f)  return m }
+// M = A then... no: returns A∘B (apply B first, then A).
+fn mat_mul(A: Vec<Float>, B: Vec<Float>) -> Vec<Float> {
+    return mat_new(A[0] * B[0] + A[2] * B[1], A[1] * B[0] + A[3] * B[1], A[0] * B[2] + A[2] * B[3], A[1] * B[2] + A[3] * B[3], A[0] * B[4] + A[2] * B[5] + A[4], A[1] * B[4] + A[3] * B[5] + A[5])
+}
+fn mx(m: Vec<Float>, x: Float, y: Float) -> Float { return m[0] * x + m[2] * y + m[4] }
+fn my(m: Vec<Float>, x: Float, y: Float) -> Float { return m[1] * x + m[3] * y + m[5] }
+fn mat_inv(m: Vec<Float>) -> Vec<Float> {
+    let det = m[0] * m[3] - m[1] * m[2]
+    if fabs(det) < 0.0000001 { return mat_id() }
+    let id = 1.0 / det
+    let a = m[3] * id
+    let b = 0.0 - m[1] * id
+    let c = 0.0 - m[2] * id
+    let d = m[0] * id
+    let e = 0.0 - (a * m[4] + c * m[5])
+    let f = 0.0 - (b * m[4] + d * m[5])
+    return mat_new(a, b, c, d, e, f)
+}
+// parse a transform="..." attribute into a matrix.
+fn parse_transform(s: Str) -> Vec<Float> {
+    var m = mat_id()
+    let n = s.len()
+    var i = 0
+    while i < n {
+        while i < n && (is_ws(ord(s.at(i))) || ord(s.at(i)) == 44) { i = i + 1 }
+        let ns = i
+        while i < n && is_name_c(ord(s.at(i))) { i = i + 1 }
+        let name = s.slice(ns, i)
+        while i < n && ord(s.at(i)) != 40 { i = i + 1 }                   // to '('
+        if i >= n { i = n }
+        else {
+            let as0 = i + 1
+            var j = as0
+            while j < n && ord(s.at(j)) != 41 { j = j + 1 }
+            let args = num_list(s.slice(as0, j))
+            i = j + 1
+            m = mat_mul(m, transform_of(name, args))
+        }
+    }
+    return m
+}
+fn transform_of(name: Str, a: Vec<Float>) -> Vec<Float> {
+    let k = a.len()
+    if name == "matrix" && k >= 6 { return mat_new(a[0], a[1], a[2], a[3], a[4], a[5]) }
+    if name == "translate" { let tx = a[0]  var ty = 0.0  if k >= 2 { ty = a[1] }  return mat_new(1.0, 0.0, 0.0, 1.0, tx, ty) }
+    if name == "scale" { let sx = a[0]  var sy = sx  if k >= 2 { sy = a[1] }  return mat_new(sx, 0.0, 0.0, sy, 0.0, 0.0) }
+    if name == "rotate" {
+        let r = a[0] * 3.141592653589793 / 180.0
+        let co = scos(r)  let si = ssin(r)
+        var rot = mat_new(co, si, 0.0 - si, co, 0.0, 0.0)
+        if k >= 3 { rot = mat_mul(mat_mul(mat_new(1.0, 0.0, 0.0, 1.0, a[1], a[2]), rot), mat_new(1.0, 0.0, 0.0, 1.0, 0.0 - a[1], 0.0 - a[2])) }
+        return rot
+    }
+    if name == "skewX" { return mat_new(1.0, 0.0, ttan(a[0]), 1.0, 0.0, 0.0) }
+    if name == "skewY" { return mat_new(1.0, ttan(a[0]), 0.0, 1.0, 0.0, 0.0) }
+    return mat_id()
+}
+fn ttan(deg: Float) -> Float { let r = deg * 3.141592653589793 / 180.0  let c = scos(r)  if fabs(c) < 0.0000001 { return 0.0 }  return ssin(r) / c }
+fn num_list(s: Str) -> Vec<Float> {
+    var out: Vec<Float> = vec()
+    let n = s.len()
+    var i = 0
+    while i < n {
+        while i < n && (is_ws(ord(s.at(i))) || ord(s.at(i)) == 44) { i = i + 1 }
+        if i >= n { return out }
+        let st = i
+        if ord(s.at(i)) == 45 || ord(s.at(i)) == 43 { i = i + 1 }
+        while i < n && ((ord(s.at(i)) >= 48 && ord(s.at(i)) <= 57) || ord(s.at(i)) == 46 || ord(s.at(i)) == 101 || ord(s.at(i)) == 69 || ((ord(s.at(i)) == 45 || ord(s.at(i)) == 43) && i > st && (ord(s.at(i - 1)) == 101 || ord(s.at(i - 1)) == 69))) { i = i + 1 }
+        if i > st { out.push(to_f(s.slice(st, i))) }
+    }
+    return out
+}
+
+// ── geometry ────────────────────────────────────────────────────────────────────────────────────────
+struct Seg { kind: Int, cx1: Float, cy1: Float, cx2: Float, cy2: Float, ex: Float, ey: Float }   // 0 line, 1 quad, 2 cubic
+struct Contour { sx: Float, sy: Float, segs: Vec<Seg> }
+
+fn seg_line(x: Float, y: Float) -> Seg { return Seg { kind: 0, cx1: 0.0, cy1: 0.0, cx2: 0.0, cy2: 0.0, ex: x, ey: y } }
+fn seg_quad(cx: Float, cy: Float, x: Float, y: Float) -> Seg { return Seg { kind: 1, cx1: cx, cy1: cy, cx2: 0.0, cy2: 0.0, ex: x, ey: y } }
+fn seg_cubic(c1x: Float, c1y: Float, c2x: Float, c2y: Float, x: Float, y: Float) -> Seg { return Seg { kind: 2, cx1: c1x, cy1: c1y, cx2: c2x, cy2: c2y, ex: x, ey: y } }
+
+// ── path data (d="...") ─────────────────────────────────────────────────────────────────────────────
+struct PScan { s: view Str, i: Int, n: Int }
+fn ps_ws(p: PScan) -> PScan { var i = p.i  while i < p.n && (is_ws(ord(p.s.at(i))) || ord(p.s.at(i)) == 44) { i = i + 1 }  return PScan { s: p.s, i: i, n: p.n } }
+
+fn parse_path(d: Str) -> Vec<Contour> {
+    var out: Vec<Contour> = vec()
+    let n = d.len()
+    // use a mutable cursor Vec for number reading
+    var cur: Vec<Int> = vec()  cur.push(0)
+    var cx = 0.0  var cy = 0.0                                                  // current point
+    var sx = 0.0  var sy = 0.0                                                  // subpath start
+    var pcx = 0.0  var pcy = 0.0                                                // last control (for S/T)
+    var lastCmd = 0
+    var segs: Vec<Seg> = vec()
+    var haveSub = false
+    var cmd = 0
+    while cur[0] < n {
+        skip_sep(d, cur, n)
+        if cur[0] >= n { cur[0] = n }
+        else {
+            let c = ord(d.at(cur[0]))
+            if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) { cmd = c  cur[0] = cur[0] + 1 }
+            let rel = cmd >= 97
+            let uc = up(cmd)
+            if uc == 77 {                                                       // M/m moveto
+                if haveSub { out.push(Contour { sx: sx, sy: sy, segs: segs }) }
+                var nx = rd_num(d, cur, n)  var ny = rd_num(d, cur, n)
+                if rel { nx = nx + cx  ny = ny + cy }
+                cx = nx  cy = ny  sx = cx  sy = cy
+                segs = vec()  haveSub = true
+                cmd = 76  if rel { cmd = 108 }                                  // subsequent pairs are lineto
+            } else if uc == 76 {                                                // L/l
+                var nx = rd_num(d, cur, n)  var ny = rd_num(d, cur, n)
+                if rel { nx = nx + cx  ny = ny + cy }
+                segs.push(seg_line(nx, ny))  cx = nx  cy = ny
+            } else if uc == 72 {                                                // H/h
+                var nx = rd_num(d, cur, n)
+                if rel { nx = nx + cx }
+                segs.push(seg_line(nx, cy))  cx = nx
+            } else if uc == 86 {                                                // V/v
+                var ny = rd_num(d, cur, n)
+                if rel { ny = ny + cy }
+                segs.push(seg_line(cx, ny))  cy = ny
+            } else if uc == 67 {                                                // C/c cubic
+                var x1 = rd_num(d, cur, n)  var y1 = rd_num(d, cur, n)  var x2 = rd_num(d, cur, n)  var y2 = rd_num(d, cur, n)  var ex = rd_num(d, cur, n)  var ey = rd_num(d, cur, n)
+                if rel { x1 = x1 + cx  y1 = y1 + cy  x2 = x2 + cx  y2 = y2 + cy  ex = ex + cx  ey = ey + cy }
+                segs.push(seg_cubic(x1, y1, x2, y2, ex, ey))  pcx = x2  pcy = y2  cx = ex  cy = ey
+            } else if uc == 83 {                                                // S/s smooth cubic
+                var rx = cx  var ry = cy
+                if up(lastCmd) == 67 || up(lastCmd) == 83 { rx = 2.0 * cx - pcx  ry = 2.0 * cy - pcy }
+                var x2 = rd_num(d, cur, n)  var y2 = rd_num(d, cur, n)  var ex = rd_num(d, cur, n)  var ey = rd_num(d, cur, n)
+                if rel { x2 = x2 + cx  y2 = y2 + cy  ex = ex + cx  ey = ey + cy }
+                segs.push(seg_cubic(rx, ry, x2, y2, ex, ey))  pcx = x2  pcy = y2  cx = ex  cy = ey
+            } else if uc == 81 {                                                // Q/q quad
+                var x1 = rd_num(d, cur, n)  var y1 = rd_num(d, cur, n)  var ex = rd_num(d, cur, n)  var ey = rd_num(d, cur, n)
+                if rel { x1 = x1 + cx  y1 = y1 + cy  ex = ex + cx  ey = ey + cy }
+                segs.push(seg_quad(x1, y1, ex, ey))  pcx = x1  pcy = y1  cx = ex  cy = ey
+            } else if uc == 84 {                                                // T/t smooth quad
+                var rx = cx  var ry = cy
+                if up(lastCmd) == 81 || up(lastCmd) == 84 { rx = 2.0 * cx - pcx  ry = 2.0 * cy - pcy }
+                var ex = rd_num(d, cur, n)  var ey = rd_num(d, cur, n)
+                if rel { ex = ex + cx  ey = ey + cy }
+                segs.push(seg_quad(rx, ry, ex, ey))  pcx = rx  pcy = ry  cx = ex  cy = ey
+            } else if uc == 65 {                                                // A/a arc
+                var frx = rd_num(d, cur, n)  var fry = rd_num(d, cur, n)  var rot = rd_num(d, cur, n)  var laf = rd_flag(d, cur, n)  var swf = rd_flag(d, cur, n)  var ex = rd_num(d, cur, n)  var ey = rd_num(d, cur, n)
+                if rel { ex = ex + cx  ey = ey + cy }
+                arc_to(segs, cx, cy, frx, fry, rot, laf, swf, ex, ey)
+                cx = ex  cy = ey
+            } else if uc == 90 {                                                // Z/z close
+                segs.push(seg_line(sx, sy))  cx = sx  cy = sy
+            } else { cur[0] = n }
+            lastCmd = cmd
+        }
+    }
+    if haveSub { out.push(Contour { sx: sx, sy: sy, segs: segs }) }
+    return out
+}
+fn up(c: Int) -> Int { if c >= 97 { return c - 32 }  return c }
+fn skip_sep(s: Str, inout cur: Vec<Int>, n: Int) { while cur[0] < n && (is_ws(ord(s.at(cur[0]))) || ord(s.at(cur[0])) == 44) { cur[0] = cur[0] + 1 } }
+fn rd_num(s: Str, inout cur: Vec<Int>, n: Int) -> Float {
+    skip_sep(s, cur, n)
+    let st = cur[0]
+    if cur[0] < n && (ord(s.at(cur[0])) == 45 || ord(s.at(cur[0])) == 43) { cur[0] = cur[0] + 1 }
+    // A second '.' ends this number and begins the next one: path data omits separators wherever it
+    // can, so `c17.65.17` is 17.65 followed by .17. Swallowing both as one token yielded a garbage
+    // coordinate and left every later number in the path shifted by one. Same for the exponent:
+    // `1e3` takes one e, and a '.' cannot follow it.
+    var go = true
+    var dot = false
+    var exp = false
+    while go && cur[0] < n {
+        let c = ord(s.at(cur[0]))
+        if c >= 48 && c <= 57 { cur[0] = cur[0] + 1 }
+        else if c == 46 { if dot || exp { go = false } else { dot = true  cur[0] = cur[0] + 1 } }
+        else if (c == 101 || c == 69) && !exp && cur[0] > st { exp = true  cur[0] = cur[0] + 1 }
+        else if (c == 45 || c == 43) && cur[0] > st && (ord(s.at(cur[0] - 1)) == 101 || ord(s.at(cur[0] - 1)) == 69) { cur[0] = cur[0] + 1 }
+        else { go = false }
+    }
+    return to_f(s.slice(st, cur[0]))
+}
+fn rd_flag(s: Str, inout cur: Vec<Int>, n: Int) -> Float { skip_sep(s, cur, n)  if cur[0] < n { let c = ord(s.at(cur[0]))  cur[0] = cur[0] + 1  if c == 49 { return 1.0 }  return 0.0 }  return 0.0 }
+
+// endpoint-parameterization arc -> cubic beziers (SVG implementation notes F.6).
+fn arc_to(inout segs: Vec<Seg>, x1: Float, y1: Float, rxIn: Float, ryIn: Float, phiDeg: Float, laf: Float, swf: Float, x2: Float, y2: Float) {
+    var rx = fabs(rxIn)  var ry = fabs(ryIn)
+    if rx < 0.0000001 || ry < 0.0000001 { segs.push(seg_line(x2, y2))  return }
+    let phi = phiDeg * 3.141592653589793 / 180.0
+    let cosp = scos(phi)  let sinp = ssin(phi)
+    let dx = (x1 - x2) / 2.0  let dy = (y1 - y2) / 2.0
+    let x1p = cosp * dx + sinp * dy
+    let y1p = 0.0 - sinp * dx + cosp * dy
+    var lam = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry)
+    if lam > 1.0 { let s = fsqrt(lam)  rx = rx * s  ry = ry * s }
+    var num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p
+    if num < 0.0 { num = 0.0 }
+    let den = rx * rx * y1p * y1p + ry * ry * x1p * x1p
+    var co = 0.0
+    if den > 0.0 { co = fsqrt(num / den) }
+    if laf == swf { co = 0.0 - co }
+    let cxp = co * rx * y1p / ry
+    let cyp = 0.0 - co * ry * x1p / rx
+    let cx = cosp * cxp - sinp * cyp + (x1 + x2) / 2.0
+    let cy = sinp * cxp + cosp * cyp + (y1 + y2) / 2.0
+    let t1 = ang(1.0, 0.0, (x1p - cxp) / rx, (y1p - cyp) / ry)
+    var dth = ang((x1p - cxp) / rx, (y1p - cyp) / ry, (0.0 - x1p - cxp) / rx, (0.0 - y1p - cyp) / ry)
+    let tau = 6.283185307179586
+    if swf == 0.0 && dth > 0.0 { dth = dth - tau }
+    if swf == 1.0 && dth < 0.0 { dth = dth + tau }
+    var nseg = to_int(fabs(dth) / (tau / 8.0)) + 1
+    if nseg < 1 { nseg = 1 }
+    if nseg > 32 { nseg = 32 }
+    let delta = dth / to_float(nseg)
+    let tt = 4.0 / 3.0 * ttan_half(delta / 2.0)
+    var th = t1
+    var i = 0
+    while i < nseg {
+        let c1 = scos(th)  let s1 = ssin(th)
+        let th2 = th + delta
+        let c2 = scos(th2)  let s2 = ssin(th2)
+        let e1x = cx + rx * (cosp * c1) - ry * (sinp * s1)     // point at th
+        let e1y = cy + rx * (sinp * c1) + ry * (cosp * s1)
+        let e2x = cx + rx * (cosp * c2) - ry * (sinp * s2)     // point at th2
+        let e2y = cy + rx * (sinp * c2) + ry * (cosp * s2)
+        let d1x = 0.0 - rx * (cosp * s1) - ry * (sinp * c1)    // derivative at th
+        let d1y = 0.0 - rx * (sinp * s1) + ry * (cosp * c1)
+        let d2x = 0.0 - rx * (cosp * s2) - ry * (sinp * c2)
+        let d2y = 0.0 - rx * (sinp * s2) + ry * (cosp * c2)
+        segs.push(seg_cubic(e1x + tt * d1x, e1y + tt * d1y, e2x - tt * d2x, e2y - tt * d2y, e2x, e2y))
+        th = th2
+        i = i + 1
+    }
+}
+fn ttan_half(x: Float) -> Float { let c = scos(x)  if fabs(c) < 0.0000001 { return 0.0 }  return ssin(x) / c }
+fn ang(ux: Float, uy: Float, vx: Float, vy: Float) -> Float {
+    let dot = ux * vx + uy * vy
+    let lu = fsqrt(ux * ux + uy * uy)
+    let lv = fsqrt(vx * vx + vy * vy)
+    var c = dot / (lu * lv)
+    if c > 1.0 { c = 1.0 }
+    if c < 0.0 - 1.0 { c = 0.0 - 1.0 }
+    var a = sacos(c)
+    if ux * vy - uy * vx < 0.0 { a = 0.0 - a }
+    return a
+}
+fn sacos(c: Float) -> Float {                                                  // acos via atan-free Newton on cos
+    // acos(c) in [0,pi]; use identity acos(c)=pi/2 - asin(c), asin via series is inaccurate near 1 -> bisection
+    var lo = 0.0  var hi = 3.141592653589793
+    var i = 0
+    while i < 40 { let mid = (lo + hi) / 2.0  if scos(mid) > c { lo = mid } else { hi = mid }  i = i + 1 }
+    return (lo + hi) / 2.0
+}
+
+// shapes -> contours
+fn shape_contours(x: Xml, id: Int) -> Vec<Contour> {
+    let tag = x.tag[id]
+    if tag == "path" { return parse_path(attr(x, id, "d")) }
+    if tag == "rect" { return rect_contours(to_f(attr(x, id, "x")), to_f(attr(x, id, "y")), to_f(attr(x, id, "width")), to_f(attr(x, id, "height")), to_f(attr(x, id, "rx")), to_f(attr(x, id, "ry")), attr(x, id, "rx").len() > 0, attr(x, id, "ry").len() > 0) }
+    if tag == "circle" { return ellipse_contours(to_f(attr(x, id, "cx")), to_f(attr(x, id, "cy")), to_f(attr(x, id, "r")), to_f(attr(x, id, "r"))) }
+    if tag == "ellipse" { return ellipse_contours(to_f(attr(x, id, "cx")), to_f(attr(x, id, "cy")), to_f(attr(x, id, "rx")), to_f(attr(x, id, "ry"))) }
+    if tag == "line" { var segs: Vec<Seg> = vec()  segs.push(seg_line(to_f(attr(x, id, "x2")), to_f(attr(x, id, "y2"))))  var out: Vec<Contour> = vec()  out.push(Contour { sx: to_f(attr(x, id, "x1")), sy: to_f(attr(x, id, "y1")), segs: segs })  return out }
+    if tag == "polygon" || tag == "polyline" { return poly_contours(num_list(attr(x, id, "points")), tag == "polygon") }
+    var e: Vec<Contour> = vec()  return e
+}
+fn rect_contours(x: Float, y: Float, w: Float, h: Float, rxIn: Float, ryIn: Float, hasRx: Bool, hasRy: Bool) -> Vec<Contour> {
+    var out: Vec<Contour> = vec()
+    if w <= 0.0 || h <= 0.0 { return out }
+    var rx = rxIn  var ry = ryIn
+    if hasRx && !hasRy { ry = rx }
+    if hasRy && !hasRx { rx = ry }
+    if rx > w / 2.0 { rx = w / 2.0 }
+    if ry > h / 2.0 { ry = h / 2.0 }
+    var segs: Vec<Seg> = vec()
+    if rx <= 0.0 || ry <= 0.0 {
+        var c: Vec<Contour> = vec()
+        var s: Vec<Seg> = vec()
+        s.push(seg_line(x + w, y))  s.push(seg_line(x + w, y + h))  s.push(seg_line(x, y + h))  s.push(seg_line(x, y))
+        c.push(Contour { sx: x, sy: y, segs: s })
+        return c
+    }
+    let k = 0.5522847498307936
+    // start at (x+rx, y), go clockwise with rounded corners
+    segs.push(seg_line(x + w - rx, y))
+    segs.push(seg_cubic(x + w - rx + k * rx, y, x + w, y + ry - k * ry, x + w, y + ry))
+    segs.push(seg_line(x + w, y + h - ry))
+    segs.push(seg_cubic(x + w, y + h - ry + k * ry, x + w - rx + k * rx, y + h, x + w - rx, y + h))
+    segs.push(seg_line(x + rx, y + h))
+    segs.push(seg_cubic(x + rx - k * rx, y + h, x, y + h - ry + k * ry, x, y + h - ry))
+    segs.push(seg_line(x, y + ry))
+    segs.push(seg_cubic(x, y + ry - k * ry, x + rx - k * rx, y, x + rx, y))
+    out.push(Contour { sx: x + rx, sy: y, segs: segs })
+    return out
+}
+fn ellipse_contours(cx: Float, cy: Float, rx: Float, ry: Float) -> Vec<Contour> {
+    var out: Vec<Contour> = vec()
+    if rx <= 0.0 || ry <= 0.0 { return out }
+    let k = 0.5522847498307936
+    var segs: Vec<Seg> = vec()
+    segs.push(seg_cubic(cx + rx, cy + k * ry, cx + k * rx, cy + ry, cx, cy + ry))
+    segs.push(seg_cubic(cx - k * rx, cy + ry, cx - rx, cy + k * ry, cx - rx, cy))
+    segs.push(seg_cubic(cx - rx, cy - k * ry, cx - k * rx, cy - ry, cx, cy - ry))
+    segs.push(seg_cubic(cx + k * rx, cy - ry, cx + rx, cy - k * ry, cx + rx, cy))
+    out.push(Contour { sx: cx + rx, sy: cy, segs: segs })
+    return out
+}
+fn poly_contours(pts: Vec<Float>, closed: Bool) -> Vec<Contour> {
+    var out: Vec<Contour> = vec()
+    if pts.len() < 4 { return out }
+    var segs: Vec<Seg> = vec()
+    var i = 2
+    while i + 1 < pts.len() { segs.push(seg_line(pts[i], pts[i + 1]))  i = i + 2 }
+    if closed { segs.push(seg_line(pts[0], pts[1])) }
+    out.push(Contour { sx: pts[0], sy: pts[1], segs: segs })
+    return out
+}
+
+// ── render state ────────────────────────────────────────────────────────────────────────────────────
+struct RS { cr: Int, cg: Int, cb: Int, fr: Int, fg: Int, fb: Int, fillHas: Bool, fillOp: Float, sr: Int, sg: Int, sb: Int, strokeHas: Bool, strokeW: Float, strokeOp: Float, opacity: Float, m: Vec<Float>, fillUrl: Str, strokeUrl: Str, fontSize: Float, anchor: Int }
+fn rs_root(sink m: Vec<Float>, cr: Int, cg: Int, cb: Int) -> RS { return RS { cr: cr, cg: cg, cb: cb, fr: cr, fg: cg, fb: cb, fillHas: true, fillOp: 1.0, sr: 0, sg: 0, sb: 0, strokeHas: false, strokeW: 1.0, strokeOp: 1.0, opacity: 1.0, m: m, fillUrl: "", strokeUrl: "", fontSize: 16.0, anchor: 0 } }
+
+// parse a paint value: sets *_Has, color, and url. Returns updated RS-ish via out params packed in a Vec.
+struct Paint { has: Bool, r: Int, g: Int, b: Int, url: Str }
+fn parse_paint(v: Str, cur_r: Int, cur_g: Int, cur_b: Int, ccr: Int, ccg: Int, ccb: Int) -> Paint {
+    let t = trim_ws(v)
+    if t.len() == 0 { return Paint { has: false, r: cur_r, g: cur_g, b: cur_b, url: "" } }   // unset -> inherit (handled by caller)
+    // `currentColor` is the CSS `color` in force: what an icon drawn in the surrounding text's
+    // colour is painted with, and the only way a page says "this icon follows the theme".
+    if lc(t) == "currentcolor" { return Paint { has: true, r: ccr, g: ccg, b: ccb, url: "" } }
+    if t == "none" { return Paint { has: false, r: 0, g: 0, b: 0, url: "" } }
+    if t.len() >= 5 && t.slice(0, 4) == "url(" {
+        var j = 4
+        while j < t.len() && ord(t.at(j)) != 41 { j = j + 1 }
+        var ref = trim_ws(t.slice(4, j))
+        if ref.len() > 0 && ord(ref.at(0)) == 35 { ref = ref.slice(1, ref.len()) }
+        return Paint { has: true, r: 0, g: 0, b: 0, url: ref }
+    }
+    let c = parse_color(t)
+    return Paint { has: true, r: c[0], g: c[1], b: c[2], url: "" }
+}
+fn parse_color(sIn: Str) -> Vec<Int> {
+    let s = lc(trim_ws(sIn))
+    if s.len() >= 4 && ord(s.at(0)) == 35 {                               // #hex
+        if s.len() == 4 { let r = hx(s.at(1))  let g = hx(s.at(2))  let b = hx(s.at(3))  return rgb(r * 16 + r, g * 16 + g, b * 16 + b) }
+        if s.len() >= 7 { return rgb(hx(s.at(1)) * 16 + hx(s.at(2)), hx(s.at(3)) * 16 + hx(s.at(4)), hx(s.at(5)) * 16 + hx(s.at(6))) }
+    }
+    if s.len() >= 4 && s.slice(0, 4) == "rgb(" {
+        var j = 4
+        while j < s.len() && ord(s.at(j)) != 41 { j = j + 1 }
+        let a = num_list(s.slice(4, j))
+        if a.len() >= 3 { return rgb(to_int(a[0]), to_int(a[1]), to_int(a[2])) }
+    }
+    return named_color(s)
+}
+fn hx(ch: Byte) -> Int { let c = ord(ch)  if c >= 48 && c <= 57 { return c - 48 }  if c >= 97 && c <= 102 { return c - 87 }  if c >= 65 && c <= 70 { return c - 55 }  return 0 }
+fn rgb(r: Int, g: Int, b: Int) -> Vec<Int> { var v: Vec<Int> = vec()  v.push(clamp255(r))  v.push(clamp255(g))  v.push(clamp255(b))  return v }
+fn clamp255(v: Int) -> Int { if v < 0 { return 0 }  if v > 255 { return 255 }  return v }
+fn lc(s: Str) -> Str { var o = ""  var i = 0  while i < s.len() { var c = ord(s.at(i))  if c >= 65 && c <= 90 { c = c + 32 }  o = o + chr(c)  i = i + 1 }  return o }
+fn named_color(s: Str) -> Vec<Int> {
+    if s == "black" { return rgb(0, 0, 0) }
+    if s == "white" { return rgb(255, 255, 255) }
+    if s == "red" { return rgb(255, 0, 0) }
+    if s == "green" { return rgb(0, 128, 0) }
+    if s == "lime" { return rgb(0, 255, 0) }
+    if s == "blue" { return rgb(0, 0, 255) }
+    if s == "yellow" { return rgb(255, 255, 0) }
+    if s == "cyan" || s == "aqua" { return rgb(0, 255, 255) }
+    if s == "magenta" || s == "fuchsia" { return rgb(255, 0, 255) }
+    if s == "gray" || s == "grey" { return rgb(128, 128, 128) }
+    if s == "silver" { return rgb(192, 192, 192) }
+    if s == "orange" { return rgb(255, 165, 0) }
+    if s == "purple" { return rgb(128, 0, 128) }
+    if s == "navy" { return rgb(0, 0, 128) }
+    if s == "teal" { return rgb(0, 128, 128) }
+    if s == "maroon" { return rgb(128, 0, 0) }
+    if s == "none" || s == "transparent" { return rgb(0, 0, 0) }
+    return rgb(0, 0, 0)
+}
+
+// ── output canvas + compositing ─────────────────────────────────────────────────────────────────────
+struct Canvas { px: Int, w: Int, h: Int }
+fn cv_blend(cv: Canvas, x: Int, y: Int, r: Int, g: Int, b: Int, a: Float) {
+    if x < 0 || y < 0 || x >= cv.w || y >= cv.h || a <= 0.0 { return }
+    let o = (y * cv.w + x) * 4
+    var dr = 0  var dg = 0  var db = 0  var da = 0
+    unsafe { dr = peek8(cv.px + o)  dg = peek8(cv.px + o + 1)  db = peek8(cv.px + o + 2)  da = peek8(cv.px + o + 3) }
+    let saf = a
+    let daf = to_float(da) / 255.0
+    let outA = saf + daf * (1.0 - saf)
+    if outA <= 0.0 { return }
+    let orr = (to_float(r) * saf + to_float(dr) * daf * (1.0 - saf)) / outA
+    let og = (to_float(g) * saf + to_float(dg) * daf * (1.0 - saf)) / outA
+    let ob = (to_float(b) * saf + to_float(db) * daf * (1.0 - saf)) / outA
+    unsafe { poke8(cv.px + o, to_int(orr + 0.5))  poke8(cv.px + o + 1, to_int(og + 0.5))  poke8(cv.px + o + 2, to_int(ob + 0.5))  poke8(cv.px + o + 3, to_int(outA * 255.0 + 0.5)) }
+}
+
+// transform + flatten all contours into raster edges within [bx0,by0); returns coverage sized bw*bh.
+// bbox is computed by the caller. Fills into one grid so nonzero winding across subpaths gives holes.
+fn rasterize_fill(contours: Vec<Contour>, m: Vec<Float>, bx0: Int, by0: Int, bw: Int, bh: Int) -> Vec<Int> {
+    var r = font::raster_new(bw, bh)
+    let ox = to_float(bx0)  let oy = to_float(by0)
+    var ci = 0
+    while ci < contours.len() {
+        let ct = contours[ci]
+        var px = mx(m, ct.sx, ct.sy) - ox  var py = my(m, ct.sx, ct.sy) - oy
+        let startx = px  let starty = py
+        var si = 0
+        while si < ct.segs.len() {
+            let sg = ct.segs[si]
+            let ex = mx(m, sg.ex, sg.ey) - ox  let ey = my(m, sg.ex, sg.ey) - oy
+            if sg.kind == 0 { font::raster_line(r, px, py, ex, ey) }
+            else if sg.kind == 1 { font::raster_quad(r, px, py, mx(m, sg.cx1, sg.cy1) - ox, my(m, sg.cx1, sg.cy1) - oy, ex, ey) }
+            else { font::raster_cubic(r, px, py, mx(m, sg.cx1, sg.cy1) - ox, my(m, sg.cx1, sg.cy1) - oy, mx(m, sg.cx2, sg.cy2) - ox, my(m, sg.cx2, sg.cy2) - oy, ex, ey) }
+            px = ex  py = ey
+            si = si + 1
+        }
+        if fabs(px - startx) > 0.01 || fabs(py - starty) > 0.01 { font::raster_line(r, px, py, startx, starty) }   // auto-close for fill
+        ci = ci + 1
+    }
+    return font::raster_cover(r)
+}
+// transformed bounding box of all contour anchor+control points (conservative), padded by `pad`.
+struct BBox { x0: Float, y0: Float, x1: Float, y1: Float, ok: Bool }
+fn contours_bbox(contours: Vec<Contour>, m: Vec<Float>, pad: Float) -> BBox {
+    var bb = BBox { x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0, ok: false }
+    var ci = 0
+    while ci < contours.len() {
+        let ct = contours[ci]
+        bb = bb_pt(bb, mx(m, ct.sx, ct.sy), my(m, ct.sx, ct.sy))
+        var si = 0
+        while si < ct.segs.len() {
+            let sg = ct.segs[si]
+            bb = bb_pt(bb, mx(m, sg.ex, sg.ey), my(m, sg.ex, sg.ey))
+            if sg.kind >= 1 { bb = bb_pt(bb, mx(m, sg.cx1, sg.cy1), my(m, sg.cx1, sg.cy1)) }
+            if sg.kind == 2 { bb = bb_pt(bb, mx(m, sg.cx2, sg.cy2), my(m, sg.cx2, sg.cy2)) }
+            si = si + 1
+        }
+        ci = ci + 1
+    }
+    if bb.ok { bb.x0 = bb.x0 - pad  bb.y0 = bb.y0 - pad  bb.x1 = bb.x1 + pad  bb.y1 = bb.y1 + pad }
+    return bb
+}
+fn bb_pt(bb: BBox, x: Float, y: Float) -> BBox {
+    if !bb.ok { return BBox { x0: x, y0: y, x1: x, y1: y, ok: true } }
+    return BBox { x0: fmin(bb.x0, x), y0: fmin(bb.y0, y), x1: fmax(bb.x1, x), y1: fmax(bb.y1, y), ok: true }
+}
+
+// composite a filled shape using its coverage. gradId>=0 paints a gradient (looked up in `grads`),
+// otherwise the solid color r,g,b.
+fn paint_fill(cv: Canvas, contours: Vec<Contour>, m: Vec<Float>, r: Int, g: Int, b: Int, alpha: Float, gradId: Int, grads: Grads) {
+    let bb = contours_bbox(contours, m, 1.0)
+    if !bb.ok { return }
+    var bx0 = to_int(bb.x0) - 1  var by0 = to_int(bb.y0) - 1
+    var bx1 = to_int(bb.x1) + 2  var by1 = to_int(bb.y1) + 2
+    if bx0 < 0 { bx0 = 0 }
+    if by0 < 0 { by0 = 0 }
+    if bx1 > cv.w { bx1 = cv.w }
+    if by1 > cv.h { by1 = cv.h }
+    let bw = bx1 - bx0  let bh = by1 - by0
+    if bw <= 0 || bh <= 0 { return }
+    let cov = rasterize_fill(contours, m, bx0, by0, bw, bh)
+    let useG = gradId >= 0 && gradId < grads.list.len()
+    var gr = Grad { kind: 0, units: 0, x1: 0.0, y1: 0.0, x2: 1.0, y2: 0.0, cx: 0.5, cy: 0.5, r: 0.5, gm: mat_id(), href: "", soff: vec(), sr: vec(), sg: vec(), sb: vec(), sa: vec() }
+    var ubb = bb
+    var inv = mat_id()
+    if useG { gr = grads.list[gradId]  ubb = contours_bbox(contours, mat_id(), 0.0)  inv = mat_inv(m) }
+    var y = 0
+    while y < bh {
+        var xx = 0
+        while xx < bw {
+            let c = cov[y * bw + xx]
+            if c > 0 {
+                if useG {
+                    let sx = to_float(bx0 + xx) + 0.5  let sy = to_float(by0 + y) + 0.5
+                    let col = grad_color(gr, mx(inv, sx, sy), my(inv, sx, sy), ubb)
+                    cv_blend(cv, bx0 + xx, by0 + y, col[0], col[1], col[2], to_float(c) / 255.0 * alpha * to_float(col[3]) / 255.0)
+                } else { cv_blend(cv, bx0 + xx, by0 + y, r, g, b, to_float(c) / 255.0 * alpha) }
+            }
+            xx = xx + 1
+        }
+        y = y + 1
+    }
+}
+
+// flatten a contour to a screen-space polyline [x0,y0,x1,y1,...] under matrix m.
+fn flatten_contour(ct: Contour, m: Vec<Float>) -> Vec<Float> {
+    var pts: Vec<Float> = vec()
+    pts.push(mx(m, ct.sx, ct.sy))  pts.push(my(m, ct.sx, ct.sy))
+    var cx = ct.sx  var cy = ct.sy
+    var i = 0
+    while i < ct.segs.len() {
+        let sg = ct.segs[i]
+        if sg.kind == 0 { pts.push(mx(m, sg.ex, sg.ey))  pts.push(my(m, sg.ex, sg.ey)) }
+        else if sg.kind == 1 {
+            var k = 1
+            while k <= 16 { let t = to_float(k) / 16.0  let mt = 1.0 - t
+                let qx = mt * mt * cx + 2.0 * mt * t * sg.cx1 + t * t * sg.ex
+                let qy = mt * mt * cy + 2.0 * mt * t * sg.cy1 + t * t * sg.ey
+                pts.push(mx(m, qx, qy))  pts.push(my(m, qx, qy))  k = k + 1 }
+        } else {
+            var k = 1
+            while k <= 22 { let t = to_float(k) / 22.0  let mt = 1.0 - t
+                let a = mt * mt * mt  let b = 3.0 * mt * mt * t  let c = 3.0 * mt * t * t  let e = t * t * t
+                let qx = a * cx + b * sg.cx1 + c * sg.cx2 + e * sg.ex
+                let qy = a * cy + b * sg.cy1 + c * sg.cy2 + e * sg.ey
+                pts.push(mx(m, qx, qy))  pts.push(my(m, qx, qy))  k = k + 1 }
+        }
+        cx = sg.ex  cy = sg.ey
+        i = i + 1
+    }
+    return pts
+}
+fn stroke_quad(inout r: font::Rast, ox: Float, oy: Float, ax: Float, ay: Float, bx: Float, by: Float, hw: Float) {
+    let dx = bx - ax  let dy = by - ay
+    let l = fsqrt(dx * dx + dy * dy)
+    if l < 0.0001 { return }
+    let nx = 0.0 - dy / l * hw  let ny = dx / l * hw
+    font::raster_line(r, ax + nx - ox, ay + ny - oy, bx + nx - ox, by + ny - oy)
+    font::raster_line(r, bx + nx - ox, by + ny - oy, bx - nx - ox, by - ny - oy)
+    font::raster_line(r, bx - nx - ox, by - ny - oy, ax - nx - ox, ay - ny - oy)
+    font::raster_line(r, ax - nx - ox, ay - ny - oy, ax + nx - ox, ay + ny - oy)
+}
+fn stroke_dot(inout r: font::Rast, ox: Float, oy: Float, cx: Float, cy: Float, hw: Float) {
+    var k = 0
+    var px = cx + hw - ox  var py = cy - oy
+    while k < 12 {
+        let a = to_float(k + 1) / 12.0 * 6.283185307179586
+        let x = cx + hw * scos(a) - ox
+        let y = cy + hw * ssin(a) - oy
+        font::raster_line(r, px, py, x, y)
+        px = x  py = y
+        k = k + 1
+    }
+}
+// stroke all contours: flatten, expand each segment to a quad + round-join dots (approximate), union.
+fn paint_stroke(cv: Canvas, contours: Vec<Contour>, m: Vec<Float>, r: Int, g: Int, b: Int, alpha: Float, strokeWUser: Float) {
+    let sc = fsqrt(fabs(m[0] * m[3] - m[1] * m[2]))
+    let hw = strokeWUser * sc / 2.0
+    if hw <= 0.01 { return }
+    var polys: Vec<Vec<Float>> = vec()
+    var bb = BBox { x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0, ok: false }
+    var ci = 0
+    while ci < contours.len() {
+        let p = flatten_contour(contours[ci], m)
+        var j = 0
+        while j + 1 < p.len() { bb = bb_pt(bb, p[j], p[j + 1])  j = j + 2 }
+        polys.push(p)
+        ci = ci + 1
+    }
+    if !bb.ok { return }
+    var bx0 = to_int(bb.x0 - hw) - 1  var by0 = to_int(bb.y0 - hw) - 1
+    var bx1 = to_int(bb.x1 + hw) + 2  var by1 = to_int(bb.y1 + hw) + 2
+    if bx0 < 0 { bx0 = 0 }
+    if by0 < 0 { by0 = 0 }
+    if bx1 > cv.w { bx1 = cv.w }
+    if by1 > cv.h { by1 = cv.h }
+    let bw = bx1 - bx0  let bh = by1 - by0
+    if bw <= 0 || bh <= 0 { return }
+    var rast = font::raster_new(bw, bh)
+    let ox = to_float(bx0)  let oy = to_float(by0)
+    var pi = 0
+    while pi < polys.len() {
+        let p = polys[pi]
+        var j = 0
+        while j + 3 < p.len() {
+            stroke_quad(rast, ox, oy, p[j], p[j + 1], p[j + 2], p[j + 3], hw)
+            if hw > 0.75 && j + 4 < p.len() { stroke_dot(rast, ox, oy, p[j + 2], p[j + 3], hw) }   // round joins at interior vertices only (butt caps at open ends)
+            j = j + 2
+        }
+        pi = pi + 1
+    }
+    let cov = font::raster_cover(rast)
+    var y = 0
+    while y < bh {
+        var xx = 0
+        while xx < bw { let c = cov[y * bw + xx]  if c > 0 { cv_blend(cv, bx0 + xx, by0 + y, r, g, b, to_float(c) / 255.0 * alpha) }  xx = xx + 1 }
+        y = y + 1
+    }
+}
+
+// ── gradients ───────────────────────────────────────────────────────────────────────────────────────
+struct Grad { kind: Int, units: Int, x1: Float, y1: Float, x2: Float, y2: Float, cx: Float, cy: Float, r: Float, gm: Vec<Float>, href: Str, soff: Vec<Float>, sr: Vec<Int>, sg: Vec<Int>, sb: Vec<Int>, sa: Vec<Float> }
+struct Grads { ids: Vec<Str>, list: Vec<Grad> }
+
+fn grad_coord(s: Str, def: Float) -> Float {
+    let t = trim_ws(s)
+    if t.len() == 0 { return def }
+    if ord(t.at(t.len() - 1)) == 37 { return to_f(t.slice(0, t.len() - 1)) / 100.0 }
+    return to_f(t)
+}
+fn stop_color_of(x: Xml, id: Int) -> Str { let v = prop(x, id, "stop-color")  if v.len() == 0 { return "black" }  return v }
+fn build_grad(x: Xml, id: Int, radial: Bool) -> Grad {
+    var g = Grad { kind: 0, units: 0, x1: 0.0, y1: 0.0, x2: 1.0, y2: 0.0, cx: 0.5, cy: 0.5, r: 0.5, gm: mat_id(), href: "", soff: vec(), sr: vec(), sg: vec(), sb: vec(), sa: vec() }
+    if radial { g.kind = 1 }
+    if attr(x, id, "gradientUnits") == "userSpaceOnUse" { g.units = 1 }
+    let gt = attr(x, id, "gradientTransform")
+    if gt.len() > 0 { g.gm = parse_transform(gt) }
+    var href = attr(x, id, "href")
+    if href.len() > 0 && ord(href.at(0)) == 35 { href = href.slice(1, href.len()) }
+    g.href = href
+    if radial { g.cx = grad_coord(attr(x, id, "cx"), 0.5)  g.cy = grad_coord(attr(x, id, "cy"), 0.5)  g.r = grad_coord(attr(x, id, "r"), 0.5) }
+    else { g.x1 = grad_coord(attr(x, id, "x1"), 0.0)  g.y1 = grad_coord(attr(x, id, "y1"), 0.0)  g.x2 = grad_coord(attr(x, id, "x2"), 1.0)  g.y2 = grad_coord(attr(x, id, "y2"), 0.0) }
+    let kids = x.kids[id]
+    var k = 0
+    while k < kids.len() {
+        if x.tag[kids[k]] == "stop" {
+            let sc = parse_color(stop_color_of(x, kids[k]))
+            var sa = 1.0
+            let soa = prop(x, kids[k], "stop-opacity")
+            if soa.len() > 0 { sa = to_f(soa) }
+            g.soff.push(grad_coord(prop(x, kids[k], "offset"), 0.0))  g.sr.push(sc[0])  g.sg.push(sc[1])  g.sb.push(sc[2])  g.sa.push(sa)
+        }
+        k = k + 1
+    }
+    return g
+}
+fn grad_index(gs: Grads, id: Str) -> Int { var i = 0  while i < gs.ids.len() { if gs.ids[i] == id { return i }  i = i + 1 }  return 0 - 1 }
+fn parse_grads(x: Xml) -> Grads {
+    var gs = Grads { ids: vec(), list: vec() }
+    var i = 0
+    while i < x.tag.len() {
+        let tag = x.tag[i]
+        if tag == "linearGradient" || tag == "radialGradient" { gs.ids.push(attr(x, i, "id"))  gs.list.push(build_grad(x, i, tag == "radialGradient")) }
+        i = i + 1
+    }
+    // one pass of href stop inheritance (a base gradient's stops reused by coord-only gradients)
+    var j = 0
+    while j < gs.list.len() {
+        if gs.list[j].soff.len() == 0 && gs.list[j].href.len() > 0 {
+            let src = grad_index(gs, gs.list[j].href)
+            if src >= 0 {
+                let s = gs.list[src]
+                let t = gs.list[j]
+                var k = 0
+                while k < s.soff.len() { t.soff.push(s.soff[k])  t.sr.push(s.sr[k])  t.sg.push(s.sg[k])  t.sb.push(s.sb[k])  t.sa.push(s.sa[k])  k = k + 1 }
+            }
+        }
+        j = j + 1
+    }
+    return gs
+}
+fn rgba4(r: Int, g: Int, b: Int, a: Int) -> Vec<Int> { var v: Vec<Int> = vec()  v.push(r)  v.push(g)  v.push(b)  v.push(a)  return v }
+fn lerpi(a: Int, b: Int, f: Float) -> Int { return to_int(to_float(a) + (to_float(b) - to_float(a)) * f + 0.5) }
+fn grad_sample(gr: Grad, t: Float) -> Vec<Int> {
+    let ns = gr.soff.len()
+    if ns == 0 { return rgba4(0, 0, 0, 0) }
+    if t <= gr.soff[0] { return rgba4(gr.sr[0], gr.sg[0], gr.sb[0], to_int(gr.sa[0] * 255.0)) }
+    let last = ns - 1
+    if t >= gr.soff[last] { return rgba4(gr.sr[last], gr.sg[last], gr.sb[last], to_int(gr.sa[last] * 255.0)) }
+    var i = 1
+    while i < ns {
+        if t <= gr.soff[i] {
+            let t0 = gr.soff[i - 1]  let t1 = gr.soff[i]
+            var f = 0.0
+            if t1 > t0 { f = (t - t0) / (t1 - t0) }
+            return rgba4(lerpi(gr.sr[i - 1], gr.sr[i], f), lerpi(gr.sg[i - 1], gr.sg[i], f), lerpi(gr.sb[i - 1], gr.sb[i], f), to_int((gr.sa[i - 1] + (gr.sa[i] - gr.sa[i - 1]) * f) * 255.0))
+        }
+        i = i + 1
+    }
+    return rgba4(gr.sr[last], gr.sg[last], gr.sb[last], to_int(gr.sa[last] * 255.0))
+}
+// color at a user-space point (ux,uy) for gradient gr; bb = shape user-space bbox (for objectBoundingBox).
+fn grad_color(gr: Grad, ux: Float, uy: Float, bb: BBox) -> Vec<Int> {
+    var px = ux  var py = uy
+    if gr.units == 0 {
+        let bw = bb.x1 - bb.x0  let bh = bb.y1 - bb.y0
+        if bw > 0.0 { px = (ux - bb.x0) / bw }
+        if bh > 0.0 { py = (uy - bb.y0) / bh }
+    } else {
+        let inv = mat_inv(gr.gm)
+        let tx = mx(inv, ux, uy)  let ty = my(inv, ux, uy)
+        px = tx  py = ty
+    }
+    var t = 0.0
+    if gr.kind == 0 {
+        let dx = gr.x2 - gr.x1  let dy = gr.y2 - gr.y1
+        let dd = dx * dx + dy * dy
+        if dd > 0.0 { t = ((px - gr.x1) * dx + (py - gr.y1) * dy) / dd }
+    } else {
+        if gr.r > 0.0 { t = fsqrt((px - gr.cx) * (px - gr.cx) + (py - gr.cy) * (py - gr.cy)) / gr.r }
+    }
+    if t < 0.0 { t = 0.0 }
+    if t > 1.0 { t = 1.0 }
+    return grad_sample(gr, t)
+}
+
+// ── document traversal ──────────────────────────────────────────────────────────────────────────────
+fn inherit(x: Xml, id: Int, parent: RS) -> RS {
+    var s = RS { cr: parent.cr, cg: parent.cg, cb: parent.cb, fr: parent.fr, fg: parent.fg, fb: parent.fb, fillHas: parent.fillHas, fillOp: parent.fillOp, sr: parent.sr, sg: parent.sg, sb: parent.sb, strokeHas: parent.strokeHas, strokeW: parent.strokeW, strokeOp: parent.strokeOp, opacity: 1.0, m: copy parent.m, fillUrl: copy parent.fillUrl, strokeUrl: copy parent.strokeUrl, fontSize: parent.fontSize, anchor: parent.anchor }
+    let colv = prop(x, id, "color")
+    if trim_ws(colv).len() > 0 && lc(trim_ws(colv)) != "currentcolor" { let c = parse_color(colv)  s.cr = c[0]  s.cg = c[1]  s.cb = c[2] }
+    let tf = attr(x, id, "transform")
+    if tf.len() > 0 { s.m = mat_mul(parent.m, parse_transform(tf)) }
+    let fillv = prop(x, id, "fill")
+    if trim_ws(fillv).len() > 0 { let p = parse_paint(fillv, parent.fr, parent.fg, parent.fb, s.cr, s.cg, s.cb)  s.fillHas = p.has  s.fr = p.r  s.fg = p.g  s.fb = p.b  s.fillUrl = sink p.url }
+    let strokev = prop(x, id, "stroke")
+    if trim_ws(strokev).len() > 0 { let p = parse_paint(strokev, parent.sr, parent.sg, parent.sb, s.cr, s.cg, s.cb)  s.strokeHas = p.has  s.sr = p.r  s.sg = p.g  s.sb = p.b  s.strokeUrl = sink p.url }
+    let sw = prop(x, id, "stroke-width")
+    if sw.len() > 0 { s.strokeW = to_f(sw) }
+    let fo = prop(x, id, "fill-opacity")
+    if fo.len() > 0 { s.fillOp = to_f(fo) }
+    let so = prop(x, id, "stroke-opacity")
+    if so.len() > 0 { s.strokeOp = to_f(so) }
+    let op = prop(x, id, "opacity")
+    if op.len() > 0 { s.opacity = to_f(op) }
+    let fs = prop(x, id, "font-size")
+    if fs.len() > 0 { s.fontSize = to_f(fs) }
+    let ta = prop(x, id, "text-anchor")
+    if ta == "middle" { s.anchor = 1 } else if ta == "end" { s.anchor = 2 } else if ta == "start" { s.anchor = 0 }
+    return s
+}
+
+// ── text ────────────────────────────────────────────────────────────────────────────────────────────
+fn collapse_ws(s: Str) -> Str {
+    var out = ""
+    var sp = false
+    var started = false
+    var i = 0
+    while i < s.len() {
+        let c = ord(s.at(i))
+        if is_ws(c) { sp = true } else { if sp && started { out = out + " " }  out = out + s.slice(i, i + 1)  started = true  sp = false }
+        i = i + 1
+    }
+    return out
+}
+fn text_content(x: Xml, id: Int) -> Str {
+    var out = ""
+    let kids = x.kids[id]
+    var i = 0
+    while i < kids.len() {
+        let k = kids[i]
+        if x.kind[k] == 1 { out = out + x.text[k] }
+        else if x.tag[k] == "tspan" || x.tag[k] == "text" || x.tag[k] == "a" { out = out + text_content(x, k) }
+        i = i + 1
+    }
+    return out
+}
+// render a <text> run (translate+scale of the CTM; glyph rotation not applied). fill color, text-anchor.
+fn paint_text(cv: Canvas, x: Xml, id: Int, s: RS, f: font::Font) {
+    let content = collapse_ws(text_content(x, id))
+    if content.len() == 0 { return }
+    let tx = to_f(attr(x, id, "x"))
+    let ty = to_f(attr(x, id, "y"))
+    let sc = fsqrt(fabs(s.m[0] * s.m[3] - s.m[1] * s.m[2]))
+    let pxSize = s.fontSize * sc
+    if pxSize < 0.5 { return }
+    let runW = font::measure_run(f, content, pxSize)
+    var ox = mx(s.m, tx, ty)
+    let oy = my(s.m, tx, ty)
+    if s.anchor == 1 { ox = ox - runW / 2.0 }
+    else if s.anchor == 2 { ox = ox - runW }
+    let glyphs = font::layout_run(f, content, pxSize)
+    var i = 0
+    while i < glyphs.len() {
+        let g = glyphs[i]
+        let gb = font::rasterize(f, g.gid, pxSize)
+        if gb.w > 0 && gb.h > 0 {
+            let gx0 = to_int(ox + g.x + g.x_off) + gb.left
+            let gy0 = to_int(oy - g.y_off) - gb.top
+            var gy = 0
+            while gy < gb.h {
+                var gx = 0
+                while gx < gb.w { let c = font::glyph_cov_at(gb, gx, gy)  if c > 0 { cv_blend(cv, gx0 + gx, gy0 + gy, s.fr, s.fg, s.fb, to_float(c) / 255.0 * s.fillOp * s.opacity) }  gx = gx + 1 }
+                gy = gy + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn render_node(cv: Canvas, x: Xml, id: Int, parent: RS, hasFont: Bool, f: font::Font, grads: Grads) {
+    let tag = x.tag[id]
+    if tag == "defs" || tag == "linearGradient" || tag == "radialGradient" || tag == "symbol" || tag == "clipPath" || tag == "mask" || tag == "title" || tag == "desc" || tag == "metadata" { return }
+    let s = inherit(x, id, parent)
+    if tag == "path" || tag == "rect" || tag == "circle" || tag == "ellipse" || tag == "line" || tag == "polygon" || tag == "polyline" {
+        let contours = shape_contours(x, id)
+        if contours.len() > 0 {
+            if s.fillHas && tag != "line" {
+                var fg = 0 - 1
+                if s.fillUrl.len() > 0 { fg = grad_index(grads, s.fillUrl) }
+                paint_fill(cv, contours, s.m, s.fr, s.fg, s.fb, s.fillOp * s.opacity, fg, grads)
+            }
+            if s.strokeHas && s.strokeW > 0.0 { paint_stroke(cv, contours, s.m, s.sr, s.sg, s.sb, s.strokeOp * s.opacity, s.strokeW) }
+        }
+    } else if tag == "text" && hasFont { paint_text(cv, x, id, s, f) }
+    // recurse into children
+    let kids = x.kids[id]
+    var i = 0
+    while i < kids.len() { if x.kind[kids[i]] == 0 { render_node(cv, x, kids[i], s, hasFont, f, grads) }  i = i + 1 }
+}
+
+// establish the root transform from viewBox / width / height mapping to the output pixel box (xMidYMid meet).
+fn root_matrix(x: Xml, root: Int, outW: Int, outH: Int) -> Vec<Float> {
+    let vb = attr(x, root, "viewBox")
+    if vb.len() > 0 {
+        let a = num_list(vb)
+        if a.len() >= 4 && a[2] > 0.0 && a[3] > 0.0 {
+            let sx = to_float(outW) / a[2]
+            let sy = to_float(outH) / a[3]
+            let sc = fmin(sx, sy)
+            let tx = (to_float(outW) - a[2] * sc) / 2.0 - a[0] * sc
+            let ty = (to_float(outH) - a[3] * sc) / 2.0 - a[1] * sc
+            return mat_new(sc, 0.0, 0.0, sc, tx, ty)
+        }
+    }
+    // no viewBox: scale the declared width/height to the output box
+    let wv = to_f(attr(x, root, "width"))
+    let hv = to_f(attr(x, root, "height"))
+    if wv > 0.0 && hv > 0.0 { return mat_new(to_float(outW) / wv, 0.0, 0.0, to_float(outH) / hv, 0.0, 0.0) }
+    return mat_id()
+}
+
+fn render(src: Str, outW: Int, outH: Int, hasFont: Bool, f: font::Font, cr: Int, cg: Int, cb: Int) -> image::Image {
+    if outW <= 0 || outH <= 0 { return image::image_new(1, 1) }
+    let x = xml_parse(src)
+    if x.root < 0 || x.tag[x.root] != "svg" { return image::image_new(outW, outH) }
+    var im = image::image_new(outW, outH)
+    if !image::ok(im) { return im }
+    let cv = Canvas { px: image::pixels(im), w: outW, h: outH }
+    let m0 = root_matrix(x, x.root, outW, outH)
+    // the <svg> element's own presentation attributes (fill="none" stroke="currentColor" on the root, as
+    // every icon set writes them) are inherited by everything in it, as a <g>'s are
+    let rs = inherit(x, x.root, rs_root(m0, cr, cg, cb))
+    let grads = parse_grads(x)
+    let kids = x.kids[x.root]
+    var i = 0
+    while i < kids.len() { if x.kind[kids[i]] == 0 { render_node(cv, x, kids[i], rs, hasFont, f, grads) }  i = i + 1 }
+    return im
+}
+
+/// rasterize an SVG document to an RGBA8 image of `w`x`h` pixels (no <text>).
+pub fn rasterize(src: Str, w: Int, h: Int) -> image::Image { return render(src, w, h, false, font::font_empty(), 0, 0, 0) }
+/// rasterize an SVG document whose `currentColor`, and whatever it leaves unpainted, is (r,g,b).
+/// An icon in a page is drawn this way: it carries no colour of its own and takes the text colour
+/// around it, which is what makes one icon set work on a light page and on a dark one.
+pub fn rasterize_current(src: Str, w: Int, h: Int, r: Int, g: Int, b: Int) -> image::Image { return render(src, w, h, false, font::font_empty(), r, g, b) }
+/// rasterize an SVG document including <text> runs, laid out with `f`.
+pub fn rasterize_font(src: Str, w: Int, h: Int, f: font::Font) -> image::Image { return render(src, w, h, true, f, 0, 0, 0) }
+/// rasterize with <text> runs laid out with `f`, and `currentColor` (and unpainted shapes) at (r,g,b).
+pub fn rasterize_font_current(src: Str, w: Int, h: Int, f: font::Font, r: Int, g: Int, b: Int) -> image::Image { return render(src, w, h, true, f, r, g, b) }

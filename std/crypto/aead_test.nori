@@ -1,0 +1,145 @@
+// .nori tests for AES-256-GCM and AES-128-GCM, run with
+//   noric --test std/crypto/aead_test.nori compiler/runtime.nori --import-root .
+//
+// The first two are the canonical all-zero cases from the GCM specification. The rest were
+// produced by a different implementation (OpenSSL, via python cryptography) and committed, so
+// this file shows agreement with an independent cipher rather than self-consistency. Shapes
+// were chosen to exercise the paths that are easy to get wrong: empty input, aad with no
+// plaintext, a partial trailing block, and an exactly-aligned one.
+//
+// Both key lengths are covered because they share one key schedule and one block function, which
+// derive their round count from the key. That is the thing most likely to be wrong, and only a
+// vector at each length can catch it: AES-128 run for fourteen rounds produces perfectly
+// well-formed ciphertext that no other implementation can open.
+//
+// The project's test suite also cross-checks fresh random vectors when a reference
+// implementation is installed, so a bug that happens to match these constants cannot hide.
+import "std/crypto" as crypto
+
+fn hexv(c: Byte) -> Int {
+    let o = ord(c)
+    if o >= 97 { return (o - 87) }
+    if o >= 65 { return (o - 55) }
+    return (o - 48)
+}
+fn unhex(h: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < h.len() { out = (out + chr(((hexv(h.at(i)) << 4) | hexv(h.at(i + 1)))))  i = i + 2 }
+    return out
+}
+fn tohex(s: Str) -> Str {
+    let d = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        let b = ord(s.at(i))
+        out = ((out + d.at((b >> 4))) + d.at((b & 15)))
+        i = i + 1
+    }
+    return out
+}
+
+fn test_gcm_vectors() {
+    // empty plaintext and aad (GCM spec case 13)
+    assert_streq(tohex(crypto::aes256_gcm_seal(unhex("0000000000000000000000000000000000000000000000000000000000000000"), unhex("000000000000000000000000"), unhex(""), unhex(""))), "530f8afbc74536b9a963b4f1c4cb738b")
+    assert_streq(tohex(crypto::aes256_gcm_open(unhex("0000000000000000000000000000000000000000000000000000000000000000"), unhex("000000000000000000000000"), unhex(""), unhex("530f8afbc74536b9a963b4f1c4cb738b"))), "")
+    // a single zero block (GCM spec case 14)
+    assert_streq(tohex(crypto::aes256_gcm_seal(unhex("0000000000000000000000000000000000000000000000000000000000000000"), unhex("000000000000000000000000"), unhex(""), unhex("00000000000000000000000000000000"))), "cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919")
+    assert_streq(tohex(crypto::aes256_gcm_open(unhex("0000000000000000000000000000000000000000000000000000000000000000"), unhex("000000000000000000000000"), unhex(""), unhex("cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919"))), "00000000000000000000000000000000")
+    // aad only, nothing to encrypt
+    assert_streq(tohex(crypto::aes256_gcm_seal(unhex("0916df65942bae1fcddfc8990a9ea9cb4358a2ff012d84094f34c28b7bb6a435"), unhex("5ceeb7331100ea6a818f9916"), unhex("663434bbca7eb01733c6fc6072d664956a174e83"), unhex(""))), "9d0a74b0819a95f357eb15dacf22c2cd")
+    assert_streq(tohex(crypto::aes256_gcm_open(unhex("0916df65942bae1fcddfc8990a9ea9cb4358a2ff012d84094f34c28b7bb6a435"), unhex("5ceeb7331100ea6a818f9916"), unhex("663434bbca7eb01733c6fc6072d664956a174e83"), unhex("9d0a74b0819a95f357eb15dacf22c2cd"))), "")
+    // one byte
+    assert_streq(tohex(crypto::aes256_gcm_seal(unhex("ba5ae69049ceb8561667ecce6df3bcb9c906fe8a5103b04125d0b8a3cb575f7a"), unhex("4fb5ced8279a70cc22acab69"), unhex(""), unhex("41"))), "9c620313f3110204deeec6596102cb12f3")
+    assert_streq(tohex(crypto::aes256_gcm_open(unhex("ba5ae69049ceb8561667ecce6df3bcb9c906fe8a5103b04125d0b8a3cb575f7a"), unhex("4fb5ced8279a70cc22acab69"), unhex(""), unhex("9c620313f3110204deeec6596102cb12f3"))), "41")
+    // 37 bytes, unaligned, with aad
+    assert_streq(tohex(crypto::aes256_gcm_seal(unhex("1dd77c239d12c99dba5c3f965ebf5d4d7aab433732c86977fb2bf8d890c77dd0"), unhex("64567fb3978c6ccded84c684"), unhex("d8d28d372b19b699cf955abc4e"), unhex("44b02a6e5cb57e29dd8193ac3bc482b161ff5abb426149ccd441b719553ff4b78ecba9f464"))), "b886b87f18b1d2cf4e3891a6dc430d98730d7649e88983442953bffad698661d33bf1f97f9a74c4db81e14b63a44754c2c2201d8cc")
+    assert_streq(tohex(crypto::aes256_gcm_open(unhex("1dd77c239d12c99dba5c3f965ebf5d4d7aab433732c86977fb2bf8d890c77dd0"), unhex("64567fb3978c6ccded84c684"), unhex("d8d28d372b19b699cf955abc4e"), unhex("b886b87f18b1d2cf4e3891a6dc430d98730d7649e88983442953bffad698661d33bf1f97f9a74c4db81e14b63a44754c2c2201d8cc"))), "44b02a6e5cb57e29dd8193ac3bc482b161ff5abb426149ccd441b719553ff4b78ecba9f464")
+    // exactly two blocks
+    assert_streq(tohex(crypto::aes256_gcm_seal(unhex("86fcd49f7b03286b579f8c1418442aa3b34f99de8aab81987eb8b61800945b71"), unhex("a80213bc69e499a9c69ebc4d"), unhex("85b5f7569b1754ce23a6133972f55f40"), unhex("ec83ca490501fe74e5e4953204f9d95ccca19dad480a31a4bc2eae1aef72e0f4"))), "d702ea1a5dda707ea7b82e31b22544cf601566ef1fcc9e1ae4b96e23bb5903dd3f40e7b1353c2bec5c9ad182f2a7d6fd")
+    assert_streq(tohex(crypto::aes256_gcm_open(unhex("86fcd49f7b03286b579f8c1418442aa3b34f99de8aab81987eb8b61800945b71"), unhex("a80213bc69e499a9c69ebc4d"), unhex("85b5f7569b1754ce23a6133972f55f40"), unhex("d702ea1a5dda707ea7b82e31b22544cf601566ef1fcc9e1ae4b96e23bb5903dd3f40e7b1353c2bec5c9ad182f2a7d6fd"))), "ec83ca490501fe74e5e4953204f9d95ccca19dad480a31a4bc2eae1aef72e0f4")
+    // 300 bytes, many blocks + tail
+    assert_streq(tohex(crypto::aes256_gcm_seal(unhex("005f91f5f7ac2d233e90647b8ba25d34bee1f07e99a4b21054ea90a454362a5e"), unhex("129878c42087627c3cefe9ec"), unhex("aa84e645d3c508"), unhex("5b1085f565b1331d4a6c062eb6d8969fc045953dda55bf4e357d0c751815642d7b3d7c25449137449c2086f46d1835f561ea98404657137160c21a092155dc15c9f0b4f45ca407fa6d83048d7d4956c6b6bc76a87541332e396a6474823b4864153f0bdb767f4992f02e8367e9eeb876eb76d2ca51b729ff7e17365e21552f934be9ec0c4a03e102c7355f02613fc33847c82dc6cacb470fdafc516e9594aa95f75c2582b21d4e6303c3ff80f8ce13d6ae4bc3770ed95616472b138f33046ff262fda8c50a222f7bac55cdff88f295e9108517ca1a801ae302f2c973ff168488ea0a71053aa259dcb2bb7d7ee03cbb9244346d7d8a1e1ba592d2ff681bab04cafcd8939df1425c91ba67800ebc9510bafeabdddce00e79e8c3905406c4cbc0ca58a8e066e9def1051fa1672b"))), "56fdfabf3aae2b2f36b6baa8be4b57b48e6fdcc7f3c0e876ce7b5ed4b5faacb759e46494e53c6fbd1d9fbdf358ffd299623a4da84353f53e278e3bcfa0a9df113dbb8e1afa2d1d605050aa59cc431eb23dfd4de89cbea0a5537865396aca3d21675d716f82877b6417cd8765eacf9a5b838d8f98f10119c731dab6b6bc0a88c4c17a10ba7dec9d024239a253d5c290aa0ddca831786fb8a145bd300b6d1e0c67986ace9d6da7edfa393e7320959968791c8697596ae0da1c6c61084bf4b1e12ce35e62ca4d79642f95c69c0e94ef6252f6038b7ffd6cdba1a9a138c3e608a162ba544bb0cb78e37925cee4dce5e9eb13f1124cb6730ad5571d50215ae0e6f6904a27ba2f07fa9af52b279cfa334eeafdf5352aaa2834d9dea897562127ff4d42b0070b028fea9ea7b4aa104d69dda21d03a9e14f33dc8551db3b88eb")
+    assert_streq(tohex(crypto::aes256_gcm_open(unhex("005f91f5f7ac2d233e90647b8ba25d34bee1f07e99a4b21054ea90a454362a5e"), unhex("129878c42087627c3cefe9ec"), unhex("aa84e645d3c508"), unhex("56fdfabf3aae2b2f36b6baa8be4b57b48e6fdcc7f3c0e876ce7b5ed4b5faacb759e46494e53c6fbd1d9fbdf358ffd299623a4da84353f53e278e3bcfa0a9df113dbb8e1afa2d1d605050aa59cc431eb23dfd4de89cbea0a5537865396aca3d21675d716f82877b6417cd8765eacf9a5b838d8f98f10119c731dab6b6bc0a88c4c17a10ba7dec9d024239a253d5c290aa0ddca831786fb8a145bd300b6d1e0c67986ace9d6da7edfa393e7320959968791c8697596ae0da1c6c61084bf4b1e12ce35e62ca4d79642f95c69c0e94ef6252f6038b7ffd6cdba1a9a138c3e608a162ba544bb0cb78e37925cee4dce5e9eb13f1124cb6730ad5571d50215ae0e6f6904a27ba2f07fa9af52b279cfa334eeafdf5352aaa2834d9dea897562127ff4d42b0070b028fea9ea7b4aa104d69dda21d03a9e14f33dc8551db3b88eb"))), "5b1085f565b1331d4a6c062eb6d8969fc045953dda55bf4e357d0c751815642d7b3d7c25449137449c2086f46d1835f561ea98404657137160c21a092155dc15c9f0b4f45ca407fa6d83048d7d4956c6b6bc76a87541332e396a6474823b4864153f0bdb767f4992f02e8367e9eeb876eb76d2ca51b729ff7e17365e21552f934be9ec0c4a03e102c7355f02613fc33847c82dc6cacb470fdafc516e9594aa95f75c2582b21d4e6303c3ff80f8ce13d6ae4bc3770ed95616472b138f33046ff262fda8c50a222f7bac55cdff88f295e9108517ca1a801ae302f2c973ff168488ea0a71053aa259dcb2bb7d7ee03cbb9244346d7d8a1e1ba592d2ff681bab04cafcd8939df1425c91ba67800ebc9510bafeabdddce00e79e8c3905406c4cbc0ca58a8e066e9def1051fa1672b")
+}
+
+// Opening must fail closed. A cipher that returns plaintext for a message it could not
+// authenticate is worse than no cipher, because everything downstream believes it.
+fn test_gcm_refuses_tampering() {
+    // a flipped tag byte
+    assert_streq(crypto::aes256_gcm_open(unhex("96ae7873c7a9ff5ba7419646533e11f403e9579babbcb26db8bf489b2fc01e76"), unhex("047542cc5e9d28f1e50ed2cd"), unhex("2c3264fda79b9435"), unhex("d8cce9962c0507b90cf000edcfb0dbe64611e94e1e7ca83c9dc0a5c0713e98e0692fc0319adf565ef819d20d0f1494b5b56a84474e19712c")), "")
+    // a flipped ciphertext byte
+    assert_streq(crypto::aes256_gcm_open(unhex("96ae7873c7a9ff5ba7419646533e11f403e9579babbcb26db8bf489b2fc01e76"), unhex("047542cc5e9d28f1e50ed2cd"), unhex("2c3264fda79b9435"), unhex("d9cce9962c0507b90cf000edcfb0dbe64611e94e1e7ca83c9dc0a5c0713e98e0692fc0319adf565ef819d20d0f1494b5b56a84474e1971ac")), "")
+    // the wrong nonce
+    assert_streq(crypto::aes256_gcm_open(unhex("96ae7873c7a9ff5ba7419646533e11f403e9579babbcb26db8bf489b2fc01e76"), unhex("f12c9b3862a6c326cd94c516"), unhex("2c3264fda79b9435"), unhex("d8cce9962c0507b90cf000edcfb0dbe64611e94e1e7ca83c9dc0a5c0713e98e0692fc0319adf565ef819d20d0f1494b5b56a84474e1971ac")), "")
+    // different aad
+    assert_streq(crypto::aes256_gcm_open(unhex("96ae7873c7a9ff5ba7419646533e11f403e9579babbcb26db8bf489b2fc01e76"), unhex("047542cc5e9d28f1e50ed2cd"), unhex("4d41e364c0f5b13c"), unhex("d8cce9962c0507b90cf000edcfb0dbe64611e94e1e7ca83c9dc0a5c0713e98e0692fc0319adf565ef819d20d0f1494b5b56a84474e1971ac")), "")
+    // the wrong key
+    assert_streq(crypto::aes256_gcm_open(unhex("7ea10818c318dc58d9976d4817d3dd6b83661664b4a9f0028b0605ae4e2826cf"), unhex("047542cc5e9d28f1e50ed2cd"), unhex("2c3264fda79b9435"), unhex("d8cce9962c0507b90cf000edcfb0dbe64611e94e1e7ca83c9dc0a5c0713e98e0692fc0319adf565ef819d20d0f1494b5b56a84474e1971ac")), "")
+    // a truncated message
+    assert_streq(crypto::aes256_gcm_open(unhex("96ae7873c7a9ff5ba7419646533e11f403e9579babbcb26db8bf489b2fc01e76"), unhex("047542cc5e9d28f1e50ed2cd"), unhex("2c3264fda79b9435"), unhex("d8cce9962c0507b90cf0")), "")
+}
+
+fn test_gcm_rejects_bad_sizes() {
+    assert_streq(crypto::aes256_gcm_seal("short key", unhex("047542cc5e9d28f1e50ed2cd"), "", "hi"), "")
+    assert_streq(crypto::aes256_gcm_seal(unhex("96ae7873c7a9ff5ba7419646533e11f403e9579babbcb26db8bf489b2fc01e76"), "short", "", "hi"), "")
+    assert_streq(crypto::aes256_gcm_open(unhex("96ae7873c7a9ff5ba7419646533e11f403e9579babbcb26db8bf489b2fc01e76"), unhex("047542cc5e9d28f1e50ed2cd"), "", "tiny"), "")
+}
+
+// AES-128-GCM. The first two are the all-zero cases from the GCM specification (cases 1 and 2,
+// the 128-bit halves of the same table the AES-256 tests above use); the rest come from OpenSSL
+// via python cryptography. The shapes repeat the AES-256 selection on purpose: the key schedule
+// and the round count are what changed, and they are exercised by every one of these.
+fn test_gcm128_vectors() {
+    // empty plaintext and aad (GCM spec case 1)
+    assert_streq(tohex(crypto::aes128_gcm_seal(unhex("00000000000000000000000000000000"), unhex("000000000000000000000000"), unhex(""), unhex(""))), "58e2fccefa7e3061367f1d57a4e7455a")
+    assert_streq(tohex(crypto::aes128_gcm_open(unhex("00000000000000000000000000000000"), unhex("000000000000000000000000"), unhex(""), unhex("58e2fccefa7e3061367f1d57a4e7455a"))), "")
+    // a single zero block (GCM spec case 2)
+    assert_streq(tohex(crypto::aes128_gcm_seal(unhex("00000000000000000000000000000000"), unhex("000000000000000000000000"), unhex(""), unhex("00000000000000000000000000000000"))), "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf")
+    assert_streq(tohex(crypto::aes128_gcm_open(unhex("00000000000000000000000000000000"), unhex("000000000000000000000000"), unhex(""), unhex("0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf"))), "00000000000000000000000000000000")
+    // aad only, nothing to encrypt
+    assert_streq(tohex(crypto::aes128_gcm_seal(unhex("fadf4ba1d159c0270f3a53998c140a64"), unhex("8e24d664aa033e9c9d97d886"), unhex("408ccc2deb7dbcb1e670002db97406bab0e6ae90"), unhex(""))), "c9ba341269224b6c7a2a5587fb3f3a41")
+    assert_streq(tohex(crypto::aes128_gcm_open(unhex("fadf4ba1d159c0270f3a53998c140a64"), unhex("8e24d664aa033e9c9d97d886"), unhex("408ccc2deb7dbcb1e670002db97406bab0e6ae90"), unhex("c9ba341269224b6c7a2a5587fb3f3a41"))), "")
+    // one byte
+    assert_streq(tohex(crypto::aes128_gcm_seal(unhex("c053d3fba33db52c1ae34a966feabc1a"), unhex("3237f10526aa0c4c22b82c20"), unhex(""), unhex("33"))), "6d649a1fdd695e0a997a0cc3d3bc496fa9")
+    assert_streq(tohex(crypto::aes128_gcm_open(unhex("c053d3fba33db52c1ae34a966feabc1a"), unhex("3237f10526aa0c4c22b82c20"), unhex(""), unhex("6d649a1fdd695e0a997a0cc3d3bc496fa9"))), "33")
+    // 37 bytes, unaligned, with aad
+    assert_streq(tohex(crypto::aes128_gcm_seal(unhex("122e818d33266e9eb25fb06da8ace28b"), unhex("ac0beb49d702edb668b4fd6c"), unhex("981225a7280f40a0146ed46887"), unhex("4aba72acdc8813593659a619a1902031080b19aaa1dc43eaf37d6c85ac5ca59fd44ff7a972"))), "77f43dad3cad52b49b937975d2dc0b471de05f29fbe9f36902a458002271ed504769a09352727053e7090b5bb06dfbf319d8a10b51")
+    assert_streq(tohex(crypto::aes128_gcm_open(unhex("122e818d33266e9eb25fb06da8ace28b"), unhex("ac0beb49d702edb668b4fd6c"), unhex("981225a7280f40a0146ed46887"), unhex("77f43dad3cad52b49b937975d2dc0b471de05f29fbe9f36902a458002271ed504769a09352727053e7090b5bb06dfbf319d8a10b51"))), "4aba72acdc8813593659a619a1902031080b19aaa1dc43eaf37d6c85ac5ca59fd44ff7a972")
+    // exactly two blocks
+    assert_streq(tohex(crypto::aes128_gcm_seal(unhex("8df96e8601f5a905d6f9536653853e13"), unhex("7a68151247971ad98423c146"), unhex("b9373253a61709a96b72add846fa0714"), unhex("2e11ee0c57eb4a515b6c86ac2ae6692bd9f48ef2981bbbf88014415846c5f8e7"))), "2b788b245b67684546035946ebba95426511178ec792db1c4860120b788a21aa5f0002caa64485ebc1712ea9e89a311d")
+    assert_streq(tohex(crypto::aes128_gcm_open(unhex("8df96e8601f5a905d6f9536653853e13"), unhex("7a68151247971ad98423c146"), unhex("b9373253a61709a96b72add846fa0714"), unhex("2b788b245b67684546035946ebba95426511178ec792db1c4860120b788a21aa5f0002caa64485ebc1712ea9e89a311d"))), "2e11ee0c57eb4a515b6c86ac2ae6692bd9f48ef2981bbbf88014415846c5f8e7")
+    // 300 bytes, many blocks + tail
+    assert_streq(tohex(crypto::aes128_gcm_seal(unhex("e6a73a427df6d1c233f50fa7c8b68183"), unhex("51c3fdb841b80a3c19176467"), unhex("a62f368773faab"), unhex("b21c4bca47da48a253000a86a7e0106f1c8d17f48406efdb3ff48af49d128e9e8ace2d2777607e148739d22dcc675aae80b3a098ac9681c5f8a7f840bfc98ed585df0a5b1f9b945bf72ba0b2946807fc1d60c4fe1a73d95d21a225da11de5e3eaebb77b95b4de56a110478f7d85daacabfdef2f6b919569599c38c2e7359607289ffed532e624d1a9a831e1ebacc6e4c74953cf1946db602d45450602878555e8cd7fdbdb1f2327de646b199aa90c04dede3ea6d13ea16b7ad96b6a39bb3b6276ac51da52d5c1d3cfed3707d69d8aeacce0c297c7031e77e48d1bbb006ba45cf2715ad3eb41035cebf3f7f38c47c648fee68064e8443883f97af1387b86df75510436cdbdb652ed5684aca9986039c83454590c047c1002b152bc59b7536f2743f34ac35feb1a2144bbfcf11"))), "a35dd6a60085aca518eb64bc253b9e954c29070f7226efa6ca0c6943b917d922670006dc6b9f6c85b359f28c10aa7b1c8eff43bff8878599f16e56b49710e54fea92e1aa9bde47186f04996eeed8afbad86a5b0ec303ca87a4d1ecc7f8f4f15394a06c7630e2efb738a7e710d56cca80c867adac5367bc22b9bc494eafda0fe39f299fdfde31d8d53543ff52a439f28d4a62dac55930f7800133d0f5873363c33975e9a2bad779e66670a1dd927f144b460ec398d0afaf3d2fe2bf989614ced3813827fbbd65385d9dc81a3dcf3042f2084ddb2b2f4022790e576ddb5c0321848efbb7672f7b5542280fe11b22fa0c9502dd4a6555c0c70f36c11f990617b1c5ecd5cca281e63d36f6213b96897577dc2a92e0e04027472be2588de46600ec4503fadb8ce510de7d0414f7bbe44205272d4474c72622f083e77167d3")
+    assert_streq(tohex(crypto::aes128_gcm_open(unhex("e6a73a427df6d1c233f50fa7c8b68183"), unhex("51c3fdb841b80a3c19176467"), unhex("a62f368773faab"), unhex("a35dd6a60085aca518eb64bc253b9e954c29070f7226efa6ca0c6943b917d922670006dc6b9f6c85b359f28c10aa7b1c8eff43bff8878599f16e56b49710e54fea92e1aa9bde47186f04996eeed8afbad86a5b0ec303ca87a4d1ecc7f8f4f15394a06c7630e2efb738a7e710d56cca80c867adac5367bc22b9bc494eafda0fe39f299fdfde31d8d53543ff52a439f28d4a62dac55930f7800133d0f5873363c33975e9a2bad779e66670a1dd927f144b460ec398d0afaf3d2fe2bf989614ced3813827fbbd65385d9dc81a3dcf3042f2084ddb2b2f4022790e576ddb5c0321848efbb7672f7b5542280fe11b22fa0c9502dd4a6555c0c70f36c11f990617b1c5ecd5cca281e63d36f6213b96897577dc2a92e0e04027472be2588de46600ec4503fadb8ce510de7d0414f7bbe44205272d4474c72622f083e77167d3"))), "b21c4bca47da48a253000a86a7e0106f1c8d17f48406efdb3ff48af49d128e9e8ace2d2777607e148739d22dcc675aae80b3a098ac9681c5f8a7f840bfc98ed585df0a5b1f9b945bf72ba0b2946807fc1d60c4fe1a73d95d21a225da11de5e3eaebb77b95b4de56a110478f7d85daacabfdef2f6b919569599c38c2e7359607289ffed532e624d1a9a831e1ebacc6e4c74953cf1946db602d45450602878555e8cd7fdbdb1f2327de646b199aa90c04dede3ea6d13ea16b7ad96b6a39bb3b6276ac51da52d5c1d3cfed3707d69d8aeacce0c297c7031e77e48d1bbb006ba45cf2715ad3eb41035cebf3f7f38c47c648fee68064e8443883f97af1387b86df75510436cdbdb652ed5684aca9986039c83454590c047c1002b152bc59b7536f2743f34ac35feb1a2144bbfcf11")
+}
+
+// Opening must fail closed, exactly as the 256-bit path does. This is repeated rather than
+// assumed: the two share `gcm_open_checked`, and a test that only covers one key length would
+// still pass if a future split gave them separate bodies.
+fn test_gcm128_refuses_tampering() {
+    // a flipped tag byte
+    assert_streq(crypto::aes128_gcm_open(unhex("0f01650c83bb63bb3ee0ac2f8b876ee3"), unhex("c4fcdb9c6c441190bbcb8e94"), unhex("156763d935d816bf"), unhex("5b79c2f2f012decbc4cbf812a8459904cb77394a8f466221f73026767224cabc5689654edbb4a92148ac289382cd51fda4a019fee42941f1")), "")
+    // a flipped ciphertext byte
+    assert_streq(crypto::aes128_gcm_open(unhex("0f01650c83bb63bb3ee0ac2f8b876ee3"), unhex("c4fcdb9c6c441190bbcb8e94"), unhex("156763d935d816bf"), unhex("5a79c2f2f012decbc4cbf812a8459904cb77394a8f466221f73026767224cabc5689654edbb4a92148ac289382cd51fda4a019fee42941f0")), "")
+    // the wrong nonce
+    assert_streq(crypto::aes128_gcm_open(unhex("0f01650c83bb63bb3ee0ac2f8b876ee3"), unhex("6f8c49ed34330dbb8ffe7fd6"), unhex("156763d935d816bf"), unhex("5b79c2f2f012decbc4cbf812a8459904cb77394a8f466221f73026767224cabc5689654edbb4a92148ac289382cd51fda4a019fee42941f0")), "")
+    // different aad
+    assert_streq(crypto::aes128_gcm_open(unhex("0f01650c83bb63bb3ee0ac2f8b876ee3"), unhex("c4fcdb9c6c441190bbcb8e94"), unhex("dfcce6fd155b9d14"), unhex("5b79c2f2f012decbc4cbf812a8459904cb77394a8f466221f73026767224cabc5689654edbb4a92148ac289382cd51fda4a019fee42941f0")), "")
+    // the wrong key
+    assert_streq(crypto::aes128_gcm_open(unhex("52c46eab5f0cbc9bee94069df67a7038"), unhex("c4fcdb9c6c441190bbcb8e94"), unhex("156763d935d816bf"), unhex("5b79c2f2f012decbc4cbf812a8459904cb77394a8f466221f73026767224cabc5689654edbb4a92148ac289382cd51fda4a019fee42941f0")), "")
+    // a truncated message
+    assert_streq(crypto::aes128_gcm_open(unhex("0f01650c83bb63bb3ee0ac2f8b876ee3"), unhex("c4fcdb9c6c441190bbcb8e94"), unhex("156763d935d816bf"), unhex("5b79c2f2f012decbc4cb")), "")
+}
+
+// A 16-byte key is AES-128 and a 32-byte key is AES-256, and neither entry point may quietly
+// accept the other's. Silently treating a short key as valid is how a caller ends up with less
+// strength than it asked for, without any error to notice.
+fn test_gcm128_rejects_bad_sizes() {
+    assert_streq(crypto::aes128_gcm_seal(unhex("b728e8aa7ab194183f2779c311ec32f9ee076230ec7c16e08203f69ddc0c6cac"), unhex("c4fcdb9c6c441190bbcb8e94"), "", "hi"), "")   // a 256-bit key
+    assert_streq(crypto::aes256_gcm_seal(unhex("0f01650c83bb63bb3ee0ac2f8b876ee3"), unhex("c4fcdb9c6c441190bbcb8e94"), "", "hi"), "")   // a 128-bit key
+    assert_streq(crypto::aes128_gcm_seal(unhex("a50cf71084438d81b4bdd7f202888a"), unhex("c4fcdb9c6c441190bbcb8e94"), "", "hi"), "")
+    assert_streq(crypto::aes128_gcm_seal(unhex("0f01650c83bb63bb3ee0ac2f8b876ee3"), "short", "", "hi"), "")
+    assert_streq(crypto::aes128_gcm_open(unhex("0f01650c83bb63bb3ee0ac2f8b876ee3"), unhex("c4fcdb9c6c441190bbcb8e94"), "", "tiny"), "")
+}

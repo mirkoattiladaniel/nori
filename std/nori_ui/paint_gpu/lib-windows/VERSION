@@ -1,0 +1,13 @@
+wgpu-native v29.0.1.1 — wgpu-windows-x86_64-gnu-release.zip
+https://github.com/gfx-rs/wgpu-native/releases/tag/v29.0.1.1
+
+The GNU (mingw) build, not the MSVC one: the cross toolchain here is
+x86_64-w64-mingw32, and an MSVC .lib is a different object format.
+
+Matched to the headers beside it — webgpu.h and wgpu.h in ../ are byte-identical
+to this release's (modulo CRLF), which is how the version was identified: the
+Linux .so carries no version string.
+
+libwgpu_native.a      static (37MB) — links the whole of wgpu into the exe
+libwgpu_native.dll.a  import library for wgpu_native.dll
+wgpu_native.dll       the runtime DLL, needed beside the exe if the import lib is used

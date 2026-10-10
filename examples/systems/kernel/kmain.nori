@@ -1,0 +1,38 @@
+// kmain.nori: a Nori kernel. No libc, no OS underneath; this is the OS.
+// Built by `noric --build kmain.nori kernel --freestanding --asm boot.S --lds kernel.lds --flatbin`
+// and booted with `qemu-system-x86_64 -kernel kernel.bin`. printl goes to COM1; the heap-backed
+// language (Str +, Vec, Map, Float) runs on rt_shim_bare.c's bump allocator at ring 0.
+
+fn main() {
+    printl("")
+    printl("NoriOS 0.1 — a Nori kernel")
+    printl("================================")
+    let who = "ring 0"
+    printl("hello from " + who + " over COM1")
+
+    // the full heap-backed language works on the bare floor: Vec …
+    var primes: Vec<Int> = vec()
+    var n = 2
+    while primes.len() < 10 {
+        var isp = true
+        var d = 2
+        while d * d <= n { if n % d == 0 { isp = false }  d = d + 1 }
+        if isp { primes.push(n) }
+        n = n + 1
+    }
+    var line = "first 10 primes:"
+    var i = 0
+    while i < primes.len() { line = line + " " + to_str(primes[i])  i = i + 1 }
+    printl(line)
+
+    // … Map …
+    var m: Map<Str, Int> = map()
+    m.put("arenas", 5)
+    m.put("com1", 1016)
+    printl("map on the kernel heap: arenas=" + to_str(m.get("arenas")) + " com1-port=" + to_str(m.get("com1")))
+
+    // … and Float (boot.S enabled SSE before calling us)
+    printl("floats too: 6.25 * 4.0 = " + to_str(6.25 * 4.0))
+
+    printl("NoriOS: all systems go")
+}

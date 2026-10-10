@@ -1,0 +1,411 @@
+// roll: the small vocabulary every other module reuses: string and path helpers, argv flags, version-string
+// arithmetic, and where the toolchain store lives on disk.
+//
+// One directory module of roll (see src/main.nori for the layout). It reaches the others through
+// their aliases below, and only what another module uses is `pub`. The modules import each other
+// freely (`cmds` and `deps` call in both directions); cycles between directory modules are fine.
+
+import "std/os" as os
+import "std/path" as path
+import "std/sys" as sys
+import "std/time" as time
+
+// ---------- locating the compiler ----------
+// noric lives at $NORI_HOME/noric; it finds its own runtime files (runtime.nori + rt_shim.c) next to
+// itself, so we pass it a PATH (not a bare name) and no runtime argument.
+pub fn nori_home() -> Str {
+    cfg(windows) { return os::env_or("NORI_HOME", "C:/Program Files/Nori") }
+    return os::env_or("NORI_HOME", "/usr/local/lib/nori")
+}
+// …and the compiler in it. On Windows the path ends in `.exe`: it is also passed to
+// `os::path_exists` before anything is spawned (toolchain.nori refuses to build without it), and
+// `<home>/noric` is not a file there, since the bundle ships `noric.exe`. CreateProcessW would
+// append the suffix on the spawn, but the existence check would still fail.
+pub fn noric_path() -> Str {
+    let h = nori_home()
+    cfg(windows) { let w = (h + "/noric.exe")  if os::path_exists(w) { return w } }
+    return(h + "/noric")
+}
+// the platform's loadable-library extension, for `kind = plugin` output names.
+pub fn plugin_ext() -> Str {
+    cfg(windows) { return "dll" }
+    cfg(macos) { return "dylib" }
+    return "so"
+}
+// …the same for a named platform, which is what a cross build needs: the one above answers from this
+// machine's own cfg, and a plugin built for Windows on a Linux box is not a `.so`.
+pub fn plugin_ext_for(plat: Str) -> Str {
+    if(plat == "windows") { return "dll" }
+    if(plat == "macos") { return "dylib" }
+    return "so"
+}
+// the machine-global, content-addressed dependency cache (fetched once per version, shared, immutable).
+pub fn cache_dir() -> Str {
+    return os::env_or("NORI_CACHE", (os::env_or("HOME", "/tmp") + "/.nori/pkg"))
+}
+
+// ---------- toolchain store: multi-version compiler management ----------
+// Side-by-side compiler versions under ~/.nori/toolchains/<ver>-<target>/, picked per-project. roll is
+// the launcher: for a build it resolves the version a project wants and re-execs that toolchain's roll.
+// With no store configured, roll uses $NORI_HOME in place (dev mode).
+pub fn nori_root() -> Str {
+    return os::env_or("NORI_ROOT", (os::env_or("HOME", "/tmp") + "/.nori"))
+}
+pub fn store_dir() -> Str {
+    return(nori_root() + "/toolchains")
+}
+pub fn settings_path() -> Str {
+    return(nori_root() + "/settings.toml")
+}
+pub fn tc_dir(ver: Str) -> Str {
+    return(store_dir() + ("/" + (ver + ("-" + sys::target()))))
+}
+pub fn vec_has(v: Vec<Str>, s: Str) -> Bool {
+    var i = 0
+    while i < v.len() {
+        if(v[i] == s) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+// the first whitespace-delimited token of `s` (a `sha256sum` line is "<hash>  <name>").
+pub fn first_token(s: Str) -> Str {
+    let n = s.len()
+    var i = 0
+    while i < n && (ord(s.at(i)) == 32 || ord(s.at(i)) == 9 || ord(s.at(i)) == 10 || ord(s.at(i)) == 13) {
+        i = i + 1
+    }
+    var j = i
+    while j < n && !(ord(s.at(j)) == 32 || ord(s.at(j)) == 9 || ord(s.at(j)) == 10 || ord(s.at(j)) == 13) {
+        j = j + 1
+    }
+    return s.slice(i, j)
+}
+// `key=value` lookup within an index entry: the run of non-space chars after `key`.
+pub fn field_after(s: Str, key: Str) -> Str {
+    let p = find_substr(s, key)
+    if p < 0 {
+        return ""
+    }
+    let start = p + key.len()
+    var i = start
+    let n = s.len()
+    while i < n {
+        let c = ord(s.at(i))
+        if c == 32 || c == 9 || c == 10 {
+            return s.slice(start, i)
+        }
+        i = i + 1
+    }
+    return s.slice(start, n)
+}
+// ── `roll update deps` pre-flight: what the new versions removed ────────────────────────────────
+// A tombstone reports at the call site, so you would learn about it on the build after the
+// upgrade, one name at a time. Here the newly resolved versions are already on disk and the lock has
+// not been written yet, so the whole list can be shown before anything is committed: which names went
+// away, what replaced them, and which of your lines use them.
+// Matching is textual and whole-word, since roll has no parser. That can flag a line that only
+// mentions the word (a comment, a same-named local); the report is a heads-up to read, and a missed
+// call site is worse than a spurious one.
+fn is_ident_byte(c: Int) -> Bool {
+    if c >= 97 {
+        if c <= 122 {
+            return true
+        }
+    }
+    // a-z
+    if c >= 65 {
+        if c <= 90 {
+            return true
+        }
+    }
+    // A-Z
+    if c >= 48 {
+        if c <= 57 {
+            return true
+        }
+    }
+    // 0-9
+    return c == 95 // _
+}
+pub fn word_at(line: Str, at: Int, w: Str) -> Bool {
+    if at > 0 {
+        if is_ident_byte(ord(line.at(at - 1))) {
+            return false
+        }
+    }
+    let e = at + w.len()
+    if e < line.len() {
+        if is_ident_byte(ord(line.at(e))) {
+            return false
+        }
+    }
+    return true
+}
+pub fn join_strs(v: Vec<Str>, sep: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < v.len() {
+        if i > 0 {
+            out = (out + sep)
+        }
+        out = (out + v[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ---------- small string helpers ----------
+pub fn trim(s: Str) -> Str {
+    var lo = 0
+    var hi = s.len()
+    while lo < hi {
+        let c = ord(s.at(lo))
+        if c == 32 || c == 9 {
+            lo = lo + 1
+        } else {
+            break
+        }
+    }
+    while hi > lo {
+        let c = ord(s.at(hi - 1))
+        if c == 32 || c == 9 {
+            hi = hi - 1
+        } else {
+            break
+        }
+    }
+    return s.slice(lo, hi)
+}
+pub fn index_of(s: Str, ch: Int) -> Int {
+    var i = 0
+    let n = s.len()
+    while i < n {
+        if ord(s.at(i)) == ch {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+pub fn nl(a: Str, b: Str) -> Str {
+    return(a + ("\n" + b))
+}
+// Delegates to std/path rather than scanning for `/` alone. `roll init D:\\src\\myproj` names the
+// project after this answer, and a `/`-only scan would return the whole path, so the manifest would
+// say `name = D:\src\myproj` on Windows.
+pub fn basename(p: Str) -> Str {
+    return path::basename(p)
+}
+pub fn dirname(p: Str) -> Str {
+    return path::dirname(p)
+}
+pub fn ends_with(s: Str, suf: Str) -> Bool {
+    let n = s.len()
+    let m = suf.len()
+    if m > n {
+        return false
+    }
+    return(s.slice(n - m, n) == suf)
+}
+pub fn starts_with(s: Str, pfx: Str) -> Bool {
+    let m = pfx.len()
+    if m > s.len() {
+        return false
+    }
+    return(s.slice(0, m) == pfx)
+}
+pub fn has_flag(flag: Str) -> Bool {
+    var k = 1
+    while k < argc() {
+        if(arg(k) == flag) {
+            return true
+        }
+        k = k + 1
+    }
+    return false
+}
+
+pub fn lookup_or(m: Map<Str, Str>, k: Str, d: Str) -> Str {
+    if m.has(k) {
+        return copy m.get(k)
+    }
+    return copy d
+}
+// first index of `needle` in `hay`, or -1.
+pub fn find_substr(hay: Str, needle: Str) -> Int {
+    let hn = hay.len() let nn = needle.len()
+    if nn == 0 {
+        return 0
+    }
+    var i = 0
+    while i + nn <= hn {
+        var j = 0
+        while j < nn {
+            if hay.at(i + j) == needle.at(j) {
+                j = j + 1
+            } else {
+                j = nn + 1
+            }
+        }
+        if j == nn {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+// ───────────────── dependency cache hygiene: usage tracking + `roll list` / `roll prune` ─────────────
+// Each cached git dep lives at cache_dir()/<name@commit>/ (shared across projects). We keep a sidecar
+// metadata file per entry at cache_dir()/.meta/<name@commit> with when it was first downloaded and last
+// used, so `roll list` shows what's installed and `roll prune` reclaims deps gone stale (default 90 days
+// unused). `last used` is stamped by git_cache_dir on every resolve that touches an entry.
+pub fn to_int_or(s: Str, dflt: Int) -> Int {
+    let n = s.len()
+    if n == 0 {
+        return dflt
+    }
+    var v = 0
+    var i = 0
+    while i < n {
+        let c = ord(s.at(i))
+        if c < 48 || c > 57 {
+            return dflt
+        }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    return v
+}
+pub fn flag_val(flag: Str, dflt: Str) -> Str {
+    var k = 1
+    while k < argc() {
+        if(arg(k) == flag) {
+            if k + 1 < argc() {
+                return arg(k + 1)
+            }
+        }
+        k = k + 1
+    }
+    return copy dflt
+}
+pub fn dep_word(n: Int) -> Str {
+    if n == 1 {
+        return "dependency"
+    }
+    return "dependencies"
+}
+fn pad2(x: Int) -> Str {
+    if x < 10 {
+        return("0" + to_str(x))
+    }
+    return to_str(x)
+}
+pub fn date_str(secs: Int) -> Str {
+    if secs <= 0 {
+        return "unknown"
+    }
+    let d = time::breakdown(secs)
+    return(to_str(d.year) + ("-" + (pad2(d.month) + ("-" + pad2(d.day)))))
+}
+pub fn ago_str(secs: Int) -> Str {
+    if secs <= 0 {
+        return "never used"
+    }
+    let days = (time::unix_secs() - secs) / 86400
+    if days <= 0 {
+        return "today"
+    }
+    if days == 1 {
+        return "1 day ago"
+    }
+    return(to_str(days) + " days ago")
+}
+pub fn str_lt(a: Str, b: Str) -> Bool {
+    let na = a.len()
+    let nb = b.len()
+    var i = 0
+    while i < na && i < nb {
+        let ca = a.at(i)
+        let cb = b.at(i)
+        if ca != cb {
+            return ca < cb
+        }
+        i = i + 1
+    }
+    return na < nb
+}
+
+// ── semver: parse "X.Y.Z" tags + caret constraints, max-of-mins version selection ──────────────
+// a version's idx-th dot field (0=major,1=minor,2=patch) as Int, after skipping any leading
+// non-digits (a 'v' tag prefix, a '^'/'=' constraint marker). Absent fields read as 0.
+fn ver_field(s0: Str, idx: Int) -> Int {
+    let n = s0.len()
+    var off = 0
+    while off < n && !(ord(s0.at(off)) >= 48 && ord(s0.at(off)) <= 57) {
+        off = off + 1
+    }
+    // skip 'v'/'^'/'='
+    var cur = 0
+    var fld = 0
+    var i = off
+    while i <= n {
+        if i == n || ord(s0.at(i)) == 46 {
+            // '.'
+            if fld == idx {
+                return cur
+            }
+            fld = fld + 1 cur = 0
+        } else { let c = ord(s0.at(i)) if c >= 48 && c <= 57 { cur = cur * 10 + (c - 48) } }
+        i = i + 1
+    }
+    return 0
+}
+pub fn ver_major(s: Str) -> Int {
+    return ver_field(s, 0)
+}
+// a single comparable magnitude for a version (minor/patch bounded < 1000), for ordering tags.
+pub fn ver_num(s: Str) -> Int {
+    return ver_field(s, 0) * 1000000 + ver_field(s, 1) * 1000 + ver_field(s, 2)
+}
+
+// ───────────────── `roll add` / `roll remove`: edit the manifest [deps] section ─────────────────
+// `roll add <name> <git-url>[@ref] [^x.y.z]`: add a git dependency (auto-pins the latest tag as a caret
+//   constraint when none is given; tracks the default branch if the repo has no version tags).
+// `roll add <name> --path <dir>`:              add a local-path dependency.
+// `roll remove <name>` (alias `rm`):           drop a dependency from [deps].
+// Both rewrite nori.manifest in place (preserving comments/order); `add` then resolves + writes nori.lock.
+
+// the positional (non-flag) args from index `start`. A `--flag VAL` pair consumes two slots.
+pub fn positionals_from(start: Int) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var k = start
+    while k < argc() {
+        let a = arg(k)
+        if starts_with(a, "--") {
+            k = k + 2
+        } else {
+            out.push(a)
+            k = k + 1
+        }
+    }
+    return out
+}
+// append `s` as a fresh line to `out` (no leading newline before the first line).
+pub fn join_line(out: Str, s: Str) -> Str {
+    if(out == "") {
+        return copy s
+    }
+    return(out + ("\n" + s))
+}
+// strip a leading 'v' from a tag ("v1.2.0" -> "1.2.0").
+pub fn strip_lead_v(s: Str) -> Str {
+    if s.len() > 0 {
+        if ord(s.at(0)) == 118 {
+            return s.slice(1, s.len())
+        }
+    }
+    return copy s
+}

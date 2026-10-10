@@ -1,0 +1,1453 @@
+//! std/archive: a Zstandard decompressor (RFC 8878 / the zstd format specification).
+//!
+//! The counterpart to this module's Brotli decoder, built in the same layers: bit readers first,
+//! then the two entropy coders zstd uses (FSE and Huffman), then the format's own frame/block/sequence
+//! structure. There is no compressor here: storing a block raw is format-legal and that is what the
+//! one in-tree writer does; see `zstd_store` at the bottom, which exists only so round-trips can be
+//! tested without the CLI.
+//!
+//! Why there are three bit readers. zstd mixes conventions, and getting one of them backwards is the classic way
+//! to produce a decoder that works on tiny inputs and dies on real ones:
+//!   · frame/block/section headers are little-endian byte fields, read forward (`zrd_*`).
+//!   · the FSE table description (`Normalized_Counts`) is a forward, LSB-first bitstream (`ZFwd`),
+//!     the same convention DEFLATE and Brotli use.
+//!   · every FSE and Huffman payload is a backward, MSB-first bitstream (`ZBwd`). It is read from the
+//!     last byte of the section towards the first. The last byte is non-zero and its highest set bit
+//!     is a padding marker that is skipped, which is what fixes the total bit count.
+//! `ZBwd` therefore tracks `pos` = how many valid bits are still unread, and a k-bit read takes bits
+//! [pos-k, pos-1] with bit pos-1 as the MSB. Running off the front is normal at the very end of a
+//! stream (the tail is zero-padded); running off it early is corruption, and `bad` records it.
+//!
+//! What is covered. Frame magic and the full frame header (descriptor, window descriptor, dictionary
+//! ID, frame content size, single-segment); skippable frames; Raw, RLE and Compressed blocks; Raw, RLE,
+//! Huffman and Treeless literals in both the 1-stream and 4-stream forms; FSE table descriptions and
+//! the three predefined distributions; Predefined / RLE / FSE_Compressed / Repeat modes for each of the
+//! three sequence symbol streams; sequence execution with the repeat-offset state; and XXH64 content
+//! checksum verification (not merely skipping; see `zxx64`).
+//!
+//! What is refused by name, rather than mis-decoded: dictionary-compressed frames (a non-zero
+//! Dictionary_ID), and reserved/invalid encodings (block type 3, reserved header bits, a bad magic).
+//! Long-distance matching and multi-threading are encoder-side and leave no trace in the format, so
+//! there is nothing to refuse: streams produced with them decode normally here.
+//!
+//! The repeat offsets are easy to get subtly wrong, so, explicitly: `r0,r1,r2` start
+//! at 1,4,8 at the start of every frame and persist across blocks. An `Offset_Value` above 3 is a
+//! literal offset of `value - 3` and pushes onto the list. A value of 1..3 selects a repeat, and which
+//! one depends on whether this sequence's literal length is zero: the effective index is
+//! `value - 1 + (literal_length == 0)`, and index 3 means "r0 minus one". See `zupdate_rep`.
+
+// ── 64-bit arithmetic as 32-bit halves (for XXH64) ─────────────────────────────────────────────────
+// Nori's Int is a 64-bit signed integer and the dev profile traps on overflow, so XXH64's wrapping
+// mod-2^64 multiply cannot be written as `a * b`. Values are carried as two 32-bit halves and the
+// multiply is done in 16-bit limbs, where every partial product fits in 32 bits with room to spare.
+struct U64 { hi: Int, lo: Int }
+
+fn u64(h: Int, l: Int) -> U64 { return U64 { hi: h & 4294967295, lo: l & 4294967295 } }
+
+fn u64_add(a: U64, b: U64) -> U64 {
+    let l = a.lo + b.lo
+    let c = (l >> 32) & 1
+    let h = ((a.hi + b.hi) + c) & 4294967295
+    return U64 { hi: h, lo: l & 4294967295 }
+}
+fn u64_xor(a: U64, b: U64) -> U64 { return U64 { hi: a.hi ^ b.hi, lo: a.lo ^ b.lo } }
+
+/// (a * b) mod 2^64, via 16-bit limbs so no partial product can overflow a signed 64-bit Int.
+fn u64_mul(a: U64, b: U64) -> U64 {
+    let a0 = a.lo & 65535
+    let a1 = (a.lo >> 16) & 65535
+    let a2 = a.hi & 65535
+    let a3 = (a.hi >> 16) & 65535
+    let b0 = b.lo & 65535
+    let b1 = (b.lo >> 16) & 65535
+    let b2 = b.hi & 65535
+    let b3 = (b.hi >> 16) & 65535
+    let c0 = a0 * b0
+    var c1 = a0 * b1
+    c1 = c1 + (a1 * b0)
+    var c2 = a0 * b2
+    c2 = c2 + (a1 * b1)
+    c2 = c2 + (a2 * b0)
+    var c3 = a0 * b3
+    c3 = c3 + (a1 * b2)
+    c3 = c3 + (a2 * b1)
+    c3 = c3 + (a3 * b0)
+    let r0 = c0 & 65535
+    let t1 = c1 + (c0 >> 16)
+    let r1 = t1 & 65535
+    let t2 = c2 + (t1 >> 16)
+    let r2 = t2 & 65535
+    let t3 = c3 + (t2 >> 16)
+    let r3 = t3 & 65535
+    return U64 { hi: r2 | (r3 << 16), lo: r0 | (r1 << 16) }
+}
+fn u64_rotl(a: U64, r: Int) -> U64 {
+    var hi = a.hi
+    var lo = a.lo
+    var k = r
+    if k >= 32 {
+        let t = hi
+        hi = lo
+        lo = t
+        k = k - 32
+    }
+    if k == 0 { return U64 { hi: hi, lo: lo } }
+    let nh = ((hi << k) | (lo >> (32 - k))) & 4294967295
+    let nl = ((lo << k) | (hi >> (32 - k))) & 4294967295
+    return U64 { hi: nh, lo: nl }
+}
+/// logical right shift by n (0 < n < 64).
+fn u64_shr(a: U64, n: Int) -> U64 {
+    if n >= 32 { return U64 { hi: 0, lo: (a.hi >> (n - 32)) & 4294967295 } }
+    if n == 0 { return U64 { hi: a.hi, lo: a.lo } }
+    let nl = ((a.lo >> n) | (a.hi << (32 - n))) & 4294967295
+    return U64 { hi: (a.hi >> n) & 4294967295, lo: nl }
+}
+
+fn xp1() -> U64 { return u64(2654435761, 2246822535) }   // 0x9E3779B1_85EBCA87
+fn xp2() -> U64 { return u64(3266489917, 668265295) }    // 0xC2B2AE3D_27D4EB4F
+fn xp3() -> U64 { return u64(374761393, 2654435833) }    // 0x165667B1_9E3779F9
+fn xp4() -> U64 { return u64(2246822519, 3266489955) }   // 0x85EBCA77_C2B2AE63
+fn xp5() -> U64 { return u64(668265263, 374761413) }     // 0x27D4EB2F_165667C5
+fn xnegp1() -> U64 { return u64(1640531534, 2048144761) }  // 0 - PRIME64_1, mod 2^64
+
+fn xx_round(acc: U64, inp: U64) -> U64 {
+    var a = u64_add(acc, u64_mul(inp, xp2()))
+    a = u64_rotl(a, 31)
+    return u64_mul(a, xp1())
+}
+fn xx_merge(acc: U64, val: U64) -> U64 {
+    let v = xx_round(u64(0, 0), val)
+    let a = u64_xor(acc, v)
+    return u64_add(u64_mul(a, xp1()), xp4())
+}
+
+/// XXH64 (seed 0) of `n` bytes at raw pointer `p`: the checksum a zstd frame carries when its
+/// Content_Checksum_flag is set (the frame stores the low 32 bits of it).
+fn zxx64(p: Int, n: Int) -> U64 {
+    var h = u64(0, 0)
+    var i = 0
+    if n >= 32 {
+        var v1 = u64_add(xp1(), xp2())
+        var v2 = xp2()
+        var v3 = u64(0, 0)
+        var v4 = xnegp1()
+        while i + 32 <= n {
+            v1 = xx_round(v1, zrd64p(p, i))
+            v2 = xx_round(v2, zrd64p(p, i + 8))
+            v3 = xx_round(v3, zrd64p(p, i + 16))
+            v4 = xx_round(v4, zrd64p(p, i + 24))
+            i = i + 32
+        }
+        h = u64_add(u64_rotl(v1, 1), u64_rotl(v2, 7))
+        h = u64_add(h, u64_rotl(v3, 12))
+        h = u64_add(h, u64_rotl(v4, 18))
+        h = xx_merge(h, v1)
+        h = xx_merge(h, v2)
+        h = xx_merge(h, v3)
+        h = xx_merge(h, v4)
+    } else {
+        h = u64_add(xp5(), u64(0, 0))
+    }
+    h = u64_add(h, u64((n >> 32) & 4294967295, n & 4294967295))
+    while i + 8 <= n {
+        let k1 = xx_round(u64(0, 0), zrd64p(p, i))
+        h = u64_xor(h, k1)
+        h = u64_add(u64_mul(u64_rotl(h, 27), xp1()), xp4())
+        i = i + 8
+    }
+    if i + 4 <= n {
+        var w = 0
+        unsafe {
+            w = peek8(p + i)
+            w = w | (peek8(p + i + 1) << 8)
+            w = w | (peek8(p + i + 2) << 16)
+            w = w | (peek8(p + i + 3) << 24)
+        }
+        h = u64_xor(h, u64_mul(u64(0, w), xp1()))
+        h = u64_add(u64_mul(u64_rotl(h, 23), xp2()), xp3())
+        i = i + 4
+    }
+    while i < n {
+        var by = 0
+        unsafe { by = peek8(p + i) }
+        h = u64_xor(h, u64_mul(u64(0, by), xp5()))
+        h = u64_mul(u64_rotl(h, 11), xp1())
+        i = i + 1
+    }
+    h = u64_xor(h, u64_shr(h, 33))
+    h = u64_mul(h, xp2())
+    h = u64_xor(h, u64_shr(h, 29))
+    h = u64_mul(h, xp3())
+    h = u64_xor(h, u64_shr(h, 32))
+    return h
+}
+fn zrd64p(p: Int, off: Int) -> U64 {
+    var lo = 0
+    var hi = 0
+    unsafe {
+        lo = peek8(p + off)
+        lo = lo | (peek8(p + off + 1) << 8)
+        lo = lo | (peek8(p + off + 2) << 16)
+        lo = lo | (peek8(p + off + 3) << 24)
+        hi = peek8(p + off + 4)
+        hi = hi | (peek8(p + off + 5) << 8)
+        hi = hi | (peek8(p + off + 6) << 16)
+        hi = hi | (peek8(p + off + 7) << 24)
+    }
+    return U64 { hi: hi & 4294967295, lo: lo & 4294967295 }
+}
+
+// ── output sink: a growable raw buffer. Match copies need O(1) random access into what was already
+// produced (an offset may reach back across block boundaries), so this is one contiguous allocation.
+struct ZOut { p: Int, len: Int, cap: Int }
+
+fn zout_new() -> ZOut {
+    var o = ZOut { p: 0, len: 0, cap: 65536 }
+    unsafe { o.p = malloc(65536) }
+    return o
+}
+fn zout_reserve(inout o: ZOut, extra: Int) {
+    if o.len + extra > o.cap {
+        var nc = o.cap
+        while nc < o.len + extra { nc = nc * 2 }
+        unsafe { o.p = realloc(o.p, nc) }
+        o.cap = nc
+    }
+}
+fn zout_byte(inout o: ZOut, v: Int) {
+    zout_reserve(o, 1)
+    unsafe { poke8(o.p + o.len, v & 255) }
+    o.len = o.len + 1
+}
+fn zout_at(o: ZOut, i: Int) -> Int {
+    var v = 0
+    unsafe { v = peek8(o.p + i) }
+    return v
+}
+
+// ── forward, LSB-first bit reader (FSE table descriptions only) ────────────────────────────────────
+struct ZFwd { d: view Str, base: Int, n: Int, pos: Int, buf: Int, cnt: Int }
+
+fn zfwd_new(d: Str, start: Int, end: Int) -> ZFwd {
+    return ZFwd { d: d, base: start, n: end, pos: start, buf: 0, cnt: 0 }
+}
+fn zfwd_fill(inout b: ZFwd, k: Int) {
+    while b.cnt < k {
+        var by = 0
+        if b.pos < b.n { by = ord(b.d.at(b.pos)) }
+        b.buf = b.buf | (by << b.cnt)
+        b.pos = b.pos + 1
+        b.cnt = b.cnt + 8
+    }
+}
+fn zfwd_peek(inout b: ZFwd, k: Int) -> Int {
+    if k <= 0 { return 0 }
+    zfwd_fill(b, k)
+    return b.buf & ((1 << k) - 1)
+}
+fn zfwd_skip(inout b: ZFwd, k: Int) {
+    if k > 0 {
+        zfwd_fill(b, k)
+        b.buf = b.buf >> k
+        b.cnt = b.cnt - k
+    }
+}
+fn zfwd_take(inout b: ZFwd, k: Int) -> Int {
+    let v = zfwd_peek(b, k)
+    zfwd_skip(b, k)
+    return v
+}
+/// how many whole bytes the reader has consumed (a partial byte counts as one): the table
+/// description's size, which is what tells the caller where the backward bitstream starts.
+fn zfwd_used(b: ZFwd) -> Int {
+    let bits = (8 * (b.pos - b.base)) - b.cnt
+    return (bits + 7) >> 3
+}
+
+// ── backward, MSB-first bit reader (every FSE and Huffman payload) ─────────────────────────────────
+// `pos` counts the bits that are still unread, so a k-bit read is bits [pos-k, pos-1] with bit pos-1
+// as the value's MSB. Bit index j means bit (j & 7) of byte (j >> 3), counting from the byte's LSB.
+struct ZBwd { d: view Str, base: Int, n: Int, pos: Int, bad: Int }
+
+fn zbwd_new(d: Str, start: Int, len: Int) -> ZBwd {
+    var b = ZBwd { d: d, base: start, n: len, pos: 0, bad: 0 }
+    if len <= 0 || start < 0 || start + len > d.len() {
+        b.bad = 1
+        return b
+    }
+    let last = ord(d.at(start + len - 1))
+    if last == 0 {
+        b.bad = 1                                    // the padding marker bit must exist
+        return b
+    }
+    var h = 7
+    while ((last >> h) & 1) == 0 { h = h - 1 }
+    b.pos = (8 * (len - 1)) + h
+    return b
+}
+fn zbwd_bits(b: ZBwd, start: Int, k: Int) -> Int {
+    var v = 0
+    var got = 0
+    var idx = start
+    while got < k {
+        if idx < 0 {
+            var take = 0 - idx
+            if take > k - got { take = k - got }
+            got = got + take                          // past the front: zero-padded, as the spec wants
+            idx = idx + take
+        } else {
+            let byi = idx >> 3
+            let bit = idx & 7
+            var take = 8 - bit
+            if take > k - got { take = k - got }
+            var by = 0
+            if byi < b.n { by = ord(b.d.at(b.base + byi)) }
+            let chunk = (by >> bit) & ((1 << take) - 1)
+            v = v | (chunk << got)
+            got = got + take
+            idx = idx + take
+        }
+    }
+    return v
+}
+fn zbwd_peek(b: ZBwd, k: Int) -> Int {
+    if k <= 0 { return 0 }
+    return zbwd_bits(b, b.pos - k, k)
+}
+fn zbwd_skip(inout b: ZBwd, k: Int) {
+    b.pos = b.pos - k
+    if b.pos < 0 { b.bad = 1 }
+}
+fn zbwd_read(inout b: ZBwd, k: Int) -> Int {
+    if k <= 0 { return 0 }
+    let v = zbwd_peek(b, k)
+    zbwd_skip(b, k)
+    return v
+}
+
+// ── FSE ────────────────────────────────────────────────────────────────────────────────────────────
+// A decoding table of 2^log entries; a state indexes it directly. Each entry says which symbol the
+// state emits, and how many bits to read to reach the next state.
+struct ZFse { sym: Vec<Int>, nb: Vec<Int>, ns: Vec<Int>, log: Int, ok: Int }
+
+fn zfse_none() -> ZFse {
+    var a: Vec<Int> = vec()
+    var b: Vec<Int> = vec()
+    var c: Vec<Int> = vec()
+    return ZFse { sym: a, nb: b, ns: c, log: 0, ok: 0 }
+}
+/// the degenerate one-state table an RLE mode asks for: always `s`, never consumes a bit.
+fn zfse_rle(s: Int) -> ZFse {
+    var a: Vec<Int> = vec()
+    var b: Vec<Int> = vec()
+    var c: Vec<Int> = vec()
+    a.push(s)
+    b.push(0)
+    c.push(0)
+    return ZFse { sym: a, nb: b, ns: c, log: 0, ok: 1 }
+}
+fn zhighbit(x: Int) -> Int {
+    var n = 0
+    var v = x
+    while v > 1 {
+        n = n + 1
+        v = v >> 1
+    }
+    return n
+}
+/// FSE_buildDTable: spread the symbols over the table with the standard stride, then derive each
+/// state's (symbol, nbBits, baseline). Symbols with a normalized count of -1 ("less than one") are
+/// parked at the top of the table and get a full-width state.
+fn zfse_build(norm: Vec<Int>, maxsym: Int, log: Int) -> ZFse {
+    let size = 1 << log
+    let mask = size - 1
+    var tsym: Vec<Int> = vec()
+    var nxt: Vec<Int> = vec()
+    var i = 0
+    while i < size {
+        tsym.push(0)
+        i = i + 1
+    }
+    i = 0
+    while i <= maxsym {
+        nxt.push(0)
+        i = i + 1
+    }
+    var high = size - 1
+    var s = 0
+    while s <= maxsym {
+        if norm[s] == -1 {
+            tsym[high] = s
+            high = high - 1
+            nxt[s] = 1
+        } else {
+            nxt[s] = norm[s]
+        }
+        s = s + 1
+    }
+    let step = ((size >> 1) + (size >> 3)) + 3
+    var pos = 0
+    s = 0
+    while s <= maxsym {
+        var c = norm[s]
+        if c < 0 { c = 0 }
+        var j = 0
+        while j < c {
+            tsym[pos] = s
+            pos = (pos + step) & mask
+            while pos > high { pos = (pos + step) & mask }
+            j = j + 1
+        }
+        s = s + 1
+    }
+    var osym: Vec<Int> = vec()
+    var onb: Vec<Int> = vec()
+    var ons: Vec<Int> = vec()
+    i = 0
+    while i < size {
+        let sv = tsym[i]
+        let st = nxt[sv]
+        nxt[sv] = st + 1
+        let bits = log - zhighbit(st)
+        osym.push(sv)
+        onb.push(bits)
+        ons.push((st << bits) - size)
+        i = i + 1
+    }
+    var okv = 1
+    if pos != 0 { okv = 0 }                           // the spread must return to slot 0 exactly
+    return ZFse { sym: osym, nb: onb, ns: ons, log: log, ok: okv }
+}
+fn zfse_start(inout b: ZBwd, t: ZFse) -> Int { return zbwd_read(b, t.log) }
+fn zfse_sym(t: ZFse, st: Int) -> Int { return t.sym[st] }
+fn zfse_next(inout b: ZBwd, t: ZFse, st: Int) -> Int { return t.ns[st] + zbwd_read(b, t.nb[st]) }
+
+// FSE_readNCount: the Normalized_Counts table description, a forward LSB-first bitstream. Counts are
+// read with a shrinking bit width; a count of 0 is followed by a 2-bit repeat run (0b11 = "three more,
+// keep reading"), and the value stored is one less than what was read so that -1 can mean "less than 1".
+struct ZNC { norm: Vec<Int>, log: Int, maxsym: Int, ok: Int }
+
+fn zfse_read_ncount(inout f: ZFwd, maxsym: Int, maxlog: Int) -> ZNC {
+    var norm: Vec<Int> = vec()
+    var i = 0
+    while i <= maxsym {
+        norm.push(0)
+        i = i + 1
+    }
+    let log = zfwd_take(f, 4) + 5
+    if log > maxlog || log < 5 { return ZNC { norm: norm, log: log, maxsym: maxsym, ok: 0 } }
+    var remaining = (1 << log) + 1
+    var threshold = 1 << log
+    var nbits = log + 1
+    var charnum = 0
+    var prev0 = false
+    var okv = 1
+    while remaining > 1 && charnum <= maxsym && okv == 1 {
+        if prev0 {
+            var n0 = charnum
+            var run = true
+            while run {
+                if zfwd_peek(f, 2) == 3 {
+                    n0 = n0 + 3
+                    zfwd_skip(f, 2)
+                } else { run = false }
+            }
+            n0 = n0 + zfwd_take(f, 2)
+            while charnum < n0 && charnum <= maxsym {
+                norm[charnum] = 0
+                charnum = charnum + 1
+            }
+            if charnum < n0 { okv = 0 }
+            prev0 = false
+        } else {
+            let mx = ((2 * threshold) - 1) - remaining
+            var count = 0
+            let low = zfwd_peek(f, nbits - 1)
+            if low < mx {
+                count = low
+                zfwd_skip(f, nbits - 1)
+            } else {
+                count = zfwd_peek(f, nbits)
+                if count >= threshold { count = count - mx }
+                zfwd_skip(f, nbits)
+            }
+            count = count - 1
+            var a = count
+            if a < 0 { a = 0 - a }
+            remaining = remaining - a
+            if remaining < 1 { okv = 0 }
+            norm[charnum] = count
+            charnum = charnum + 1
+            prev0 = count == 0
+            while remaining < threshold {
+                nbits = nbits - 1
+                threshold = threshold >> 1
+            }
+        }
+        if f.pos - f.base > (f.n - f.base) + 8 { okv = 0 }
+    }
+    if remaining != 1 { okv = 0 }
+    return ZNC { norm: norm, log: log, maxsym: maxsym, ok: okv }
+}
+
+// ── Huffman (literals) ─────────────────────────────────────────────────────────────────────────────
+// A flat table of 2^log entries indexed by the next `log` bits of the MSB-first backward stream, so a
+// symbol costs one lookup plus a skip of that entry's code length. zstd describes the tree by weights:
+// weight w means code length `log + 1 - w`, w = 0 means the symbol is absent, and the last symbol's
+// weight is implied: it is whatever completes the code space to the next power of two.
+struct ZHuf { sym: Vec<Int>, nb: Vec<Int>, log: Int, ok: Int }
+
+fn zhuf_none() -> ZHuf {
+    var a: Vec<Int> = vec()
+    var b: Vec<Int> = vec()
+    return ZHuf { sym: a, nb: b, log: 0, ok: 0 }
+}
+/// canonical assignment, MSB-first, with the longest codes numbered first: symbols are ordered by
+/// increasing weight (so decreasing code length), ties in increasing symbol value, and code 0 goes to
+/// the first of them. Worked example: weights A=1 B=2 C=1 D=3 over a 3-bit table give A=000, C=001,
+/// B=01, D=1, so the table reads A,C,BB,DDDD. (The opposite order also builds a valid prefix code,
+/// which is why this is the single easiest thing to get wrong here and still pass a small test.)
+fn zhuf_build(w: Vec<Int>, nsym: Int, log: Int) -> ZHuf {
+    let size = 1 << log
+    var cnt: Vec<Int> = vec()
+    var i = 0
+    while i <= log + 1 {
+        cnt.push(0)
+        i = i + 1
+    }
+    var wok = 1
+    i = 0
+    while i < nsym {
+        if w[i] > log { wok = 0 }
+        if w[i] > 0 && w[i] <= log {
+            let l = (log + 1) - w[i]
+            cnt[l] = cnt[l] + 1
+        }
+        i = i + 1
+    }
+    if wok == 0 { return zhuf_none() }
+    var next: Vec<Int> = vec()
+    i = 0
+    while i <= log + 1 {
+        next.push(0)
+        i = i + 1
+    }
+    // codes are issued longest-first: zstd gives code 0 to the lowest weight (the longest code), not
+    // to the shortest one. Getting this backwards produces a table that is self-consistent and wrong.
+    var code = 0
+    var bl = log
+    while bl >= 1 {
+        next[bl] = code
+        code = (code + cnt[bl]) >> 1
+        bl = bl - 1
+    }
+    var sym: Vec<Int> = vec()
+    var nb: Vec<Int> = vec()
+    i = 0
+    while i < size {
+        sym.push(0)
+        nb.push(log)
+        i = i + 1
+    }
+    var okv = 1
+    i = 0
+    while i < nsym {
+        if w[i] > 0 {
+            let l = (log + 1) - w[i]
+            let c = next[l]
+            next[l] = c + 1
+            let start = c << (log - l)
+            let span = 1 << (log - l)
+            if start + span > size {
+                okv = 0
+            } else {
+                var j = 0
+                while j < span {
+                    sym[start + j] = i
+                    nb[start + j] = l
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ZHuf { sym: sym, nb: nb, log: log, ok: okv }
+}
+fn zhuf_decode(inout b: ZBwd, h: ZHuf) -> Int {
+    let idx = zbwd_peek(b, h.log)
+    zbwd_skip(b, h.nb[idx])
+    return h.sym[idx]
+}
+
+// Huffman_Tree_Description. A header byte >= 128 means the weights follow directly, 4 bits each, high
+// nibble first, and there are `hdr - 127` of them. Otherwise the byte is the size of an FSE-compressed
+// weight stream, whose payload is decoded with two interleaved FSE states over one backward bitstream.
+struct ZTree { h: ZHuf, used: Int, ok: Int }
+
+fn zhuf_read_tree(d: Str, off: Int, endp: Int) -> ZTree {
+    if off >= endp { return ZTree { h: zhuf_none(), used: 0, ok: 0 } }
+    let hdr = ord(d.at(off))
+    var w: Vec<Int> = vec()
+    var used = 0
+    var okv = 1
+    if hdr >= 128 {
+        let nw = hdr - 127
+        let nbytes = (nw + 1) >> 1
+        used = 1 + nbytes
+        if off + used > endp {
+            okv = 0
+        } else {
+            var i = 0
+            while i < nw {
+                let by = ord(d.at(off + 1 + (i >> 1)))
+                if (i & 1) == 0 { w.push((by >> 4) & 15) } else { w.push(by & 15) }
+                i = i + 1
+            }
+        }
+    } else {
+        let csize = hdr
+        used = 1 + csize
+        if off + used > endp || csize < 1 {
+            okv = 0
+        } else {
+            var f = zfwd_new(d, off + 1, off + 1 + csize)
+            let nc = zfse_read_ncount(f, 255, 9)
+            if nc.ok == 0 {
+                okv = 0
+            } else {
+                let hdrb = zfwd_used(f)
+                let t = zfse_build(nc.norm, 255, nc.log)
+                if t.ok == 0 || hdrb >= csize {
+                    okv = 0
+                } else {
+                    var bw = zbwd_new(d, off + 1 + hdrb, csize - hdrb)
+                    var st: Vec<Int> = vec()
+                    st.push(zfse_start(bw, t))
+                    st.push(zfse_start(bw, t))
+                    var cur = 0
+                    var done = false
+                    if bw.bad == 1 { okv = 0 }
+                    while !done && okv == 1 && w.len() < 256 {
+                        w.push(zfse_sym(t, st[cur]))
+                        st[cur] = zfse_next(bw, t, st[cur])
+                        if bw.pos < 0 {
+                            w.push(zfse_sym(t, st[1 - cur]))
+                            done = true
+                        }
+                        cur = 1 - cur
+                    }
+                    if !done { okv = 0 }
+                }
+            }
+        }
+    }
+    if okv == 0 { return ZTree { h: zhuf_none(), used: used, ok: 0 } }
+    // total code space of the explicit weights; the implied last weight fills it to a power of two.
+    var total = 0
+    var i2 = 0
+    while i2 < w.len() {
+        if w[i2] > 0 { total = total + (1 << (w[i2] - 1)) }
+        i2 = i2 + 1
+    }
+    if total < 1 { return ZTree { h: zhuf_none(), used: used, ok: 0 } }
+    let log = zhighbit(total) + 1
+    let rest = (1 << log) - total
+    if rest <= 0 || (rest & (rest - 1)) != 0 || log > 11 {
+        return ZTree { h: zhuf_none(), used: used, ok: 0 }
+    }
+    w.push(zhighbit(rest) + 1)
+    let hh = zhuf_build(w, w.len(), log)
+    if hh.ok == 0 { return ZTree { h: zhuf_none(), used: used, ok: 0 } }
+    return ZTree { h: hh, used: used, ok: 1 }
+}
+
+// ── constant tables (RFC 8878 §3.1.1.3.2) ──────────────────────────────────────────────────────────
+fn zpush8(inout v: Vec<Int>, a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int) {
+    v.push(a)
+    v.push(b)
+    v.push(c)
+    v.push(d)
+    v.push(e)
+    v.push(f)
+    v.push(g)
+    v.push(h)
+}
+fn zll_base() -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    var i = 0
+    while i < 16 {
+        v.push(i)
+        i = i + 1
+    }
+    zpush8(v, 16, 18, 20, 22, 24, 28, 32, 40)
+    zpush8(v, 48, 64, 128, 256, 512, 1024, 2048, 4096)
+    v.push(8192)
+    v.push(16384)
+    v.push(32768)
+    v.push(65536)
+    return v
+}
+fn zll_bits() -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    var i = 0
+    while i < 16 {
+        v.push(0)
+        i = i + 1
+    }
+    zpush8(v, 1, 1, 1, 1, 2, 2, 3, 3)
+    zpush8(v, 4, 6, 7, 8, 9, 10, 11, 12)
+    v.push(13)
+    v.push(14)
+    v.push(15)
+    v.push(16)
+    return v
+}
+fn zml_base() -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    var i = 0
+    while i < 32 {
+        v.push(i + 3)
+        i = i + 1
+    }
+    zpush8(v, 35, 37, 39, 41, 43, 47, 51, 59)
+    zpush8(v, 67, 83, 99, 131, 259, 515, 1027, 2051)
+    zpush8(v, 4099, 8195, 16387, 32771, 65539, 0, 0, 0)
+    var r: Vec<Int> = vec()
+    i = 0
+    while i < 53 {
+        r.push(v[i])
+        i = i + 1
+    }
+    return r
+}
+fn zml_bits() -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    var i = 0
+    while i < 32 {
+        v.push(0)
+        i = i + 1
+    }
+    zpush8(v, 1, 1, 1, 1, 2, 2, 3, 3)
+    zpush8(v, 4, 4, 5, 7, 8, 9, 10, 11)
+    zpush8(v, 12, 13, 14, 15, 16, 0, 0, 0)
+    var r: Vec<Int> = vec()
+    i = 0
+    while i < 53 {
+        r.push(v[i])
+        i = i + 1
+    }
+    return r
+}
+fn zll_default() -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    zpush8(v, 4, 3, 2, 2, 2, 2, 2, 2)
+    zpush8(v, 2, 2, 2, 2, 2, 1, 1, 1)
+    zpush8(v, 2, 2, 2, 2, 2, 2, 2, 2)
+    zpush8(v, 2, 3, 2, 1, 1, 1, 1, 1)
+    v.push(0 - 1)
+    v.push(0 - 1)
+    v.push(0 - 1)
+    v.push(0 - 1)
+    return v
+}
+fn zml_default() -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    zpush8(v, 1, 4, 3, 2, 2, 2, 2, 2)
+    zpush8(v, 2, 1, 1, 1, 1, 1, 1, 1)
+    zpush8(v, 1, 1, 1, 1, 1, 1, 1, 1)
+    zpush8(v, 1, 1, 1, 1, 1, 1, 1, 1)
+    zpush8(v, 1, 1, 1, 1, 1, 1, 1, 1)
+    zpush8(v, 1, 1, 1, 1, 1, 1, 0 - 1, 0 - 1)
+    var i = 0
+    while i < 5 {
+        v.push(0 - 1)
+        i = i + 1
+    }
+    return v
+}
+fn zof_default() -> Vec<Int> {
+    var v: Vec<Int> = vec()
+    zpush8(v, 1, 1, 1, 1, 1, 1, 2, 2)
+    zpush8(v, 2, 1, 1, 1, 1, 1, 1, 1)
+    zpush8(v, 1, 1, 1, 1, 1, 1, 1, 1)
+    var i = 0
+    while i < 5 {
+        v.push(0 - 1)
+        i = i + 1
+    }
+    return v
+}
+
+// ── frame/block decode state carried across blocks ─────────────────────────────────────────────────
+// The Huffman table survives into a Treeless_Literals_Block; the three sequence FSE tables survive into
+// a Repeat mode; the repeat offsets survive unconditionally. All three are per-frame, not per-block.
+struct ZS {
+    ll: ZFse,
+    of: ZFse,
+    ml: ZFse,
+    huf: ZHuf,
+    r0: Int,
+    r1: Int,
+    r2: Int,
+    err: Str
+}
+fn zfail(inout s: ZS, sink m: Str) {
+    if s.err.len() == 0 { s.err = m }
+}
+
+fn zrd_le(d: Str, off: Int, n: Int) -> Int {
+    var v = 0
+    var i = 0
+    while i < n {
+        let by = ord(d.at(off + i))
+        v = v | (by << (8 * i))
+        i = i + 1
+    }
+    return v
+}
+
+/// ZSTD_updateRep. `ov` is the raw Offset_Value from the sequence (>3 = a literal offset of ov-3,
+/// 1..3 = a repeat). `ll0` is 1 when this sequence's literal length is zero, which shifts which repeat
+/// slot the code names (the rule that makes offset code 3 with no literals mean "r0 - 1").
+fn zupdate_rep(inout s: ZS, ov: Int, ll0: Int) -> Int {
+    if ov > 3 {
+        let o = ov - 3
+        s.r2 = s.r1
+        s.r1 = s.r0
+        s.r0 = o
+        return o
+    }
+    let rc = (ov - 1) + ll0
+    if rc == 0 { return s.r0 }
+    var o = 0
+    if rc == 3 { o = s.r0 - 1 } else { o = s.r1 }
+    if rc == 2 { o = s.r2 }
+    if rc >= 2 { s.r2 = s.r1 }
+    s.r1 = s.r0
+    s.r0 = o
+    return o
+}
+
+// ── literals section ───────────────────────────────────────────────────────────────────────────────
+// Returns the number of bytes the section occupied, or -1. Decoded literals land in `lit`, whose length
+// is reset by the caller each block.
+fn zliterals(d: Str, off: Int, endp: Int, inout lit: ZOut, inout s: ZS) -> Int {
+    if off >= endp {
+        zfail(s, "zstd: literals section runs past the end of the block")
+        return 0 - 1
+    }
+    let b0 = ord(d.at(off))
+    let ltype = b0 & 3
+    let sfmt = (b0 >> 2) & 3
+    var hdrsz = 0
+    var regen = 0
+    var csize = 0
+    var nstreams = 1
+    if ltype < 2 {
+        if sfmt == 1 {
+            hdrsz = 2
+            if off + 2 > endp {
+                zfail(s, "zstd: truncated literals header")
+                return 0 - 1
+            }
+            regen = (zrd_le(d, off, 2) >> 4) & 4095
+        } else if sfmt == 3 {
+            hdrsz = 3
+            if off + 3 > endp {
+                zfail(s, "zstd: truncated literals header")
+                return 0 - 1
+            }
+            regen = (zrd_le(d, off, 3) >> 4) & 1048575
+        } else {
+            hdrsz = 1
+            regen = (b0 >> 3) & 31
+        }
+        if ltype == 0 {
+            if off + hdrsz + regen > endp {
+                zfail(s, "zstd: raw literals run past the end of the block")
+                return 0 - 1
+            }
+            var i = 0
+            zout_reserve(lit, regen)
+            while i < regen {
+                zout_byte(lit, ord(d.at(off + hdrsz + i)))
+                i = i + 1
+            }
+            return hdrsz + regen
+        }
+        if off + hdrsz + 1 > endp {
+            zfail(s, "zstd: truncated RLE literals")
+            return 0 - 1
+        }
+        let by = ord(d.at(off + hdrsz))
+        var i2 = 0
+        zout_reserve(lit, regen)
+        while i2 < regen {
+            zout_byte(lit, by)
+            i2 = i2 + 1
+        }
+        return hdrsz + 1
+    }
+    // Compressed (2) or Treeless (3): Regenerated_Size and Compressed_Size are two equal-width fields
+    // packed after the 4 header bits, and Size_Format also picks 1 vs 4 Huffman streams.
+    var fw = 10
+    if sfmt == 0 {
+        hdrsz = 3
+        nstreams = 1
+    } else if sfmt == 1 {
+        hdrsz = 3
+        nstreams = 4
+    } else if sfmt == 2 {
+        hdrsz = 4
+        fw = 14
+        nstreams = 4
+    } else {
+        hdrsz = 5
+        fw = 18
+        nstreams = 4
+    }
+    if off + hdrsz > endp {
+        zfail(s, "zstd: truncated compressed-literals header")
+        return 0 - 1
+    }
+    let hv = zrd_le(d, off, hdrsz)
+    regen = (hv >> 4) & ((1 << fw) - 1)
+    csize = (hv >> (4 + fw)) & ((1 << fw) - 1)
+    if off + hdrsz + csize > endp {
+        zfail(s, "zstd: compressed literals run past the end of the block")
+        return 0 - 1
+    }
+    var dpos = off + hdrsz
+    var dleft = csize
+    if ltype == 2 {
+        let t = zhuf_read_tree(d, dpos, dpos + csize)
+        if t.ok == 0 {
+            zfail(s, "zstd: bad Huffman tree description in the literals section")
+            return 0 - 1
+        }
+        s.huf = sink t.h
+        dpos = dpos + t.used
+        dleft = dleft - t.used
+    } else {
+        if s.huf.ok == 0 {
+            zfail(s, "zstd: Treeless_Literals_Block with no previous Huffman table")
+            return 0 - 1
+        }
+    }
+    if dleft < 1 {
+        zfail(s, "zstd: empty Huffman literals payload")
+        return 0 - 1
+    }
+    if nstreams == 1 {
+        if zhuf_stream(d, dpos, dleft, regen, lit, s) == 0 { return 0 - 1 }
+    } else {
+        if dleft < 6 {
+            zfail(s, "zstd: 4-stream literals with no jump table")
+            return 0 - 1
+        }
+        let s1 = zrd_le(d, dpos, 2)
+        let s2 = zrd_le(d, dpos + 2, 2)
+        let s3 = zrd_le(d, dpos + 4, 2)
+        let s4 = ((dleft - 6) - s1) - s2 - s3
+        if s4 < 0 {
+            zfail(s, "zstd: 4-stream literals jump table is inconsistent")
+            return 0 - 1
+        }
+        let seg = (regen + 3) >> 2
+        let last = regen - (3 * seg)
+        if last < 0 {
+            zfail(s, "zstd: 4-stream literals regenerated size is inconsistent")
+            return 0 - 1
+        }
+        var p = dpos + 6
+        if zhuf_stream(d, p, s1, seg, lit, s) == 0 { return 0 - 1 }
+        p = p + s1
+        if zhuf_stream(d, p, s2, seg, lit, s) == 0 { return 0 - 1 }
+        p = p + s2
+        if zhuf_stream(d, p, s3, seg, lit, s) == 0 { return 0 - 1 }
+        p = p + s3
+        if zhuf_stream(d, p, s4, last, lit, s) == 0 { return 0 - 1 }
+    }
+    return hdrsz + csize
+}
+/// decode exactly `n` literals out of one backward Huffman bitstream of `blen` bytes.
+fn zhuf_stream(d: Str, start: Int, blen: Int, n: Int, inout lit: ZOut, inout s: ZS) -> Int {
+    if n == 0 { return 1 }
+    var bw = zbwd_new(d, start, blen)
+    if bw.bad == 1 {
+        zfail(s, "zstd: malformed Huffman literals bitstream (no padding marker)")
+        return 0
+    }
+    zout_reserve(lit, n)
+    var i = 0
+    while i < n {
+        zout_byte(lit, zhuf_decode(bw, s.huf))
+        i = i + 1
+    }
+    if bw.pos < 0 {
+        zfail(s, "zstd: Huffman literals bitstream ran out of bits")
+        return 0
+    }
+    return 1
+}
+
+// ── sequences ──────────────────────────────────────────────────────────────────────────────────────
+// One FSE table per symbol stream, described in the order literal-lengths, offsets, match-lengths; then
+// a single backward bitstream holding, per sequence, the extra bits and the three state transitions.
+fn zsequences(d: Str, off: Int, endp: Int, lit: ZOut, inout out: ZOut, framestart: Int, inout s: ZS) -> Int {
+    var p = off
+    if p >= endp {
+        // no sequences section at all: the block is literals only
+        var li = 0
+        zout_reserve(out, lit.len)
+        while li < lit.len {
+            zout_byte(out, zout_at(lit, li))
+            li = li + 1
+        }
+        return 1
+    }
+    let b0 = ord(d.at(p))
+    var nseq = 0
+    if b0 == 0 {
+        p = p + 1
+        nseq = 0
+    } else if b0 < 128 {
+        nseq = b0
+        p = p + 1
+    } else if b0 < 255 {
+        if p + 2 > endp {
+            zfail(s, "zstd: truncated sequence count")
+            return 0
+        }
+        nseq = ((b0 - 128) << 8) + ord(d.at(p + 1))
+        p = p + 2
+    } else {
+        if p + 3 > endp {
+            zfail(s, "zstd: truncated sequence count")
+            return 0
+        }
+        nseq = zrd_le(d, p + 1, 2) + 32512
+        p = p + 3
+    }
+    if nseq == 0 {
+        var li2 = 0
+        zout_reserve(out, lit.len)
+        while li2 < lit.len {
+            zout_byte(out, zout_at(lit, li2))
+            li2 = li2 + 1
+        }
+        return 1
+    }
+    if p >= endp {
+        zfail(s, "zstd: missing Symbol_Compression_Modes byte")
+        return 0
+    }
+    let modes = ord(d.at(p))
+    p = p + 1
+    if (modes & 3) != 0 {
+        zfail(s, "zstd: reserved bits set in Symbol_Compression_Modes")
+        return 0
+    }
+    let lmode = (modes >> 6) & 3
+    let omode = (modes >> 4) & 3
+    let mmode = (modes >> 2) & 3
+    p = ztable(d, p, endp, lmode, 0, 35, 9, zll_default(), s)
+    if p < 0 { return 0 }
+    p = ztable(d, p, endp, omode, 1, 31, 8, zof_default(), s)
+    if p < 0 { return 0 }
+    p = ztable(d, p, endp, mmode, 2, 52, 9, zml_default(), s)
+    if p < 0 { return 0 }
+    if p >= endp {
+        zfail(s, "zstd: empty sequence bitstream")
+        return 0
+    }
+    var bw = zbwd_new(d, p, endp - p)
+    if bw.bad == 1 {
+        zfail(s, "zstd: malformed sequence bitstream (no padding marker)")
+        return 0
+    }
+    let llb = zll_base()
+    let lle = zll_bits()
+    let mlb = zml_base()
+    let mle = zml_bits()
+    // initial states, in the order the spec fixes: literal length, then offset, then match length.
+    var lst = zfse_start(bw, s.ll)
+    var ost = zfse_start(bw, s.of)
+    var mst = zfse_start(bw, s.ml)
+    var litpos = 0
+    var i = 0
+    var okv = 1
+    while i < nseq && okv == 1 {
+        let ocode = zfse_sym(s.of, ost)
+        let mcode = zfse_sym(s.ml, mst)
+        let lcode = zfse_sym(s.ll, lst)
+        if ocode > 31 || mcode > 52 || lcode > 35 {
+            zfail(s, "zstd: sequence symbol out of range")
+            okv = 0
+        } else {
+            // extra bits are read offset first, then match length, then literal length
+            let ov = (1 << ocode) + zbwd_read(bw, ocode)
+            let ml = mlb[mcode] + zbwd_read(bw, mle[mcode])
+            let ll = llb[lcode] + zbwd_read(bw, lle[lcode])
+            var ll0 = 0
+            if ll == 0 { ll0 = 1 }
+            let offset = zupdate_rep(s, ov, ll0)
+            if okv == 1 {
+                okv = zexec(lit, out, framestart, litpos, ll, ml, offset, s)
+                litpos = litpos + ll
+            }
+            if i + 1 < nseq && okv == 1 {
+                // state updates, in the order the spec fixes: LL, then ML, then OF
+                lst = zfse_next(bw, s.ll, lst)
+                mst = zfse_next(bw, s.ml, mst)
+                ost = zfse_next(bw, s.of, ost)
+                if bw.bad == 1 {
+                    zfail(s, "zstd: sequence bitstream ran out of bits")
+                    okv = 0
+                }
+            }
+        }
+        i = i + 1
+    }
+    if okv == 0 { return 0 }
+    if bw.pos != 0 {
+        zfail(s, "zstd: sequence bitstream did not end exactly at its first bit")
+        return 0
+    }
+    var rest = litpos
+    zout_reserve(out, lit.len - rest)
+    while rest < lit.len {
+        zout_byte(out, zout_at(lit, rest))
+        rest = rest + 1
+    }
+    return 1
+}
+/// one sequence: `ll` literals, then `ml` bytes copied from `offset` back in the output. The match copy
+/// is byte-at-a-time because an offset shorter than the match length is legal and means the copy
+/// reads bytes it is itself producing.
+fn zexec(lit: ZOut, inout out: ZOut, framestart: Int, litpos: Int, ll: Int, ml: Int, offset: Int, inout s: ZS) -> Int {
+    if litpos + ll > lit.len {
+        zfail(s, "zstd: a sequence asks for more literals than the block holds")
+        return 0
+    }
+    zout_reserve(out, ll + ml)
+    var i = 0
+    while i < ll {
+        zout_byte(out, zout_at(lit, litpos + i))
+        i = i + 1
+    }
+    if offset <= 0 || offset > out.len - framestart {
+        zfail(s, "zstd: match offset reaches before the start of the frame")
+        return 0
+    }
+    let src = out.len - offset
+    var j = 0
+    while j < ml {
+        zout_byte(out, zout_at(out, src + j))
+        j = j + 1
+    }
+    return 1
+}
+/// read one sequence FSE table description. `which` selects the slot (0 = LL, 1 = OF, 2 = ML) so that
+/// Repeat mode can leave the previous block's table in place. Returns the new read position, or -1.
+fn ztable(d: Str, off: Int, endp: Int, mode: Int, which: Int, maxsym: Int, maxlog: Int, dflt: Vec<Int>, inout s: ZS) -> Int {
+    if mode == 0 {
+        var dlog = 6
+        if which == 1 { dlog = 5 }
+        // the predefined distributions cover fewer symbols than an FSE_Compressed table may (the
+        // offset one stops at 28, not 31), so the table is built over the distribution's own range.
+        let t = zfse_build(dflt, dflt.len() - 1, dlog)
+        zset(s, which, t)
+        return off
+    }
+    if mode == 1 {
+        if off >= endp {
+            zfail(s, "zstd: truncated RLE sequence table")
+            return 0 - 1
+        }
+        let sv = ord(d.at(off))
+        if sv > maxsym {
+            zfail(s, "zstd: RLE sequence symbol out of range")
+            return 0 - 1
+        }
+        zset(s, which, zfse_rle(sv))
+        return off + 1
+    }
+    if mode == 2 {
+        var f = zfwd_new(d, off, endp)
+        let nc = zfse_read_ncount(f, maxsym, maxlog)
+        if nc.ok == 0 {
+            zfail(s, "zstd: bad FSE table description in the sequences section")
+            return 0 - 1
+        }
+        let t = zfse_build(nc.norm, maxsym, nc.log)
+        if t.ok == 0 {
+            zfail(s, "zstd: FSE distribution does not fill its table")
+            return 0 - 1
+        }
+        zset(s, which, t)
+        return off + zfwd_used(f)
+    }
+    if zget_ok(s, which) == 0 {
+        zfail(s, "zstd: Repeat_Mode sequence table with no previous table")
+        return 0 - 1
+    }
+    return off
+}
+fn zset(inout s: ZS, which: Int, sink t: ZFse) {
+    if which == 0 { s.ll = t } else if which == 1 { s.of = t } else if which == 2 { s.ml = t }
+}
+fn zget_ok(s: ZS, which: Int) -> Int {
+    if which == 0 { return s.ll.ok }
+    if which == 1 { return s.of.ok }
+    return s.ml.ok
+}
+
+// ── frames ─────────────────────────────────────────────────────────────────────────────────────────
+/// decode one frame starting at `pos`; returns the position just past it, or -1 with `s.err` set.
+fn zframe(d: Str, pos: Int, inout out: ZOut, inout s: ZS) -> Int {
+    let n = d.len()
+    if pos + 4 > n {
+        zfail(s, "zstd: truncated frame magic")
+        return 0 - 1
+    }
+    let magic = zrd_le(d, pos, 4)
+    if magic >= 407710288 && magic <= 407710303 {
+        // Skippable_Frame: magic 0x184D2A50..0x184D2A5F, then a 4-byte little-endian size, then that
+        // many bytes of user data which are not part of the decompressed output.
+        if pos + 8 > n {
+            zfail(s, "zstd: truncated skippable frame header")
+            return 0 - 1
+        }
+        let sz = zrd_le(d, pos + 4, 4)
+        if pos + 8 + sz > n {
+            zfail(s, "zstd: skippable frame runs past the end of the input")
+            return 0 - 1
+        }
+        return pos + 8 + sz
+    }
+    if magic != 4247762216 {
+        zfail(s, "zstd: bad frame magic (not a Zstandard frame)")
+        return 0 - 1
+    }
+    var p = pos + 4
+    if p >= n {
+        zfail(s, "zstd: truncated frame header")
+        return 0 - 1
+    }
+    let fhd = ord(d.at(p))
+    p = p + 1
+    let fcsflag = (fhd >> 6) & 3
+    let single = (fhd >> 5) & 1
+    let checksum = (fhd >> 2) & 1
+    let didflag = fhd & 3
+    if (fhd & 8) != 0 {
+        zfail(s, "zstd: reserved bit set in the frame header descriptor")
+        return 0 - 1
+    }
+    if single == 0 {
+        if p >= n {
+            zfail(s, "zstd: truncated window descriptor")
+            return 0 - 1
+        }
+        p = p + 1                                     // Window_Descriptor: the window size is advisory
+    }                                                 // here, since the whole output is kept in memory
+    var didsz = didflag
+    if didflag == 3 { didsz = 4 }
+    if didsz > 0 {
+        if p + didsz > n {
+            zfail(s, "zstd: truncated dictionary ID")
+            return 0 - 1
+        }
+        let did = zrd_le(d, p, didsz)
+        p = p + didsz
+        if did != 0 {
+            zfail(s, "zstd: dictionary-compressed frame (Dictionary_ID set) — dictionaries are not supported")
+            return 0 - 1
+        }
+    }
+    var fcssz = 0
+    if fcsflag == 1 { fcssz = 2 }
+    if fcsflag == 2 { fcssz = 4 }
+    if fcsflag == 3 { fcssz = 8 }
+    if fcsflag == 0 && single == 1 { fcssz = 1 }
+    var fcs = 0 - 1
+    if fcssz > 0 {
+        if p + fcssz > n {
+            zfail(s, "zstd: truncated frame content size")
+            return 0 - 1
+        }
+        fcs = zrd_le(d, p, fcssz)
+        if fcssz == 2 { fcs = fcs + 256 }
+        p = p + fcssz
+    }
+    let framestart = out.len
+    s.r0 = 1
+    s.r1 = 4
+    s.r2 = 8
+    s.huf = zhuf_none()
+    s.ll = zfse_none()
+    s.of = zfse_none()
+    s.ml = zfse_none()
+    var lit = zout_new()
+    var last = 0
+    var okv = 1
+    while last == 0 && okv == 1 {
+        if p + 3 > n {
+            zfail(s, "zstd: truncated block header")
+            okv = 0
+        } else {
+            let bh = zrd_le(d, p, 3)
+            p = p + 3
+            last = bh & 1
+            let btype = (bh >> 1) & 3
+            let bsize = bh >> 3
+            // an RLE block's Block_Size is the regenerated size; only one byte of it is present.
+            var need = bsize
+            if btype == 1 { need = 1 }
+            if p + need > n {
+                zfail(s, "zstd: block runs past the end of the input")
+                okv = 0
+            } else if btype == 0 {
+                zout_reserve(out, bsize)
+                var i = 0
+                while i < bsize {
+                    zout_byte(out, ord(d.at(p + i)))
+                    i = i + 1
+                }
+                p = p + bsize
+            } else if btype == 1 {
+                let by = ord(d.at(p))
+                zout_reserve(out, bsize)
+                var j = 0
+                while j < bsize {
+                    zout_byte(out, by)
+                    j = j + 1
+                }
+                p = p + 1
+            } else if btype == 2 {
+                lit.len = 0
+                let used = zliterals(d, p, p + bsize, lit, s)
+                if used < 0 {
+                    okv = 0
+                } else if zsequences(d, p + used, p + bsize, lit, out, framestart, s) == 0 {
+                    okv = 0
+                } else {
+                    p = p + bsize
+                }
+            } else {
+                zfail(s, "zstd: reserved block type 3")
+                okv = 0
+            }
+        }
+    }
+    unsafe { free(lit.p) }
+    if okv == 0 { return 0 - 1 }
+    if fcs >= 0 && out.len - framestart != fcs {
+        zfail(s, "zstd: decoded size does not match the frame's Frame_Content_Size")
+        return 0 - 1
+    }
+    if checksum == 1 {
+        if p + 4 > n {
+            zfail(s, "zstd: truncated content checksum")
+            return 0 - 1
+        }
+        let want = zrd_le(d, p, 4)
+        p = p + 4
+        let got = zxx64(out.p + framestart, out.len - framestart)
+        if got.lo != want {
+            zfail(s, "zstd: content checksum mismatch (XXH64)")
+            return 0 - 1
+        }
+    }
+    return p
+}
+
+// ── public surface ─────────────────────────────────────────────────────────────────────────────────
+/// a decode result: the bytes, or the reason they could not be produced.
+pub struct ZstdResult { data: Str, err: Str }
+
+pub fn zstd_result_ok(r: ZstdResult) -> Bool { return r.err.len() == 0 }
+pub fn zstd_result_error(r: ZstdResult) -> view Str { return r.err }
+pub fn zstd_result_data(r: ZstdResult) -> view Str { return r.data }
+
+/// decompress a Zstandard stream (RFC 8878), reporting why on failure.
+///
+/// The input may hold several frames back to back; their outputs are concatenated, and skippable
+/// frames contribute nothing. When a frame carries a content checksum it is verified (XXH64), so a
+/// silently corrupted payload is an error rather than wrong bytes. Dictionary-compressed frames are
+/// refused by name.
+pub fn zstd_decompress_checked(data: Str) -> ZstdResult {
+    var out = zout_new()
+    var s = ZS { ll: zfse_none(), of: zfse_none(), ml: zfse_none(), huf: zhuf_none(), r0: 1, r1: 4, r2: 8, err: "" }
+    var p = 0
+    let n = data.len()
+    if n == 0 {
+        unsafe { free(out.p) }
+        return ZstdResult { data: "", err: "zstd: empty input" }
+    }
+    var okv = 1
+    while p < n && okv == 1 {
+        let np = zframe(data, p, out, s)
+        if np < 0 {
+            okv = 0
+        } else if np <= p {
+            zfail(s, "zstd: frame made no progress")
+            okv = 0
+        } else {
+            p = np
+        }
+    }
+    if okv == 0 {
+        unsafe { free(out.p) }
+        return ZstdResult { data: "", err: sink s.err }
+    }
+    var res = ""
+    unsafe {
+        res = str_from_buf(out.p, out.len)
+        free(out.p)
+    }
+    return ZstdResult { data: res, err: "" }
+}
+
+/// decompress a Zstandard stream, or return "" if it cannot be decoded. Use
+/// `zstd_decompress_checked` when the reason matters: an empty result is also what a valid stream of
+/// zero bytes produces.
+pub fn zstd_decompress(data: Str) -> Str {
+    var r = zstd_decompress_checked(data)
+    return sink r.data
+}
+
+/// wrap `data` in a single Zstandard frame of Raw blocks. Not a compressor, just the format-legal
+/// "store" path, so a round-trip can be exercised without the CLI. Blocks are 65535 bytes; the frame
+/// carries a Frame_Content_Size and no checksum.
+pub fn zstd_store(data: Str) -> Str {
+    var o = ""
+    o = o + chr(40)
+    o = o + chr(181)
+    o = o + chr(47)
+    o = o + chr(253)                                  // magic 0xFD2FB528, little-endian
+    o = o + chr(160)                                  // Single_Segment, FCS_Field_Size = 4
+    let n = data.len()
+    o = o + chr(n & 255)
+    o = o + chr((n >> 8) & 255)
+    o = o + chr((n >> 16) & 255)
+    o = o + chr((n >> 24) & 255)
+    var p = 0
+    var done = false
+    while !done {
+        var sz = n - p
+        if sz > 65535 { sz = 65535 }
+        var lastf = 0
+        if p + sz >= n { lastf = 1 }
+        let bh = lastf | (sz << 3)
+        o = o + chr(bh & 255)
+        o = o + chr((bh >> 8) & 255)
+        o = o + chr((bh >> 16) & 255)
+        o = o + data.slice(p, p + sz)
+        p = p + sz
+        if lastf == 1 { done = true }
+    }
+    return o
+}

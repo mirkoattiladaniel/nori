@@ -1,0 +1,115 @@
+//! std/set: an insertion-ordered set of strings, backed by the Str-keyed Map (O(1) membership) plus a
+//! Vec that preserves insertion order for iteration. Strings are the element type (other types stringify
+//! via `"" + v` before insertion).
+//!
+//!   import "std/set" as set
+//!   var s = set::new()
+//!   s.add("a")  s.add("b")  s.add("a")   // add returns false the second time
+//!   s.contains("a")        // true
+//!   s.remove("a")          // true (was present); s.size() is now 1
+//!   s.size()               // 2
+//!   foreach-style: iterate s.items() (a Vec<Str> in insertion order)
+//!   set::unique(words)     // dedup a Vec<Str>, order-preserving
+
+struct Set { m: Map<Str, Int>, keys: Vec<Str> }
+
+// ── ISet: an insertion-ordered set of Ints over the scalar-keyed Map: identity
+// hashing, no stringification, O(1) membership. Same shape as Set with Int elements.
+pub struct ISet { m: Map<Int, Int>, keys: Vec<Int> }
+
+/// a fresh empty Int set.
+pub fn inew() -> ISet {
+    var m: Map<Int, Int> = map()
+    var k: Vec<Int> = vec()
+    return ISet { m: m, keys: k }
+}
+
+impl ISet {
+    /// insert `k`; returns true if newly added, false if already present.
+    fn add(inout self, k: Int) -> Bool {
+        if self.m.has(k) { return false }
+        self.m.put(k, 1)
+        self.keys.push(k)
+        return true
+    }
+    /// is `k` a member of the set?
+    fn contains(self, k: Int) -> Bool { return self.m.has(k) }
+    /// number of elements in the set.
+    fn size(self) -> Int { return self.keys.len() }
+    /// the members in insertion order (do not mutate the returned Vec).
+    fn items(self) -> view Vec<Int> { return self.keys }
+    /// remove `k`; returns true if it was present, false if it wasn't in the set.
+    fn remove(inout self, k: Int) -> Bool {
+        if !self.m.delete(k) { return false }
+        self.keys = self.m.keys()     // the Map stays insertion-ordered, so its keys are the new order
+        return true
+    }
+}
+
+
+/// a fresh empty set.
+pub fn new() -> Set {
+    var m: Map<Str, Int> = map()
+    var k: Vec<Str> = vec()
+    return Set { m: m, keys: k }
+}
+
+impl Set {
+    /// insert `k`; returns true if newly added, false if already present.
+    fn add(inout self, k: Str) -> Bool {
+        if self.m.has(k) { return false }
+        self.m.put(k, 1)
+        self.keys.push(copy k)
+        return true
+    }
+    /// is `k` a member of the set?
+    fn contains(self, k: Str) -> Bool { return self.m.has(k) }
+    /// number of elements in the set.
+    fn size(self) -> Int { return self.keys.len() }
+    /// the members in insertion order (do not mutate the returned Vec).
+    fn items(self) -> view Vec<Str> { return self.keys }
+    /// remove `k`; returns true if it was present, false if it wasn't in the set.
+    fn remove(inout self, k: Str) -> Bool {
+        if !self.m.delete(k) { return false }
+        self.keys = copy self.m.keys()     // the Map stays insertion-ordered, so its keys are the new order
+        return true
+    }
+}
+
+/// a set containing every element of a Vec<Str> (deduplicated).
+pub fn from_vec(v: Vec<Str>) -> Set {
+    var s = new()
+    var i = 0
+    while i < v.len() { s.add(v[i])  i = i + 1 }
+    return s
+}
+
+/// dedup a Vec<Str>, preserving first-seen order.
+pub fn unique(v: Vec<Str>) -> Vec<Str> { var s = from_vec(v)  return sink s.keys }
+
+/// a ∪ b: every element of either, a's order first.
+pub fn union(a: Set, b: Set) -> Set {
+    var s = from_vec(a.items())
+    var bi = b.items()
+    var i = 0
+    while i < bi.len() { s.add(bi[i])  i = i + 1 }
+    return s
+}
+
+/// a ∩ b: elements present in both (a's order).
+pub fn intersect(a: Set, b: Set) -> Set {
+    var s = new()
+    var ai = a.items()
+    var i = 0
+    while i < ai.len() { if b.contains(ai[i]) { s.add(ai[i]) }  i = i + 1 }
+    return s
+}
+
+/// a \ b: elements of a not in b (a's order).
+pub fn difference(a: Set, b: Set) -> Set {
+    var s = new()
+    var ai = a.items()
+    var i = 0
+    while i < ai.len() { if !b.contains(ai[i]) { s.add(ai[i]) }  i = i + 1 }
+    return s
+}

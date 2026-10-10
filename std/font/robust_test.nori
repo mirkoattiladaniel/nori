@@ -1,0 +1,119 @@
+// std/font must never trap on a malformed font: fonts are input. These tests corrupt and truncate
+// the vendored fonts' layout, color and outline tables and shape, position and draw through them.
+// Run with
+//   noric --test std/font/robust_test.nori compiler/runtime.nori --import-root .
+import "std/font" as font
+
+fn texts() -> Vec<Str> {
+    var v: Vec<Str> = vec()
+    v.push("office AVATAR naïve q́ Tiếng")
+    v.push("السلام عليكم لا بِسْمِ")
+    v.push("नमस्ते क्षत्रिय र्कि")
+    v.push("שָׁלוֹם 日本語 😀👨‍👩‍👧🇭🇺")
+    return v
+}
+
+// flip one byte in every `step` bytes of [start, start+len) of `d` (deterministically), from `seed`
+fn corrupt(d: Str, start: Int, len: Int, step: Int, seed: Int) -> Str {
+    var out = d.slice(0, d.len())
+    var p = start + (seed % step)
+    var k = seed
+    while p < start + len && p < out.len() {
+        k = (k * 1103515245 + 12345) & 2147483647
+        out.set_at(p, byte((ord(out.at(p)) + (k & 255)) & 255))
+        p = p + step
+    }
+    return out
+}
+
+fn exercise(d: Str) -> Int {
+    let fr = font::font_load(d)
+    if !fr.ok { return 0 }
+    let f = fr.font
+    let ts = texts()
+    var n = 0
+    var i = 0
+    while i < ts.len() {
+        let gs = font::shape(f, ts[i], "", font::DIR_AUTO(), "", "")
+        n = n + gs.len()
+        var k = 0
+        while k < gs.len() && k < 8 {
+            let b = font::rasterize(f, gs[k].gid, 14.0)
+            n = n + b.w
+            if font::glyph_is_color(f, gs[k].gid) { let cb = font::rasterize_color(f, gs[k].gid, 14.0, 255)  n = n + cb.w }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn test_corrupt_layout_tables() {
+    var paths: Vec<Str> = vec()
+    paths.push("std/font/assets/NotoSans-subset.ttf")
+    paths.push("std/font/assets/NotoSansArabic-subset.ttf")
+    paths.push("std/font/assets/NotoSansDevanagari-subset.ttf")
+    paths.push("std/font/assets/NotoNastaliqUrdu-subset.ttf")
+    paths.push("std/font/assets/NotoColorEmoji-subset.ttf")
+    paths.push("std/font/assets/ColrTest.ttf")
+    var total = 0
+    var pi = 0
+    while pi < paths.len() {
+        let d = read_file(paths[pi])
+        let f = font::font_load(d).font
+        var offs: Vec<Int> = vec()
+        offs.push(f.gsub_off)  offs.push(f.gpos_off)  offs.push(f.gdef_off)  offs.push(f.cblc_off)
+        offs.push(f.colr_off)  offs.push(f.cmap_off)  offs.push(f.cff_off)  offs.push(f.glyf_off)
+        var t = 0
+        while t < offs.len() {
+            if offs[t] >= 0 {
+                var seed = 1
+                while seed < 6 {
+                    total = total + exercise(corrupt(d, offs[t], 4000, 37 + seed * 11, seed * 7919))
+                    seed = seed + 1
+                }
+            }
+            t = t + 1
+        }
+        pi = pi + 1
+    }
+    assert_true(total > 0)
+}
+
+fn test_truncated_fonts() {
+    var paths: Vec<Str> = vec()
+    paths.push("std/font/assets/NotoSansArabic-subset.ttf")
+    paths.push("std/font/assets/NotoColorEmoji-subset.ttf")
+    paths.push("std/font/assets/NotoSansCJK-subset.ttc")
+    var pi = 0
+    var total = 0
+    while pi < paths.len() {
+        let d = read_file(paths[pi])
+        var cut = 100
+        while cut < d.len() {
+            total = total + exercise(d.slice(0, cut))
+            cut = cut + d.len() / 23 + 1
+        }
+        pi = pi + 1
+    }
+    assert_true(total >= 0)
+}
+
+fn test_bidi_and_breaks_on_junk() {
+    // every code point class, unpaired surrogates' replacements, deep embeddings past the limit
+    var cps: Vec<Int> = vec()
+    var i = 0
+    while i < 400 { cps.push(8235)  i = i + 1 }                     // 400 RLEs (past the 125 limit)
+    cps.push(1488)  cps.push(65)  cps.push(8297)  cps.push(8294)  cps.push(40)  cps.push(41)
+    let r = font::bidi_resolve(cps, font::BIDI_AUTO())
+    assert_eq(r.levels.len(), cps.len())
+    let o = font::bidi_visual_order(r, 0, cps.len())
+    assert_true(o.len() <= cps.len())
+    let lb = font::line_breaks(cps)
+    assert_eq(lb.len(), cps.len() + 1)
+    // malformed UTF-8 shapes as U+FFFD
+    let f = font::font_load(read_file("std/font/assets/NotoSans-subset.ttf")).font
+    let bad = "a" + chr(255) + chr(192) + "b" + chr(237) + chr(160) + chr(128)
+    let gs = font::shape(f, bad, "Latn", font::DIR_LTR(), "", "")
+    assert_true(gs.len() >= 3)
+}

@@ -1,0 +1,172 @@
+//! std/archive: writing zip archives.
+//!
+//! Reading a zip is not what this is for. The operation is `zip_add_stored`: take an archive that
+//! already exists and hand back one with a file added, leaving every existing entry byte for byte as
+//! it was. That is the shape the job usually has (an APK is an aapt2-produced zip that a build
+//! must drop a native library into), and it keeps this small: entries already deflated
+//! are copied, never recompressed, so nothing here needs a deflate encoder. Only the new entry is
+//! written, and it is stored.
+//!
+//! Stored is not a shortcut. Android's loader maps a native library straight out of the APK, which
+//! it can only do when the bytes are uncompressed; a deflated one installs fine and then fails
+//! at launch.
+
+// ---- little-endian scalars -------------------------------------------------------------------
+fn z_rd16(s: Str, at: Int) -> Int { return ord(s.at(at)) | (ord(s.at(at + 1)) << 8) }
+fn z_rd32(s: Str, at: Int) -> Int {
+    return ord(s.at(at)) | (ord(s.at(at + 1)) << 8) | (ord(s.at(at + 2)) << 16) | (ord(s.at(at + 3)) << 24)
+}
+fn z_w16(v: Int) -> Str { return ("" + chr(v & 255)) + chr((v >> 8) & 255) }
+fn z_w32(v: Int) -> Str {
+    return ((("" + chr(v & 255)) + chr((v >> 8) & 255)) + chr((v >> 16) & 255)) + chr((v >> 24) & 255)
+}
+
+// CRC-32/ISO-HDLC, the one zip and gzip both use. Written out here rather than imported: this module
+// has no dependencies and is worth keeping that way for twenty lines.
+fn z_crc32(s: Str) -> Int {
+    var crc = 4294967295
+    var i = 0
+    let n = s.len()
+    while i < n {
+        crc = crc ^ ord(s.at(i))
+        var k = 0
+        while k < 8 {
+            let lsb = crc & 1
+            crc = (crc >> 1) & 2147483647
+            if lsb == 1 { crc = crc ^ 3988292384 }      // 0xEDB88320, the reversed polynomial
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return (crc ^ 4294967295) & 4294967295
+}
+
+// The end-of-central-directory record, found by scanning back from the end: it is last, but a
+// trailing comment may follow it, so its position is not fixed. -1 when there is none.
+fn z_find_eocd(z: Str) -> Int {
+    let n = z.len()
+    if n < 22 { return 0 - 1 }
+    var at = n - 22
+    var floor = 0
+    if n > 65557 { floor = n - 65557 }                  // 22 + the largest comment a u16 can describe
+    while at >= floor {
+        if z_rd32(z, at) == 101010256 { return at }     // 0x06054B50
+        at = at - 1
+    }
+    return 0 - 1
+}
+
+/// Add `name` to the zip in `z` as an uncompressed entry holding `data`, returning the new archive
+/// ("" if `z` is not a zip). Existing entries keep their bytes, their compression and their order.
+///
+/// Offsets are what make this more than appending: every central-directory entry
+/// records where its local header sits, so copying the records forward means rewriting each of those
+/// numbers. An archive with stale offsets unzips on a forgiving tool and fails on a strict one.
+pub fn zip_add_stored(z: Str, name: Str, data: Str) -> Str {
+    let eocd = z_find_eocd(z)
+    if eocd < 0 { return "" }
+    let count = z_rd16(z, eocd + 10)                    // entries on this disk
+    let cd_off = z_rd32(z, eocd + 16)
+    if cd_off + 46 > z.len() { if count > 0 { return "" } }
+
+    var out = ""                                        // the rebuilt archive
+    var cds: Vec<Str> = vec()                           // its central directory, one raw entry each
+    var p = cd_off
+    var i = 0
+    while i < count {
+        if z_rd32(z, p) != 33639248 { return "" }        // 0x02014B50: not a central-directory entry
+        let nlen = z_rd16(z, p + 28)
+        let elen = z_rd16(z, p + 30)
+        let clen = z_rd16(z, p + 32)
+        let loff = z_rd32(z, p + 42)
+        let cdlen = 46 + (nlen + (elen + clen))
+
+        // copy the local record unchanged: header, name, extra, then the (possibly compressed) data
+        if z_rd32(z, loff) != 67324752 { return "" }     // 0x04034B50: not a local file header
+        let lnlen = z_rd16(z, loff + 26)
+        let lelen = z_rd16(z, loff + 28)
+        let csize = z_rd32(z, loff + 18)
+        let lrec = 30 + (lnlen + (lelen + csize))
+        let newoff = out.len()
+        out = out + z.slice(loff, loff + lrec)
+
+        // the same central-directory entry, with its pointer moved to where the record now is
+        let cd = z.slice(p, p + cdlen)
+        cds.push((cd.slice(0, 42) + (z_w32(newoff) + cd.slice(46, cdlen))))
+        p = p + cdlen
+        i = i + 1
+    }
+
+    // the new entry: method 0 (stored), so compressed and uncompressed sizes are the same number
+    let crc = z_crc32(data)
+    let sz = data.len()
+    let myoff = out.len()
+    var lh = z_w32(67324752)
+    lh = lh + z_w16(20)                                  // version needed: 2.0
+    lh = lh + z_w16(0)                                   // flags
+    lh = lh + z_w16(0)                                   // method: stored
+    lh = lh + z_w16(0)                                   // modification time
+    lh = lh + z_w16(0)                                   // modification date
+    lh = lh + z_w32(crc)
+    lh = lh + z_w32(sz)
+    lh = lh + z_w32(sz)
+    lh = lh + z_w16(name.len())
+    lh = lh + z_w16(0)                                   // extra length
+    out = out + (lh + (name + data))
+
+    var cd = z_w32(33639248)
+    cd = cd + z_w16(20)                                  // version made by
+    cd = cd + z_w16(20)                                  // version needed
+    cd = cd + z_w16(0)                                   // flags
+    cd = cd + z_w16(0)                                   // method: stored
+    cd = cd + z_w16(0)                                   // time
+    cd = cd + z_w16(0)                                   // date
+    cd = cd + z_w32(crc)
+    cd = cd + z_w32(sz)
+    cd = cd + z_w32(sz)
+    cd = cd + z_w16(name.len())
+    cd = cd + z_w16(0)                                   // extra
+    cd = cd + z_w16(0)                                   // comment
+    cd = cd + z_w16(0)                                   // disk number
+    cd = cd + z_w16(0)                                   // internal attributes
+    cd = cd + z_w32(2175008768)                          // external attributes: 0x81A40000, rw-r--r--
+    cd = cd + z_w32(myoff)
+    cd = cd + name
+    cds.push(cd)
+
+    let cdstart = out.len()
+    var j = 0
+    while j < cds.len() { out = out + cds[j]  j = j + 1 }
+    let cdsize = out.len() - cdstart
+
+    var e = z_w32(101010256)
+    e = e + z_w16(0)                                     // this disk
+    e = e + z_w16(0)                                     // disk with the central directory
+    e = e + z_w16(cds.len())
+    e = e + z_w16(cds.len())
+    e = e + z_w32(cdsize)
+    e = e + z_w32(cdstart)
+    e = e + z_w16(0)                                     // comment length
+    return out + e
+}
+
+/// The names an archive holds, in central-directory order ("" entries never appear). Empty when `z`
+/// is not a zip. Enough to check what a build produced without shelling out to a tool.
+pub fn zip_names(z: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let eocd = z_find_eocd(z)
+    if eocd < 0 { return out }
+    let count = z_rd16(z, eocd + 10)
+    var p = z_rd32(z, eocd + 16)
+    var i = 0
+    while i < count {
+        if z_rd32(z, p) != 33639248 { return out }
+        let nlen = z_rd16(z, p + 28)
+        let elen = z_rd16(z, p + 30)
+        let clen = z_rd16(z, p + 32)
+        out.push(z.slice(p + 46, p + 46 + nlen))
+        p = p + (46 + (nlen + (elen + clen)))
+        i = i + 1
+    }
+    return out
+}

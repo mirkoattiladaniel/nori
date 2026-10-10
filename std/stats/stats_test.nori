@@ -1,0 +1,57 @@
+// Tests for std/stats. Run with
+//   noric --test std/stats/stats_test.nori compiler/runtime.nori --import-root .
+import "std/stats" as stats
+
+fn mkv(a: Float, b: Float, c: Float, d: Float) -> Vec<Float> {
+    var v: Vec<Float> = vec()  v.push(a)  v.push(b)  v.push(c)  v.push(d)  return v
+}
+
+fn test_basic() {
+    let v = mkv(1.0, 2.0, 3.0, 4.0)
+    assert_feq(stats::sum(v), 10.0, 0.0001)
+    assert_feq(stats::mean(v), 2.5, 0.0001)
+    assert_feq(stats::min(v), 1.0, 0.0001)
+    assert_feq(stats::max(v), 4.0, 0.0001)
+}
+
+fn test_variance_stddev() {
+    // classic population-variance example: {2,4,4,4,5,5,7,9} -> var 4, stddev 2
+    var v: Vec<Float> = vec()
+    v.push(2.0)  v.push(4.0)  v.push(4.0)  v.push(4.0)  v.push(5.0)  v.push(5.0)  v.push(7.0)  v.push(9.0)
+    assert_feq(stats::variance(v), 4.0, 0.0001)
+    assert_feq(stats::stddev(v), 2.0, 0.0001)
+}
+
+fn test_median_percentile() {
+    let even = mkv(4.0, 1.0, 3.0, 2.0)                    // unsorted on purpose
+    assert_feq(stats::median(even), 2.5, 0.0001)
+    var odd: Vec<Float> = vec()  odd.push(3.0)  odd.push(1.0)  odd.push(2.0)
+    assert_feq(stats::median(odd), 2.0, 0.0001)
+    assert_feq(stats::percentile(even, 0.0), 1.0, 0.0001)
+    assert_feq(stats::percentile(even, 100.0), 4.0, 0.0001)
+    assert_feq(stats::percentile(even, 50.0), 2.5, 0.0001)
+}
+
+fn test_empty() {
+    var e: Vec<Float> = vec()
+    assert_feq(stats::mean(e), 0.0, 0.0001)
+    assert_feq(stats::median(e), 0.0, 0.0001)
+}
+
+// ---- laws: statistical invariants (fuzzed by `noric --fuzz-laws` / `roll law`) ----
+// (guarded to non-empty; a tiny epsilon absorbs float rounding in mean/median.)
+law stats_min_le_mean_le_max(v: Vec<Float>) {
+    if v.len() > 0 {
+        let mn = stats::min(v)
+        let mx = stats::max(v)
+        let mu = stats::mean(v)
+        assert(mn <= mu + 0.000001)
+        assert(mu <= mx + 0.000001)
+    }
+}
+law stats_median_within_range(v: Vec<Float>) {
+    if v.len() > 0 {
+        assert(stats::median(v) >= stats::min(v) - 0.000001)
+        assert(stats::median(v) <= stats::max(v) + 0.000001)
+    }
+}

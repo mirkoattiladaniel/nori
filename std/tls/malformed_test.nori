@@ -1,0 +1,202 @@
+// What happens when the bytes are wrong, run with
+//   noric --test std/tls/malformed_test.nori compiler/runtime.nori --import-root .
+//
+// Every parser in std/tls reads bytes a hostile peer chose. In Nori an out-of-range `Str.at` is a
+// trap, not an error, so a missing bounds check here is a remote crash rather than a wrong answer.
+// That makes this file's job different from a vector file's: the vectors say the right input gives
+// the right answer, and this says the wrong input gives an error: never a trap, never a hang, and
+// never a value built out of bytes that were not there.
+//
+// The method is exhaustive rather than illustrative. Real messages from RFC 8448 are truncated at
+// every prefix length, and mutated byte by byte, and every result is required to be either a clean
+// parse or a clean refusal. A test that tried three hand-picked malformed inputs would prove much
+// less: the interesting truncation is always the one nobody thought of.
+import "std/tls" as tls
+
+fn hexv(c: Byte) -> Int {
+    let o = ord(c)
+    if o >= 97 { return (o - 87) }
+    if o >= 65 { return (o - 55) }
+    return (o - 48)
+}
+fn unhex(h: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < h.len() { out = (out + chr(((hexv(h.at(i)) << 4) | hexv(h.at(i + 1)))))  i = i + 2 }
+    return out
+}
+fn rep(b: Int, n: Int) -> Str {
+    var out = ""
+    var i = 0
+    while i < n { out = (out + chr(b))  i = i + 1 }
+    return out
+}
+// Real message bodies from RFC 8448 section 3, with the handshake header stripped, because that is
+// what each parser is handed. Real ones rather than invented: a hand-built message tends to be
+// malformed in a way that makes every truncation of it fail for the wrong reason.
+fn real_server_hello() -> Str { return unhex("0303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304") }
+fn real_certificate() -> Str { return unhex("000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de10000") }
+fn real_certificate_verify() -> Str { return unhex("080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea20d53dfacd42f74f3") }
+
+// Truncation. Every prefix of a real message, fed to the parser it belongs to. The only acceptable
+// outcomes are a clean parse (for a prefix that happens to be complete) and a clean error, and
+// the process surviving to the end of the loop is itself the assertion, because a trap would take
+// the whole test with it.
+fn test_truncated_server_hello() {
+    let full = real_server_hello()
+    var n = 0
+    while n <= full.len() {
+        let sh = tls::parse_server_hello(full.slice(0, n))
+        if n < full.len() { assert_true(sh.err.len() > 0) }
+        n = n + 1
+    }
+    assert_streq(tls::parse_server_hello(full).err, "")
+}
+
+fn test_truncated_handshake_framing() {
+    let full = (tls::handshake_msg(2, real_server_hello()))
+    var n = 0
+    while n <= full.len() {
+        let m = tls::parse_handshake(full.slice(0, n))
+        // an incomplete message reports total 0 and is not presented as parsed
+        if n < full.len() { assert_eq(m.total, 0) }
+        n = n + 1
+    }
+    assert_eq(tls::parse_handshake(full).total, full.len())
+}
+
+fn test_truncated_certificate() {
+    let full = real_certificate()
+    var n = 0
+    while n <= full.len() {
+        let cs = tls::parse_certificate(full.slice(0, n))
+        // a truncated list yields nothing, never a prefix of the chain, because a caller that
+        // received three certificates and got two would validate a chain that was never sent
+        if n < full.len() { assert_eq(cs.len(), 0) }
+        n = n + 1
+    }
+    assert_true(tls::parse_certificate(full).len() > 0)
+}
+
+fn test_truncated_certificate_verify() {
+    let full = real_certificate_verify()
+    var n = 0
+    while n <= full.len() {
+        let v = tls::parse_certificate_verify(full.slice(0, n))
+        if n < full.len() { assert_true(v.err.len() > 0) }
+        n = n + 1
+    }
+}
+
+// Single-byte mutation. Every byte of a real ServerHello, set to four different values. Most of
+// these produce a clean error and some are still valid; neither is the point. The point is that
+// none of them traps.
+fn test_mutated_server_hello_never_traps() {
+    let full = real_server_hello()
+    var i = 0
+    var errs = 0
+    while i < full.len() {
+        var k = 0
+        while k < 4 {
+            let v = ((ord(full.at(i)) + ((k * 61) + 1)) & 0xff)
+            let m = ((full.slice(0, i) + chr(v)) + full.slice(i + 1, full.len()))
+            let sh = tls::parse_server_hello(m)
+            if sh.err.len() > 0 { errs = errs + 1 }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    // most mutations should be rejected; a parser that accepted everything would be the bug
+    assert_true(errs > 0)
+}
+
+// Absurd lengths. A length field is 16 or 24 bits, so a peer can always claim far more than it
+// sent, and the parser must refuse rather than try.
+fn test_absurd_lengths() {
+    // a handshake header claiming 16MB, with four bytes behind it
+    assert_eq(tls::parse_handshake(unhex("02ffffff")).total, 0)
+    assert_eq(tls::parse_handshake(unhex("02ffffff00")).total, 0)
+    // a ServerHello that stops immediately after its legacy_version
+    assert_true(tls::parse_server_hello(unhex("0303")).err.len() > 0)
+    // one whose extensions block claims more than the message holds
+    assert_true(tls::parse_server_hello((real_server_hello().slice(0, 39) + unhex("ffff"))).err.len() > 0)
+    // a certificate list whose declared length disagrees with what follows
+    assert_eq(tls::parse_certificate(unhex("00ffffff")).len(), 0)
+    assert_eq(tls::parse_certificate(unhex("00000003ffffff")).len(), 0)
+}
+
+// The reader itself: the primitive every parser is built on. Once it has failed it must stay
+// failed, because a parser that recovers mid-message resumes reading at an offset the sender never
+// intended.
+fn test_reader_latches_its_error() {
+    var r = tls::reader_new("ab")
+    assert_eq(tls::r_u8(r), 97)
+    assert_eq(tls::r_u8(r), 98)
+    assert_eq(tls::r_left(r), 0)
+    assert_eq(tls::r_u8(r), 0)                       // past the end
+    assert_true(r.err.len() > 0)
+    let first = copy r.err
+    assert_streq(tls::r_bytes(r, 0), "")             // even a zero-length read stays failed
+    assert_streq(r.err, first)                       // and the first error is the one kept
+    assert_eq(tls::r_u16(r), 0)
+    assert_streq(r.err, first)
+}
+
+fn test_reader_rejects_bad_lengths() {
+    var r = tls::reader_new("abc")
+    assert_streq(tls::r_bytes(r, 0 - 1), "")
+    assert_true(r.err.len() > 0)
+    var q = tls::reader_new("abc")
+    assert_streq(tls::r_bytes(q, 4), "")
+    assert_true(q.err.len() > 0)
+    // a length prefix larger than the remainder
+    let ffb = unhex("ff41")
+    var v = tls::reader_new(ffb)
+    assert_streq(tls::r_vec8(v), "")
+    assert_true(v.err.len() > 0)
+}
+
+// Records. The framing is read before anything is decrypted, so it is the first thing a hostile
+// peer reaches and the place an unbounded allocation would live.
+fn test_record_framing_refuses_the_absurd() {
+    var k = tls::keys_new(rep(1, 16), rep(2, 12))
+    // a header claiming 65535 bytes is over the limit and must be refused, not buffered
+    assert_eq(tls::record_len(unhex("170303ffff")), 0 - 1)
+    assert_true(tls::record_open(k, unhex("170303ffff")).err.len() > 0)
+    // not yet a whole record
+    assert_eq(tls::record_len(unhex("17030300")), 0)
+    assert_eq(tls::record_len(unhex("1703030005ab")), 0)
+    assert_eq(tls::record_len(unhex("170303000501020304")), 0)
+    assert_eq(tls::record_len(unhex("17030300050102030405")), 10)
+    assert_eq(tls::record_len(""), 0)
+    // too short to hold an AEAD tag at all
+    assert_true(tls::record_open(k, unhex("1703030001aa")).err.len() > 0)
+    // every prefix of a plausible record
+    let wire = unhex("170303002000112233445566778899aabbccddeeff00112233445566778899aabb")
+    var n = 0
+    while n <= wire.len() {
+        let r = tls::record_open(k, wire.slice(0, n))
+        assert_true(r.err.len() > 0)                  // wrong key, so it can never authenticate
+        n = n + 1
+    }
+}
+
+// A record that decrypts but is entirely padding has no content type, and must be refused rather
+// than reported as type 0: RFC 8446 §5.4 makes this an error, and type 0 is not a content type.
+fn test_all_padding_record_is_refused() {
+    var seal = tls::keys_new(rep(9, 16), rep(3, 12))
+    var open = tls::keys_new(rep(9, 16), rep(3, 12))
+    // seal a record whose content type byte is 0 by sealing type 0 with an empty body
+    let wire = tls::record_seal(seal, 0, "")
+    assert_true(wire.len() > 0)
+    let r = tls::record_open(open, wire)
+    assert_true(r.err.len() > 0)
+}
+
+// Sealing must refuse a body over the plaintext limit rather than emit a record no peer will read.
+fn test_record_seal_refuses_oversize() {
+    var k = tls::keys_new(rep(1, 16), rep(2, 12))
+    assert_streq(tls::record_seal(k, 23, rep(65, 16385)), "")
+    assert_eq(k.seq, 0)                               // and a refused seal does not burn a sequence number
+    assert_streq(tls::record_plain(22, 0x0303, rep(65, 16385)), "")
+}

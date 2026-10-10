@@ -1,0 +1,60 @@
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// CSS-like nested overflow scroll regions
+// ===========================================================================
+
+/// the region id for the single-viewport root panel scroll.
+pub fn panel_scroll_root() -> Str { return "_root" }
+
+/// scroll axis for a region.
+pub enum ScrollAxis { AxisY AxisX }
+
+/// the integer tag of a ScrollAxis (0 = Y, 1 = X).
+pub fn scroll_axis_tag(a: ScrollAxis) -> Int {
+    match a { ScrollAxis::AxisY => { return 0 } ScrollAxis::AxisX => { return 1 } }
+}
+
+/// overflow behaviour (CSS overflow-*).
+pub enum OverflowMode { OvVisible OvHidden OvAuto OvScroll }
+
+/// true when content can scroll (Auto or Scroll).
+pub fn overflow_scrolls(m: OverflowMode) -> Bool {
+    match m {
+        OverflowMode::OvAuto => { return true }
+        OverflowMode::OvScroll => { return true }
+        OverflowMode::OvVisible => { return false }
+        OverflowMode::OvHidden => { return false }
+    }
+}
+
+/// true when content outside the viewport should be clipped (Hidden, Auto, or Scroll).
+pub fn overflow_clips(m: OverflowMode) -> Bool {
+    match m {
+        OverflowMode::OvVisible => { return false }
+        OverflowMode::OvHidden => { return true }
+        OverflowMode::OvAuto => { return true }
+        OverflowMode::OvScroll => { return true }
+    }
+}
+
+/// a scroll-position request: an absolute offset, or "scroll to bottom".
+pub struct PanelScrollRequest { to_bottom: Bool, absolute: Float }
+
+/// request scrolling to an absolute offset.
+pub fn scroll_to(px: Float) -> PanelScrollRequest { return PanelScrollRequest { to_bottom: false, absolute: px } }
+/// request scrolling to the bottom.
+pub fn scroll_to_bottom() -> PanelScrollRequest { return PanelScrollRequest { to_bottom: true, absolute: 0.0 } }
+
+/// one scroll region reported during a panel frame.
+pub struct RegisteredScrollRegion {
+    id: Str, viewport: Rect, content_extent: Float, depth: Int, axis: ScrollAxis
+}
+
+/// a key for persistent per-tab scroll state in the host runner.
+pub struct ScrollBarKey { tab_id: Str, region_id: Str }
+
+/// a ScrollBarKey for a tab's root scroll region.
+pub fn scrollbar_key_root(tab_id: Str) -> ScrollBarKey { return ScrollBarKey { tab_id: copy tab_id, region_id: panel_scroll_root() } }
+

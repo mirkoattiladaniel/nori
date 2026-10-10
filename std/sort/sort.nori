@@ -1,0 +1,156 @@
+//! std/sort: ordering. Implement the `Ord` trait (`cmp(self, other) -> Int`, returning negative /
+//! zero / positive like `a - b`) on your type, then `sort` any Vec of it; `min`/`max` find extremes.
+//! For the built-in scalar types use `sort_int` / `sort_str` (and `strcmp` for strings). All sorts
+//! are stable merge sorts, O(n log n), and return a fresh Vec.
+//!
+//!   import "std/sort" as sort
+//!   struct Person { age: Int, name: Str }
+//!   impl sort::Ord for Person { fn cmp(self, o: Person) -> Int { return self.age - o.age } }
+//!   var sorted = sort::sort(people)         // by age
+//!   var names  = sort::sort_str(raw_names)  // lexicographic
+//!   var lowest = sort::min(people)
+
+/// a totally-ordered type: `cmp` returns <0 if self<other, 0 if equal, >0 if self>other.
+/// (the `other: Int` here is a placeholder; your impl declares the real type.)
+pub trait Ord { fn cmp(self, other: Int) -> Int }
+
+/// sort a Vec of any `Ord` type ascending (stable; merge sort).
+///
+/// A bottom-up merge sort rather than an insertion sort, so large inputs (thousands of paths, say)
+/// stay O(n log n). Stable (a tie keeps its left element first), and moves elements rather than
+/// copying them.
+pub fn sort<T: Ord>(v: Vec<T>) -> Vec<T> {
+    var a: Vec<T> = vec()
+    var b: Vec<T> = vec()
+    var i = 0
+    while i < v.len() { a.push(copy v[i])  b.push(copy v[i])  i = i + 1 }
+    let n = a.len()
+    var width = 1
+    var in_a = true
+    while width < n {
+        if in_a { ord_pass(a, b, width, n) } else { ord_pass(b, a, width, n) }
+        in_a = !in_a
+        width = width * 2
+    }
+    if in_a { return a }
+    return b
+}
+fn ord_pass<T: Ord>(inout src: Vec<T>, inout dst: Vec<T>, width: Int, n: Int) {
+    var lo = 0
+    while lo < n {
+        var mid = lo + width
+        if mid > n { mid = n }
+        var hi = lo + 2 * width
+        if hi > n { hi = n }
+        var l = lo
+        var r = mid
+        var k = lo
+        while k < hi {
+            if l < mid && (r >= hi || src[l].cmp(src[r]) <= 0) { dst[k] = sink src[l]  l = l + 1 }
+            else { dst[k] = sink src[r]  r = r + 1 }
+            k = k + 1
+        }
+        lo = hi
+    }
+}
+
+/// the smallest element of a non-empty Vec<T: Ord>.
+pub fn min<T: Ord>(v: Vec<T>) -> T {
+    var m = v[0]
+    var i = 1
+    while i < v.len() { if v[i].cmp(m) < 0 { m = v[i] }  i = i + 1 }
+    return copy m
+}
+/// the largest element of a non-empty Vec<T: Ord>.
+pub fn max<T: Ord>(v: Vec<T>) -> T {
+    var m = v[0]
+    var i = 1
+    while i < v.len() { if v[i].cmp(m) > 0 { m = v[i] }  i = i + 1 }
+    return copy m
+}
+
+/// lexicographic comparison of two strings by byte: <0 if a<b, 0 if equal, >0 if a>b.
+pub fn strcmp(a: Str, b: Str) -> Int {
+    var i = 0
+    var na = a.len()
+    var nb = b.len()
+    while i < na && i < nb {
+        var ca = ord(a.at(i))
+        var cb = ord(b.at(i))
+        if ca != cb { return ca - cb }
+        i = i + 1
+    }
+    return na - nb
+}
+
+/// sort a Vec<Str> ascending (lexicographic, via strcmp; stable merge sort).
+pub fn sort_str(v: Vec<Str>) -> Vec<Str> {
+    var a: Vec<Str> = vec()
+    var b: Vec<Str> = vec()
+    var i = 0
+    while i < v.len() { a.push(copy v[i])  b.push("")  i = i + 1 }
+    let n = a.len()
+    var width = 1
+    var in_a = true
+    while width < n {
+        if in_a { str_pass(a, b, width, n) } else { str_pass(b, a, width, n) }
+        in_a = !in_a
+        width = width * 2
+    }
+    if in_a { return a }
+    return b
+}
+fn str_pass(inout src: Vec<Str>, inout dst: Vec<Str>, width: Int, n: Int) {
+    var lo = 0
+    while lo < n {
+        var mid = lo + width
+        if mid > n { mid = n }
+        var hi = lo + 2 * width
+        if hi > n { hi = n }
+        var l = lo
+        var r = mid
+        var k = lo
+        while k < hi {
+            if l < mid && (r >= hi || strcmp(src[l], src[r]) <= 0) { dst[k] = sink src[l]  l = l + 1 }
+            else { dst[k] = sink src[r]  r = r + 1 }
+            k = k + 1
+        }
+        lo = hi
+    }
+}
+
+/// sort a Vec<Int> ascending (merge sort).
+pub fn sort_int(v: Vec<Int>) -> Vec<Int> {
+    var a: Vec<Int> = vec()
+    var b: Vec<Int> = vec()
+    var i = 0
+    while i < v.len() { a.push(v[i])  b.push(0)  i = i + 1 }
+    let n = a.len()
+    var width = 1
+    var in_a = true
+    while width < n {
+        if in_a { int_pass(a, b, width, n) } else { int_pass(b, a, width, n) }
+        in_a = !in_a
+        width = width * 2
+    }
+    if in_a { return a }
+    return b
+}
+fn int_pass(inout src: Vec<Int>, inout dst: Vec<Int>, width: Int, n: Int) {
+    var lo = 0
+    while lo < n {
+        var mid = lo + width
+        if mid > n { mid = n }
+        var hi = lo + 2 * width
+        if hi > n { hi = n }
+        var l = lo
+        var r = mid
+        var k = lo
+        while k < hi {
+            if l < mid && (r >= hi || src[l] <= src[r]) { dst[k] = src[l]  l = l + 1 }
+            else { dst[k] = src[r]  r = r + 1 }
+            k = k + 1
+        }
+        lo = hi
+    }
+}

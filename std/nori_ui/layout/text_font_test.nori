@@ -1,0 +1,233 @@
+// Native tests for fonts from `.style` and `.ui`: font_family lists, font_weight, font_style, the
+// `--ui-font` token, fallback past missing families. Run with
+//   noric --test std/nori_ui/layout/text_font_test.nori compiler/runtime.nori --import-root .
+import "std/nori_ui" as ui
+import "std/font" as font
+
+fn load(path: Str) -> font::Font {
+    let fr = font::font_load(read_file(path))
+    assert_true(fr.ok)
+    return copy fr.font
+}
+// a UI font installed by a painter, the test fonts as the faces families resolve against, and no
+// system fonts (the result must not depend on the machine)
+fn install() {
+    ui::layout::text_engine_reset()
+    ui::layout::text_engine_use_system_fonts(false)
+    ui::layout::text_engine_add_font_dir("std/font/assets")
+    var f = load("std/font/assets/DejaVuSans.ttf")
+    ui::layout::text_engine_set_font(f)
+}
+fn family_of(stack: Int, k: Int) -> Str {
+    let faces = ui::layout::text_engine_stack_faces(stack)
+    return font::font_face_info(ui::layout::text_engine_face(faces[k])).family
+}
+fn arabic() -> Str { return "السلام عليكم" }
+
+fn test_a_family_list_is_a_stack() {
+    install()
+    let s = ui::layout::text_engine_family_stack("\"Noto Sans\", \"Noto Sans Arabic\", sans-serif", 0, false)
+    assert_true(s > 0)
+    let faces = ui::layout::text_engine_stack_faces(s)
+    assert_eq(faces.len(), 3)                         // the two named faces, then the UI font
+    assert_streq(family_of(s, 0), "Noto Sans")
+    assert_streq(family_of(s, 1), "Noto Sans Arabic")
+    // the same list asks again: the same stack, nothing loaded twice
+    let n = ui::layout::text_engine_face_count()
+    assert_eq(ui::layout::text_engine_family_stack("\"Noto Sans\", \"Noto Sans Arabic\", sans-serif", 0, false), s)
+    assert_eq(ui::layout::text_engine_face_count(), n)
+    // measured through the stack: the shaped width of the same faces in a FontSet of std/font's own
+    var fs = font::fontset_new()
+    font::fontset_add(fs, load("std/font/assets/NotoSans-subset.ttf"))
+    font::fontset_add(fs, load("std/font/assets/NotoSansArabic-subset.ttf"))
+    font::fontset_add(fs, load("std/font/assets/DejaVuSans.ttf"))
+    var st = ui::layout::text_measure_style(18.0)
+    st.stack = s
+    assert_feq(ui::layout::text_measure_width(arabic(), st), font::shape_line(fs, arabic(), 18.0, font::BIDI_AUTO(), "", "").width, 0.001)
+}
+
+fn test_missing_families_fall_back_without_error() {
+    install()
+    let s = ui::layout::text_engine_family_stack("No Such Font, \"Noto Sans Arabic\"", 0, false)
+    assert_true(s > 0)
+    assert_streq(family_of(s, 0), "Noto Sans Arabic")
+    // nothing installed by any name: the default stack
+    assert_eq(ui::layout::text_engine_family_stack("No Such Font, Another Missing One", 0, false), 0)
+    var r = ui::layout::dsl_parse_document("text { text: hello font_family: \"No Such Font\" }")
+    assert_true(r.ok)
+    assert_eq(ui::layout::node_font_stack(r.doc.tree), 0)
+}
+
+fn test_weight_and_slant_pick_the_face() {
+    install()
+    let b = ui::layout::text_engine_family_stack("DejaVu Sans", 700, false)
+    let bi = font::font_face_info(ui::layout::text_engine_face(ui::layout::text_engine_stack_faces(b)[0]))
+    assert_streq(bi.family, "DejaVu Sans")
+    assert_eq(bi.weight, 700)
+    let o = ui::layout::text_engine_family_stack("DejaVu Sans", 400, true)
+    let oi = font::font_face_info(ui::layout::text_engine_face(ui::layout::text_engine_stack_faces(o)[0]))
+    assert_true(oi.italic)
+    assert_true(b != o)
+}
+
+fn test_font_properties_from_style_and_ui() {
+    install()
+    // CSS spellings in a .style source: font-family with a bare list, font-weight, font-style
+    let sp = ui::layout::style_parse(".ar { font-family: \"Noto Sans Arabic\", \"Noto Sans\", sans-serif  font-weight: bold  font-style: normal }", "t.style")
+    assert_true(sp.ok)
+    var d = ui::layout::rdoc_new()
+    var r = ui::layout::dsl_parse_document("column { padding: 0 text { class: ar text: \"" + arabic() + "\" } text { text: plain } }")
+    assert_true(r.ok)
+    ui::layout::rdoc_set_tree(d, sink r.doc.tree)
+    let e = ui::layout::rdoc_set_styles(d, "t", sp.styles)
+    assert_streq(e.msg, "")
+    ui::layout::rdoc_set_viewport(d, 300.0, 100.0)
+    let _f = ui::layout::rdoc_frame(d, 0.0)
+    let ov = ui::layout::rdoc_overlay(d)
+    var ar_font = 0 - 1
+    var plain_font = 0 - 1
+    var i = 0
+    while i < ov.prims.len() {
+        if ov.prims[i].kind == 2 && ov.prims[i].text == arabic() { ar_font = ov.prims[i].font }
+        if ov.prims[i].kind == 2 && ov.prims[i].text == "plain" { plain_font = ov.prims[i].font }
+        i = i + 1
+    }
+    assert_true(ar_font > 0)
+    assert_streq(family_of(ar_font, 0), "Noto Sans Arabic")
+    assert_eq(plain_font, 0)
+    // a bad weight is an error at its position
+    let bad = ui::layout::style_parse("text { font-weight: heavy-ish }", "t.style")
+    assert_false(bad.ok)
+    // .ui attributes
+    var u = ui::layout::dsl_parse_document("text { text: x font_family: [\"Noto Sans\", serif] font_weight: 300 font_style: italic }")
+    assert_true(u.ok)
+    assert_streq(u.doc.tree.font_family, "Noto Sans,serif")
+    assert_eq(u.doc.tree.font_weight, 300)
+    assert_eq(u.doc.tree.font_slant, 2)
+}
+
+fn test_one_token_sets_the_ui_font() {
+    install()
+    // a theme: one token. Every node that names no family of its own is drawn in it.
+    let theme = ui::layout::style_parse("vars { --ui-font: \"Noto Sans Arabic\", \"Noto Sans\", sans-serif }", "theme.style")
+    assert_true(theme.ok)
+    var d = ui::layout::rdoc_new()
+    var r = ui::layout::dsl_parse_document("column { padding: 0 text { text: \"" + arabic() + "\" } text { text: own font_family: \"Noto Sans\" } }")
+    ui::layout::rdoc_set_tree(d, sink r.doc.tree)
+    let e = ui::layout::rdoc_set_styles_ranked(d, "theme", 0 - 1, theme.styles)
+    assert_streq(e.msg, "")
+    ui::layout::rdoc_set_viewport(d, 300.0, 100.0)
+    let _f = ui::layout::rdoc_frame(d, 0.0)
+    let ov = ui::layout::rdoc_overlay(d)
+    var i = 0
+    var seen = 0
+    while i < ov.prims.len() {
+        if ov.prims[i].kind == 2 && ov.prims[i].text == arabic() { assert_streq(family_of(ov.prims[i].font, 0), "Noto Sans Arabic")  seen = seen + 1 }
+        if ov.prims[i].kind == 2 && ov.prims[i].text == "own" { assert_streq(family_of(ov.prims[i].font, 0), "Noto Sans")  seen = seen + 1 }
+        i = i + 1
+    }
+    assert_eq(seen, 2)
+    // an undefined token in the list is an error, and the document keeps its sheet
+    let bad = ui::layout::style_parse("vars { --ui-font: --nope }", "theme.style")
+    assert_true(bad.ok)
+    let e2 = ui::layout::rdoc_set_styles_ranked(d, "theme", 0 - 1, bad.styles)
+    assert_true(e2.msg.len() > 0)
+}
+
+fn test_the_painter_draws_a_stack_from_the_pool() {
+    install()
+    var f = load("std/font/assets/DejaVuSans.ttf")
+    let s = ui::layout::text_engine_family_stack("\"Noto Sans Arabic\"", 0, false)
+    var pr = ui::layout::pp_text(ui::core::vec2(4.0, 4.0), arabic(), ui::core::color_rgb(255, 255, 255), 20.0)
+    let nox: Vec<Float> = vec()
+    ui::layout::pp_text_set_lines(pr, s, "", "R", nox)
+    var ov = ui::layout::overlay_empty()
+    ov.prims.push(pr)
+    var cv = ui::paint_cpu::canvas_new(200, 40, f)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::render_overlay(cv, ov)
+    var ink = 0
+    var y = 0
+    while y < 40 { var x = 0  while x < 200 { if ui::paint_cpu::pixel_at(cv, x, y) != 0 { ink = ink + 1 }  x = x + 1 }  y = y + 1 }
+    // the canvas's own face has no Arabic: ink means the stack's face drew it
+    assert_true(ink > 100)
+    ui::paint_cpu::canvas_free(cv)
+}
+
+// a text_input in its own face: the value drawn with the stack its font_family / font_weight name (from the
+// .ui or a class), and the caret after its last letter as that face measures it, not the UI font
+fn test_text_input_in_its_own_face() {
+    install()
+    let sp = ui::layout::style_parse(".q { font_family: \"Noto Sans\" size_px: 20 }", "t.style")
+    assert_true(sp.ok)
+    var d = ui::layout::rdoc_new()
+    var r = ui::layout::dsl_parse_document("column { padding: 0 text_input { id: \"q\" value: \"wind\" caret: 4 classes: [q, focused] } }")
+    assert_streq(r.err, "")
+    ui::layout::rdoc_set_tree(d, sink r.doc.tree)
+    let e = ui::layout::rdoc_set_styles(d, "t", sp.styles)
+    assert_streq(e.msg, "")
+    ui::layout::rdoc_set_viewport(d, 300.0, 100.0)
+    let _f = ui::layout::rdoc_frame(d, 0.0)
+    let ov = ui::layout::rdoc_overlay(d)
+    var font_of = 0 - 1
+    var tx = 0.0
+    var caret_x = 0.0 - 1.0
+    var i = 0
+    while i < ov.prims.len() {
+        let p = ov.prims[i]
+        if p.kind == 2 && p.text == "wind" { font_of = p.font  tx = p.pos.x }
+        if p.kind == 0 && p.rect.width() < 2.0 && p.rect.height() > 10.0 { caret_x = p.rect.min.x }
+        i = i + 1
+    }
+    assert_true(font_of > 0)
+    assert_streq(family_of(font_of, 0), "Noto Sans")
+    var st = ui::layout::text_measure_style(20.0)
+    st.stack = font_of
+    let w = ui::layout::text_measure_width("wind", st)
+    assert_feq(caret_x - tx, w, 0.01)
+    assert_true(math_abs(w - ui::layout::text_measure_width("wind", ui::layout::text_measure_style(20.0))) > 0.5)   // the faces differ here
+}
+fn math_abs(v: Float) -> Float { if v < 0.0 { return 0.0 - v }  return v }
+
+// a rich text's bold and italic spans are shaped and painted in their own faces (not only flagged on
+// the primitive, which the painters do not read), and measured in them too,
+// so what follows a bold run starts where the bold run ends
+fn test_rich_spans_bold_and_italic_have_their_faces() {
+    install()
+    var spans: Vec<ui::layout::TextSpanRun> = vec()
+    spans.push(ui::layout::span("plain "))
+    var b = ui::layout::span("WWWW")
+    b.bold = true
+    spans.push(b)
+    var it = ui::layout::span(" slanted")
+    it.italic = true
+    spans.push(it)
+    var node = ui::layout::ui_text_spans(spans, 16.0)
+    var kids: Vec<ui::layout::UiNode> = vec()  kids.push(node)
+    let ov = ui::layout::layout_overlay(ui::layout::ui_column(0.0, 0.0, kids), ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(600.0, 60.0)))
+    var plain_font = 0 - 1
+    var bold_font = 0 - 1
+    var italic_font = 0 - 1
+    var bold_x = 0.0
+    var italic_x = 0.0
+    var i = 0
+    while i < ov.prims.len() {
+        if ov.prims[i].kind == 2 && ov.prims[i].text == "plain " { plain_font = ov.prims[i].font }
+        if ov.prims[i].kind == 2 && ov.prims[i].text == "WWWW" { bold_font = ov.prims[i].font  bold_x = ov.prims[i].pos.x }
+        if ov.prims[i].kind == 2 && ov.prims[i].text == " slanted" { italic_font = ov.prims[i].font  italic_x = ov.prims[i].pos.x }
+        i = i + 1
+    }
+    assert_eq(plain_font, 0)
+    assert_true(bold_font > 0)
+    let bf = font::font_face_info(ui::layout::text_engine_face(ui::layout::text_engine_stack_faces(bold_font)[0]))
+    assert_eq(bf.weight, 700)
+    assert_true(italic_font > 0)
+    let itf = font::font_face_info(ui::layout::text_engine_face(ui::layout::text_engine_stack_faces(italic_font)[0]))
+    assert_true(itf.italic)
+    // the italic run starts where the bold run ends, measured in the bold face (wider than the regular one)
+    var bst = ui::layout::text_measure_style(16.0)
+    bst.stack = bold_font
+    let bw = ui::layout::text_measure_width("WWWW", bst)
+    assert_feq(italic_x - bold_x, bw, 0.01)
+    assert_true(bw > ui::layout::text_measure_width("WWWW", ui::layout::text_measure_style(16.0)))
+}

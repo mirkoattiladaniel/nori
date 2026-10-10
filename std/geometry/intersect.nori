@@ -1,0 +1,83 @@
+//! std/geometry, intersect.nori: the ray queries. Every one returns a result struct from
+//! `geometry.nori` (`RayHit`, `AabbHit`, `TriHit`) rather than a bare Bool, because Nori has no
+//! tuple return and a hit is never just yes/no.
+//!
+//! A ray is a half-line: an intersection behind the origin is a miss. `t` is measured in units of
+//! `dir`'s length, so normalize the direction (`ray_normalized`) to get world distances.
+
+import "std/math" as m
+
+/// ray against an axis-aligned box, by the slab method.
+///
+/// A ray that starts inside hits with `t_min == 0`. Division by a zero direction component is
+/// left unguarded: IEEE gives +/-infinity, the slab for that axis becomes
+/// (-inf, +inf) or empty, and both are the right answer. The one case the infinities get wrong is
+/// an origin exactly on a slab plane with a zero direction, which yields 0*inf = NaN; the
+/// comparisons below are written so a NaN falls out as a miss.
+pub fn ray_aabb(r: Ray, a: Aabb) -> AabbHit {
+    let ix = 1.0 / r.dir.x
+    let iy = 1.0 / r.dir.y
+    let iz = 1.0 / r.dir.z
+    let x1 = (a.min.x - r.origin.x) * ix
+    let x2 = (a.max.x - r.origin.x) * ix
+    let y1 = (a.min.y - r.origin.y) * iy
+    let y2 = (a.max.y - r.origin.y) * iy
+    let z1 = (a.min.z - r.origin.z) * iz
+    let z2 = (a.max.z - r.origin.z) * iz
+    var tmin = m::fmax(m::fmax(m::fmin(x1, x2), m::fmin(y1, y2)), m::fmin(z1, z2))
+    let tmax = m::fmin(m::fmin(m::fmax(x1, x2), m::fmax(y1, y2)), m::fmax(z1, z2))
+    if tmax < 0.0 { return AabbHit { hit: false, t_min: 0.0, t_max: 0.0 } }   // box is behind the origin
+    if tmin > tmax { return AabbHit { hit: false, t_min: 0.0, t_max: 0.0 } }  // slabs never overlap; also catches a NaN
+    if tmin < 0.0 { tmin = 0.0 }                                              // origin inside: entry is here
+    return AabbHit { hit: true, t_min: tmin, t_max: tmax }
+}
+/// ray against an infinite plane. A ray parallel to the plane misses, even if it lies in the plane,
+/// since there is no single `t` to report for a whole line of contact.
+pub fn ray_plane(r: Ray, pl: Plane) -> RayHit {
+    let dn = m::vec3_dot(pl.normal, r.dir)
+    if m::fabs(dn) < 1.0e-12 { return RayHit { hit: false, t: 0.0 } }
+    let t = (0.0 - plane_signed_distance(pl, r.origin)) / dn
+    if t < 0.0 { return RayHit { hit: false, t: 0.0 } }
+    return RayHit { hit: true, t: t }
+}
+/// ray against a sphere; `t` is the near intersection, or the far one when the origin is inside.
+pub fn ray_sphere(r: Ray, s: Sphere) -> RayHit {
+    let oc = m::vec3_sub(r.origin, s.center)
+    let a = m::vec3_dot(r.dir, r.dir)
+    let b = m::vec3_dot(oc, r.dir)                              // half the usual b, so the discriminant loses the 4
+    let c = m::vec3_dot(oc, oc) - s.radius * s.radius
+    let disc = b * b - a * c
+    if disc < 0.0 { return RayHit { hit: false, t: 0.0 } }
+    let sd = sqrt(disc)
+    let t0 = (0.0 - b - sd) / a
+    if t0 >= 0.0 { return RayHit { hit: true, t: t0 } }
+    let t1 = (0.0 - b + sd) / a
+    if t1 >= 0.0 { return RayHit { hit: true, t: t1 } }       // origin inside: the exit point
+    return RayHit { hit: false, t: 0.0 }                      // whole sphere is behind
+}
+/// ray against a triangle, Möller-Trumbore, double-sided.
+///
+/// Returns the barycentric `u`, `v` alongside `t`, which is what picking wants: the hit point's
+/// uv/normal/colour is the same interpolation of the vertices' own. Backface culling is left to the
+/// caller (the sign of `det` before the reciprocal) because a picker usually wants both faces and a
+/// renderer usually does not.
+pub fn ray_triangle(r: Ray, v0: m::Vec3, v1: m::Vec3, v2: m::Vec3) -> TriHit {
+    let e1 = m::vec3_sub(v1, v0)
+    let e2 = m::vec3_sub(v2, v0)
+    let pv = m::vec3_cross(r.dir, e2)
+    let det = m::vec3_dot(e1, pv)
+    // a determinant at zero means the ray is parallel to the triangle's plane: the pyramid the
+    // barycentrics are ratios of has no volume, and every one of them would divide by zero
+    if m::fabs(det) < 1.0e-12 { return TriHit { hit: false, t: 0.0, u: 0.0, v: 0.0 } }
+    let inv = 1.0 / det
+    let tv = m::vec3_sub(r.origin, v0)
+    let u = m::vec3_dot(tv, pv) * inv
+    if u < 0.0 || u > 1.0 { return TriHit { hit: false, t: 0.0, u: 0.0, v: 0.0 } }
+    let qv = m::vec3_cross(tv, e1)
+    let v = m::vec3_dot(r.dir, qv) * inv
+    if v < 0.0 || u + v > 1.0 { return TriHit { hit: false, t: 0.0, u: 0.0, v: 0.0 } }
+    let t = m::vec3_dot(e2, qv) * inv
+    if t < 0.0 { return TriHit { hit: false, t: 0.0, u: 0.0, v: 0.0 } }
+    return TriHit { hit: true, t: t, u: u, v: v }
+}
+

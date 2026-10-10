@@ -1,0 +1,536 @@
+use core::*
+import "std/parse" as parse
+import "std/os" as os
+import "std/image" as image
+import "std/svg" as svg
+
+extern fn free(Int)
+
+// ===========================================================================
+// `.ui` media node parser: image.
+//
+// A sibling root file of std/nori_ui/layout; see dsl_widgets.nori's header.
+//
+// This file owns four things:
+//   1. the `image { }` parser
+//   2. `resolve_image_png_path`
+//   3. measure + layout for nk_image()
+//   4. the decoded-image cache + letterbox fit shared by both painters
+//
+// The paint primitive is PaintPrimitive kind 3, with the resolved absolute
+// path carried in the existing `text` field.
+// No struct change, so no other PaintPrimitive construction site is touched.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 1. the parser
+// ---------------------------------------------------------------------------
+
+/// `align_self:` for image: the cross-axis parse, including its
+/// two distinct error strings. The shared `ds_cross` in dsl.nori merges them into one message,
+/// so image keeps its own (per-kind error text is part of the language).
+fn dsm_cross(inout p: DslP, v: DslValue) -> Int {
+    if v.kind == 3 {
+        if (v.s == "stretch") { return cross_stretch() }
+        if (v.s == "start") { return cross_start() }
+        if (v.s == "center") { return cross_center() }
+        if (v.s == "end") { return cross_end() }
+        dsl_fail(p, ("unknown cross_align " + dsm_dbg(v.s)))
+        return cross_stretch()
+    }
+    dsl_fail(p, "cross_align must be stretch, center, or end")
+    return cross_stretch()
+}
+/// A string rendered in debug form: a double-quoted, escaped form. The quotes are part of
+/// the message text (`unknown image field "foo"`), so they are reproduced here.
+fn dsm_dbg(s: Str) -> Str {
+    var out = "" + chr(34)
+    var i = 0
+    while i < s.len() {
+        let c = ord(s.at(i))
+        if c == 34 { out = (out + chr(92)) + chr(34) }
+        else if c == 92 { out = (out + chr(92)) + chr(92) }
+        else if c == 10 { out = (out + chr(92)) + "n" }
+        else if c == 13 { out = (out + chr(92)) + "r" }
+        else if c == 9 { out = (out + chr(92)) + "t" }
+        else { out = out + chr(c) }
+        i = i + 1
+    }
+    return (out + chr(34))
+}
+/// is `s` a string a strict f32 parse would accept? Sign, digits, optional fraction,
+/// optional exponent, and nothing left over. (A strict parse also accepts "inf"/"NaN"; a length of either is
+/// not a thing a stylesheet writes, and neither survives layout, so they are not accepted here.)
+///
+/// This exists because Nori's `parse_float_sub` is a best-effort reader: it happily turns "bogus"
+/// into 0.0, so the shared `ui_length_parse` reports ok for any garbage. Image rejects it and the
+/// caller raises `invalid w: "bogus"`. Per-kind value strictness is part of the language, so image
+/// validates before it converts.
+fn dsm_is_f32(s: Str) -> Bool {
+    let t = nui_trim(s)
+    var i = 0
+    if t.len() > 0 {
+        let c0 = ord(t.at(0))
+        if c0 == 43 || c0 == 45 { i = 1 }
+    }
+    var digits = 0
+    while i < t.len() && dsl_is_digit(ord(t.at(i))) { i = i + 1  digits = digits + 1 }
+    if i < t.len() && ord(t.at(i)) == 46 {
+        i = i + 1
+        while i < t.len() && dsl_is_digit(ord(t.at(i))) { i = i + 1  digits = digits + 1 }
+    }
+    if digits == 0 { return false }
+    if i < t.len() && (ord(t.at(i)) == 101 || ord(t.at(i)) == 69) {
+        i = i + 1
+        if i < t.len() && (ord(t.at(i)) == 43 || ord(t.at(i)) == 45) { i = i + 1 }
+        var ed = 0
+        while i < t.len() && dsl_is_digit(ord(t.at(i))) { i = i + 1  ed = ed + 1 }
+        if ed == 0 { return false }
+    }
+    return i == t.len()
+}
+/// a strict `<number><unit>` reader, the tail of the strict length parse.
+///
+/// `parse_float_sub` stops at the `e` of an exponent ("-1.5e2" reads back as -1.5), and
+/// a strict f32 parse does not, so the exponent is split off and applied here rather than
+/// quietly dropping two orders of magnitude out of a length.
+fn dsm_unit_num(s: Str, unit: Int) -> UiLengthOpt {
+    let t = nui_trim(s)
+    if !dsm_is_f32(t) { return UiLengthOpt { ok: false, len: ui_px(0.0) } }
+    var epos = 0 - 1
+    var i = 0
+    while i < t.len() {
+        let c = ord(t.at(i))
+        if (c == 101 || c == 69) && epos < 0 { epos = i }
+        i = i + 1
+    }
+    if epos < 0 { return UiLengthOpt { ok: true, len: UiLength { unit: unit, value: parse_float_sub(t, 0, t.len()) } } }
+    var v = parse_float_sub(t, 0, epos)
+    var j = epos + 1
+    var eneg = false
+    if j < t.len() && ord(t.at(j)) == 45 { eneg = true  j = j + 1 }
+    else if j < t.len() && ord(t.at(j)) == 43 { j = j + 1 }
+    var ev = 0
+    while j < t.len() { ev = ev * 10 + (ord(t.at(j)) - 48)  j = j + 1 }
+    var k = 0
+    while k < ev { if eneg { v = v / 10.0 } else { v = v * 10.0 }  k = k + 1 }
+    return UiLengthOpt { ok: true, len: UiLength { unit: unit, value: v } }
+}
+/// Strict length parse. Same suffix order as the shared
+/// `ui_length_parse`, but a mantissa that is not a number is a rejection rather than a 0.0.
+/// Note `"ui"` alone is Ui(1.0), and the `is_empty` test for the `ui` suffix happens before the
+/// trim, so `"  ui"` (with the bare-"ui" case already ruled out by the leading trim) is invalid.
+fn dsm_length_parse(s: Str) -> UiLengthOpt {
+    let t = nui_trim(s)
+    if t.len() == 0 { return UiLengthOpt { ok: false, len: ui_px(0.0) } }
+    if (nui_lower(t) == "ui") { return UiLengthOpt { ok: true, len: ui_scale_len(1.0) } }
+    if nui_ends_with(t, "%") { return dsm_unit_num(t.slice(0, t.len() - 1), 1) }
+    if nui_ends_with(t, "vw") { return dsm_unit_num(t.slice(0, t.len() - 2), 2) }
+    if nui_ends_with(t, "vh") { return dsm_unit_num(t.slice(0, t.len() - 2), 3) }
+    if nui_ends_with(t, "ui") {
+        let num = t.slice(0, t.len() - 2)
+        if num.len() == 0 { return UiLengthOpt { ok: true, len: ui_scale_len(1.0) } }
+        return dsm_unit_num(num, 4)
+    }
+    return dsm_unit_num(t, 0)
+}
+/// `w:` / `h:` for image: the length value with its three error strings.
+/// A Number keeps the inline unit suffix the cursor is sitting on (`50%`, `2vh`, `4ui`).
+fn dsm_length(inout p: DslP, v: DslValue, what: Str) -> UiLength {
+    if v.kind == 1 { return dsl_length_suffix(p, v.f) }
+    if v.kind == 0 || v.kind == 3 {
+        if (v.s == "fill") { dsl_fail(p, (what + ": use fill_w / fill_h instead of `fill`"))  return ui_px(0.0) }
+        let lp = dsm_length_parse(v.s)
+        if lp.ok { return sink lp.len }
+        dsl_fail(p, ("invalid " + (what + (": " + dsm_dbg(v.s)))))
+        return ui_px(0.0)
+    }
+    dsl_fail(p, (what + " must be a number or length"))
+    return ui_px(0.0)
+}
+/// `classes: [..]` for image, with its own error strings.
+fn dsm_classes(inout p: DslP, inout node: UiNode, v: DslValue) {
+    if v.kind != 4 { dsl_fail(p, "classes must be [...]")  return }
+    var nc: Vec<Str> = vec()
+    var i = 0
+    while i < v.arr.len() {
+        var e = v.arr[i]
+        if e.kind != 0 && e.kind != 3 { dsl_fail(p, "class names must be strings or identifiers")  return }
+        nc.push(copy e.s)
+        i = i + 1
+    }
+    node.classes = nc
+}
+
+/// parse an `image { ... }` body (the opening `{` is already consumed).
+///
+/// A serializer may write
+/// `flex_weight` / `flex_shrink` / `bind_visible` for an image, but the parser here rejects all
+/// three (`unknown image field ...`). They are always unset on an image;
+/// `ui_node_blank` already leaves them unset.
+///
+/// Image takes no child elements, so `name {` hits the same ``expected `:` in image node`` error
+/// as any other missing colon.
+fn dsl_media_node(inout p: DslP, kindname: Str, kind: Int) -> UiNode {
+    var node = ui_node_blank(kind)
+    // fill_w defaults false here, unlike text_input/text_area.
+    node.fill_w = false
+    node.fill_h = false
+    node.w = ui_px(0.0)
+    node.h = ui_px(0.0)
+    var has_path = false
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 {
+            dsl_bump(p)
+            // note there is no trailing colon on this message, unlike
+            if !has_path { dsl_fail(p, "image requires path") }
+            return node
+        }
+        var name = dsl_ident(p)                       // EOF lands here: "expected an identifier"
+        if p.failed[0] == 1 { return node }
+        dsl_skip(p)
+        if dsl_peek(p) != 58 { dsl_fail(p, "expected `:` in image node")  return node }
+        dsl_bump(p)
+        if (name == "fill_w") || (name == "fill") {
+            var v = dsl_value(p)
+            if p.failed[0] == 1 { return node }
+            node.fill_w = dsl_bool_of(p, v, "fill_w")
+        } else if (name == "fill_h") {
+            var v = dsl_value(p)
+            if p.failed[0] == 1 { return node }
+            node.fill_h = dsl_bool_of(p, v, "fill_h")
+        } else if (name == "w") {
+            // A leading `-`/digit is the inline numeric+suffix path;
+            // otherwise a value is read and a bare ident `fill` means `fill_w = true`
+            // instead of a length. dsl_value already returns kind 1 for a leading `-`/digit and
+            // dsl_length reads the unit suffix straight off the cursor, so the two branches
+            // collapse into one here: a numeric value can never be Ident("fill").
+            var v = dsl_value(p)
+            if p.failed[0] == 1 { return node }
+            if v.kind == 3 && (v.s == "fill") { node.fill_w = true } else { node.w = dsm_length(p, v, "w") }
+        } else if (name == "h") {
+            var v = dsl_value(p)                      // the same `fill` special case
+            if p.failed[0] == 1 { return node }
+            if v.kind == 3 && (v.s == "fill") { node.fill_h = true } else { node.h = dsm_length(p, v, "h") }
+        } else if (name == "path") {
+            // Quoted string only. There is no `src` alias; Ident, Number, Bool and
+            // Array are all rejected. The node field is `src` (the struct's `text` is the label
+            // slot); the resolved path is what reaches the paint primitive.
+            var v = dsl_value(p)
+            if p.failed[0] == 1 { return node }
+            if v.kind != 0 { dsl_fail(p, "path must be a quoted string")  return node }
+            node.src = copy v.s
+            has_path = true
+        } else if (name == "classes") {
+            var v = dsl_value(p)
+            if p.failed[0] == 1 { return node }
+            dsm_classes(p, node, v)
+        } else if (name == "class") {
+            var v = dsl_value(p)                      // string or ident, replacing the list
+            if p.failed[0] == 1 { return node }
+            if v.kind != 0 && v.kind != 3 { dsl_fail(p, "class must be string or ident")  return node }
+            var nc: Vec<Str> = vec()
+            nc.push(copy v.s)
+            node.classes = nc
+        } else if (name == "align_self") {
+            var v = dsl_value(p)
+            if p.failed[0] == 1 { return node }
+            node.has_align_self = true
+            node.align_self = dsm_cross(p, v)
+        } else {
+            dsl_fail(p, ("unknown image field " + dsm_dbg(name)))
+            return node
+        }
+        if p.failed[0] == 1 { return node }
+    }
+    return node
+}
+
+// ---------------------------------------------------------------------------
+// 2. the resolver
+// ---------------------------------------------------------------------------
+
+// A resolver could take a context of { save_dir, project_root, read_project_file }
+// as an argument. Nori's layout pass has nowhere to thread a host context through (LayoutLengthContext
+// carries viewport geometry only, and widening it would touch runtime_document.nori),
+// so the two path roots live in module globals a host sets once.
+//
+// Behaviour specific to Nori, and the only one in the resolver:
+//   * `save_dir`     "" means absent: the save_dir/thumbs probe is
+//                    skipped entirely.
+//   * `project_root` "" means present and empty, i.e. the process working directory, where an
+//                    absent root would skip the project_root probes altogether. An unset root would
+//                    otherwise make every `image { }` in the library silently undrawable, which
+//                    is a far worse default than "relative to the cwd".
+global g_media_project_root: Str
+global g_media_save_dir: Str
+global g_media_extra_roots: Vec<Str>
+
+/// set the two host path roots used to resolve `image { path: ... }` strings.
+/// `project_root` "" = the process working directory; `save_dir` "" = no save directory.
+/// further directories an image path may be found under, tried after the project root, in order (a desktop
+/// shell gives the XDG data directories, so a document can name an application's icon as
+/// `icons/hicolor/48x48/apps/foot.png`); none by default. The same rules apply (relative paths only, no `..`).
+pub fn ui_media_set_extra_roots(roots: Vec<Str>) {
+    var v: Vec<Str> = vec()
+    foreach r in roots { v.push(copy r) }
+    g_media_extra_roots = v
+}
+
+pub fn ui_media_set_resolve_roots(project_root: Str, save_dir: Str) {
+    g_media_project_root = copy project_root
+    g_media_save_dir = copy save_dir
+}
+/// the currently configured project root ("" = the process working directory).
+pub fn ui_media_project_root() -> Str { return copy g_media_project_root }
+/// the currently configured save directory ("" = none).
+pub fn ui_media_save_dir() -> Str { return copy g_media_save_dir }
+
+/// `Path::join` for the two roots: an empty base yields the relative path unchanged, so an unset
+/// project root resolves against the working directory.
+fn dsm_join(base: Str, rel: Str) -> Str {
+    if base.len() == 0 { return copy rel }
+    if nui_ends_with(base, "/") { return (base + rel) }
+    return (base + ("/" + rel))
+}
+/// An is-file test: exists and is not a directory. `os::path_exists` uses access(F_OK),
+/// which is perfectly happy with a directory, so it is not enough on its own.
+fn dsm_is_file(path: Str) -> Bool {
+    if path.len() == 0 { return false }
+    let st = os::stat_path(path)
+    return st.ok && !st.is_dir
+}
+
+/// resolve a layout `path` string to an on-disk PNG. `ok = false` means "draw nothing".
+///
+/// The path goes through these steps, in order:
+///
+/// 1. sanitize      - `sanitize_overlay_image_path`: trim, then reject empty, any `\`,
+///                    any `..`, a leading `/`, or a drive letter (byte 1 == ':').
+/// 2. thumb lookup  - only when the path contains no `/`; re-checked with
+///                    `sanitize_save_thumb_filename`, then probed as
+///                    save_dir/thumbs/<name> and then project_root/thumbs/<name>. First file wins.
+/// 3. extension     - PNG only, ASCII-case-insensitive. Anything else resolves to nothing.
+/// 4. `./` strip    - repeatedly.
+/// 5. direct probe  - project_root/rel on the filesystem.
+///
+/// There is no virtual-filesystem step: an asset that exists only behind a host callback resolves
+/// to nothing (`ok = false`).
+pub fn resolve_image_png_path(requested: Str) -> StrOpt {
+    let none = StrOpt { ok: false, value: "" }
+    let san = sanitize_overlay_image_path(requested)                  // step 1
+    if !san.ok { return none }
+    let req = san.value
+    if !nui_contains(req, "/") {                                      // step 2
+        let safe = sanitize_save_thumb_filename(req)
+        if safe.ok {
+            if g_media_save_dir.len() > 0 {
+                let t0 = dsm_join(dsm_join(g_media_save_dir, "thumbs"), safe.value)
+                if dsm_is_file(t0) { return StrOpt { ok: true, value: t0 } }
+            }
+            let t1 = dsm_join(dsm_join(g_media_project_root, "thumbs"), safe.value)
+            if dsm_is_file(t1) { return StrOpt { ok: true, value: t1 } }
+        }
+    }
+    // step 3: PNG, and SVG (an extension: icons, drawn at the size they are shown at)
+    if !nui_ends_with(nui_lower(req), ".png") && !nui_ends_with(nui_lower(req), ".svg") { return none }
+    var rel = req                                                     // step 4
+    while nui_starts_with(rel, "./") { rel = rel.slice(2, rel.len()) }
+    let direct = dsm_join(g_media_project_root, rel)                  // step 5
+    if dsm_is_file(direct) { return StrOpt { ok: true, value: direct } }
+    foreach r in g_media_extra_roots {                                // (and the extra roots, in order)
+        let e = dsm_join(r, rel)
+        if dsm_is_file(e) { return StrOpt { ok: true, value: e } }
+    }
+    return none                                                       // nothing found
+}
+
+// ---------------------------------------------------------------------------
+// 3. measure + layout
+// ---------------------------------------------------------------------------
+
+/// a filled-image paint primitive: kind 3, the resolved absolute path in `text`, and the placed
+/// rect. Reusing `text` is what keeps PaintPrimitive unchanged.
+pub fn pp_image(rect: Rect, path: Str) -> PaintPrimitive {
+    // built from pp_rect and re-tagged rather than written as a literal: PaintPrimitive has the
+    // text-effect fields (runtime_document.nori) and a literal here would have to repeat
+    // every default. One constructor, one place to keep in step.
+    var p = pp_rect(rect, color_rgba(255, 255, 255, 255), 0.0)
+    p.kind = 3
+    p.text = copy path
+    return p
+}
+
+/// intrinsic size of image (see nodes_ext.nori). Pure explicit size, the `nk_rect` / `nk_surface`
+/// model in runtime_document.nori. An image has no measurable intrinsic size at layout
+/// time either: the pixels are not decoded until the renderer's blit.
+fn ui_measure_media(node: UiNode, ctx: LayoutLengthContext) -> Vec2 {
+    return vec2(ui_length_resolve(node.w, ctx, 0), ui_length_resolve(node.h, ctx, 1))
+}
+/// paint image (see nodes_ext.nori), including the host resolve step.
+///
+/// A path that fails to resolve draws nothing, silently: no placeholder, no border, no error.
+/// That is why a typo in `path:` looks like an empty box rather than a bug.
+fn ui_layout_media(inout node: UiNode, rect: Rect, ctx: LayoutLengthContext, inout out: ComputedOverlay) {
+    let res = resolve_image_png_path(node.src)
+    if !res.ok { return }
+    var p = pp_image(rect, res.value)
+    // an SVG's `currentColor` is the node's `color` (an icon takes its colour from the style), and its
+    // alpha the image's opacity, as a PNG's is
+    if ui_media_is_svg(res.value) { p.color = rgba_color(node.color) }
+    out.prims.push(p)
+}
+
+// ---------------------------------------------------------------------------
+// 4. the decoded-image cache + the letterbox fit rule, shared by both painters
+// ---------------------------------------------------------------------------
+
+// The decoded-texture cache. There is no in-memory image registry, so the key is
+// { path, byte length, mtime }; an mtime or length change invalidates the entry.
+//
+// Parallel vectors rather than a Map: the value is four machine words (pixels pointer, w, h,
+// last-used tick) and the table is capped at 64 entries, so a linear scan is cheaper than hashing
+// a path string, and `px` must be freed on eviction, which a Map<Str,Int> would not help with.
+global g_ovimg_path: Vec<Str>
+global g_ovimg_len: Vec<Int>
+global g_ovimg_mtime: Vec<Int>
+global g_ovimg_px: Vec<Int>
+global g_ovimg_w: Vec<Int>
+global g_ovimg_h: Vec<Int>
+global g_ovimg_used: Vec<Int>
+global g_ovimg_tick: Int = 0
+
+/// a decoded overlay image. `px` is `w*h*4` RGBA bytes owned by the cache: never free it, and
+/// never hold it across a call that could evict (blit and drop it).
+pub struct UiMediaImage { ok: Bool, px: Int, w: Int, h: Int }
+
+/// drop entry `i`, freeing its pixels. Swap-remove: order in the table is meaningless because
+/// eviction picks by `last_used`, not by position.
+fn ovimg_drop(i: Int) {
+    if g_ovimg_px[i] != 0 { unsafe { free(g_ovimg_px[i]) } }
+    let last = g_ovimg_path.len() - 1
+    var lastp = g_ovimg_path.take(last)
+    g_ovimg_path[i] = lastp
+    g_ovimg_len[i] = g_ovimg_len[last]
+    g_ovimg_mtime[i] = g_ovimg_mtime[last]
+    g_ovimg_px[i] = g_ovimg_px[last]
+    g_ovimg_w[i] = g_ovimg_w[last]
+    g_ovimg_h[i] = g_ovimg_h[last]
+    g_ovimg_used[i] = g_ovimg_used[last]
+    let _p1 = g_ovimg_path.pop()
+    let _p2 = g_ovimg_len.pop()
+    let _p3 = g_ovimg_mtime.pop()
+    let _p4 = g_ovimg_px.pop()
+    let _p5 = g_ovimg_w.pop()
+    let _p6 = g_ovimg_h.pop()
+    let _p7 = g_ovimg_used.pop()
+}
+/// evict least-recently-used entries down to MAX_CACHED = 64.
+fn ovimg_evict() {
+    while g_ovimg_path.len() > 64 {
+        var oldest = 0
+        var i = 1
+        while i < g_ovimg_used.len() {
+            if g_ovimg_used[i] < g_ovimg_used[oldest] { oldest = i }
+            i = i + 1
+        }
+        ovimg_drop(oldest)
+    }
+}
+/// how many images the decode cache currently holds (for tests and diagnostics).
+pub fn ui_media_cache_len() -> Int { return g_ovimg_path.len() }
+/// drop every cached image, freeing the pixel buffers.
+pub fn ui_media_cache_clear() {
+    while g_ovimg_path.len() > 0 { ovimg_drop(g_ovimg_path.len() - 1) }
+}
+
+/// decode `path` (a resolved absolute/cwd-relative PNG) through the cache.
+///
+/// `read_file` aborts the process on a missing or unreadable path: it is a trapping
+/// builtin, not a Result-returning one, so the stat below is a guard, not an optimisation, and
+/// the same stat supplies the cache key's length and mtime.
+pub fn ui_media_image_load(path: Str) -> UiMediaImage {
+    let bad = UiMediaImage { ok: false, px: 0, w: 0, h: 0 }
+    if path.len() == 0 { return bad }
+    let st = os::stat_path(path)
+    if !st.ok || st.is_dir { return bad }
+    g_ovimg_tick = g_ovimg_tick + 1
+    var i = 0
+    while i < g_ovimg_path.len() {
+        if (g_ovimg_path[i] == path) && g_ovimg_len[i] == st.size && g_ovimg_mtime[i] == st.mtime {
+            g_ovimg_used[i] = g_ovimg_tick
+            if g_ovimg_px[i] == 0 { return bad }
+            return UiMediaImage { ok: true, px: g_ovimg_px[i], w: g_ovimg_w[i], h: g_ovimg_h[i] }
+        }
+        i = i + 1
+    }
+    var im = image::load_png(read_file(path))
+    if !image::ok(im) { image::dispose(im)  return bad }
+    if image::width(im) <= 0 || image::height(im) <= 0 { image::dispose(im)  return bad }
+    g_ovimg_path.push(copy path)
+    g_ovimg_len.push(st.size)
+    g_ovimg_mtime.push(st.mtime)
+    g_ovimg_px.push(image::pixels(im))              // ownership moves into the cache; no dispose
+    g_ovimg_w.push(image::width(im))
+    g_ovimg_h.push(image::height(im))
+    g_ovimg_used.push(g_ovimg_tick)
+    ovimg_evict()
+    return UiMediaImage { ok: true, px: image::pixels(im), w: image::width(im), h: image::height(im) }
+}
+
+/// is `path` an SVG (by its extension)?
+pub fn ui_media_is_svg(path: Str) -> Bool { return nui_ends_with(nui_lower(path), ".svg") }
+
+/// an SVG rasterized at `w` x `h` device pixels with `currentColor` (r, g, b), through the same cache
+/// as the PNGs (keyed by path, size and colour; a changed file is drawn again). An icon is drawn at the
+/// size it is shown at (crisp at any scale) rather than a bitmap stretched.
+pub fn ui_media_svg_load(path: Str, w: Int, h: Int, r: Int, g: Int, b: Int) -> UiMediaImage {
+    let bad = UiMediaImage { ok: false, px: 0, w: 0, h: 0 }
+    if path.len() == 0 || w <= 0 || h <= 0 || w > 4096 || h > 4096 { return bad }
+    let st = os::stat_path(path)
+    if !st.ok || st.is_dir { return bad }
+    let key = path + "#" + to_str(w) + "x" + to_str(h) + "#" + to_str(r) + "," + to_str(g) + "," + to_str(b)
+    g_ovimg_tick = g_ovimg_tick + 1
+    var i = 0
+    while i < g_ovimg_path.len() {
+        if (g_ovimg_path[i] == key) && g_ovimg_len[i] == st.size && g_ovimg_mtime[i] == st.mtime {
+            g_ovimg_used[i] = g_ovimg_tick
+            if g_ovimg_px[i] == 0 { return bad }
+            return UiMediaImage { ok: true, px: g_ovimg_px[i], w: g_ovimg_w[i], h: g_ovimg_h[i] }
+        }
+        i = i + 1
+    }
+    var im = svg::rasterize_current(read_file(path), w, h, r, g, b)
+    if !image::ok(im) { image::dispose(im)  return bad }
+    g_ovimg_path.push(key)
+    g_ovimg_len.push(st.size)
+    g_ovimg_mtime.push(st.mtime)
+    g_ovimg_px.push(image::pixels(im))
+    g_ovimg_w.push(image::width(im))
+    g_ovimg_h.push(image::height(im))
+    g_ovimg_used.push(g_ovimg_tick)
+    ovimg_evict()
+    return UiMediaImage { ok: true, px: image::pixels(im), w: image::width(im), h: image::height(im) }
+}
+
+/// the letterbox-contain fit: `scale = min(panel_w/src_w, panel_h/src_h)`, blit size `src*scale`
+/// (floored at 1.0 per axis), centered in `panel`, including
+/// the `.max(1.0)` on the panel extents that keeps a zero-width rect from producing a NaN scale.
+pub fn ui_media_letterbox(panel: Rect, src_w: Int, src_h: Int) -> Rect {
+    var pw = panel.width()
+    var ph = panel.height()
+    if pw < 1.0 { pw = 1.0 }
+    if ph < 1.0 { ph = 1.0 }
+    let sw = to_float(src_w)
+    let sh = to_float(src_h)
+    var scale = pw / sw
+    if (ph / sh) < scale { scale = ph / sh }
+    var bw = sw * scale
+    var bh = sh * scale
+    if bw < 1.0 { bw = 1.0 }
+    if bh < 1.0 { bh = 1.0 }
+    let x = panel.min.x + (pw - bw) * 0.5
+    let y = panel.min.y + (ph - bh) * 0.5
+    return rect_min_max(vec2(x, y), vec2(x + bw, y + bh))
+}

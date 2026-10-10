@@ -1,0 +1,30 @@
+[Icon Theme]
+Name=My Test Theme
+Comment=A small theme for the std/xdg tests
+Inherits=parent;
+Directories=48x48/apps,128x128/apps,scalable/apps,22x22/apps,64x64/apps
+
+[48x48/apps]
+Size=48
+Type=Fixed
+Context=Applications
+
+[128x128/apps]
+Size=128
+Type=Fixed
+
+[scalable/apps]
+Size=48
+Type=Scalable
+MinSize=16
+MaxSize=512
+
+[22x22/apps]
+Size=22
+Type=Threshold
+Threshold=4
+
+[64x64/apps]
+Size=32
+Type=Fixed
+Scale=2

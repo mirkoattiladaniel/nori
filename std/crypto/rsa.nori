@@ -1,0 +1,196 @@
+// RSA signature verification (RFC 8017): PKCS#1 v1.5 and PSS.
+//
+// Verification only. There is no signing here and none is wanted: this exists so a TLS client can
+// check a certificate chain and a CertificateVerify, and every value it touches (a modulus, a
+// public exponent, a signature) is public. That is what makes `bigint`'s value-dependent timing
+// survivable; it would not be for a private-key operation, so adding one here would quietly
+// make that false.
+//
+// Both schemes are needed, for different things. TLS 1.3 forbids PKCS#1 v1.5 in CertificateVerify
+// and requires PSS, but certificates in the chain are still routinely signed with v1.5, so a
+// client that implements one and assumes it covers the other fails halfway through a real chain.
+//
+// The dangerous half of RSA verification is not the arithmetic, it is the unpadding. A signature
+// is turned into a number, raised to the public exponent, and then that number is expected to have
+// a very particular shape. Every historical break of PKCS#1 v1.5 verification is a parser that was
+// relaxed about that shape (accepting extra bytes after the digest, or a short padding run), so
+// what follows compares the whole encoded block against one built from scratch rather than
+// searching inside it for something that looks right.
+
+/// An RSA public key: modulus and exponent, big-endian, as they came out of a certificate.
+pub struct RsaPub { n: Str, e: Str }
+
+// A modulus is a number, so its width is the minimal one; leading zero bytes are an artifact of
+// however it was carried. DER INTEGERs keep a 0x00 sign byte on a value whose top bit is set, and
+// counting that byte makes a 2048-bit key look 2056 bits wide and its signatures the wrong length.
+// RFC 8017 defines k as the octet length of n, which is this.
+fn strip_leading_zeros(s: Str) -> Str {
+    var i = 0
+    while i < s.len() { if ord(s.at(i)) != 0 { return s.slice(i, s.len()) }  i = i + 1 }
+    return ""
+}
+
+/// The modulus size in bits, counted from the top set bit, which is what "a 2048-bit key" means,
+/// and not the byte length times eight.
+pub fn rsa_bits(k: RsaPub) -> Int {
+    var i = 0
+    while i < k.n.len() {
+        let b = ord(k.n.at(i))
+        if b != 0 {
+            var bits = ((k.n.len() - i - 1) * 8)
+            var v = b
+            while v > 0 { bits = bits + 1  v = (v >> 1) }
+            return bits
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// s^e mod n, as exactly as many bytes as the modulus has. "" if the signature is not a valid
+// representative, which includes being numerically >= n, a case that must be refused rather than
+// reduced, since reducing it would accept two different signatures for one message.
+fn rsa_public_op(k: RsaPub, sig: Str) -> Str {
+    let nb = strip_leading_zeros(k.n)
+    let eb = strip_leading_zeros(k.e)
+    if nb.len() == 0 { return "" }
+    if eb.len() == 0 { return "" }
+    // A signature is exactly k octets. One of a different length is malformed, and accepting a
+    // short one by zero-extending it would make two encodings of one number both verify.
+    if sig.len() != nb.len() { return "" }
+    if (ord(nb.at(nb.len() - 1)) & 1) == 0 { return "" }        // an even modulus is not an RSA one
+    let n = mont_limbs_of(nb)
+    let e = mont_limbs_of(eb)
+    var s = mont_limbs_of(sig)
+    while s.len() < n.len() { s.push(0) }
+    if s.len() > n.len() { return "" }
+    if mont_ge(s, n) { return "" }                               // s must be a residue, not reduced into one
+    return mont_bytes_of(mont_modexp(s, e, n), nb.len())
+}
+
+// `chr()` yields a Byte, and Byte + Byte is arithmetic rather than concatenation, so a string of
+// literal bytes starts from "".
+fn bytes_of_two(a: Int, b: Int) -> Str { return ((("" + chr(a)) + chr(b))) }
+
+// The DigestInfo prefix for a hash: SEQUENCE { SEQUENCE { OID, NULL }, OCTET STRING }.
+// Built here rather than parsed out of the signature, because building is a comparison and parsing
+// is an invitation.
+fn digest_info(hash_len: Int, digest: Str) -> Str {
+    // 2.16.840.1.101.3.4.2.{1,2,3}: SHA-256, SHA-384, SHA-512
+    var tail = 0
+    if hash_len == 32 { tail = 1 }
+    if hash_len == 48 { tail = 2 }
+    if hash_len == 64 { tail = 3 }
+    if tail == 0 { return "" }
+    if digest.len() != hash_len { return "" }
+    var oid = ""
+    oid = (((((("" + chr(0x60)) + chr(0x86)) + chr(0x48)) + chr(0x01)) + chr(0x65)) + chr(0x03))
+    oid = (((oid + chr(0x04)) + chr(0x02)) + chr(tail))
+    let algid = ((bytes_of_two(0x06, oid.len()) + oid) + bytes_of_two(0x05, 0))
+    let alg = (bytes_of_two(0x30, algid.len()) + algid)
+    let oct = (bytes_of_two(0x04, digest.len()) + digest)
+    return (bytes_of_two(0x30, (alg.len() + oct.len())) + (alg + oct))
+}
+
+/// Verify an RSASSA-PKCS1-v1_5 signature over `digest`, which must be the hash of the message and
+/// `hash_len` bytes long (32, 48 or 64; SHA-1 is not offered, as a matter of policy).
+///
+/// The whole expected block is constructed and compared. That is the difference between this and
+/// the implementations that have been broken: there is no scan for a 0x00 separator, no "skip the
+/// padding and look at what follows", and so nothing after the digest can be smuggled anywhere.
+pub fn rsa_pkcs1_verify(k: RsaPub, digest: Str, hash_len: Int, sig: Str) -> Bool {
+    let m = rsa_public_op(k, sig)
+    if m.len() == 0 { return false }
+    let di = digest_info(hash_len, digest)
+    if di.len() == 0 { return false }
+    // 0x00 0x01 then at least eight 0xFF, a 0x00, and the DigestInfo
+    if (di.len() + 11) > m.len() { return false }
+    var want = bytes_of_two(0, 1)
+    var i = 0
+    let pad = ((m.len() - di.len()) - 3)
+    while i < pad { want = (want + chr(0xff))  i = i + 1 }
+    want = ((want + chr(0)) + di)
+    return ct_eq(want, m)
+}
+
+// MGF1 (RFC 8017 B.2.1): a mask of `n` bytes from a seed, by hashing seed ‖ counter.
+fn mgf1(seed: Str, n: Int, hash_len: Int) -> Str {
+    var out = ""
+    var c = 0
+    while out.len() < n {
+        let ctr = ((bytes_of_two(((c >> 24) & 0xff), ((c >> 16) & 0xff))
+                  + bytes_of_two(((c >> 8) & 0xff), (c & 0xff))))
+        out = (out + hash_by_len(hash_len, (seed + ctr)))
+        c = c + 1
+    }
+    return out.slice(0, n)
+}
+
+fn hash_by_len(hash_len: Int, data: Str) -> Str {
+    if hash_len == 32 { return sha256_raw(data) }
+    if hash_len == 48 { return sha384_raw(data) }
+    if hash_len == 64 { return sha512_raw(data) }
+    return ""
+}
+
+/// Verify an RSASSA-PSS signature over `digest`. `salt_len` is the expected salt length; TLS 1.3
+/// requires it to equal the hash length, and a verifier that accepts any length accepts forgeries
+/// that a fixed-length one would not.
+///
+/// PSS is what TLS 1.3 mandates for CertificateVerify. The steps below are RFC 8017 §9.1.2 in
+/// order, and every one of them is a rejection point: an implementation that skips the leftmost
+/// bit check, or the zero-padding check, still verifies genuine signatures perfectly.
+pub fn rsa_pss_verify(k: RsaPub, digest: Str, hash_len: Int, salt_len: Int, sig: Str) -> Bool {
+    if digest.len() != hash_len { return false }
+    let embits = (rsa_bits(k) - 1)
+    if embits < 0 { return false }
+    let emlen = ((embits + 7) / 8)
+    let m = rsa_public_op(k, sig)
+    if m.len() == 0 { return false }
+    // The encoded message may be one byte shorter than the modulus when the modulus's top bit is
+    // the only one set in its first byte.
+    var em = m
+    if emlen < m.len() {
+        var j = 0
+        while j < (m.len() - emlen) { if ord(m.at(j)) != 0 { return false }  j = j + 1 }
+        em = m.slice((m.len() - emlen), m.len())
+    }
+    if em.len() != emlen { return false }
+    if (emlen < (hash_len + salt_len + 2)) { return false }
+    if ord(em.at(emlen - 1)) != 0xbc { return false }
+
+    let dblen = ((emlen - hash_len) - 1)
+    let maskeddb = em.slice(0, dblen)
+    let h = em.slice(dblen, (dblen + hash_len))
+
+    // The unused leading bits of the first byte must be zero. Skipping this check is the classic
+    // PSS weakness: it lets a signature that is one bit different still verify.
+    let topbits = ((8 * emlen) - embits)
+    if topbits > 0 {
+        if (ord(maskeddb.at(0)) >> (8 - topbits)) != 0 { return false }
+    }
+
+    let mask = mgf1(h, dblen, hash_len)
+    if mask.len() != dblen { return false }
+    var db = ""
+    var i = 0
+    while i < dblen { db = (db + chr((ord(maskeddb.at(i)) ^ ord(mask.at(i)))))  i = i + 1 }
+    // clear the same leading bits in the unmasked block
+    if topbits > 0 {
+        let first = (ord(db.at(0)) & (0xff >> topbits))
+        db = (chr(first) + db.slice(1, db.len()))
+    }
+    // DB is PS ‖ 0x01 ‖ salt, with PS all zero
+    let pslen = ((dblen - salt_len) - 1)
+    i = 0
+    while i < pslen { if ord(db.at(i)) != 0 { return false }  i = i + 1 }
+    if ord(db.at(pslen)) != 0x01 { return false }
+    let salt = db.slice((pslen + 1), dblen)
+    if salt.len() != salt_len { return false }
+
+    // H' = Hash(0x00 * 8 ‖ mHash ‖ salt)
+    var pre = ""
+    i = 0
+    while i < 8 { pre = (pre + chr(0))  i = i + 1 }
+    return ct_eq(h, hash_by_len(hash_len, ((pre + digest) + salt)))
+}

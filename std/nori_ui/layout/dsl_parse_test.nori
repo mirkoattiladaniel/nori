@@ -1,0 +1,411 @@
+// Native .nori tests for attributes on the `.ui` node kinds
+// (row / scroll_row / button / rect / surface / text / spacer). Run with
+//   noric --test std/nori_ui/layout/dsl_parse_test.nori compiler/runtime.nori --import-root .
+// A root file of std/nori_ui/layout, so it shares the module scope and can call the parser
+// directly.
+import "std/nori_ui" as ui
+
+// ---- helpers (must not be named test_*) ----
+
+/// parse `src` as a whole document and return its root node; asserts the parse succeeded.
+fn dpt_root(src: Str) -> ui::layout::UiNode {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    return sink r.doc.tree
+}
+/// parse `src`, assert it failed, and assert the message contains `needle`.
+fn dpt_err(src: Str, needle: Str) {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_false(r.ok)
+    assert_true(ui::layout::nui_contains(r.err, needle))
+}
+/// lay `src`'s root out in a `w` x `h` viewport at the origin.
+fn dpt_lay(src: Str, w: Float, h: Float) -> ui::layout::ComputedOverlay {
+    var root = dpt_root(src)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(w, h))
+    return ui::layout::layout_overlay(root, vp)
+}
+/// the n-th primitive of kind `k` (0 fill / 1 border / 2 text).
+fn dpt_prim(ov: ui::layout::ComputedOverlay, k: Int, n: Int) -> ui::layout::PaintPrimitive {
+    var seen = 0
+    var i = 0
+    while i < ov.prims.len() {
+        if ov.prims[i].kind == k {
+            if seen == n { return ui::layout::pp_dup(ov.prims[i]) }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    assert_true(false)
+    return ui::layout::pp_dup(ov.prims[0])
+}
+/// the intrinsic size of `src`'s root in a 400x300 viewport.
+fn dpt_measure(src: Str) -> ui::core::Vec2 {
+    var root = dpt_root(src)
+    var ctx = ui::layout::length_context_root(400.0, 300.0)
+    return ui::layout::ui_measure(root, ctx)
+}
+
+// ---- 1. align_self ----
+
+fn test_align_self_parses_on_leaves() {
+    var b = dpt_root("button { label: \"Go\" on_click: go align_self: center }")
+    assert_true(b.has_align_self)
+    assert_eq(b.align_self, ui::layout::cross_center())
+    var rc = dpt_root("rect { w: 10 h: 10 align_self: end }")
+    assert_true(rc.has_align_self)
+    assert_eq(rc.align_self, ui::layout::cross_end())
+    var sf = dpt_root("surface { id: cam align_self: start }")
+    assert_true(sf.has_align_self)
+    assert_eq(sf.align_self, ui::layout::cross_start())
+    var tx = dpt_root("text { text: \"hi\" align_self: stretch }")
+    assert_true(tx.has_align_self)
+    assert_eq(tx.align_self, ui::layout::cross_stretch())
+    // unset stays unset
+    var plain = dpt_root("rect { w: 10 h: 10 }")
+    assert_false(plain.has_align_self)
+}
+
+fn test_align_self_bad_value_and_container_rejection() {
+    // parse_cross rejects non-idents and unknown words
+    dpt_err("rect { w: 1 h: 1 align_self: 3 }", "cross_align must be")
+    dpt_err("rect { w: 1 h: 1 align_self: sideways }", "unknown cross_align")
+    // row/column/scroll_* have no align_self attribute
+    dpt_err("column { align_self: center }", "unknown column field \"align_self\"")
+    dpt_err("row { align_self: center }", "unknown row field \"align_self\"")
+    dpt_err("scroll_column { align_self: center text { text: x } }", "unknown scroll_column field \"align_self\"")
+    dpt_err("scroll_row { align_self: center text { text: x } }", "unknown scroll_row field \"align_self\"")
+}
+
+fn test_align_self_overrides_cross_align_in_layout() {
+    // a row 200x100, cross_align: start, one 20-tall rect that asks for align_self: end.
+    var src = "row { padding: 0 gap: 0 cross_align: start rect { w: 30 h: 20 color: [255,0,0,255] align_self: end } }"
+    var ov = dpt_lay(src, 200.0, 100.0)
+    var pr = dpt_prim(ov, 0, 0)
+    assert_feq(pr.rect.min.y, 80.0, 0.01)             // pushed to the bottom, not the top
+    assert_feq(pr.rect.max.y, 100.0, 0.01)
+    // the same tree without align_self stays at the top
+    var src2 = "row { padding: 0 gap: 0 cross_align: start rect { w: 30 h: 20 color: [255,0,0,255] } }"
+    var ov2 = dpt_lay(src2, 200.0, 100.0)
+    var pr2 = dpt_prim(ov2, 0, 0)
+    assert_feq(pr2.rect.min.y, 0.0, 0.01)
+    // align_self: stretch on a child of a cross_align: start row
+    var src3 = "row { padding: 0 gap: 0 cross_align: start rect { w: 30 h: 20 color: [255,0,0,255] align_self: stretch } }"
+    var pr3 = dpt_prim(dpt_lay(src3, 200.0, 100.0), 0, 0)
+    assert_feq(pr3.rect.min.y, 0.0, 0.01)
+    assert_feq(pr3.rect.max.y, 100.0, 0.01)
+    // and align_self: center inside a cross_align: stretch column (cross axis = x)
+    var src4 = "column { padding: 0 gap: 0 cross_align: stretch rect { w: 40 h: 20 color: [0,255,0,255] align_self: center } }"
+    var pr4 = dpt_prim(dpt_lay(src4, 200.0, 100.0), 0, 0)
+    assert_feq(pr4.rect.min.x, 80.0, 0.01)
+    assert_feq(pr4.rect.max.x, 120.0, 0.01)
+}
+
+// ---- 2. flex_wrap ----
+
+fn test_flex_wrap_on_row() {
+    assert_true(dpt_root("row { flex_wrap: true }").flex_wrap)
+    assert_false(dpt_root("row { flex_wrap: false }").flex_wrap)
+    assert_true(dpt_root("row { flex_wrap: wrap }").flex_wrap)
+    assert_true(dpt_root("row { flex_wrap: \"wrap\" }").flex_wrap)
+    assert_true(dpt_root("row { flex_wrap: \"true\" }").flex_wrap)
+    assert_false(dpt_root("row { flex_wrap: nowrap }").flex_wrap)   // any other word is false, not an error
+    assert_true(dpt_root("row { wrap: wrap }").flex_wrap)            // `wrap` on a row is flex wrap
+    assert_false(dpt_root("row { }").flex_wrap)                      // default
+}
+
+fn test_flex_wrap_errors_and_column_rejection() {
+    dpt_err("row { flex_wrap: [1,2] }", "flex_wrap must be true, false, or wrap")
+    // a column has no flex_wrap attribute at all
+    dpt_err("column { flex_wrap: true }", "unknown column field \"flex_wrap\"")
+    // the `flex-wrap` hyphen alias is not accepted: `-` is not an identifier character, so the
+    // lexer reads ident `flex` and the parser reports a missing `:` on every kind.
+    dpt_err("row { flex-wrap: true }", "expected `:` or `{` after \"flex\"")
+    dpt_err("column { flex-wrap: true }", "expected `:` or `{` after \"flex\"")
+    dpt_err("scroll_row { flex_wrap: true text { text: x } }", "unknown scroll_row field \"flex_wrap\"")
+    // `wrap` on a non-row is still the text-wrap attribute, not flex wrap
+    var t = dpt_root("text { text: \"hello\" wrap: true }")
+    assert_true(t.wrap)
+    assert_false(t.flex_wrap)
+}
+
+// ---- 3. min_width / min_height asymmetry on the scroll containers ----
+
+fn test_scroll_row_min_width() {
+    var sr = dpt_root("scroll_row { min_width: 200 text { text: x } }")
+    assert_true(sr.has_min_width)
+    assert_feq(sr.min_width, 200.0, 0.01)
+    // it is the fixed viewport width: measure = min_width + padding*2
+    var m = dpt_measure("scroll_row { padding: 6 min_width: 200 text { text: x } }")
+    assert_feq(m.x, 212.0, 0.01)
+    // unset -> the 120 default
+    var m2 = dpt_measure("scroll_row { padding: 0 text { text: x } }")
+    assert_feq(m2.x, 120.0, 0.01)
+}
+
+fn test_scroll_min_asymmetry_rejections() {
+    dpt_err("scroll_row { min_width: nope text { text: x } }", "min_width must be a number")
+    // scroll_row takes min_width but not min_height; scroll_column is the reverse
+    dpt_err("scroll_row { min_height: 100 text { text: x } }", "unknown scroll_row field \"min_height\"")
+    dpt_err("scroll_column { min_width: 100 text { text: x } }", "unknown scroll_column field \"min_width\"")
+    var sc = dpt_root("scroll_column { min_height: 150 text { text: x } }")
+    assert_feq(sc.min_height, 150.0, 0.01)
+    // min_width is scroll_row-only everywhere else too
+    dpt_err("column { min_width: 100 }", "unknown column field \"min_width\"")
+    dpt_err("rect { w: 1 h: 1 min_width: 100 }", "unknown rect field \"min_width\"")
+}
+
+// ---- 4. the hyphen aliases ----
+
+fn test_hyphen_flex_aliases() {
+    // `flex-weight` / `flex-shrink` are not accepted either: `-` is not an identifier
+    // character, so `flex-weight` lexes as ident `flex` followed
+    // by `-`, and the parser reports a missing `:`.
+    dpt_err("surface { id: cam flex-weight: 2 }", "expected `:` in surface node")
+    dpt_err("button { label: \"a\" on_click: b flex-shrink: 2 }", "expected `:` in button node")
+    // the underscore forms do work, on both button and surface
+    var b = dpt_root("button { label: \"a\" on_click: b flex_weight: 2 flex_shrink: 3 }")
+    assert_true(b.has_flex_weight)
+    assert_feq(b.flex_weight, 2.0, 0.01)
+    assert_true(b.has_flex_shrink)
+    assert_feq(b.flex_shrink, 3.0, 0.01)
+    var s = dpt_root("surface { id: cam flex_weight: 4 flex_shrink: 5 }")
+    assert_feq(s.flex_weight, 4.0, 0.01)
+    assert_feq(s.flex_shrink, 5.0, 0.01)
+}
+
+// ---- 5. button strictness ----
+
+fn test_button_label_and_fill_w_are_strict() {
+    // `label` must be a quoted string on a button
+    var b = dpt_root("button { label: \"Go\" on_click: go }")
+    assert_streq(b.text, "Go")
+    dpt_err("button { label: Go on_click: go }", "label must be a quoted string")
+    dpt_err("button { label: 3 on_click: go }", "label must be a quoted string")
+    dpt_err("button { label: true on_click: go }", "label must be a quoted string")
+    // `fill_w` must be a literal Bool; the lenient Number coercion is not available
+    assert_true(dpt_root("button { label: \"a\" on_click: b fill_w: true }").fill_w)
+    assert_false(dpt_root("button { label: \"a\" on_click: b fill_w: false }").fill_w)
+    dpt_err("button { label: \"a\" on_click: b fill_w: 1 }", "fill_w must be true or false")
+    // elsewhere `fill_w` stays lenient (value_bool takes a Number)
+    assert_true(dpt_root("rect { w: 1 h: 1 fill_w: 1 }").fill_w)
+    // a text node's `label` is still the lenient string/ident alias for `text`
+    assert_streq(dpt_root("text { label: hi }").text, "hi")
+}
+
+fn test_button_label_typography() {
+    var b = dpt_root("button { label: \"a\" on_click: b label_bold: true label_italic: true label_line_height_mult: 1.5 }")
+    assert_true(b.font_bold)
+    assert_true(b.font_italic)
+    assert_feq(b.line_height_mult, 1.5, 0.001)
+    dpt_err("button { label: \"a\" on_click: b label_bold: 1 }", "label_bold must be true or false")
+    dpt_err("button { label: \"a\" on_click: b label_italic: yes }", "label_italic must be true or false")
+    dpt_err("button { label: \"a\" on_click: b label_line_height_mult: big }", "label_line_height_mult must be a number")
+    // and the flags reach the painted label primitive
+    var ov = dpt_lay("button { label: \"a\" on_click: b label_bold: true }", 100.0, 50.0)
+    var t = dpt_prim(ov, 2, 0)
+    assert_true(t.font_bold)
+    assert_false(t.font_italic)
+}
+
+// ---- 6. `w: fill` / `h: fill` on rect and surface ----
+
+fn test_rect_and_surface_w_h_fill() {
+    var rc = dpt_root("rect { w: fill h: 20 color: [255,0,0,255] }")
+    assert_true(rc.fill_w)
+    assert_false(rc.fill_h)
+    assert_feq(rc.w.value, 0.0, 0.001)                // the length is untouched
+    assert_feq(rc.h.value, 20.0, 0.001)
+    var rc2 = dpt_root("rect { w: 20 h: fill color: [255,0,0,255] }")
+    assert_true(rc2.fill_h)
+    assert_false(rc2.fill_w)
+    var sf = dpt_root("surface { id: cam w: fill h: fill }")
+    assert_true(sf.fill_w)
+    assert_true(sf.fill_h)
+    // a quoted "fill" is not the bare ident, so it still takes the value_length error path
+    dpt_err("rect { w: \"fill\" h: 1 }", "fill_w / fill_h")
+    // and on a kind without the quirk, `fill` keeps the hint
+    dpt_err("column { w: fill }", "fill_w / fill_h")
+    // the fill flag actually grows the rect in a row
+    var ov = dpt_lay("row { padding: 0 gap: 0 rect { w: fill h: 10 color: [1,2,3,255] } }", 200.0, 50.0)
+    assert_feq(dpt_prim(ov, 0, 0).rect.max.x, 200.0, 0.01)
+}
+
+// ---- 7. spacer ----
+
+fn test_spacer_lengths_and_default() {
+    var sp = dpt_root("spacer { w: 12 h: 30% }")
+    assert_eq(sp.kind, ui::layout::nk_spacer())
+    assert_eq(sp.w.unit, 0)
+    assert_feq(sp.w.value, 12.0, 0.001)
+    assert_eq(sp.h.unit, 1)
+    assert_feq(sp.h.value, 30.0, 0.001)
+    var vh = dpt_root("spacer { h: 40vh }")
+    assert_eq(vh.h.unit, 3)
+    // an unset extent measures 8px, not 0
+    var m = dpt_measure("spacer { }")
+    assert_feq(m.x, 8.0, 0.001)
+    assert_feq(m.y, 8.0, 0.001)
+    var m2 = dpt_measure("spacer { h: 24 }")
+    assert_feq(m2.y, 24.0, 0.001)
+    assert_feq(m2.x, 8.0, 0.001)
+    // a spacer between two rects in a zero-gap column pushes the second one down by 8
+    var ov = dpt_lay("column { padding: 0 gap: 0 cross_align: start rect { w: 10 h: 10 color: [1,2,3,255] } spacer { } rect { w: 10 h: 10 color: [4,5,6,255] } }", 100.0, 100.0)
+    assert_feq(dpt_prim(ov, 0, 1).rect.min.y, 18.0, 0.01)
+}
+
+// ---- 8. the `text` node's typography tail ----
+
+fn test_text_anchor_and_alignment() {
+    var t = dpt_root("text { text: \"hi\" anchor: [0.25, 0.75] }")
+    assert_true(t.has_anchor)
+    assert_feq(t.anchor_x, 0.25, 0.001)
+    assert_feq(t.anchor_y, 0.75, 0.001)
+    // text_align / horizontal_align write anchor[0]
+    assert_feq(dpt_root("text { text: x text_align: center }").anchor_x, 0.5, 0.001)
+    assert_feq(dpt_root("text { text: x text_align: right }").anchor_x, 1.0, 0.001)
+    assert_feq(dpt_root("text { text: x horizontal_align: left }").anchor_x, 0.0, 0.001)
+    // vertical_align writes anchor[1]
+    assert_feq(dpt_root("text { text: x vertical_align: bottom }").anchor_y, 1.0, 0.001)
+    assert_feq(dpt_root("text { text: x vertical_align: middle }").anchor_y, 0.5, 0.001)
+    // on a text node justify_content / align_items are anchor components, not flex alignment
+    var jc = dpt_root("text { text: x justify_content: end align_items: top }")
+    assert_true(jc.has_anchor)
+    assert_feq(jc.anchor_x, 1.0, 0.001)
+    assert_feq(jc.anchor_y, 0.0, 0.001)
+    assert_eq(jc.main_align, ui::layout::main_start())     // untouched
+    assert_eq(jc.cross_align, ui::layout::cross_start())
+    // on a container they keep their flex meaning
+    var row = dpt_root("row { justify_content: end align_items: center }")
+    assert_eq(row.main_align, ui::layout::main_end())
+    assert_eq(row.cross_align, ui::layout::cross_center())
+    assert_false(row.has_anchor)
+}
+
+fn test_text_anchor_errors() {
+    dpt_err("text { text: x anchor: 3 }", "expected [x, y]")
+    dpt_err("text { text: x anchor: [1] }", "anchor array must have 2 elements")
+    dpt_err("text { text: x anchor: [a, b] }", "anchor must be numbers")
+    dpt_err("text { text: x text_align: middleish }", "text alignment must be start, left, center, end, or right")
+    dpt_err("text { text: x text_align: 1 }", "text alignment must be start, left, center, end, or right")
+    dpt_err("text { text: x vertical_align: sideways }", "vertical alignment must be start, top, center, middle, end, or bottom")
+}
+
+fn test_text_anchor_moves_the_glyphs() {
+    // default: left, vertically centred
+    var d = dpt_prim(dpt_lay("text { text: \"hi\" size_px: 10 }", 200.0, 100.0), 2, 0)
+    assert_feq(d.pos.x, 0.0, 0.01)
+    // anchor [1,0] -> right-aligned, top
+    var r = dpt_prim(dpt_lay("text { text: \"hi\" size_px: 10 text_align: right vertical_align: top }", 200.0, 100.0), 2, 0)
+    assert_true(r.pos.x > 150.0)
+    assert_feq(r.pos.y, 0.0, 0.01)
+    // anchor [0.5, 1] -> centred, bottom
+    var c = dpt_prim(dpt_lay("text { text: \"hi\" size_px: 10 text_align: center vertical_align: bottom }", 200.0, 100.0), 2, 0)
+    assert_true(c.pos.x > 60.0)
+    assert_true(c.pos.x < 140.0)
+    assert_true(c.pos.y > 80.0)
+}
+
+fn test_text_bold_italic_and_spacing() {
+    var t = dpt_root("text { text: \"hi\" bold: true italic: true letter_spacing: 1.5 word_spacing: 3 line_height_mult: 1.8 }")
+    assert_true(t.font_bold)
+    assert_true(t.font_italic)
+    assert_true(t.has_letter_spacing)
+    assert_feq(t.letter_spacing, 1.5, 0.001)
+    assert_true(t.has_word_spacing)
+    assert_feq(t.word_spacing, 3.0, 0.001)
+    assert_feq(t.line_height_mult, 1.8, 0.001)
+    // all strict: a Number is not a Bool and an Ident is not a Number
+    dpt_err("text { text: x bold: 1 }", "bold must be true or false")
+    dpt_err("text { text: x italic: yes }", "italic must be true or false")
+    dpt_err("text { text: x letter_spacing: wide }", "letter_spacing must be a number")
+    dpt_err("text { text: x word_spacing: wide }", "word_spacing must be a number")
+    dpt_err("text { text: x line_height_mult: tall }", "line_height_mult must be a number")
+    // bold/italic reach the painted primitive
+    var pr = dpt_prim(dpt_lay("text { text: \"hi\" bold: true }", 100.0, 40.0), 2, 0)
+    assert_true(pr.font_bold)
+    assert_false(pr.font_italic)
+}
+
+fn test_text_wrap_text_and_nowrap() {
+    // `wrap_text` is the real attribute name on `text`, and it is a strict Bool
+    assert_true(dpt_root("text { text: \"a b\" wrap_text: true }").wrap)
+    assert_false(dpt_root("text { text: \"a b\" wrap_text: false }").wrap)
+    dpt_err("text { text: x wrap_text: 1 }", "wrap_text must be true or false")
+    // `nowrap: true` clears wrap; `nowrap: false` is a no-op (it must not re-enable it)
+    assert_false(dpt_root("text { text: \"a b\" wrap_text: true nowrap: true }").wrap)
+    assert_true(dpt_root("text { text: \"a b\" wrap_text: true nowrap: false }").wrap)
+    assert_false(dpt_root("text { text: \"a b\" nowrap: false }").wrap)
+    dpt_err("text { text: x nowrap: maybe }", "nowrap must be true or false")
+}
+
+fn test_text_transform_and_overflow_aliases() {
+    assert_eq(dpt_root("text { text: x transform: uppercase }").text_transform, ui::layout::tt_uppercase())
+    assert_eq(dpt_root("text { text: x text_transform: lowercase }").text_transform, ui::layout::tt_lowercase())
+    assert_eq(dpt_root("text { text: x overflow: ellipsis }").text_overflow, 1)
+    assert_eq(dpt_root("text { text: x text_overflow: clip }").text_overflow, 0)
+    dpt_err("text { text: x transform: sideways }", "unknown text_transform")
+    dpt_err("text { text: x overflow: fade }", "unknown text_overflow")
+}
+
+fn test_text_only_and_button_only_gating() {
+    // the typography tail is a `text` attribute table, not a shared one
+    dpt_err("rect { w: 1 h: 1 bold: true }", "unknown rect field \"bold\"")
+    dpt_err("column { italic: true }", "unknown column field \"italic\"")
+    dpt_err("surface { id: cam letter_spacing: 2 }", "unknown surface field \"letter_spacing\"")
+    dpt_err("row { word_spacing: 2 }", "unknown row field \"word_spacing\"")
+    dpt_err("column { wrap_text: true }", "unknown column field \"wrap_text\"")
+    dpt_err("column { nowrap: true }", "unknown column field \"nowrap\"")
+    dpt_err("column { anchor: [0,0] }", "unknown column field \"anchor\"")
+    dpt_err("column { text_align: center }", "unknown column field \"text_align\"")
+    dpt_err("column { vertical_align: top }", "unknown column field \"vertical_align\"")
+    dpt_err("column { line_height_mult: 2 }", "unknown column field \"line_height_mult\"")
+    // the bare `overflow` / `transform` aliases are text-only too
+    dpt_err("column { overflow: hidden }", "unknown column field \"overflow\"")
+    dpt_err("column { transform: uppercase }", "unknown column field \"transform\"")
+    // ...and the label_* trio is button-only
+    dpt_err("text { text: x label_bold: true }", "unknown text field \"label_bold\"")
+    dpt_err("column { label_italic: true }", "unknown column field \"label_italic\"")
+    dpt_err("text { text: x label_line_height_mult: 2 }", "unknown text field \"label_line_height_mult\"")
+    // the container attributes they shadow still work
+    assert_eq(dpt_root("column { overflow_y: hidden }").overflow_y, 1)
+    assert_feq(dpt_root("column { line_height: 2 }").line_height_mult, 2.0, 0.001)
+}
+
+// A length that is not a number is an error, not a silent zero.
+//
+// `rect { w: bogus }` must not parse as Px(0): `parse_unit_num` rejects text that is not a
+// number and the DSL reports `invalid w: "bogus"`. Several node families check this, so it is
+// pinned here.
+fn test_length_rejects_non_numbers() {
+    var bad = ui::layout::dsl_parse_document("column { rect { w: bogus h: 1 } }")
+    assert_false(bad.ok)
+    assert_true(ui::layout::nui_contains(bad.err, "bogus"))
+    // the unit suffixes are just as strict
+    assert_false(ui::layout::dsl_parse_document("column { rect { w: \"abc%\" h: 1 } }").ok)
+    assert_false(ui::layout::dsl_parse_document("column { rect { w: \"xxvh\" h: 1 } }").ok)
+    assert_false(ui::layout::dsl_parse_document("column { rect { w: \"1.2.3\" h: 1 } }").ok)
+    assert_false(ui::layout::dsl_parse_document("column { rect { w: \"1e\" h: 1 } }").ok)
+    // …and real numbers still parse, in every unit
+    var ok = ui::layout::dsl_parse_document("column { rect { w: \"50%\" h: \"2vh\" } }")
+    assert_true(ok.ok)
+    assert_eq(ok.doc.tree.children[0].w.unit, 1)
+    assert_feq(ok.doc.tree.children[0].w.value, 50.0, 0.001)
+    assert_eq(ok.doc.tree.children[0].h.unit, 3)
+}
+
+// `parse_float_sub` reads exponents: "1.5e2" is 150, not 1.5.
+fn test_parse_float_sub_exponents() {
+    assert_feq(ui::layout::parse_float_sub("1.5e2", 0, 5), 150.0, 0.001)
+    assert_feq(ui::layout::parse_float_sub("-1.5e-2", 0, 7), -0.015, 0.000001)
+    assert_feq(ui::layout::parse_float_sub("+3", 0, 2), 3.0, 0.001)
+    assert_feq(ui::layout::parse_float_sub("2e+3", 0, 4), 2000.0, 0.001)
+    assert_true(ui::layout::is_number("-1.5e-2"))
+    assert_true(ui::layout::is_number("+3"))
+    assert_true(ui::layout::is_number("0.5"))
+    assert_false(ui::layout::is_number("bogus"))
+    assert_false(ui::layout::is_number("1.2.3"))
+    assert_false(ui::layout::is_number("1e"))
+    assert_false(ui::layout::is_number(""))
+    assert_false(ui::layout::is_number("12px"))
+}

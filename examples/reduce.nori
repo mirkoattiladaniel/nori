@@ -1,0 +1,13 @@
+// Monoid reduction: `reduce(OP, init) over i in lo..hi { body }`.
+// The combiner is declared associative, which licenses the vectorizer to tree-reduce
+// it. With bounds-check erasure removing the a[i]/b[i] checks, the
+// loop lowers to AVX-512 SIMD.
+fn dot(let n: Int) -> Int {
+    var a = fill(n, 2)
+    var b = fill(n, 3)
+    return reduce(+, 0) over i in 0..n { a[i] * b[i] }
+}
+fn main() -> Int {
+    printl(dot(10))      // 10 * (2*3) = 60
+    return 0
+}

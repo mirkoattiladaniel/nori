@@ -1,0 +1,292 @@
+// roll: `roll law`, the verification gradient. Fuzz every `law` property, cache the ones that hold, and
+// track which rung of the gradient each has reached.
+//
+// One directory module of roll (see src/main.nori for the layout). It reaches the others through
+// their aliases below, and only what another module uses is `pub`. The modules import each other
+// freely (`cmds` and `deps` call in both directions); cycles between directory modules are fine.
+
+import "std/os" as os
+import "../caps" as caps
+import "../cmds" as cmds
+import "../deps" as deps
+import "../manifest" as manifest
+import "../ui" as ui
+import "../util" as util
+
+use caps::*
+use cmds::*
+use deps::*
+use manifest::*
+use ui::*
+use util::*
+
+// ---- `roll law`: the verification gradient: fuzz every `law` property, cache held ones, track the rung ----
+pub fn law_split_lines(s: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let n = s.len() var start = 0 var i = 0
+    while i <= n {
+        if i == n || ord(s.at(i)) == 10 {
+            if i > start {
+                out.push(s.slice(start, i))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+fn law_field(line: Str, idx: Int) -> Str {
+    // tab-separated field `idx`
+    let n = line.len() var f = 0 var start = 0 var i = 0
+    while i <= n {
+        if i == n || ord(line.at(i)) == 9 {
+            if f == idx {
+                return line.slice(start, i)
+            }
+            f = f + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+fn law_idx_of(v: Vec<Str>, s: Str) -> Int {
+    var i = 0
+    while i < v.len() {
+        if(v[i] == s) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+fn law_is_proven(name: Str) -> Bool {
+    return is_file(("proofs/laws/" + (name + ".proven")))
+}
+fn law_cache_put(inout cn: Vec<Str>, inout ch: Vec<Str>, inout cr: Vec<Str>, name: Str, hash: Str, rung: Str) {
+    let i = law_idx_of(cn, copy name)
+    if i >= 0 {
+        ch[i] = copy hash
+        cr[i] = copy rung
+        return
+    }
+    cn.push(copy name) ch.push(copy hash) cr.push(copy rung)
+}
+fn law_load_cache(inout cn: Vec<Str>, inout ch: Vec<Str>, inout cr: Vec<Str>) {
+    if !is_file("build/law_cache.tsv") {
+        return
+    }
+    let lines = law_split_lines(read_file("build/law_cache.tsv"))
+    var i = 0
+    while i < lines.len() {
+        cn.push(law_field(lines[i], 0))
+        ch.push(law_field(lines[i], 1))
+        cr.push(law_field(lines[i], 2))
+        i = i + 1
+    }
+}
+fn law_save_cache(cn: Vec<Str>, ch: Vec<Str>, cr: Vec<Str>) {
+    var out = ""
+    var i = 0
+    while i < cn.len() {
+        out = (out + (cn[i] + ("\t" + (ch[i] + ("\t" + (cr[i] + "\n"))))))
+        i = i + 1
+    }
+    write_file("build/law_cache.tsv", out)
+}
+// `roll law prove <name> [--discharged]`: scaffold a Lean obligation, or stamp the law proven.
+fn law_prove_cmd() -> Int {
+    if argc() < 3 {
+        printl("usage: roll law prove <name> [--discharged]")
+        return 1
+    }
+    let mf = load_manifest()
+    let name = arg(2)
+    var discharged = false
+    var i = 3
+    while i < argc() {
+        if(arg(i) == "--discharged") {
+            discharged = true
+        }
+        i = i + 1
+    }
+    os::make_dir("proofs") os::make_dir("proofs/laws")
+    if discharged {
+        write_file(("proofs/laws/" + (name + ".proven")), "discharged\n")
+        printl(("law " + (name + " stamped proven — `roll law` will report it as proven and stop fuzzing it")))
+        return 0
+    }
+    let leanf = ("proofs/laws/" + (name + ".lean"))
+    if is_file(copy leanf) {
+        printl(("proof scaffold already exists: " + leanf))
+    }
+    else {
+        // ask noric to auto-derive the obligation from the law's asserts (searches project files for it)
+        var derived = false
+        var dir = "src"
+        let entry = section_get(mf, "", "entry")
+        if !(entry == "") {
+            dir = dirname(entry)
+        }
+        let all = os::list_tree(dir)
+        var fi = 0
+        while fi < all.len() && !derived {
+            if ends_with(all[fi], ".nori") {
+                var lc: Vec<Str> = vec()
+                lc.push(noric_path()) lc.push("--law-lean") lc.push(copy name) lc.push(copy all[fi]) lc.push("--out") lc.push(copy leanf)
+                if os::run(lc) == 0 && is_file(copy leanf) {
+                    derived = true
+                }
+            }
+            fi = fi + 1
+        }
+        if derived {
+            printl(("scaffolded " + (leanf + " (auto-derived from the law's asserts — verify it matches intent)")))
+        }
+        else {
+            var g = ("-- Proof obligation for the Nori `law " + (name + "`.\n"))
+            g = (g + "-- Could not locate `law " + (name + "` in the project; state the property here by hand.\n\n"))
+            g = (g + ("theorem " + (name + " : True := by\n  trivial  -- TODO: state the real property and prove it\n")))
+            write_file(copy leanf, g)
+            printl(("scaffolded " + (leanf + " (law not found — generic stub)")))
+        }
+    }
+    printl("")
+    printl("next steps:")
+    printl(("  1. edit " + (leanf + " — state the law as a Lean theorem and prove it")))
+    printl("  2. verify it with your Lean toolchain (e.g. `lake build`)")
+    printl(("  3. run `roll law prove " + (name + " --discharged` to stamp it proven")))
+    return 0
+}
+pub fn law_cmd() -> Int {
+    if argc() >= 2 && (arg(1) == "prove") {
+        return law_prove_cmd()
+    }
+    let mf = load_manifest()
+    os::make_dir("build")
+    if caps_enforce(mf) != 0 {
+        return 1
+    }
+    var files: Vec<Str> = vec()
+    if argc() >= 2 && !starts_with(arg(1), "-") && is_file(arg(1)) {
+        files.push(arg(1))
+    }
+    else {
+        var dir = "src"
+        let entry = section_get(mf, "", "entry")
+        if !(entry == "") {
+            dir = dirname(entry)
+        }
+        let all = os::list_tree(dir)
+        var i = 0
+        while i < all.len() {
+            if ends_with(all[i], ".nori") {
+                files.push(copy all[i])
+            }
+            i = i + 1
+        }
+    }
+    var cn: Vec<Str> = vec() var ch: Vec<Str> = vec() var cr: Vec<Str> = vec()
+    law_load_cache(cn, ch, cr)
+    eprintl((verb("Fuzzing", "1;36") + " the project's laws"))
+    var tot = 0 var nf = 0 var nc = 0 var np = 0 var nv = 0
+    var fi = 0
+    while fi < files.len() {
+        let f = files[fi]
+        var lc: Vec<Str> = vec()
+        lc.push(noric_path()) lc.push("--list-laws") lc.push(copy f) lc.push("--out") lc.push("build/.laws_list.tsv")
+        if os::run(lc) != 0 {
+            fi = fi + 1
+            continue
+        }
+        if !is_file("build/.laws_list.tsv") {
+            fi = fi + 1
+            continue
+        }
+        let lines = law_split_lines(read_file("build/.laws_list.tsv"))
+        if lines.len() == 0 {
+            fi = fi + 1
+            continue
+        }
+        var names: Vec<Str> = vec() var hashes: Vec<Str> = vec()
+        var i = 0
+        while i < lines.len() {
+            names.push(law_field(lines[i], 0))
+            hashes.push(law_field(lines[i], 1))
+            i = i + 1
+        }
+        printl(dim(("  " + (f + ":"))))
+        var tofuzz = ""
+        i = 0
+        while i < names.len() {
+            let nm = names[i]
+            if law_is_proven(nm) {
+                i = i + 1
+                continue
+            }
+            let ci = law_idx_of(cn, nm)
+            if ci >= 0 && (ch[ci] == hashes[i]) && (cr[ci] == "held") {
+                i = i + 1
+                continue
+            }
+            if !(tofuzz == "") {
+                tofuzz = (tofuzz + ",")
+            }
+            tofuzz = (tofuzz + nm)
+            i = i + 1
+        }
+        var rn: Vec<Str> = vec() var rp: Vec<Str> = vec()
+        if !(tofuzz == "") {
+            remove_path("build/.law_result.tsv")
+            var fc: Vec<Str> = vec()
+            fc.push(noric_path()) fc.push("--fuzz-laws") fc.push(copy f) fc.push("--only") fc.push(tofuzz) fc.push("--result") fc.push("build/.law_result.tsv")
+            add_import_flags(fc, mf)
+            os::run(fc)
+            if is_file("build/.law_result.tsv") {
+                let rl = law_split_lines(read_file("build/.law_result.tsv"))
+                var j = 0
+                while j < rl.len() {
+                    rn.push(law_field(rl[j], 0))
+                    rp.push(law_field(rl[j], 1))
+                    j = j + 1
+                }
+            }
+        }
+        i = 0
+        while i < names.len() {
+            let nm = names[i]
+            tot = tot + 1
+            if law_is_proven(nm) {
+                np = np + 1
+                printl(("    " + (col("1;32", "proven  ") + (" " + nm))))
+                law_cache_put(cn, ch, cr, nm, hashes[i], "proven")
+                i = i + 1 continue
+            }
+            let ri = law_idx_of(rn, nm)
+            if ri >= 0 {
+                if(rp[ri] == "PASS") {
+                    nf = nf + 1
+                    printl(("    " + (col("1;32", "fuzzed  ") + (" " + (nm + dim("  (held)"))))))
+                    law_cache_put(cn, ch, cr, nm, hashes[i], "held")
+                } else {
+                    nv = nv + 1
+                    printl(("    " + (col("1;31", "VIOLATED") + (" " + (nm + dim("  (counterexample printed above)"))))))
+                    law_cache_put(cn, ch, cr, nm, hashes[i], "violated")
+                }
+            } else {
+                nc = nc + 1
+                printl(("    " + (dim("cached  ") + (" " + (nm + dim("  (held earlier, unchanged)"))))))
+                law_cache_put(cn, ch, cr, nm, hashes[i], "held")
+            }
+            i = i + 1
+        }
+        fi = fi + 1
+    }
+    law_save_cache(cn, ch, cr)
+    printl("")
+    printl((dim(("  " + (tot + " laws — "))) + (nf + (" fuzzed, " + (nc + (" cached, " + (np + (" proven, " + (nv + " violated")))))))))
+    if nv > 0 {
+        return 1
+    }
+    return 0
+}

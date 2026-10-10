@@ -1,0 +1,150 @@
+// roll: external subcommands. `roll X` runs `roll-X` from PATH/$NORI_HOME, or builds and runs tools/X.nori.
+//
+// One directory module of roll (see src/main.nori for the layout). It reaches the others through
+// their aliases below, and only what another module uses is `pub`. The modules import each other
+// freely (`cmds` and `deps` call in both directions); cycles between directory modules are fine.
+
+import "std/os" as os
+import "std/time" as time
+import "../cmds" as cmds
+import "../deps" as deps
+import "../manifest" as manifest
+import "../util" as util
+
+use cmds::*
+use deps::*
+use manifest::*
+use util::*
+
+// ---------- extensions: external subcommands (`roll X` -> `roll-X`) ----------
+// Any command roll doesn't recognise is delegated to an external tool `roll-X`. roll looks for that
+// binary in $NORI_HOME/bin, then $NORI_HOME, then on PATH; failing that, if the tool ships as a roll
+// project at $NORI_HOME/tools/X/ (a nori.manifest + src/), it is built once (to $NORI_HOME/roll-X) and
+// run. Remaining args are forwarded as given, with no shell. e.g. `roll foo a.txt` -> `roll-foo a.txt`.
+//
+// build the tool project at $NORI_HOME/tools/<name>/ to $NORI_HOME/roll-<name> (silently); "" if there
+// is no such project or the build fails. Honours the tool's manifest entry + [native] deps.
+pub fn build_tool(name: Str) -> Str {
+    let projdir = (nori_home() + ("/tools/" + name))
+    let mf = (projdir + "/nori.manifest")
+    if !os::path_exists(mf) {
+        return ""
+    }
+    let manifest = read_file(mf)
+    var entry = section_get(manifest, "", "entry")
+    if(entry == "") {
+        entry = "src/main.nori"
+    }
+    let bin = (nori_home() + ("/roll-" + name))
+    // Build into a private staging directory and move the finished binary into place. The output path
+    // is what noric derives its intermediates from (`<out>.ll`, `<out>.mlir`, …), so building straight
+    // to the fixed `roll-<name>` would let two concurrent builds of the same extension write the same
+    // `.ll` and read each other's half-written IR.
+    // The move is a rename, so a concurrent reader sees either the old binary or the new one, never a
+    // half-written file. It also keeps the intermediates out of $NORI_HOME.
+    let stage = (nori_home() + ("/.roll-build-" + (name + ("-" + to_str(time::now_ns())))))
+    let _mk = mkdirs(stage)
+    let staged = (stage + ("/roll-" + name))
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--build") cmd.push((projdir + ("/" + entry))) cmd.push(copy staged)
+    cmd.push("--import-root") cmd.push(nori_home()) cmd.push("--quiet")
+    add_native_flags(cmd, manifest) // [native] cfile/clink, if the tool declares any
+    if os::run(cmd) != 0 {
+        let _rm1 = os::remove_tree(stage)
+        return ""
+    }
+    if os::move_path(copy staged, bin) != 0 {
+        let _rm2 = os::remove_tree(stage)
+        return ""
+    }
+    let _rm3 = os::remove_tree(stage)
+    return bin
+}
+pub fn dispatch_external(cmd: Str) -> Int {
+    let bin = ("roll-" + cmd)
+    let h = nori_home()
+    let p1 = (h + ("/bin/" + bin))
+    let p2 = (h + ("/" + bin))
+    var tool = ""
+    if os::path_exists(p1) {
+        tool = p1
+    } else {
+        if os::path_exists(p2) {
+            tool = p2
+        }
+    }
+    if(tool == "") {
+        // not a prebuilt binary: try the tool project
+        if os::path_exists((h + ("/tools/" + (cmd + "/nori.manifest")))) {
+            printl(("  building " + (bin + " (first use) ...")))
+            tool = build_tool(cmd)
+            if(tool == "") {
+                printl(("roll: failed to build " + bin))
+                return 1
+            }
+        }
+    }
+    let found = !(tool == "")
+    var argv: Vec<Str> = vec()
+    if found {
+        argv.push(copy tool)
+    } else {
+        argv.push(copy bin)
+    }
+    // bare name => PATH-searched
+    var k = 1
+    while k < argc() {
+        argv.push(arg(k))
+        k = k + 1
+    }
+    let rc = os::run(argv)
+    if !found && (rc == 127 || rc == 0 - 1) {
+        // spawn failed: nothing to dispatch to
+        printl(("roll: unknown command `" + (cmd + "`")))
+        printl(("  no built-in, no `" + (bin + ("` on PATH, and no tools/" + (cmd + "/ project")))))
+        return 1
+    }
+    return rc
+}
+// the name of the tool whose project manifest is at list_tree path `f` ("tools/<name>/nori.manifest"),
+// relative to the tools/ dir; "" if `f` isn't a tool manifest.
+pub fn tool_name_of(f: Str, toolsdir: Str) -> Str {
+    if !ends_with(f, "/nori.manifest") {
+        return ""
+    }
+    let rel = f.slice(toolsdir.len(), f.len()) // "/foo/nori.manifest"
+    var start = 0
+    if rel.len() > 0 && ord(rel.at(0)) == 47 {
+        start = 1
+    }
+    let rest = rel.slice(start, rel.len())
+    let slash = index_of(rest, 47)
+    if slash < 0 {
+        return ""
+    }
+    return rest.slice(0, slash)
+}
+// list the extensions that ship as source projects ($NORI_HOME/tools/<name>/), for `roll help`.
+pub fn list_externals() {
+    let dir = (nori_home() + "/tools")
+    if !os::path_exists(dir) {
+        return
+    }
+    let files = os::list_tree(dir)
+    var shown = false
+    var i = 0
+    while i < files.len() {
+        let nm = tool_name_of(files[i], dir)
+        if !(nm == "") {
+            if !shown {
+                printl("extensions (built on first use from tools/<name>/; or any roll-* on PATH):")
+                shown = true
+            }
+            printl(("  roll " + nm))
+        }
+        i = i + 1
+    }
+    if shown {
+        printl("")
+    }
+}

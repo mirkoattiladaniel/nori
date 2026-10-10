@@ -1,0 +1,799 @@
+//! The shell core: what an editor needs that is not a panel and not a renderer.
+//!
+//! Discovery of plugins, seeding a dock from what they declared, remembering the layout, and
+//! remembering which plugins the user turned off. All of it is headless (no window, no GPU), so an
+//! application supplies only the frame loop.
+//!
+//! **Looking for how to open a window? Not here.** A window is `std/window`, and drawing in it is
+//! `ui::render`; `ref::std::nori_ui` has the whole program. A program with one window never needs
+//! the shell.
+//!
+//! **This file names no domain.** It has no idea whether the panels it places belong to a game
+//! engine or an IDE; that is decided by which plugins are on disk. If anything here ever
+//! needs to know, the separation has leaked.
+
+use core::*
+use layout::*
+use plugin::*
+import "std/os" as os
+import "std/json" as json
+
+/// what the shell was told to do: where to look for plugins, and which ones to leave alone.
+pub struct ShellConfig { plugin_dirs: Vec<Str>, disabled: Vec<Str>, layout: Str }
+
+/// a config with one plugin directory and nothing disabled.
+pub fn config_new(dir: Str) -> ShellConfig {
+    var d: Vec<Str> = vec()
+    if dir.len() > 0 { d.push(copy dir) }
+    var off: Vec<Str> = vec()
+    return ShellConfig { plugin_dirs: d, disabled: off, layout: "" }
+}
+
+/// true when `name` has been turned off.
+pub fn config_is_disabled(c: ShellConfig, name: Str) -> Bool {
+    var i = 0
+    while i < c.disabled.len() { if c.disabled[i] == name { return true }  i = i + 1 }
+    return false
+}
+
+/// turn a plugin off. Already-off is not an error.
+pub fn config_disable(inout c: ShellConfig, name: Str) {
+    if config_is_disabled(c, name) { return }
+    c.disabled.push(copy name)
+}
+
+/// turn a plugin back on.
+pub fn config_enable(inout c: ShellConfig, name: Str) {
+    var keep: Vec<Str> = vec()
+    var i = 0
+    while i < c.disabled.len() { if !(c.disabled[i] == name) { keep.push(copy c.disabled[i]) }  i = i + 1 }
+    c.disabled = keep
+}
+
+// ---- config text --------------------------------------------------------------------------------
+// One `key value` per line, value running to end of line. A layout is written as `layout_line` rows
+// so the whole config stays one flat file with no quoting rules to get wrong.
+
+/// render a config back to text.
+pub fn config_write(c: ShellConfig) -> Str {
+    var out = ""
+    var i = 0
+    while i < c.plugin_dirs.len() { out = (out + ("plugin_dir " + (c.plugin_dirs[i] + "\n")))  i = i + 1 }
+    i = 0
+    while i < c.disabled.len() { out = (out + ("disabled " + (c.disabled[i] + "\n")))  i = i + 1 }
+    var ls = str_lines(c.layout)
+    i = 0
+    while i < ls.len() {
+        if ls[i].len() > 0 { out = (out + ("layout_line " + (ls[i] + "\n"))) }
+        i = i + 1
+    }
+    return out
+}
+
+/// split on newlines, dropping a trailing empty.
+pub fn str_lines(s: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var start = 0
+    var i = 0
+    while i < s.len() {
+        if ord(s.at(i)) == 10 { out.push(s.slice(start, i))  start = i + 1 }
+        i = i + 1
+    }
+    if start < s.len() { out.push(s.slice(start, s.len())) }
+    return out
+}
+
+/// the first word of `line`, and the rest after the single separating space.
+fn split_key(line: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var i = 0
+    while i < line.len() {
+        if ord(line.at(i)) == 32 {
+            out.push(line.slice(0, i))
+            out.push(line.slice(i + 1, line.len()))
+            return out
+        }
+        i = i + 1
+    }
+    out.push(copy line)
+    out.push("")
+    return out
+}
+
+/// read a config back. Unknown keys are ignored, so a newer file stays readable by an older shell.
+pub fn config_parse(src: Str) -> ShellConfig {
+    var c = config_new("")
+    var lay = ""
+    var ls = str_lines(src)
+    var i = 0
+    while i < ls.len() {
+        let kv = split_key(ls[i])
+        if kv[0] == "plugin_dir" { if kv[1].len() > 0 { c.plugin_dirs.push(copy kv[1]) } }
+        else if kv[0] == "disabled" { if kv[1].len() > 0 { c.disabled.push(copy kv[1]) } }
+        else if kv[0] == "layout_line" { lay = (lay + (kv[1] + "\n")) }
+        i = i + 1
+    }
+    c.layout = lay
+    return c
+}
+
+/// read the config at `path`. A missing file is an empty config, not a failure.
+pub fn config_load(path: Str) -> ShellConfig {
+    if !os::path_exists(path) { return config_new("") }
+    return config_parse(read_file(path))
+}
+
+/// write the config to `path`.
+pub fn config_save(c: ShellConfig, path: Str) { write_file(path, config_write(c)) }
+
+// ---- discovery ----------------------------------------------------------------------------------
+
+/// load every enabled plugin from every configured directory into `h`. Returns how many loaded.
+///
+/// A disabled plugin is opened far enough to read its name and then closed again, since the shell has to
+/// know a plugin exists to offer turning it back on.
+pub fn shell_discover(inout h: PluginHost, c: ShellConfig) -> Int {
+    var n = 0
+    var d = 0
+    while d < c.plugin_dirs.len() {
+        var found = scan(c.plugin_dirs[d])
+        var i = 0
+        while i < found.len() {
+            let p = found[i]
+            if !p.ok { host_note_error(h, (p.path + (": " + p.err))) }
+            else if config_is_disabled(c, p.name) { let _u = unload(p) }
+            else { if host_add(h, p) >= 0 { n = n + 1 } }
+            i = i + 1
+        }
+        d = d + 1
+    }
+    return n
+}
+
+/// every plugin name present in the configured directories, whether enabled or not; what a
+/// preferences panel lists. Each is opened for its manifest and closed again.
+pub fn shell_available(c: ShellConfig) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var d = 0
+    while d < c.plugin_dirs.len() {
+        var found = scan(c.plugin_dirs[d])
+        var i = 0
+        while i < found.len() {
+            if found[i].ok { out.push(copy found[i].name) }
+            let _u = unload(found[i])
+            i = i + 1
+        }
+        d = d + 1
+    }
+    return out
+}
+
+// ---- seeding a dock -----------------------------------------------------------------------------
+
+/// build a dock from what the loaded panels asked for: left down the sidebar, bottom along the
+/// bottom, everything else in the middle. A panel that named no position lands in the middle.
+pub fn seed_dock(h: PluginHost) -> DockState {
+    var valid = host_panel_ids(h)
+    var side = host_panel_ids_at(h, POS_LEFT())
+    var bottom = host_panel_ids_at(h, POS_BOTTOM())
+    var mid: Vec<Str> = vec()
+    var i = 0
+    while i < host_panel_count(h) {
+        let d = host_panel_at(h, i)
+        if !(d.position == POS_LEFT()) && !(d.position == POS_BOTTOM()) { mid.push(copy d.id) }
+        i = i + 1
+    }
+    if valid.len() == 0 { var none: Vec<Str> = vec()  return dock_state_new(none) }
+    return build_ide(valid, side, mid, bottom, 0.22, 0.75)
+}
+
+// ---- layout persistence -------------------------------------------------------------------------
+// Prefix-order lines. `E` empty, `L active ntabs` then one `T id` per tab, `S dir ratio fc sc` then
+// its two subtrees in order. Reading is the same walk, so the two cannot drift apart.
+
+fn write_tree(t: Tree) -> Str {
+    let n = tree_node(t)
+    match n {
+        Node::NEmpty => { return "E\n" }
+        Node::NLeaf(l) => {
+            var tabs = ld_tabs(l)
+            var out = ("L " + (to_str(ld_active(l)) + (" " + (to_str(tabs.len()) + "\n"))))
+            var i = 0
+            while i < tabs.len() { out = (out + ("T " + (tabs[i] + "\n")))  i = i + 1 }
+            return out
+        }
+        Node::NSplit(s) => {
+            var fc = 0
+            if sd_first_collapsed(s) { fc = 1 }
+            var sc = 0
+            if sd_second_collapsed(s) { sc = 1 }
+            var head = ("S " + (to_str(split_direction_tag(sd_direction(s))) + (" " + (to_str(sd_ratio(s)) + (" " + (to_str(fc) + (" " + (to_str(sc) + "\n"))))))))
+            return (head + (write_tree(sd_first(s)) + write_tree(sd_second(s))))
+        }
+    }
+}
+
+/// serialize a dock layout to text.
+pub fn dock_serialize(d: DockState) -> Str {
+    var out = ("surfaces " + (to_str(d.surfaces.len()) + "\n"))
+    var i = 0
+    while i < d.surfaces.len() { out = (out + write_tree(d.surface_tree(i)))  i = i + 1 }
+    return out
+}
+
+/// the words of a line, split on single spaces.
+fn words(line: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var start = 0
+    var i = 0
+    while i < line.len() {
+        if ord(line.at(i)) == 32 { out.push(line.slice(start, i))  start = i + 1 }
+        i = i + 1
+    }
+    if start < line.len() { out.push(line.slice(start, line.len())) }
+    return out
+}
+
+fn read_tree(ls: Vec<Str>, inout at: Vec<Int>) -> Tree {
+    if at[0] >= ls.len() { return tree_empty() }
+    let w = words(ls[at[0]])
+    at[0] = at[0] + 1
+    if w.len() == 0 { return tree_empty() }
+    if w[0] == "L" {
+        var tabs: Vec<Str> = vec()
+        var active = 0
+        if w.len() > 1 { active = to_int_or(w[1], 0) }
+        var ntabs = 0
+        if w.len() > 2 { ntabs = to_int_or(w[2], 0) }
+        var k = 0
+        while k < ntabs {
+            if at[0] < ls.len() {
+                let tw = split_key(ls[at[0]])
+                if tw[0] == "T" { tabs.push(copy tw[1]) }
+                at[0] = at[0] + 1
+            }
+            k = k + 1
+        }
+        return tree_leaf(tabs, active)
+    }
+    if w[0] == "S" {
+        var dir = SplitDirection::DirHorizontal
+        if w.len() > 1 { if to_int_or(w[1], 0) == 1 { dir = SplitDirection::DirVertical } }
+        var ratio = 0.5
+        if w.len() > 2 { ratio = to_float_or(w[2], 0.5) }
+        var first = read_tree(ls, at)
+        var second = read_tree(ls, at)
+        var t = tree_split(dir, ratio, first, second)
+        let node = tree_node(t)
+        match node {
+            Node::NSplit(s) => {
+                if w.len() > 3 { sd_set_first_collapsed(s, to_int_or(w[3], 0) == 1) }
+                if w.len() > 4 { sd_set_second_collapsed(s, to_int_or(w[4], 0) == 1) }
+            }
+            Node::NLeaf(l) => { }
+            Node::NEmpty => { }
+        }
+        return t
+    }
+    return tree_empty()
+}
+
+/// an Int from `s`, or `dflt` when it is not one.
+fn to_int_or(s: Str, dflt: Int) -> Int { return parse_int_or(s, dflt) }
+
+/// a Float from `s`, or `dflt` when it is not one.
+fn to_float_or(s: Str, dflt: Float) -> Float { return parse_float_or(s, dflt) }
+
+/// read a dock layout back. Anything unreadable yields an empty dock, which the caller replaces with
+/// a fresh seed; a corrupt layout file must never stop the shell from starting.
+pub fn dock_deserialize(src: Str) -> DockState {
+    var ls = str_lines(src)
+    var none: Vec<Str> = vec()
+    var d = dock_state_new(none)
+    if ls.len() == 0 { return d }
+    let head = words(ls[0])
+    if head.len() < 2 { return d }
+    if !(head[0] == "surfaces") { return d }
+    let n = to_int_or(head[1], 0)
+    if n <= 0 { return d }
+    var at: Vec<Int> = vec()
+    at.push(1)
+    var surfaces: Vec<Surface> = vec()
+    var i = 0
+    while i < n { surfaces.push(Surface { tree: read_tree(ls, at) })  i = i + 1 }
+    d.surfaces = surfaces
+    return d
+}
+
+/// the layout to start with: the remembered one when it still matches the panels that are actually
+/// registered, otherwise a fresh seed. A layout naming panels that are gone is not restored, since the
+/// user would get a dock full of dead tabs.
+pub fn restore_or_seed(h: PluginHost, c: ShellConfig) -> DockState {
+    if c.layout.len() == 0 { return seed_dock(h) }
+    var d = dock_deserialize(c.layout)
+    var valid = host_panel_ids(h)
+    var saved = collect_dock_tab_ids_from_state(d)
+    if saved.len() == 0 { return seed_dock(h) }
+    var i = 0
+    while i < saved.len() {
+        if !str_vec_contains(valid, saved[i]) { return seed_dock(h) }
+        i = i + 1
+    }
+    return d
+}
+
+// ---- Filling the holes a document declared -------------------------------------------
+
+/// **the whole generic surface path.** Fill every hole in `overlay` that some plugin claims, on the
+/// host's borrowed `device` and `queue`, and record the resulting texture views in `b`.
+///
+/// This is the function that lets the shell stop knowing what it is a shell of. It walks the holes a
+/// document declared, matches each id against what the loaded plugins said they fill, hands over the
+/// device and the hole's pixel size, and binds whatever handle comes back. There is no branch here
+/// for 3D, for an image canvas, or for a web view: a hole is a name and a rect, and the plugin that
+/// claimed the name decides what appears in it.
+///
+/// A hole nothing claims, or a plugin that returns 0, keeps `surface_placeholder_color()`, which is
+/// a visible colour on purpose: an unfilled surface should look wrong rather than look like a
+/// background.
+pub fn shell_fill_surfaces(inout h: PluginHost, overlay: ComputedOverlay, inout b: SurfaceBindings, device: Int, queue: Int) -> Int {
+    if device == 0 || queue == 0 { return 0 }
+    var filled = 0
+    var i = 0
+    while i < surface_count(overlay) {
+        let id = surface_id_at(overlay, i)
+        let owner = host_surface_owner(h, id)
+        if owner >= 0 {
+            let look = surface_rect_of(overlay, id)
+            if look.found {
+                let w = to_int(look.rect.width())
+                let ht = to_int(look.rect.height())
+                let tex = surface(h.libs[owner], id, device, queue, w, ht)
+                if tex != 0 { surface_bind_texture(b, id, tex)  filled = filled + 1 }
+            }
+        }
+        i = i + 1
+    }
+    return filled
+}
+
+// ---- What a plugin contributes to the shell's own chrome -----------------------------------
+//
+// A shell that names no domain still has to show a File and a View menu, and a plugin still has to
+// be able to put a command there. "Reset Camera" belongs to whatever owns the camera, and the shell
+// must not be the thing that knows a camera exists.
+//
+// This needs no new entry point. `nori_plugin_service` already lets the host ask a plugin a question
+// by name, so the question is asked under one reserved key, `shell.menu`, dispatched per library
+// rather than through the shared bus, which keeps two plugins from colliding on it.
+//
+// The reply is the ordinary success shape carrying an array:
+//
+//     {"ok":true,"result":[{"menu":"View","label":"Reset Camera","action":"scene_3d.camera_reset"}]}
+//
+// `action` is a service key. The shell invokes it on the bus and never interprets it, so a
+// contributed command is as opaque to the shell as the panel that contributed it.
+
+/// one command a plugin asked the shell to show: which top-level menu, what to call it, and the
+/// service key to invoke when it is chosen.
+///
+/// `key` is a shortcut spelling ("ctrl+s", "ctrl+shift+b", "f5") or "" for a row with no binding.
+/// It travels with the row rather than living in a table in the shell, because the shell does not
+/// know what any of these do and should not have to know what any of them are worth binding to. A
+/// panel that grows a command grows its shortcut in the same line, and the menu shows the key beside
+/// the label because they came from the same place and therefore cannot disagree.
+pub struct MenuItem { menu: Str, label: Str, action: Str, key: Str, arg: Str }
+
+/// the reserved service key a plugin answers to contribute menu commands.
+pub fn SHELL_MENU_KEY() -> Str { return "shell.menu" }
+
+/// ask every loaded plugin what it wants in the menus, in load order.
+///
+/// A plugin that does not serve, does not declare the key, or answers anything unparseable
+/// contributes nothing: a malformed reply is not worth failing a frame over, and the shell has no
+/// way to judge one anyway.
+pub fn shell_menu_items(h: PluginHost) -> Vec<MenuItem> {
+    var out: Vec<MenuItem> = vec()
+    var i = 0
+    while i < h.libs.len() {
+        if serves(h.libs[i]) {
+            let reply = service(h.libs[i], SHELL_MENU_KEY(), "{}")
+            let j = json::parse(reply)
+            let arr = json::field(j, "result")
+            var k = 0
+            while k < json::jlen(arr) {
+                let it = json::at(arr, k)
+                let menu = copy json::as_str(json::field(it, "menu"))
+                let label = copy json::as_str(json::field(it, "label"))
+                let action = copy json::as_str(json::field(it, "action"))
+                let key = copy json::as_str(json::field(it, "key"))
+                // `arg` is what the service is called with: "build" and "run" are one key and two
+                // rows, and without it every parameterised command would need its own service.
+                let arg = copy json::as_str(json::field(it, "arg"))
+                if menu.len() > 0 && label.len() > 0 && action.len() > 0 { out.push(MenuItem { menu: menu, label: label, action: action, key: key, arg: arg }) }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// one setting a plugin declares: what it is called, what kind of value it holds, and what it is
+/// worth when nobody has said otherwise.
+///
+/// `key` is namespaced by whoever owns it (`editor.font`, `viewer.theme`) because the settings
+/// of every plugin land in one file and one panel; a bare `shell` from two plugins is two plugins
+/// fighting over a line in a config nobody can read.
+///
+/// `kind` is one of "text", "bool", "int", "choice". A "choice" carries its options in `options`,
+/// separated by `|` or by `,`: a Vec would be the better type, but a Str survives the JSON
+/// reply without a second parse. Both separators are accepted because nothing about the field says
+/// which one it wants, and choosing the other fails silently as one option wearing the whole list.
+/// `plugin` and `plugin_label` are filled in by the shell, not by the plugin: the declaration was
+/// answered by a `.so` that the host already knows the name of, and asking a panel author to repeat
+/// it in every row would invite mistakes. `plugin_label` is the name of the plugin's
+/// first panel, which is what the person calls it ("Editor", not `editor_panel`).
+/// `service` is for `kind: "secret"` and empty for everything else: the name of a service on the
+/// bus that owns the value, so the shell can route it without ever holding it.
+///
+/// A secret is not a setting with a mask on it. Everything else here is stored by the shell in
+/// `<config>.prefs`, a plain file people paste into bug reports; an API token stored the same way
+/// with a nicer widget in front of it is the same token in the same plain file. So a secret declares
+/// where it lives instead: the shell asks that service for its state ("none", "saved", "env") to
+/// draw a row, and hands it a new value to keep, and at no point has the value itself.
+/// `picker` names a picker scope that can answer this setting: `font` for a face, and whatever
+/// else grows one. A path is exact and is the wrong way to ask somebody what they want; a row that
+/// offers the list as well is the difference between a setting and a puzzle.
+pub struct SettingDecl { key: Str, label: Str, kind: Str, dflt: Str, options: Str, group: Str, help: Str, plugin: Str, plugin_label: Str, service: Str, picker: Str }
+
+/// the reserved key a shell asks every plugin for the settings it owns.
+pub fn SHELL_SETTINGS_KEY() -> Str { return "shell.settings" }
+
+/// ask every loaded plugin what it can be configured with, in load order.
+///
+/// The same contract as `shell_menu_items`, and for the same reason: a plugin knows what it can be
+/// told and the shell knows how to ask a person. Neither has to know the other's business. A panel
+/// that declares nothing is simply not configurable, and one that declares a setting gets it stored,
+/// edited and handed back without writing a line of UI.
+pub fn shell_settings_decls(h: PluginHost) -> Vec<SettingDecl> {
+    var out: Vec<SettingDecl> = vec()
+    var i = 0
+    while i < h.libs.len() {
+        if serves(h.libs[i]) {
+            let reply = service(h.libs[i], SHELL_SETTINGS_KEY(), "{}")
+            let pname = h.libs[i].name
+            var plabel = pname
+            if h.libs[i].panels.len() > 0 {
+                if h.libs[i].panels[0].name.len() > 0 { plabel = h.libs[i].panels[0].name }
+            }
+            let j = json::parse(reply)
+            let arr = json::field(j, "result")
+            var k = 0
+            while k < json::jlen(arr) {
+                let it = json::at(arr, k)
+                let key = copy json::as_str(json::field(it, "key"))
+                let label = copy json::as_str(json::field(it, "label"))
+                var kind = copy json::as_str(json::field(it, "kind"))
+                if kind.len() == 0 { kind = "text" }
+                let dflt = copy json::as_str(json::field(it, "default"))
+                let options = copy json::as_str(json::field(it, "options"))
+                let group = copy json::as_str(json::field(it, "group"))
+                let help = copy json::as_str(json::field(it, "help"))
+                let svc = copy json::as_str(json::field(it, "service"))
+                let pik = copy json::as_str(json::field(it, "picker"))
+                // A declaration without a key is not one. Everything else has a sensible absence
+                // (no help, no group, no options), but a setting nothing can be stored under is a row
+                // that would edit thin air.
+                if key.len() > 0 && label.len() > 0 {
+                    out.push(SettingDecl { key: key, label: label, kind: kind, dflt: dflt, options: options,
+                                           group: group, help: help, plugin: copy pname, plugin_label: copy plabel,
+                                           service: svc, picker: pik })
+                }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// one picker scope a plugin provides: the word you type before `::`, what it is for, and who
+/// answers when you enter it.
+///
+/// The picker has no content of its own. It is a box with a query in it and a list under that; which
+/// lists exist, what is in them and what picking one does are the things a plugin knows and a shell
+/// does not. This is the declaration that says "I can answer `file::`", the same shape as
+/// `shell.menu` and `shell.settings`, for the same reason: the panel that owns a kind of thing is
+/// the panel that should be asked about it.
+///
+/// `plugin` and `plugin_label` are filled in by the shell from the `.so` that answered, never by the
+/// plugin. `service` is the key the shell calls to get the rows, defaulting to `picker.rows`; it is
+/// called with the scope as its argument and answers `{"result":[{label,detail,note,action}, …]}`.
+/// `key` is the chord that opens the picker already narrowed to this scope, spelled the way
+/// `shell_key_name` spells one ("ctrl+e"); empty for a scope you reach by typing its name. `row` is
+/// whether the scope is offered in the unscoped list: false for the pseudo-scope that names the
+/// unscoped list itself, which exists so that its chord has somewhere to be declared.
+pub struct PickerScope { scope: Str, note: Str, plugin: Str, plugin_label: Str, service: Str, key: Str, row: Bool }
+
+/// the reserved key a shell asks every plugin for the picker scopes it can answer.
+pub fn SHELL_PICKERS_KEY() -> Str { return "shell.pickers" }
+
+/// the default service a scope is answered by, when a declaration does not name one.
+pub fn PICKER_ROWS_KEY() -> Str { return "picker.rows" }
+/// the service asked for the preview of a selected row; answered by the same plugin.
+pub fn PICKER_PREVIEW_KEY() -> Str { return "picker.preview" }
+/// the service asked whether a typed word names a scope; see `shell_picker_resolve`.
+pub fn PICKER_RESOLVE_KEY() -> Str { return "picker.resolve" }
+
+/// every scope every loaded plugin says it can answer, in load order.
+pub fn shell_picker_scopes(h: PluginHost) -> Vec<PickerScope> {
+    var out: Vec<PickerScope> = vec()
+    var i = 0
+    while i < h.libs.len() {
+        if serves(h.libs[i]) {
+            let reply = service(h.libs[i], SHELL_PICKERS_KEY(), "{}")
+            let pname = h.libs[i].name
+            var plabel = pname
+            if h.libs[i].panels.len() > 0 {
+                if h.libs[i].panels[0].name.len() > 0 { plabel = h.libs[i].panels[0].name }
+            }
+            let j = json::parse(reply)
+            let arr = json::field(j, "result")
+            var k = 0
+            while k < json::jlen(arr) {
+                let it = json::at(arr, k)
+                let scope = copy json::as_str(json::field(it, "scope"))
+                let note = copy json::as_str(json::field(it, "note"))
+                var svc = copy json::as_str(json::field(it, "service"))
+                if svc.len() == 0 { svc = PICKER_ROWS_KEY() }
+                let key = copy json::as_str(json::field(it, "key"))
+                // Offered unless it says otherwise. Absent means true, because a scope nobody can
+                // find is the unusual one and should be the thing that has to be spelled out.
+                var row = true
+                // Spelled as the string "false", because an absent JSON field and a `false` one
+                // both read as false through `as_bool` and the difference is the whole meaning here.
+                if json::as_str(json::field(it, "row")) == "false" { row = false }
+                // A scope with no name is not one: there would be nothing to type and nothing to
+                // show on the row that offers it.
+                if scope.len() > 0 { out.push(PickerScope { scope: scope, note: note, plugin: copy pname, plugin_label: copy plabel, service: svc, key: key, row: row }) }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// the declaration for `scope`, matched on its head: `preference::editor` is answered by whoever
+/// declared `preference`. An empty `scope` field means nothing claimed it.
+pub fn shell_picker_owner(scopes: Vec<PickerScope>, scope: Str) -> PickerScope {
+    let head = shell_picker_head(scope)
+    var i = 0
+    while i < scopes.len() {
+        if scopes[i].scope == head { return PickerScope { scope: copy scopes[i].scope, note: copy scopes[i].note, plugin: copy scopes[i].plugin, plugin_label: copy scopes[i].plugin_label, service: copy scopes[i].service, key: copy scopes[i].key, row: scopes[i].row } }
+        i = i + 1
+    }
+    return PickerScope { scope: "", note: "", plugin: "", plugin_label: "", service: "", key: "", row: false }
+}
+
+/// the part of a scope before the first `::`. `preference::editor::changed` is the `preference`
+/// plugin's business all the way down; only the head decides who is asked.
+pub fn shell_picker_head(scope: Str) -> Str {
+    var i = 0
+    while i + 1 < scope.len() {
+        if ord(scope.at(i)) == 58 && ord(scope.at(i + 1)) == 58 { return scope.slice(0, i) }
+        i = i + 1
+    }
+    return copy scope
+}
+
+/// what chord `name` opens, as the string `shell.pick` takes, or "" when nothing is bound to it.
+///
+/// The chords are contributed, like every other key in this window. A scope that arrives from a
+/// plugin brings the key that opens it, and a shell that has no picker of its own has no business
+/// owning the chord for one.
+pub fn shell_picker_chord(scopes: Vec<PickerScope>, name: Str) -> Str {
+    var i = 0
+    while i < scopes.len() {
+        if scopes[i].key.len() > 0 && scopes[i].key == name {
+            // The pseudo-scope `all` is the unscoped list; everything else opens it and narrows.
+            if scopes[i].scope == "all" { return "all" }
+            return "all:" + scopes[i].scope
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+/// the rows of `scope`, from whoever declared it.
+pub fn shell_picker_rows(h: PluginHost, scopes: Vec<PickerScope>, scope: Str) -> Vec<PickerItem> {
+    var out: Vec<PickerItem> = vec()
+    let own = shell_picker_owner(scopes, scope)
+    if own.scope.len() == 0 { return out }
+    var i = 0
+    while i < h.libs.len() {
+        if h.libs[i].name == own.plugin {
+            if serves(h.libs[i]) {
+                let reply = service(h.libs[i], own.service, copy scope)
+                let j = json::parse(reply)
+                let arr = json::field(j, "result")
+                var k = 0
+                while k < json::jlen(arr) {
+                    let it = json::at(arr, k)
+                    let label = copy json::as_str(json::field(it, "label"))
+                    let detail = copy json::as_str(json::field(it, "detail"))
+                    let note = copy json::as_str(json::field(it, "note"))
+                    let action = copy json::as_str(json::field(it, "action"))
+                    if label.len() > 0 { out.push(PickerItem { label: label, detail: detail, note: note, action: action }) }
+                    k = k + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// the preview of a selected row: a strip of lines, or an image, or nothing.
+///
+/// `kind` is "lines", "image" or "" for nothing to show. `of` is what is being previewed, which the
+/// picker uses to know whether the preview it holds is still the right one.
+pub struct PickerPreview { kind: Str, of: Str, lang: Str, path: Str, lines: Vec<Str> }
+
+/// ask the providers what to show beside `action`, stopping at the first that offers anything.
+///
+/// This goes by action, not by scope. In the unscoped list a file row, a command row and a setting
+/// row sit beside one another, and the thing that can describe a row is whoever produced it, so the
+/// question is asked of each provider with the row's own action, and the one that recognises it
+/// answers. A provider that does not is expected to say nothing, which costs a service call and is
+/// the price of not having the shell know what a `.nori` file is.
+pub fn shell_picker_preview(h: PluginHost, scopes: Vec<PickerScope>, action: Str) -> PickerPreview {
+    var none: Vec<Str> = vec()
+    var i = 0
+    while i < h.libs.len() {
+        if serves(h.libs[i]) {
+            var claims = false
+            var s = 0
+            while s < scopes.len() { if scopes[s].plugin == h.libs[i].name { claims = true }  s = s + 1 }
+            if claims {
+                let reply = service(h.libs[i], PICKER_PREVIEW_KEY(), copy action)
+                let j = json::parse(reply)
+                let r = json::field(j, "result")
+                let kind = copy json::as_str(json::field(r, "kind"))
+                if kind.len() > 0 {
+                    var lines: Vec<Str> = vec()
+                    let arr = json::field(r, "lines")
+                    var k = 0
+                    while k < json::jlen(arr) { lines.push(copy json::as_str(json::at(arr, k)))  k = k + 1 }
+                    return PickerPreview { kind: kind, of: copy json::as_str(json::field(r, "of")),
+                                           lang: copy json::as_str(json::field(r, "lang")),
+                                           path: copy json::as_str(json::field(r, "path")), lines: lines }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return PickerPreview { kind: "", of: "", lang: "", path: "", lines: none }
+}
+
+/// what a plugin makes of a word typed before `::` while `have` is the scope already applied.
+///
+/// `preference::` narrows to `preference::editor` when you type `editor::`, and only the plugin that
+/// owns `preference` knows that `editor` is one of the things it holds. Asked of every provider until
+/// one claims it; "" means nobody did, and the word stays part of the query.
+pub fn shell_picker_resolve(h: PluginHost, scopes: Vec<PickerScope>, have: Str, word: Str) -> Str {
+    var i = 0
+    while i < h.libs.len() {
+        if serves(h.libs[i]) {
+            var claims = false
+            var s = 0
+            while s < scopes.len() { if scopes[s].plugin == h.libs[i].name { claims = true }  s = s + 1 }
+            if claims {
+                let reply = service(h.libs[i], PICKER_RESOLVE_KEY(), have + (chr(9) + word))
+                let j = json::parse(reply)
+                let got = copy json::as_str(json::field(j, "result"))
+                if got.len() > 0 { return got }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+/// the item bound to `key`, or one with an empty action when nothing is.
+///
+/// The shell asks this on every keystroke it did not otherwise consume. Linear over a list that is
+/// a few dozen rows at most, once per key press. The alternative is an index that has to be
+/// rebuilt whenever a plugin is reloaded, for a saving nobody can measure.
+pub fn shell_menu_binding(items: Vec<MenuItem>, key: Str) -> MenuItem {
+    var i = 0
+    while i < items.len() {
+        if items[i].key.len() > 0 && items[i].key == key { return copy items[i] }
+        i = i + 1
+    }
+    return MenuItem { menu: "", label: "", action: "", key: "", arg: "" }
+}
+
+/// `mods`+`keysym` as the spelling a contribution uses: "ctrl+shift+s", "f5", "ctrl+p".
+///
+/// Lower case and in a fixed order, so "ctrl+shift+b" is the only way to write that chord and a
+/// plugin cannot miss its own binding by spelling it "shift+ctrl+B".
+pub fn shell_key_name(sym: Int, mods: Int) -> Str {
+    var name = shell_keysym_name(sym)
+    if name.len() == 0 { return "" }
+    var o = ""
+    if (mods & 2) != 0 { o = o + "ctrl+" }
+    if (mods & 4) != 0 { o = o + "alt+" }
+    if (mods & 1) != 0 { o = o + "shift+" }
+    return o + name
+}
+
+/// the bare name of a keysym: "a".."z", "0".."9", "f1".."f12", and the few worth binding.
+fn shell_keysym_name(sym: Int) -> Str {
+    if sym >= 97 && sym <= 122 { return "" + chr(sym) }                 // a-z
+    if sym >= 65 && sym <= 90 { return "" + chr(sym + 32) }             // A-Z, as typed with shift
+    if sym >= 48 && sym <= 57 { return "" + chr(sym) }                  // 0-9
+    if sym >= 65470 && sym <= 65481 { return "f" + to_str(sym - 65469) }  // F1-F12
+    if sym == 65293 { return "enter" }
+    if sym == 65307 { return "escape" }
+    if sym == 32 { return "space" }
+    if sym == 65535 { return "delete" }
+    if sym == 65360 { return "home" }
+    if sym == 65367 { return "end" }
+    return ""
+}
+
+/// the reserved key a shell asks every plugin once, after the dock exists.
+pub fn SHELL_STARTUP_KEY() -> Str { return "shell.startup" }
+
+/// what each plugin wants done the moment the dock is up, in load order.
+///
+/// A plugin cannot arrange this for itself. `nori_plugin_init` runs before there is a dock, and
+/// `nori_plugin_render` runs only for panels that are already visible, so a panel that wants to be
+/// the one you land on can neither ask early enough nor, if it is behind another tab, ask at all.
+///
+/// The reply is an action string, the same vocabulary the menu bar speaks: a service key, or the
+/// shell's own `panel:<id>`. An empty reply means "nothing, thank you", which is what every plugin
+/// that has not thought about this returns by not answering the key at all.
+pub fn shell_startup_actions(h: PluginHost) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var i = 0
+    while i < h.libs.len() {
+        if serves(h.libs[i]) {
+            let reply = service(h.libs[i], SHELL_STARTUP_KEY(), "{}")
+            if reply.len() > 0 {
+                let j = json::parse(reply)
+                if json::as_bool(json::field(j, "ok")) {
+                    let act = json::as_str(json::field(j, "result"))
+                    if act.len() > 0 { out.push(copy act) }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// the contributed items for one top-level menu.
+pub fn shell_menu_items_for(items: Vec<MenuItem>, menu: Str) -> Vec<MenuItem> {
+    var out: Vec<MenuItem> = vec()
+    var i = 0
+    while i < items.len() { if items[i].menu == menu { out.push(copy items[i]) }  i = i + 1 }
+    return out
+}
+
+/// every top-level menu name any plugin contributed to, deduplicated and in contribution order.
+/// A shell uses this to grow a menu it did not itself declare.
+pub fn shell_menu_names(items: Vec<MenuItem>) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var i = 0
+    while i < items.len() {
+        var seen = false
+        var q = 0
+        while q < out.len() { if out[q] == items[i].menu { seen = true }  q = q + 1 }
+        if !seen { out.push(copy items[i].menu) }
+        i = i + 1
+    }
+    return out
+}

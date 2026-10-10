@@ -1,0 +1,408 @@
+//! std/audio: PCM sound: a WAV reader/writer, a real output device, and a small voice mixer.
+//!
+//!   import "std/audio" as audio
+//!
+//!   var s = audio::wav_read(read_file("boing.wav"))          // -> Sound (S16 interleaved)
+//!   var d = audio::open_default(s.rate, s.channels)          // an ALSA playback device
+//!   if audio::ok(d) { audio::play_blocking(d, s)  audio::close(d) }
+//!
+//! **The sample format is interleaved signed 16-bit little-endian, held in a `Str`.** A Nori `Str` is
+//! a length-prefixed byte range that may contain NULs (`str_from_buf`), so it is the natural PCM
+//! buffer here: it comes straight out of `read_file`, goes straight into `write_file`, and its
+//! backing pointer can be handed to `snd_pcm_writei` with no copy. `Vec<Int>` would cost 8 bytes per
+//! 2-byte sample and a conversion on every write.
+//!
+//! Not included: an audio graph, effects, a resampler of its own (ALSA's `soft_resample` covers
+//! rate mismatch) and a callback/pull thread. `Device` writes block. The
+//! mixer (see mixer.nori) sums voices into a buffer that the caller then writes. That is enough for
+//! a game's `audio.play` / `audio.stop` / `audio.set_volume`.
+//!
+//! Backends: ALSA (`alsa.nori`) on Linux, resolved with `dlopen` at first use. Importing std/audio
+//! adds no link or header dependency, and on a machine with no libasound every call
+//! answers -ENOSYS instead of the program failing to start. `pipewire` and `pulse` are reached as
+//! ALSA PCM names, which is how both projects expose themselves to ALSA clients; no separate
+//! binding is needed for either.
+
+// alsa.nori is a sibling file: same module, so its `alsa_*` helpers are called unqualified. They
+// carry that prefix because Nori module-private/public function symbols are global link names.
+
+extern fn nori_str_ptr(Str) -> Int      // runtime: a Str's raw data pointer (zero-copy PCM writes)
+extern fn malloc(Int) -> Int
+extern fn realloc(Int, Int) -> Int
+extern fn free(Int)
+
+// ── a growable raw byte sink ───────────────────────────────────────────────────────────────────
+// PCM buffers are hundreds of kilobytes. Building one with `s = s + chr(b)` is quadratic: a
+// 1-second stereo 44.1k clip is 176400 bytes and would copy ~15 GB. Everything that emits bytes
+// here goes through this instead and finishes with one `str_from_buf`.
+struct Bytes { p: Int, len: Int, cap: Int }
+fn by_new(cap: Int) -> Bytes {
+    var c = cap
+    if c < 64 { c = 64 }
+    var b = Bytes { p: 0, len: 0, cap: c }
+    unsafe { b.p = malloc(c) }
+    return b
+}
+fn by_grow(inout b: Bytes, need: Int) {
+    if b.len + need <= b.cap { return }
+    var c = b.cap
+    while c < b.len + need { c = c * 2 }
+    unsafe { b.p = realloc(b.p, c) }
+    b.cap = c
+}
+fn by_u8(inout b: Bytes, v: Int) {
+    by_grow(b, 1)
+    unsafe { poke8(b.p + b.len, v & 255) }
+    b.len = b.len + 1
+}
+fn by_u16(inout b: Bytes, v: Int) { by_u8(b, v)  by_u8(b, v >> 8) }
+fn by_u32(inout b: Bytes, v: Int) { by_u8(b, v)  by_u8(b, v >> 8)  by_u8(b, v >> 16)  by_u8(b, v >> 24) }
+fn by_str(inout b: Bytes, s: Str) {
+    by_grow(b, s.len())
+    var i = 0
+    while i < s.len() { unsafe { poke8(b.p + b.len + i, ord(s.at(i))) }  i = i + 1 }
+    b.len = b.len + s.len()
+}
+/// S16 sample, clamped, little-endian.
+fn by_s16(inout b: Bytes, v: Int) {
+    var u = clamp16(v)
+    if u < 0 { u = u + 65536 }
+    by_u8(b, u)
+    by_u8(b, u >> 8)
+}
+fn by_take(inout b: Bytes) -> Str {
+    var s = ""
+    unsafe { s = str_from_buf(b.p, b.len)  free(b.p) }
+    b.p = 0
+    b.len = 0
+    b.cap = 0
+    return s
+}
+
+/// 16-bit signed little-endian interleaved PCM. `data.len()` is always `frames * channels * 2`.
+pub struct Sound { rate: Int, channels: Int, data: Str }
+
+/// An open playback device. `h` is the backend handle (> 0 when open); `rate`/`channels` are what
+/// was actually negotiated, and `err` is the ALSA error code if the open failed (0 otherwise).
+pub struct Device { h: Int, rate: Int, channels: Int, name: Str, err: Int }
+
+// ── construction / arithmetic ──────────────────────────────────────────────────────────────────
+
+/// A Sound from raw interleaved S16LE bytes.
+pub fn sound(rate: Int, channels: Int, sink data: Str) -> Sound { return Sound { rate: rate, channels: channels, data: data } }
+
+/// `frames * channels * 2` — the byte length one buffer of `frames` frames occupies.
+pub fn frame_bytes(channels: Int) -> Int { return channels * 2 }
+
+/// How many whole frames a Sound holds.
+pub fn frames(s: Sound) -> Int {
+    let fb = s.channels * 2
+    if fb <= 0 { return 0 }
+    return s.data.len() / fb
+}
+
+/// Duration in milliseconds.
+pub fn duration_ms(s: Sound) -> Int {
+    if s.rate <= 0 { return 0 }
+    return frames(s) * 1000 / s.rate
+}
+
+/// Sample `i` of frame `f`, channel `c`, as a signed value in [-32768, 32767].
+pub fn sample_at(s: Sound, f: Int, c: Int) -> Int {
+    let i = (f * s.channels + c) * 2
+    if i < 0 { return 0 }
+    if i + 1 >= s.data.len() { return 0 }
+    let v = ord(s.data.at(i)) | (ord(s.data.at(i + 1)) << 8)
+    if v >= 32768 { return v - 65536 }
+    return v
+}
+
+/// Sound of `n` frames of silence.
+pub fn silence(rate: Int, channels: Int, n: Int) -> Sound {
+    let total = n * channels * 2
+    var b = by_new(total + 1)
+    var i = 0
+    while i < total { by_u8(b, 0)  i = i + 1 }
+    return Sound { rate: rate, channels: channels, data: by_take(b) }
+}
+
+// ── WAV (RIFF/WAVE) ────────────────────────────────────────────────────────────────────────────
+// Only the two encodings anything actually emits: PCM 16-bit (format tag 1) and IEEE float 32-bit
+// (tag 3), plus WAVE_FORMAT_EXTENSIBLE (tag 0xFFFE), whose real tag is the first two bytes of the
+// extension. 8-bit PCM (unsigned, biased by 128) and 24-bit PCM are converted too, since a WAV from a
+// recorder is as likely to be 24-bit as anything. Everything lands as S16.
+
+fn le16(s: Str, o: Int) -> Int {
+    if o + 1 >= s.len() { return 0 }
+    return ord(s.at(o)) | (ord(s.at(o + 1)) << 8)
+}
+fn le32(s: Str, o: Int) -> Int {
+    if o + 3 >= s.len() { return 0 }
+    return ord(s.at(o)) | (ord(s.at(o + 1)) << 8) | (ord(s.at(o + 2)) << 16) | (ord(s.at(o + 3)) << 24)
+}
+fn clamp16(v: Int) -> Int {
+    if v > 32767 { return 32767 }
+    if v < 0 - 32768 { return 0 - 32768 }
+    return v
+}
+
+/// The outcome of decoding a WAV: `sound.rate == 0` means it failed and `error` says why.
+pub struct WavResult { sound: Sound, error: Str }
+
+/// Decode a RIFF/WAVE file into S16 interleaved PCM, with the reason on failure.
+pub fn wav_decode(b: Str) -> WavResult {
+    if b.len() < 44 { return wav_fail("too short to be a WAV (" + to_str(b.len()) + " bytes)") }
+    if !(b.slice(0, 4) == "RIFF") { return wav_fail("no RIFF magic") }
+    if !(b.slice(8, 12) == "WAVE") { return wav_fail("not a WAVE file") }
+    var pos = 12
+    var tag = 0
+    var ch = 0
+    var rate = 0
+    var bits = 0
+    var have_fmt = false
+    var out = wav_fail("no data chunk")
+    var done = false
+    // Walk the chunk list. Chunks are word-aligned: an odd size carries a pad byte.
+    while !done && pos + 8 <= b.len() {
+        let id = b.slice(pos, pos + 4)
+        let sz = le32(b, pos + 4)
+        if sz < 0 { done = true }
+        let body = pos + 8
+        if !done {
+            if id == "fmt " && sz >= 16 {
+                tag = le16(b, body)
+                ch = le16(b, body + 2)
+                rate = le32(b, body + 4)
+                bits = le16(b, body + 14)
+                if tag == 65534 && sz >= 40 { tag = le16(b, body + 24) }   // EXTENSIBLE: real tag in the GUID
+                have_fmt = true
+            }
+            if id == "data" {
+                if !have_fmt { return wav_fail("data chunk before fmt chunk") }
+                var end = body + sz
+                if end > b.len() { end = b.len() }               // truncated file: take what is there
+                out = wav_convert(b, body, end, tag, ch, rate, bits)
+                done = true
+            }
+            var step = sz
+            if (step & 1) == 1 { step = step + 1 }
+            pos = body + step
+        }
+    }
+    return out
+}
+
+/// Decode a WAV, discarding the diagnostic. A Sound with `rate == 0` means it failed; use
+/// `wav_decode` when you want to know why.
+pub fn wav_read(b: Str) -> Sound {
+    var r = wav_decode(b)
+    return sink r.sound
+}
+
+fn wav_fail(sink msg: Str) -> WavResult {
+    return WavResult { sound: Sound { rate: 0, channels: 0, data: "" }, error: msg }
+}
+fn wav_okay(rate: Int, ch: Int, sink data: Str) -> WavResult {
+    return WavResult { sound: Sound { rate: rate, channels: ch, data: data }, error: "" }
+}
+
+// The data chunk is read in place (`b` with a `lo`/`hi` window) rather than sliced out first. The
+// slice is only the answer on the already-S16 path; slicing up front would make every other path
+// allocate a copy of the chunk it is about to convert and drop.
+fn wav_convert(b: Str, lo: Int, hi: Int, tag: Int, ch: Int, rate: Int, bits: Int) -> WavResult {
+    if ch <= 0 || rate <= 0 { return wav_fail("nonsense fmt chunk (channels=" + to_str(ch) + " rate=" + to_str(rate) + ")") }
+    let n = hi - lo
+    if tag == 1 && bits == 16 { return wav_okay(rate, ch, b.slice(lo, hi)) }              // already S16LE
+    if tag == 1 && bits == 8 {                                       // unsigned, biased by 128
+        var o = by_new(n * 2 + 1)
+        var i = 0
+        while i < n { by_s16(o, (ord(b.at(lo + i)) - 128) * 256)  i = i + 1 }
+        return wav_okay(rate, ch, by_take(o))
+    }
+    if tag == 1 && bits == 24 {
+        var o = by_new(n / 3 * 2 + 1)
+        var i = 0
+        while i + 2 < n {
+            var v = ord(b.at(lo + i + 1)) | (ord(b.at(lo + i + 2)) << 8)     // keep the top 16 of the 24
+            if v >= 32768 { v = v - 65536 }
+            by_s16(o, v)
+            i = i + 3
+        }
+        return wav_okay(rate, ch, by_take(o))
+    }
+    if tag == 1 && bits == 32 {
+        var o = by_new(n / 2 + 1)
+        var i = 0
+        while i + 3 < n {
+            var v = ord(b.at(lo + i + 2)) | (ord(b.at(lo + i + 3)) << 8)     // top 16 of the 32
+            if v >= 32768 { v = v - 65536 }
+            by_s16(o, v)
+            i = i + 4
+        }
+        return wav_okay(rate, ch, by_take(o))
+    }
+    if tag == 3 && bits == 32 {
+        var o = by_new(n / 2 + 1)
+        var i = 0
+        while i + 3 < n {
+            let f = f32_from_bits(le32(b, lo + i))
+            by_s16(o, float_to_s16(f))
+            i = i + 4
+        }
+        return wav_okay(rate, ch, by_take(o))
+    }
+    return wav_fail("unsupported WAV encoding: format tag " + to_str(tag) + ", " + to_str(bits) + " bits")
+}
+
+/// Round a normalised sample in [-1, 1] to S16, clamping (not wrapping) outside it.
+pub fn float_to_s16(f: Float) -> Int {
+    var v = f * 32767.0
+    if v >= 0.0 { v = v + 0.5 } else { v = v - 0.5 }
+    let i = to_int(v)
+    return clamp16(i)
+}
+
+/// Reassemble an IEEE-754 binary32 from its 32 raw bits (WAV float samples arrive as bits).
+pub fn f32_from_bits(bits: Int) -> Float {
+    let u = bits & 4294967295
+    let sign = (u >> 31) & 1
+    let expo = (u >> 23) & 255
+    let mant = u & 8388607
+    if expo == 255 { return 0.0 }                       // NaN/Inf: not a sample; treat as silence
+    var m = to_float(mant)
+    var e = expo - 127
+    if expo == 0 { e = 0 - 126 } else { m = m + 8388608.0 }
+    var v = m / 8388608.0
+    // ldexp by repeated halving/doubling: no libm dependency, and |e| here is at most ~150.
+    var k = e
+    while k > 0 { v = v * 2.0  k = k - 1 }
+    while k < 0 { v = v / 2.0  k = k + 1 }
+    if sign == 1 { return 0.0 - v }
+    return v
+}
+
+/// Encode a Sound as a 16-bit PCM RIFF/WAVE file.
+pub fn wav_write(s: Sound) -> Str {
+    let n = s.data.len()
+    var b = by_new(n + 64)
+    by_str(b, "RIFF")   by_u32(b, 36 + n)   by_str(b, "WAVE")
+    by_str(b, "fmt ")   by_u32(b, 16)                      // PCM fmt chunk is 16 bytes
+    by_u16(b, 1)                                           // WAVE_FORMAT_PCM
+    by_u16(b, s.channels)
+    by_u32(b, s.rate)
+    by_u32(b, s.rate * s.channels * 2)                     // byte rate
+    by_u16(b, s.channels * 2)                              // block align
+    by_u16(b, 16)                                          // bits per sample
+    by_str(b, "data")   by_u32(b, n)
+    by_str(b, s.data)
+    return by_take(b)
+}
+
+// ── the device ─────────────────────────────────────────────────────────────────────────────────
+
+/// The PCM device names tried by `open_default`, in order. "default" is first because it is what the
+/// user configured. `pipewire` and `pulse` come next because on a modern desktop they are the real
+/// server, and "default" only reaches them if the distro installed the ALSA plugin config (otherwise
+/// "default" resolves to dmix over `hw:0,0` and fails with ENOENT if card 0 has no playback
+/// device 0, as on an HDMI-only card). `plughw:` entries come last: they are the hardware directly,
+/// with ALSA's conversion plugin in front so a rate the card refuses still works.
+pub fn default_device_names() -> Vec<Str> {
+    var v: Vec<Str> = vec()
+    v.push("default")
+    v.push("pipewire")
+    v.push("pulse")
+    v.push("sysdefault")
+    v.push("plughw:0,0")
+    v.push("plughw:1,0")
+    v.push("plughw:2,0")
+    return v
+}
+
+/// Open a named PCM device. `latency_us` is the target buffer latency (20000 = 20 ms is a reasonable
+/// game default; larger is safer under load). A failed open returns a Device with `h == 0` and `err`
+/// set to the ALSA code, so `ok()` is false and `error_text()` names it.
+pub fn open_device(sink name: Str, rate: Int, channels: Int, latency_us: Int) -> Device {
+    let h = alsa_open(name, rate, channels, 0, latency_us)
+    if h < 0 { return Device { h: 0, rate: rate, channels: channels, name: name, err: h } }
+    return Device { h: h, rate: rate, channels: channels, name: name, err: 0 }
+}
+
+/// Open the first device in `default_device_names()` that accepts this rate/channels. Returns a
+/// closed Device carrying the last error if none did.
+pub fn open_default(rate: Int, channels: Int) -> Device {
+    return open_default_lat(rate, channels, 40000)
+}
+
+/// `open_default` with an explicit target latency in microseconds.
+pub fn open_default_lat(rate: Int, channels: Int, latency_us: Int) -> Device {
+    alsa_set_quiet(true)                      // probing a device that is not there is not an error
+    var names = default_device_names()
+    var i = 0
+    var last = Device { h: 0, rate: rate, channels: channels, name: "", err: 0 - 2 }
+    while i < names.len() {
+        if last.h == 0 {
+            let d = open_device(copy names[i], rate, channels, latency_us)
+            if d.h > 0 { return d }
+            last = sink d
+        }
+        i = i + 1
+    }
+    return last
+}
+
+/// Is the device open and usable?
+pub fn ok(d: Device) -> Bool { return d.h > 0 }
+
+/// The ALSA text for a failed open ("" when the device is fine).
+pub fn error_text(d: Device) -> Str {
+    if d.h > 0 { return "" }
+    return alsa_strerror(d.err)
+}
+
+/// Write interleaved S16 frames. Blocks until they are queued (the ring buffer drains in real time,
+/// so writing more than the buffer holds takes as long as the audio lasts). Returns frames written,
+/// or a negative ALSA error. Underruns are recovered internally and the write retried.
+pub fn write(d: Device, pcm: Str) -> Int {
+    if d.h <= 0 { return 0 - 19 }                                  // -ENODEV
+    let fb = d.channels * 2
+    if fb <= 0 { return 0 }
+    let n = pcm.len() / fb
+    if n <= 0 { return 0 }
+    var p = 0
+    unsafe { p = nori_str_ptr(pcm) }
+    return alsa_write_raw(d.h, p, n)
+}
+
+/// Frames writable right now without blocking. Use it to size the next mix.
+pub fn writable(d: Device) -> Int {
+    if d.h <= 0 { return 0 }
+    return alsa_avail(d.h)
+}
+
+/// Play a whole Sound and wait for it to finish. Blocks for its full duration. The Sound's rate and
+/// channel count must match the device's — `play_blocking` does not resample.
+pub fn play_blocking(d: Device, s: Sound) -> Int {
+    let n = write(d, s.data)
+    if n < 0 { return n }
+    return alsa_drain(d.h)
+}
+
+/// Block until everything queued has played out.
+pub fn drain(d: Device) -> Int {
+    if d.h <= 0 { return 0 }
+    return alsa_drain(d.h)
+}
+
+/// Throw away everything queued and stop immediately.
+pub fn stop(d: Device) -> Int {
+    if d.h <= 0 { return 0 }
+    return alsa_drop_pending(d.h)
+}
+
+/// Close the device.
+pub fn close(inout d: Device) -> Int {
+    if d.h <= 0 { return 0 }
+    let r = alsa_close(d.h)
+    d.h = 0
+    return r
+}

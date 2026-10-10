@@ -1,0 +1,474 @@
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// Margin, Stroke, CornerRadius, WidgetVisuals, Widgets,
+// Visuals, Spacing, FontId, TextStyle, Theme
+// ===========================================================================
+
+// An optional Color. A plain struct (`present` + `color`) rather than an Option,
+// so consumers across a module boundary can read the fields directly.
+
+/// an optional color: `color` is meaningful only when `present` is true.
+pub struct OptColor { present: Bool, color: Color }
+
+/// a present OptColor.
+pub fn some_color(copy c: Color) -> OptColor { return OptColor { present: true, color: c } }
+/// an OptColor of its own with `o`'s state and colour.
+pub fn opt_color_copy(o: OptColor) -> OptColor { return OptColor { present: o.present, color: copy o.color } }
+/// an absent OptColor (color is a placeholder).
+pub fn no_color() -> OptColor { return OptColor { present: false, color: color_transparent() } }
+
+/// per-edge margin (left, right, top, bottom).
+pub struct Margin { left: Float, right: Float, top: Float, bottom: Float }
+
+/// zero margin.
+pub fn margin_zero() -> Margin { return Margin { left: 0.0, right: 0.0, top: 0.0, bottom: 0.0 } }
+/// the same margin on all four edges.
+pub fn margin_same(v: Float) -> Margin { return Margin { left: v, right: v, top: v, bottom: v } }
+/// symmetric margin: horizontal `h` (left/right), vertical `v` (top/bottom).
+pub fn margin_symmetric(h: Float, v: Float) -> Margin { return Margin { left: h, right: h, top: v, bottom: v } }
+
+/// a stroke: line width plus color, for borders and outlines.
+pub struct Stroke { width: Float, color: Color }
+/// a stroke of its own with `s`'s width and colour, for a field or a return that must not share them.
+pub fn stroke_copy(s: Stroke) -> Stroke { return Stroke { width: s.width, color: copy s.color } }
+
+/// construct a stroke.
+pub fn stroke(width: Float, copy color: Color) -> Stroke { return Stroke { width: width, color: color } }
+/// the default stroke (width 1, black).
+pub fn stroke_default() -> Stroke { return Stroke { width: 1.0, color: color_black() } }
+
+/// per-corner radius (nw, ne, sw, se).
+pub struct CornerRadius { nw: Float, ne: Float, sw: Float, se: Float }
+
+/// the same radius on all corners.
+pub fn corner_same(r: Float) -> CornerRadius { return CornerRadius { nw: r, ne: r, sw: r, se: r } }
+/// a CornerRadius of its own with `c`'s four radii.
+pub fn corner_copy(c: CornerRadius) -> CornerRadius { return CornerRadius { nw: c.nw, ne: c.ne, sw: c.sw, se: c.se } }
+
+/// the look of a single widget state (fills, strokes, rounding, hover expansion).
+pub struct WidgetVisuals {
+    weak_bg_fill: Color,
+    bg_fill: Color,
+    bg_stroke: Stroke,
+    corner_radius: CornerRadius,
+    fg_stroke: Stroke,
+    expansion: Float
+}
+
+/// the default widget visuals.
+pub fn widget_visuals_default() -> WidgetVisuals {
+    return WidgetVisuals {
+        weak_bg_fill: color_transparent(),
+        bg_fill: color_black(),
+        bg_stroke: stroke(1.0, color_black()),
+        corner_radius: corner_same(2.0),
+        fg_stroke: stroke(1.0, color_white()),
+        expansion: 0.0
+    }
+}
+
+/// widget visuals for every interaction state.
+pub struct Widgets {
+    noninteractive: WidgetVisuals,
+    inactive: WidgetVisuals,
+    hovered: WidgetVisuals,
+    active: WidgetVisuals,
+    open: WidgetVisuals
+}
+
+/// a WidgetVisuals of its own with `w`'s fills, strokes and rounding.
+pub fn widget_visuals_copy(w: WidgetVisuals) -> WidgetVisuals {
+    return WidgetVisuals {
+        weak_bg_fill: copy w.weak_bg_fill, bg_fill: copy w.bg_fill, bg_stroke: stroke_copy(w.bg_stroke),
+        corner_radius: corner_copy(w.corner_radius), fg_stroke: stroke_copy(w.fg_stroke), expansion: w.expansion
+    }
+}
+/// a Widgets of its own with `w`'s five states.
+pub fn widgets_copy(w: Widgets) -> Widgets {
+    return Widgets {
+        noninteractive: widget_visuals_copy(w.noninteractive), inactive: widget_visuals_copy(w.inactive),
+        hovered: widget_visuals_copy(w.hovered), active: widget_visuals_copy(w.active), open: widget_visuals_copy(w.open)
+    }
+}
+
+/// the default set of per-state widget visuals.
+pub fn widgets_default() -> Widgets {
+    return Widgets {
+        noninteractive: widget_visuals_default(),
+        inactive: widget_visuals_default(),
+        hovered: widget_visuals_default(),
+        active: widget_visuals_default(),
+        open: widget_visuals_default()
+    }
+}
+
+/// high-level visuals: panel/window fills, text/selection, and dock chrome colors.
+pub struct Visuals {
+    dark_mode: Bool,
+    panel_fill: Color,
+    window_fill: Color,
+    extreme_bg_color: Color,
+    faint_bg_color: Color,
+    override_text_color: OptColor,
+    hyperlink_color: OptColor,
+    selection_bg: Color,
+    selection_stroke: Stroke,
+    window_stroke: Stroke,
+    window_corner_radius: CornerRadius,
+    menu_corner_radius: CornerRadius,
+    input_bg: Color,
+    dock_menu_bar_fill: Color,
+    dock_menu_bar_border: Color,
+    dock_tab_bar_fill: Color,
+    dock_tab_active_fill: Color,
+    dock_tab_inactive_fill: Color,
+    dock_tab_bar_border: Color,
+    dock_active_tab_indicator: Color,
+    dock_content_fill: Color,
+    dock_splitter_fill: Color,
+    dock_splitter_hover_fill: Color,
+    dock_splitter_center_line: Color,
+    dock_menu_item_hover_fill: Color
+}
+
+/// a Visuals of its own with every colour, stroke and rounding of `v`.
+pub fn visuals_copy(v: Visuals) -> Visuals {
+    return Visuals {
+        dark_mode: v.dark_mode,
+        panel_fill: copy v.panel_fill,
+        window_fill: copy v.window_fill,
+        extreme_bg_color: copy v.extreme_bg_color,
+        faint_bg_color: copy v.faint_bg_color,
+        override_text_color: opt_color_copy(v.override_text_color),
+        hyperlink_color: opt_color_copy(v.hyperlink_color),
+        selection_bg: copy v.selection_bg,
+        selection_stroke: stroke_copy(v.selection_stroke),
+        window_stroke: stroke_copy(v.window_stroke),
+        window_corner_radius: corner_copy(v.window_corner_radius),
+        menu_corner_radius: corner_copy(v.menu_corner_radius),
+        input_bg: copy v.input_bg,
+        dock_menu_bar_fill: copy v.dock_menu_bar_fill,
+        dock_menu_bar_border: copy v.dock_menu_bar_border,
+        dock_tab_bar_fill: copy v.dock_tab_bar_fill,
+        dock_tab_active_fill: copy v.dock_tab_active_fill,
+        dock_tab_inactive_fill: copy v.dock_tab_inactive_fill,
+        dock_tab_bar_border: copy v.dock_tab_bar_border,
+        dock_active_tab_indicator: copy v.dock_active_tab_indicator,
+        dock_content_fill: copy v.dock_content_fill,
+        dock_splitter_fill: copy v.dock_splitter_fill,
+        dock_splitter_hover_fill: copy v.dock_splitter_hover_fill,
+        dock_splitter_center_line: copy v.dock_splitter_center_line,
+        dock_menu_item_hover_fill: copy v.dock_menu_item_hover_fill
+    }
+}
+
+/// the default dark visuals.
+pub fn visuals_default() -> Visuals {
+    return Visuals {
+        dark_mode: true,
+        panel_fill: color_rgb(18, 18, 20),
+        window_fill: color_rgb(20, 20, 22),
+        extreme_bg_color: color_black(),
+        faint_bg_color: color_rgb(12, 12, 14),
+        override_text_color: some_color(color_rgb(233, 236, 244)),
+        hyperlink_color: no_color(),
+        selection_bg: color_rgba(86, 180, 255, 80),
+        selection_stroke: stroke(1.0, color_rgb(86, 180, 255)),
+        window_stroke: stroke(1.0, color_rgb(48, 48, 56)),
+        window_corner_radius: corner_same(10.0),
+        menu_corner_radius: corner_same(6.0),
+        input_bg: color_rgb(37, 37, 38),
+        dock_menu_bar_fill: color_rgb(45, 45, 48),
+        dock_menu_bar_border: color_rgb(60, 60, 60),
+        dock_tab_bar_fill: color_rgb(37, 37, 38),
+        dock_tab_active_fill: color_rgb(30, 30, 30),
+        dock_tab_inactive_fill: color_rgb(45, 45, 48),
+        dock_tab_bar_border: color_rgb(60, 60, 60),
+        dock_active_tab_indicator: color_rgb(0, 122, 204),
+        dock_content_fill: color_rgb(30, 30, 30),
+        dock_splitter_fill: color_rgb(60, 60, 60),
+        dock_splitter_hover_fill: color_rgb(80, 80, 80),
+        dock_splitter_center_line: color_rgb(85, 85, 85),
+        dock_menu_item_hover_fill: color_rgb(60, 60, 64)
+    }
+}
+
+/// spacing and minimum sizes used by widget and dock layout.
+pub struct Spacing {
+    item_spacing: Vec2,
+    button_padding: Vec2,
+    indent: Float,
+    window_margin: Margin,
+    menu_margin: Margin,
+    interact_size: Vec2,
+    slider_width: Float,
+    text_edit_width: Float
+}
+
+/// the default spacing.
+pub fn spacing_default() -> Spacing {
+    return Spacing {
+        item_spacing: vec2(10.0, 6.0),
+        button_padding: vec2(10.0, 7.0),
+        indent: 18.0,
+        window_margin: margin_same(10.0),
+        menu_margin: margin_symmetric(8.0, 6.0),
+        interact_size: vec2(20.0, 24.0),
+        slider_width: 120.0,
+        text_edit_width: 80.0
+    }
+}
+
+/// a font identifier: point size plus family name ("Proportional" / "Monospace" / custom).
+pub struct FontId { size: Float, family: Str }
+
+/// a proportional font of the given size.
+pub fn font_proportional(size: Float) -> FontId { return FontId { size: size, family: "Proportional" } }
+/// a monospace font of the given size.
+pub fn font_monospace(size: Float) -> FontId { return FontId { size: size, family: "Monospace" } }
+/// the default font (proportional 13).
+pub fn font_default() -> FontId { return font_proportional(13.0) }
+
+// Text styles are identified by name. The five built-ins are "Small", "Body",
+// "Button", "Heading", "Monospace"; any other string is a custom style.
+// `custom_names[i]` maps to `custom_fonts[i]`.
+// This is a struct of parallel vectors rather than a Map<FontId>, so the font values can be read
+// by field access.
+
+/// the resolved FontId for each named text style.
+pub struct TextStyles {
+    small: FontId,
+    body: FontId,
+    button: FontId,
+    heading: FontId,
+    monospace: FontId,
+    custom_names: Vec<Str>,
+    custom_fonts: Vec<FontId>
+}
+
+/// the full theme: visuals, widget visuals, spacing, named text styles, and animation time.
+pub struct Theme {
+    visuals: Visuals,
+    widgets: Widgets,
+    spacing: Spacing,
+    text_styles: TextStyles,
+    animation_time: Float
+}
+
+/// the default text-style -> FontId set (Small/Body/Button/Heading/Monospace, no custom styles).
+pub fn default_text_styles() -> TextStyles {
+    var names: Vec<Str> = vec()
+    var fonts: Vec<FontId> = vec()
+    return TextStyles {
+        small: font_proportional(11.5),
+        body: font_proportional(13.0),
+        button: font_proportional(13.0),
+        heading: font_proportional(16.0),
+        monospace: font_monospace(12.0),
+        custom_names: names,
+        custom_fonts: fonts
+    }
+}
+
+impl TextStyles {
+    /// register or replace a custom named style.
+    fn put_style(inout self, name: Str, sink font: FontId) {
+        var i = 0
+        while i < self.custom_names.len() {
+            if (self.custom_names[i] == name) { self.custom_fonts[i] = font  return }
+            i = i + 1
+        }
+        self.custom_names.push(copy name)
+        self.custom_fonts.push(font)
+    }
+    /// resolve a style name to its FontId; Option::None if unknown.
+    fn get(self, name: Str) -> Option<FontId> {
+        if (name == "Small") { return Option::Some(copy self.small) }
+        if (name == "Body") { return Option::Some(copy self.body) }
+        if (name == "Button") { return Option::Some(copy self.button) }
+        if (name == "Heading") { return Option::Some(copy self.heading) }
+        if (name == "Monospace") { return Option::Some(copy self.monospace) }
+        var i = 0
+        while i < self.custom_names.len() {
+            if (self.custom_names[i] == name) { return Option::Some(copy self.custom_fonts[i]) }
+            i = i + 1
+        }
+        return Option::None
+    }
+}
+
+/// the default theme (delegates to the dark editor chrome, like Theme::default_dark).
+pub fn theme_default() -> Theme {
+    return Theme {
+        visuals: visuals_default(),
+        widgets: widgets_default(),
+        spacing: spacing_default(),
+        text_styles: default_text_styles(),
+        animation_time: 0.08
+    }
+}
+
+/// the dark editor chrome (deep blue-gray surfaces, bright blue active controls).
+pub fn theme_engine_dark() -> Theme {
+    var v = visuals_default()
+    v.panel_fill = color_rgb(26, 26, 31)
+    v.window_fill = color_rgb(11, 11, 17)
+    v.extreme_bg_color = color_rgb(33, 33, 39)
+    v.faint_bg_color = color_rgb(20, 20, 24)
+    v.override_text_color = some_color(color_rgb(230, 230, 240))
+    v.input_bg = color_rgb(36, 36, 42)
+    v.selection_bg = color_rgba(69, 101, 151, 90)
+    v.selection_stroke = stroke(1.0, color_rgb(43, 109, 163))
+    v.window_stroke = stroke(1.0, color_rgb(50, 50, 58))
+    v.window_corner_radius = corner_same(0.0)
+    v.menu_corner_radius = corner_same(4.0)
+    v.dock_menu_bar_fill = color_rgb(11, 11, 17)
+    v.dock_menu_bar_border = color_rgb(15, 15, 22)
+    v.dock_tab_bar_fill = color_rgb(28, 28, 35)
+    v.dock_tab_active_fill = color_rgb(45, 45, 58)
+    v.dock_tab_inactive_fill = color_rgb(28, 28, 35)
+    v.dock_tab_bar_border = color_rgb(15, 15, 22)
+    v.dock_active_tab_indicator = color_rgb(66, 150, 250)
+    v.dock_content_fill = color_rgb(26, 26, 31)
+    v.dock_splitter_fill = color_rgb(15, 15, 22)
+    v.dock_splitter_hover_fill = color_rgb(56, 56, 68)
+    v.dock_splitter_center_line = color_rgb(45, 45, 52)
+    v.dock_menu_item_hover_fill = color_rgb(56, 56, 68)
+
+    var ni = widget_visuals_default()
+    ni.bg_fill = color_rgb(36, 36, 42)
+    ni.fg_stroke = stroke(1.0, color_rgb(180, 180, 190))
+    ni.corner_radius = corner_same(4.0)
+    var ia = widget_visuals_default()
+    ia.bg_fill = color_rgb(46, 46, 56)
+    ia.bg_stroke = stroke(1.0, color_rgb(45, 45, 52))
+    ia.fg_stroke = stroke(1.0, color_rgb(200, 200, 210))
+    ia.corner_radius = corner_same(4.0)
+    var hv = widget_visuals_default()
+    hv.bg_fill = color_rgb(56, 56, 68)
+    hv.fg_stroke = stroke(1.0, color_rgb(220, 220, 230))
+    hv.corner_radius = corner_same(4.0)
+    var ac = widget_visuals_default()
+    ac.bg_fill = color_rgb(66, 150, 250)
+    ac.fg_stroke = stroke(1.0, color_rgb(255, 255, 255))
+    ac.corner_radius = corner_same(4.0)
+    var op = widget_visuals_default()
+    op.bg_fill = copy ac.bg_fill
+    op.fg_stroke = stroke_copy(ac.fg_stroke)
+    op.corner_radius = corner_same(4.0)
+    var w = Widgets { noninteractive: ni, inactive: ia, hovered: hv, active: ac, open: op }
+
+    var sp = spacing_default()
+    sp.item_spacing = vec2(8.0, 6.0)
+    sp.button_padding = vec2(8.0, 4.0)
+    sp.interact_size = vec2(20.0, 26.0)
+
+    return Theme { visuals: v, widgets: w, spacing: sp, text_styles: default_text_styles(), animation_time: 0.08 }
+}
+
+/// the default dark editor theme (alias of theme_engine_dark).
+pub fn theme_default_dark() -> Theme { return theme_engine_dark() }
+
+/// a VS Code-style light theme.
+pub fn theme_default_light() -> Theme {
+    var ni = widget_visuals_default()
+    ni.bg_fill = color_rgb(243, 243, 243)
+    var ia = widget_visuals_default()
+    ia.bg_fill = color_rgb(243, 243, 243)
+    ia.bg_stroke = stroke(1.0, color_rgb(220, 220, 220))
+    var hv = widget_visuals_default()
+    hv.bg_fill = color_rgb(230, 230, 230)
+    var ac = widget_visuals_default()
+    ac.bg_fill = color_rgb(0, 102, 204)
+    var w = Widgets { noninteractive: ni, inactive: ia, hovered: hv, active: ac, open: widget_visuals_default() }
+
+    var v = visuals_default()
+    v.dark_mode = false
+    v.panel_fill = color_rgb(250, 250, 250)
+    v.window_fill = color_rgb(255, 255, 255)
+    v.faint_bg_color = color_rgb(243, 243, 243)
+    v.override_text_color = some_color(color_rgb(51, 51, 51))
+    v.selection_bg = color_rgba(0, 102, 204, 51)
+    v.selection_stroke = stroke(1.0, color_rgb(0, 102, 204))
+    v.window_stroke = stroke(1.0, color_rgb(214, 214, 214))
+    v.input_bg = color_rgb(255, 255, 255)
+    v.dock_menu_bar_fill = color_rgb(240, 240, 240)
+    v.dock_menu_bar_border = color_rgb(214, 214, 214)
+    v.dock_tab_bar_fill = color_rgb(243, 243, 243)
+    v.dock_tab_active_fill = color_rgb(255, 255, 255)
+    v.dock_tab_inactive_fill = color_rgb(230, 230, 230)
+    v.dock_tab_bar_border = color_rgb(214, 214, 214)
+    v.dock_active_tab_indicator = color_rgb(0, 122, 204)
+    v.dock_content_fill = color_rgb(255, 255, 255)
+    v.dock_splitter_fill = color_rgb(214, 214, 214)
+    v.dock_splitter_hover_fill = color_rgb(180, 180, 180)
+    v.dock_splitter_center_line = color_rgb(180, 180, 180)
+    v.dock_menu_item_hover_fill = color_rgb(220, 220, 220)
+
+    var sp = spacing_default()
+    sp.button_padding = vec2(14.0, 7.0)
+    sp.interact_size = vec2(20.0, 28.0)
+
+    return Theme { visuals: v, widgets: w, spacing: sp, text_styles: default_text_styles(), animation_time: 0.08 }
+}
+
+impl Theme {
+    /// resolve a text-style name to its FontId; Option::None if the name is unknown.
+    fn resolve_text_style(self, style: Str) -> Option<FontId> {
+        return self.text_styles.get(style)
+    }
+
+    /// a copy with spacing and font sizes multiplied by `scale_factor` (clamped to >= 0.25).
+    fn scale(self, scale_factor: Float) -> Theme {
+        var f = math::fmax(scale_factor, 0.25)
+        var old = self.text_styles
+        var nnames: Vec<Str> = vec()
+        var nfonts: Vec<FontId> = vec()
+        var i = 0
+        while i < old.custom_names.len() {
+            nnames.push(copy old.custom_names[i])
+            nfonts.push(font_scale(old.custom_fonts[i], f))
+            i = i + 1
+        }
+        var ts = TextStyles {
+            small: font_scale(old.small, f),
+            body: font_scale(old.body, f),
+            button: font_scale(old.button, f),
+            heading: font_scale(old.heading, f),
+            monospace: font_scale(old.monospace, f),
+            custom_names: nnames,
+            custom_fonts: nfonts
+        }
+        var sp = self.spacing
+        var nsp = Spacing {
+            item_spacing: sp.item_spacing.mul(f),
+            button_padding: sp.button_padding.mul(f),
+            indent: sp.indent * f,
+            window_margin: margin_scale(sp.window_margin, f),
+            menu_margin: margin_scale(sp.menu_margin, f),
+            interact_size: sp.interact_size.mul(f),
+            slider_width: sp.slider_width * f,
+            text_edit_width: sp.text_edit_width * f
+        }
+        return Theme {
+            visuals: visuals_copy(self.visuals),
+            widgets: widgets_copy(self.widgets),
+            spacing: nsp,
+            text_styles: ts,
+            animation_time: self.animation_time
+        }
+    }
+}
+
+/// multiply every edge of a margin by `f` (internal helper).
+pub fn margin_scale(m: Margin, f: Float) -> Margin {
+    return Margin { left: m.left * f, right: m.right * f, top: m.top * f, bottom: m.bottom * f }
+}
+
+/// scale a FontId's size by `f` (clamped to >= 8), keeping its family (internal helper).
+pub fn font_scale(fid: FontId, f: Float) -> FontId {
+    return FontId { size: math::fmax(fid.size * f, 8.0), family: copy fid.family }
+}
+

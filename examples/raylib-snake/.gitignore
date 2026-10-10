@@ -1,0 +1,11 @@
+# vendored raylib (build it locally with ./build-raylib.sh)
+vendor/raylib.h
+vendor/libraylib.a
+vendor/libraylib.so*
+# build artifacts
+build/
+snake
+*.mlir
+*.ll
+*.cbind.*
+*.check.log

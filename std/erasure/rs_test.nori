@@ -1,0 +1,193 @@
+// .nori tests for Reed–Solomon erasure coding, run with
+//   noric --test std/erasure/rs_test.nori compiler/runtime.nori --import-root .
+//
+// The committed parity vectors come from an independent implementation (written from the
+// construction rather than from this code), so they prove the field arithmetic and the
+// generator matrix are standard rather than merely self-consistent.
+//
+// Cauchy is chosen over Vandermonde because every square submatrix of a Cauchy matrix is
+// invertible: any k survivors must give a solvable system, and when that does not hold the
+// failure is not a wrong answer. It is a set of shards that cannot be inverted at all, found when
+// something has already been lost and it is far too late to choose a different matrix.
+//
+// Which of these tests pins that, measured rather than assumed: swapping the generator
+// for a Vandermonde one was caught by the known-answer vectors alone. Every exhaustive recovery
+// test still passed, because at RS(4,3) and RS(6,3) a Vandermonde matrix happens to have no
+// singular submatrix either. So the vectors are what fix which matrix this is, the exhaustive
+// sweeps prove the recovery path handles every loss pattern, and the larger randomised sweep
+// below is the one that would notice a generator whose guarantee runs out with size.
+import "std/erasure/rs" as rs
+
+fn hexv(c: Byte) -> Int {
+    let o = ord(c)
+    if o >= 97 { return (o - 87) }
+    if o >= 65 { return (o - 55) }
+    return (o - 48)
+}
+fn unhex(h: Str) -> Str {
+    var out = ""
+    var i = 0
+    while (i + 1) < h.len() { out = (out + chr(((hexv(h.at(i)) << 4) | hexv(h.at(i + 1)))))  i = i + 2 }
+    return out
+}
+fn tohex(s: Str) -> Str {
+    let d = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < s.len() { let b = ord(s.at(i))  out = ((out + d.at((b >> 4))) + d.at((b & 15)))  i = i + 1 }
+    return out
+}
+
+fn sample4() -> Vec<Str> {
+    var d: Vec<Str> = vec()
+    d.push(unhex("a54dca182530bb1d6d132cded6237b2e"))
+    d.push(unhex("d91e3f721fcb1971174494d6493c9d5c"))
+    d.push(unhex("3460be31201e69fedaa0eee8b9997f5c"))
+    d.push(unhex("7c2999fdafe593253cd654af4dfad714"))
+    return d
+}
+
+fn test_parity_matches_an_independent_implementation() {
+    let p = rs::rs_encode(sample4(), 3)
+    assert_true(p.len() == 3)
+    assert_streq(tohex(p[0]), "779f42f02d2fcdc6a6c34730c1e7a3c5")
+    assert_streq(tohex(p[1]), "d262563af439ac903c144453b7ba8c49")
+    assert_streq(tohex(p[2]), "9e49a6568886a4c8b2ba1816fbfc96bb")
+}
+
+fn test_systematic_reads_need_no_arithmetic() {
+    // nothing missing: the data shards come back as themselves, untouched. This is what lets a
+    // reader that has the data ignore the coding entirely.
+    let d = sample4()
+    let p = rs::rs_encode(d, 3)
+    var all: Vec<Str> = vec()
+    var i = 0
+    while i < d.len() { all.push(copy d[i])  i = i + 1 }
+    var j = 0
+    while j < p.len() { all.push(copy p[j])  j = j + 1 }
+    let back = rs::rs_recover(all, 4)
+    assert_true(back.len() == 4)
+    var q = 0
+    while q < 4 { assert_streq(tohex(back[q]), tohex(d[q]))  q = q + 1 }
+}
+
+/// try every way of losing `lose` shards out of k+m and rebuild each time
+fn exhaustive(k: Int, m: Int, lose: Int) -> Int {
+    var d: Vec<Str> = vec()
+    var i = 0
+    while i < k {
+        var s = ""
+        var b = 0
+        while b < 24 { s = (s + chr((((i * 37) + (b * 11)) & 255)))  b = b + 1 }
+        d.push(s)
+        i = i + 1
+    }
+    let p = rs::rs_encode(d, m)
+    let n = (k + m)
+    var bad = 0
+    var mask = 0
+    while mask < (1 << n) {
+        var bits = 0
+        var t = 0
+        while t < n { if ((mask >> t) & 1) == 1 { bits = bits + 1 }  t = t + 1 }
+        if bits == lose {
+            var sh: Vec<Str> = vec()
+            var z = 0
+            while z < n {
+                var v = ""
+                if ((mask >> z) & 1) == 0 { if z < k { v = copy d[z] } else { v = copy p[(z - k)] } }
+                sh.push(v)
+                z = z + 1
+            }
+            let back = rs::rs_recover(sh, k)
+            if back.len() != k { bad = bad + 1 }
+            else {
+                var q = 0
+                while q < k { if back[q] != d[q] { bad = bad + 1 }  q = q + 1 }
+            }
+        }
+        mask = mask + 1
+    }
+    return bad
+}
+
+fn test_every_loss_pattern_rs_4_3() {
+    // 35 ways to lose three of seven, and all of them must rebuild
+    assert_true(exhaustive(4, 3, 3) == 0)
+}
+
+fn test_every_loss_pattern_rs_6_3() {
+    // 84 ways to lose three of nine
+    assert_true(exhaustive(6, 3, 3) == 0)
+}
+
+fn test_fewer_losses_are_fine_too() {
+    assert_true(exhaustive(4, 3, 1) == 0)
+    assert_true(exhaustive(4, 3, 2) == 0)
+}
+
+/// Bigger parameters, sampled rather than exhaustive: 2^26 masks is not a test. This is the size
+/// at which a generator without Cauchy's guarantee starts to have singular submatrices, so it is
+/// the sweep that would notice one.
+fn test_larger_parameters_recover() {
+    let k = 20
+    let m = 6
+    var d: Vec<Str> = vec()
+    var i = 0
+    while i < k {
+        var s = ""
+        var b = 0
+        while b < 16 { s = (s + chr((((i * 91) + (b * 7)) & 255)))  b = b + 1 }
+        d.push(s)
+        i = i + 1
+    }
+    let p = rs::rs_encode(d, m)
+    assert_true(p.len() == m)
+    let n = (k + m)
+    // walk a spread of loss patterns: every window of m consecutive shards, which covers losing
+    // only data, only parity, and every straddle of the boundary between them
+    var start = 0
+    while start < n {
+        var sh: Vec<Str> = vec()
+        var z = 0
+        while z < n {
+            var lost = false
+            var w = 0
+            while w < m { if z == ((start + w) % n) { lost = true }  w = w + 1 }
+            var v = ""
+            if !lost { if z < k { v = copy d[z] } else { v = copy p[(z - k)] } }
+            sh.push(v)
+            z = z + 1
+        }
+        let back = rs::rs_recover(sh, k)
+        assert_true(back.len() == k)
+        var q = 0
+        while q < k { assert_true(back[q] == d[q])  q = q + 1 }
+        start = start + 1
+    }
+}
+
+fn test_one_loss_too_many_refuses() {
+    // k+1 losses cannot be recovered, and must say so rather than return rubbish
+    let d = sample4()
+    let p = rs::rs_encode(d, 3)
+    var sh: Vec<Str> = vec()
+    var i = 0
+    while i < 4 { sh.push(copy d[i])  i = i + 1 }
+    var j = 0
+    while j < 3 { sh.push(copy p[j])  j = j + 1 }
+    sh[0] = ""
+    sh[1] = ""
+    sh[2] = ""
+    sh[3] = ""
+    assert_true(rs::rs_recover(sh, 4).len() == 0)
+}
+
+fn test_refuses_malformed_input() {
+    var uneven: Vec<Str> = vec()
+    uneven.push(unhex("0011223344"))
+    uneven.push(unhex("00112233"))
+    assert_true(rs::rs_encode(uneven, 2).len() == 0)     // shards must be equal length
+    var empty: Vec<Str> = vec()
+    assert_true(rs::rs_encode(empty, 2).len() == 0)
+}

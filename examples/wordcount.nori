@@ -1,0 +1,44 @@
+// Word frequencies: text handling and a Map.
+//
+//   wordcount FILE     prints each distinct word with its count, in alphabetical order
+//
+// Words are runs of letters and digits, lower-cased.
+import "std/sort" as sort
+
+fn is_word_byte(c: Int) -> Bool {
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)
+}
+
+fn lower(c: Int) -> Int {
+    if c >= 65 && c <= 90 { return c + 32 }
+    return c
+}
+
+fn main() -> Int {
+    if argc() != 1 {
+        printl("usage: wordcount FILE")
+        return 2
+    }
+    let text = read_file(arg(0))
+    var counts: Map<Str, Int> = map()
+    var word = ""
+    var i = 0
+    while i <= text.len() {
+        let c = if i < text.len() { ord(text.at(i)) } else { 32 }
+        if is_word_byte(c) {
+            word = word + chr(lower(c))
+        } else if word.len() > 0 {
+            counts.bump(word, 1)
+            word = ""
+        }
+        i = i + 1
+    }
+    var total = 0
+    foreach w in sort::sort_str(counts.keys()) {
+        let n = counts.get(w)
+        printl("${w} ${n}")
+        total = total + n
+    }
+    printl("words: ${total}, distinct: ${counts.keys().len()}")
+    return 0
+}

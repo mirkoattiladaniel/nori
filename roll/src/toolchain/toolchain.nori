@@ -1,0 +1,950 @@
+// roll: the toolchain store: many noric versions side by side, the registry that publishes them, the
+// launcher that routes a command into the version a project asks for, and `roll update`.
+//
+// One directory module of roll (see src/main.nori for the layout). It reaches the others through
+// their aliases below, and only what another module uses is `pub`. The modules import each other
+// freely (`cmds` and `deps` call in both directions); cycles between directory modules are fine.
+
+import "std/os" as os
+import "std/sys" as sys
+import "std/http" as http
+import "std/crypto" as crypto
+import "std/archive" as archive
+import "../git" as git
+import "../cmds" as cmds
+import "../deps" as deps
+import "../ext" as ext
+import "../manifest" as manifest
+import "../ui" as ui
+import "../util" as util
+
+use cmds::*
+use deps::*
+use ext::*
+use manifest::*
+use ui::*
+use util::*
+
+fn default_toolchain() -> Str {
+    if !os::path_exists(settings_path()) {
+        return ""
+    }
+    return section_get(read_file(settings_path()), "toolchain", "default")
+}
+fn set_default_toolchain(ver: Str) {
+    os::make_dir_p(nori_root())
+    var existing = ""
+    if os::path_exists(settings_path()) {
+        existing = read_file(settings_path())
+    }
+    write_file(settings_path(), toml_set(existing, "toolchain", "default", ver)) // preserves [registry] etc.
+}
+// store mode = a configured store exists (env pin, settings default, or a locked toolchain). Otherwise
+// dev mode: roll uses $NORI_HOME directly.
+fn store_mode() -> Bool {
+    if !(os::env("NORI_TOOLCHAIN") == "") {
+        return true
+    }
+    if os::path_exists(settings_path()) {
+        return true
+    }
+    if os::path_exists("nori.lock") {
+        if !(section_get(read_file("nori.lock"), "toolchain", "version") == "") {
+            return true
+        }
+    }
+    return false
+}
+// the toolchain version/constraint this project wants: env > manifest `nori` > lock > default; "" in dev.
+fn resolve_want() -> Str {
+    if !store_mode() {
+        return ""
+    }
+    let e = os::env("NORI_TOOLCHAIN")
+    if !(e == "") && !(e == "auto") && !(e == "local") {
+        return e
+    }
+    if os::path_exists("nori.manifest") {
+        let req = section_get(read_file("nori.manifest"), "", "nori")
+        if !(req == "") {
+            return req
+        }
+    }
+    if os::path_exists("nori.lock") {
+        let v = section_get(read_file("nori.lock"), "toolchain", "version")
+        if !(v == "") {
+            return v
+        }
+    }
+    return default_toolchain()
+}
+// installed versions (store sub-dir names with the "-<target>" suffix stripped).
+fn installed_toolchains() -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let sd = store_dir()
+    if !os::path_exists(sd) {
+        return out
+    }
+    let files = os::list_tree(sd)
+    let suf = ("-" + sys::target())
+    var i = 0
+    while i < files.len() {
+        let rel = files[i].slice(sd.len(), files[i].len()) // "/0.12.0-x86_64-linux/noric"
+        var start = 0
+        if rel.len() > 0 && ord(rel.at(0)) == 47 {
+            start = 1
+        }
+        let rest = rel.slice(start, rel.len())
+        let slash = index_of(rest, 47)
+        var seg = rest
+        if slash >= 0 {
+            seg = rest.slice(0, slash)
+        }
+        var ver = seg
+        if ends_with(seg, suf) {
+            ver = seg.slice(0, seg.len() - suf.len())
+        }
+        if !(ver == "") && !vec_has(out, ver) {
+            out.push(copy ver)
+        }
+        i = i + 1
+    }
+    return out
+}
+// the installed version satisfying `want` (exact match first, else highest caret-compatible), or "".
+fn match_installed(want: Str) -> Str {
+    let inst = installed_toolchains()
+    var i = 0
+    while i < inst.len() {
+        if(inst[i] == want) {
+            return copy inst[i]
+        }
+        i = i + 1
+    }
+    var best = ""
+    var bestn = 0
+    i = 0
+    while i < inst.len() {
+        if tag_sat(inst[i], want) {
+            let n = ver_num(inst[i])
+            if(best == "") || n > bestn {
+                best = inst[i]
+                bestn = n
+            }
+        }
+        i = i + 1
+    }
+    return copy best
+}
+pub fn needs_toolchain(cmd: Str) -> Bool {
+    return(cmd == "build") || (cmd == "db") || (cmd == "check") || (cmd == "run") || (cmd == "xray") || (cmd == "todo") || (cmd == "fixme") || (cmd == "unsafe") || (cmd == "caps") || (cmd == "test") || (cmd == "doc") || (cmd == "shadow") || (cmd == "bench") || (cmd == "lsp") || (cmd == "lsp-flags")
+}
+
+
+// ---- the registry: nori versions + binaries by convention (no index file) ----
+// A single base hosts the repos `nori` (compiler), `nori-std` (std), `nori-roll` (roll). Published
+// versions are the git tags of the `nori` repo; a release uploads `noric-<ver>-<target>.tar.gz` plus a
+// sibling `.sha256`. Override the base in settings.toml `[registry] base = ...`.
+fn registry_base() -> Str {
+    if os::path_exists(settings_path()) {
+        let b = section_get(read_file(settings_path()), "registry", "base")
+        if !(b == "") {
+            return b
+        }
+    }
+    return "https://github.com/mirkoattiladaniel"
+}
+fn repo_url(name: Str) -> Str {
+    return(registry_base() + ("/" + name))
+}
+// strip a leading 'v' from a tag for use as a bare version ("v1.2.0" -> "1.2.0").
+fn ver_of_tag(t: Str) -> Str {
+    if t.len() > 0 {
+        if ord(t.at(0)) == 118 {
+            return t.slice(1, t.len())
+        }
+    }
+    return copy t
+}
+// published versions = the `nori` repo's git tags (bare).
+fn published_versions() -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let tags = git::tags(repo_url("nori"))
+    var i = 0
+    while i < tags.len() {
+        let v = ver_of_tag(tags[i])
+        if !(v == "") {
+            out.push(v)
+        }
+        i = i + 1
+    }
+    return out
+}
+// the newest version, read from the `stable.txt` file each release carries: plain HTTPS, no git needed.
+fn stable_from_release() -> Str {
+    os::make_dir_p((nori_root() + "/dl"))
+    let dest = (nori_root() + "/dl/stable.txt")
+    if http::http_get((repo_url("nori") + "/releases/latest/download/stable.txt"), dest) != 0 {
+        return ""
+    }
+    let raw = read_file(dest)
+    var out = ""
+    var i = 0
+    while i < raw.len() {
+        let c = ord(raw.at(i))
+        if(c >= 48 && c <= 57) || (c == 46) {
+            out = (out + raw.slice(i, i + 1))
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    return copy out
+}
+// true for a plain `x.y.z` version: digits and exactly two dots.
+fn is_plain_version(s: Str) -> Bool {
+    if s.len() == 0 {
+        return false
+    }
+    var dots = 0
+    var i = 0
+    while i < s.len() {
+        let c = ord(s.at(i))
+        if c == 46 {
+            dots = dots + 1
+        } else {
+            if c < 48 || c > 57 {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return dots == 2
+}
+// resolve `want` (channel `stable`/`latest`, an exact version, or a `^x.y.z` caret) to a published version.
+// When the tag list is unavailable (no git access), `stable` falls back to the release's stable.txt and an exact
+// version is taken as given: the download that follows fails clearly if it does not exist.
+fn resolve_version(want: Str) -> Str {
+    let vers = published_versions()
+    if(want == "stable") || (want == "latest") {
+        var best = ""
+        var bestn = 0 - 1
+        var i = 0
+        while i < vers.len() {
+            let n = ver_num(vers[i])
+            if n > bestn {
+                best = vers[i]
+                bestn = n
+            }
+            i = i + 1
+        }
+        if(best == "") {
+            return stable_from_release()
+        }
+        return copy best
+    }
+    var j = 0
+    while j < vers.len() {
+        if(vers[j] == want) {
+            return copy vers[j]
+        }
+        j = j + 1
+    }
+    // exact
+    if vers.len() == 0 {
+        if is_plain_version(want) {
+            return copy want
+        }
+    }
+    return best_tag(vers, want) // highest satisfying a caret
+}
+// the release asset name + URL for `ver` on this target, and the sibling checksum URL.
+fn asset_name(ver: Str) -> Str {
+    return("noric-" + (ver + ("-" + (sys::target() + ".tar.gz"))))
+}
+fn release_url(ver: Str) -> Str {
+    return(repo_url("nori") + ("/releases/download/v" + (ver + ("/" + asset_name(ver)))))
+}
+// pin the resolved toolchain in the project's nori.lock (if not already pinned), for reproducible builds.
+fn lock_pin_toolchain(ver: Str, sha: Str) {
+    var lk = ""
+    if os::path_exists("nori.lock") {
+        lk = read_file("nori.lock")
+    }
+    if find_substr(lk, "[toolchain]") >= 0 {
+        return
+    }
+    let block = ("[toolchain]\nversion = " + (ver + ("\ntarget = " + (sys::target() + ("\nsha256 = " + (sha + "\n"))))))
+    if(lk == "") {
+        write_file("nori.lock", block)
+    } else {
+        write_file("nori.lock", (lk + ("\n" + block)))
+    }
+}
+// download + verify + unpack the toolchain satisfying `want` from the index into the store. 0 = ok.
+fn net_install(want: Str, write_lock: Bool) -> Int {
+    let ver = resolve_version(want)
+    if(ver == "") {
+        printl(("roll: no published version satisfies " + (want + ("  (tags: " + (repo_url("nori") + ")")))))
+        return 1
+    }
+    let url = release_url(ver)
+    os::make_dir_p((nori_root() + "/dl"))
+    let tarball = (nori_root() + ("/dl/" + asset_name(ver)))
+    printl(("  downloading noric " + (ver + ("  (" + (url + ")")))))
+    if http::http_get(url, tarball) != 0 {
+        printl(("roll: download failed (" + (url + ")")))
+        return 1
+    }
+    // verify against the sibling .sha256 (best effort: if it isn't published, warn and proceed)
+    var sha = ""
+    let shafile = (tarball + ".sha256")
+    if http::http_get((url + ".sha256"), shafile) == 0 {
+        sha = first_token(read_file(shafile))
+        if !(sha == "") {
+            let got = crypto::sha256_file(tarball)
+            if !(got == sha) {
+                printl(("roll: checksum mismatch for noric " + ver))
+                printl(("  expected " + sha))
+                printl(("  got      " + got))
+                os::remove_tree(tarball)
+                return 1
+            }
+            printl("  checksum ok")
+        }
+    } else { printl("  (no .sha256 published — skipping checksum)") }
+    let dest = tc_dir(ver)
+    os::remove_tree(dest)
+    let tmp = (store_dir() + ("/.unpack-" + ver))
+    os::remove_tree(tmp)
+    os::make_dir_p(tmp)
+    if archive::unpack(tarball, tmp) != 0 {
+        printl("roll: unpack failed")
+        os::remove_tree(tmp)
+        return 1
+    }
+    os::make_dir_p(store_dir())
+    os::move_path(tmp, dest)
+    write_file((dest + "/toolchain.toml"), ("version = " + (ver + ("\ntarget = " + (sys::target() + ("\nmode = binary\nsha256 = " + (sha + "\n")))))))
+    set_default_toolchain(ver) // `install` selects the version it installed
+    if write_lock {
+        lock_pin_toolchain(ver, sha)
+    }
+    printl(("installed toolchain " + (ver + ("  (" + (sys::target() + ")")))))
+    return 0
+}
+
+// ---- the interactive mismatch prompt: never auto-download; always ask, exit available ----
+fn tc_download(want: Str) -> Int {
+    if net_install(want, true) != 0 {
+        return 1
+    }
+    let inst = match_installed(want)
+    if(inst == "") {
+        return 1
+    }
+    printl(("  continuing the build with noric " + inst))
+    return reexec_into(inst)
+}
+fn prompt_toolchain(want: Str) -> Int {
+    printl(("roll: this project requires noric " + (want + ", which is not installed.")))
+    printl("  [1] download it")
+    printl("  [2] exit")
+    printl("  choose [1/2]: ")
+    let c = os::read_line()
+    if(c == "1") {
+        return tc_download(want)
+    }
+    printl("  exiting; install a toolchain with `roll toolchain install` and try again.")
+    return 1
+}
+
+// the launcher: for a build-like command, route to the toolchain the project requires by re-execing
+// that toolchain's roll (with NORI_TOOLCHAIN + NORI_HOME set, so the child uses it for everything).
+// Returns the sentinel -999 to mean "run locally" (dev mode, or we are the active toolchain already).
+pub fn route_to_toolchain(cmd: Str) -> Int {
+    if !store_mode() {
+        return 0 - 999
+    }
+    let want = resolve_want()
+    if(want == "") {
+        return 0 - 999
+    }
+    let inst = match_installed(want)
+    // NORI_ACTIVE is set only by the re-exec below, so it means "we are this toolchain's roll" (unlike
+    // NORI_TOOLCHAIN, a user request that may name an uninstalled version).
+    if !(inst == "") && (os::env("NORI_ACTIVE") == inst) {
+        return 0 - 999
+    }
+    if(inst == "") {
+        // mismatch
+        if(policy() == "local") {
+            printl(("roll: noric " + (want + " is not installed, and policy=local (offline).")))
+            printl(("  install it:  roll toolchain install " + want))
+            return 1
+        }
+        return prompt_toolchain(want) // auto: ask the user
+    }
+    return reexec_into(inst)
+}
+// re-exec the current command into toolchain `inst`'s roll, with NORI_ACTIVE (the loop guard) + NORI_HOME
+// pointed at it. Returns the child's exit code.
+fn reexec_into(inst: Str) -> Int {
+    let rbin = (tc_dir(inst) + "/bin/roll")
+    if !os::path_exists(rbin) {
+        printl(("roll: toolchain " + (inst + " has no roll binary")))
+        return 1
+    }
+    os::set_env("NORI_ACTIVE", inst)
+    os::set_env("NORI_HOME", tc_dir(inst))
+    var argv: Vec<Str> = vec()
+    argv.push(rbin)
+    var k = 0
+    while k < argc() {
+        argv.push(arg(k))
+        k = k + 1
+    }
+    let rc = os::run(argv)
+    if rc == 0 - 1 {
+        printl("roll: failed to launch the toolchain")
+        return 1
+    }
+    return rc
+}
+
+// network policy: `auto` (may fetch a missing toolchain) | `local` (never touch the network). From
+// NORI_TOOLCHAIN=auto|local, else settings.toml `[toolchain] policy`, else `auto`.
+fn policy() -> Str {
+    let e = os::env("NORI_TOOLCHAIN")
+    if(e == "local") {
+        return "local"
+    }
+    if(e == "auto") {
+        return "auto"
+    }
+    if os::path_exists(settings_path()) {
+        let p = section_get(read_file(settings_path()), "toolchain", "policy")
+        if !(p == "") {
+            return p
+        }
+    }
+    return "auto"
+}
+
+// ---- `roll update <nori|deps|tools|all>`: bump the compiler / re-resolve deps / rebuild extensions ----
+pub fn cmd_update() -> Int {
+    var target = ""
+    if argc() >= 2 {
+        if !starts_with(arg(1), "--") {
+            target = arg(1)
+        }
+    }
+    if(target == "") {
+        printl("usage: roll update <nori | deps | tools | all>")
+        printl("  nori          bump the compiler/toolchain to the newest published version (same install mode)")
+        printl("  deps [NAME..] re-resolve deps to the newest allowed (all, or just the named ones), refresh nori.lock")
+        printl("  tools         rebuild the roll-* extensions with the active noric")
+        printl("  all     all of the above")
+        return 1
+    }
+    if(target == "nori") {
+        return update_nori()
+    }
+    if(target == "deps") {
+        return update_deps()
+    }
+    if(target == "tools") {
+        return update_extensions()
+    }
+    if(target == "all") {
+        var rc = update_nori()
+        if update_deps() != 0 {
+            rc = 1
+        }
+        if update_extensions() != 0 {
+            rc = 1
+        }
+        return rc
+    }
+    printl(("roll update: unknown target `" + (target + "` — use  nori | deps | tools | all")))
+    return 1
+}
+// the identifier a tombstone key names at a call site: `Box::size` is written `x.size(…)`, so the
+// text to look for is the part after `::`.
+fn tomb_ident(key: Str) -> Str {
+    var i = 0
+    while i + 1 < key.len() {
+        if ord(key.at(i)) == 58 {
+            if ord(key.at(i + 1)) == 58 {
+                return key.slice(i + 2, key.len())
+            }
+        }
+        i = i + 1
+    }
+    return copy key
+}
+// every "path:line" in `files` where `w` appears as a whole word
+fn uses_of(files: Vec<Str>, w: Str) -> Vec<Str> {
+    var hits: Vec<Str> = vec()
+    var fi = 0
+    while fi < files.len() {
+        let f = files[fi]
+        if ends_with(f, ".nori") {
+            let src = read_file(f)
+            var ln = 1
+            var start = 0
+            var i = 0
+            let n = src.len()
+            while i <= n {
+                if i == n || ord(src.at(i)) == 10 {
+                    let line = src.slice(start, i)
+                    var c = 0
+                    while c + w.len() <= line.len() {
+                        if(line.slice(c, c + w.len()) == w) {
+                            if word_at(line, c, w) {
+                                hits.push((f + (":" + to_str(ln))))
+                                c = line.len()
+                            }
+                        }
+                        c = c + 1
+                    }
+                    ln = ln + 1
+                    start = i + 1
+                }
+                i = i + 1
+            }
+        }
+        fi = fi + 1
+    }
+    return hits
+}
+// Report every [removed] entry of the newly-resolved deps that this project still uses.
+// Returns the number of affected call sites (0 = nothing to say).
+fn preflight_removed(mf: Str, dirs: Map<Str, Str>, names: Vec<Str>) -> Int {
+    var scan = dirname(section_get(mf, "", "entry"))
+    if(scan == "") {
+        scan = "."
+    }
+    if !os::path_exists(scan) {
+        return 0
+    }
+    let files = os::list_tree(scan)
+    var report: Vec<Str> = vec() // collected first, so the count can lead the report
+    var total = 0
+    var ni = 0
+    while ni < names.len() {
+        let dep = names[ni]
+        if dirs.has(dep) {
+            let dmf = (dirs.get(dep) + "/nori.manifest")
+            if os::path_exists(dmf) {
+                let dm = read_file(dmf)
+                let keys = section_keys(dm, "removed")
+                var ki = 0
+                while ki < keys.len() {
+                    let hits = uses_of(files, tomb_ident(keys[ki]))
+                    if hits.len() > 0 {
+                        var msg = section_get(dm, "removed", keys[ki])
+                        if msg.len() >= 2 {
+                            if ord(msg.at(0)) == 34 {
+                                if ord(msg.at(msg.len() - 1)) == 34 {
+                                    msg = msg.slice(1, msg.len() - 1)
+                                }
+                            }
+                        }
+                        report.push(("  " + (col("1;33", "▲ ") + (dep + (" removed `" + (keys[ki] + ("` — " + msg)))))))
+                        var hi = 0
+                        while hi < hits.len() {
+                            report.push(("      " + dim(hits[hi])))
+                            hi = hi + 1
+                        }
+                        total = total + hits.len()
+                    }
+                    ki = ki + 1
+                }
+            }
+        }
+        ni = ni + 1
+    }
+    if total > 0 {
+        var what = " call sites use a name these versions removed"
+        if total == 1 {
+            what = " call site uses a name these versions removed"
+        }
+        eprintl((verb("Warning", "1;33") + (" " + (to_str(total) + (what + dim(" — migrate before building"))))))
+        var li = 0
+        while li < report.len() {
+            eprintl(report[li])
+            li = li + 1
+        }
+    }
+    return total
+}
+// `roll update deps [<name>...]`: re-resolve to the newest version each constraint allows, refreshing
+// nori.lock. With no names, all deps update (resolve with no locks). With names, only those re-resolve:
+// they're dropped from the existing lock while every other dep stays pinned at its locked commit.
+fn update_deps() -> Int {
+    if !os::path_exists("nori.manifest") {
+        printl("roll: no nori.manifest here — run `roll init` first")
+        return 1
+    }
+    var only: Vec<Str> = vec()
+    var k = 2
+    while k < argc() {
+        if !starts_with(arg(k), "--") {
+            only.push(arg(k))
+        }
+        k = k + 1
+    }
+    // the dep names after `deps`
+    let mf = read_file("nori.manifest")
+    var locks = load_lock()
+    if only.len() == 0 {
+        locks = map()
+    }
+    // update everything: forget all pins
+    else {
+        var i = 0
+        while i < only.len() {
+            locks.delete(only[i])
+            i = i + 1
+        }
+    }
+    // unpin just the named deps
+    var lk: Vec<Str> = vec()
+    lk.push("# nori.lock — exact commits roll resolved for git dependencies. Commit this for\n# reproducible builds; delete a line to re-resolve that dependency.\n")
+    var dirs: Map<Str, Str> = map()
+    var names: Vec<Str> = vec()
+    resolve_graph(mf, locks, lk, dirs, names, false)
+    // Before the lock is written: the new versions are on disk, so their tombstones can be read now
+    // rather than discovered one call site at a time on the next build.
+    preflight_removed(mf, dirs, names)
+    if find_substr(lk[0], " commit=") >= 0 {
+        write_file("nori.lock", lk[0])
+        if only.len() == 0 {
+            printl((verb("Updated", "1;32") + " all dependencies in nori.lock"))
+        }
+        else {
+            printl((verb("Updated", "1;32") + (" " + (join_strs(only, ", ") + " in nori.lock"))))
+        }
+    } else { printl("no git dependencies to update") }
+    return 0
+}
+// rebuild every source-shipped extension ($NORI_HOME/tools/*.nori -> $NORI_HOME/roll-<name>) with the
+// active noric, so extensions stay in sync after a toolchain change (they are otherwise built lazily,
+// once, by dispatch_external).
+fn update_extensions() -> Int {
+    let dir = (nori_home() + "/tools")
+    if !os::path_exists(dir) {
+        printl("no extensions to update")
+        return 0
+    }
+    let files = os::list_tree(dir)
+    var n = 0
+    var i = 0
+    while i < files.len() {
+        let name = tool_name_of(files[i], dir)
+        if !(name == "") {
+            printl(("  rebuilding roll-" + name))
+            if !(build_tool(name) == "") {
+                n = n + 1
+            } else {
+                printl(("  FAILED: roll-" + name))
+            }
+        }
+        i = i + 1
+    }
+    printl(("updated " + (to_str(n) + " extension(s)")))
+    return 0
+}
+// `roll update nori`: bump to the newest published version, using the same install mode (binary/source)
+// as the current toolchain (recorded in its toolchain.toml). No-op when already current. Respects `local`
+// policy (refuses to touch the network).
+fn update_nori() -> Int {
+    if(policy() == "local") {
+        printl("roll: policy=local — refusing to fetch. Use `roll install` explicitly, or set policy=auto.")
+        return 1
+    }
+    let latest = resolve_version("stable")
+    if(latest == "") {
+        printl("roll: could not determine the latest version")
+        return 1
+    }
+    let cur = default_toolchain()
+    if(latest == cur) {
+        printl(("nori is up to date (" + (cur + ")")))
+        return 0
+    }
+    if(cur == "") {
+        printl(("installing nori " + latest))
+    } else {
+        printl(("updating nori " + (cur + (" -> " + latest))))
+    }
+    return net_install(latest, false)
+}
+// `roll install <ver|stable|latest>`: download a toolchain, verify it, and select it.
+pub fn cmd_install() -> Int {
+    var ver = ""
+    var k = 1
+    while k < argc() {
+        if !starts_with(arg(k), "--") {
+            ver = arg(k)
+        }
+        k = k + 1
+    }
+    if(ver == "") {
+        ver = "stable"
+    }
+    return net_install(ver, false)
+}
+// `roll use <ver>`: switch the active (default) toolchain to an already-installed version.
+pub fn cmd_use() -> Int {
+    if argc() < 2 {
+        printl("usage: roll use <version>")
+        return 1
+    }
+    let want = arg(1)
+    let inst = match_installed(want)
+    if(inst == "") {
+        printl(("roll: no installed toolchain matches " + (want + " — install it with `roll install " + (want + "`"))))
+        let have = installed_toolchains()
+        if have.len() > 0 {
+            printl(("  installed: " + join_strs(have, ", ")))
+        }
+        return 1
+    }
+    set_default_toolchain(inst)
+    printl(("now using nori " + inst))
+    return 0
+}
+
+// ---- `roll toolchain` subcommands (run in this roll; never routed) ----
+pub fn toolchain_cmd() -> Int {
+    var sub = ""
+    if argc() >= 2 {
+        sub = arg(1)
+    }
+    if(sub == "list") {
+        return tc_list()
+    }
+    if(sub == "install") {
+        return tc_install()
+    }
+    if(sub == "default") {
+        return tc_set_default_cmd()
+    }
+    if(sub == "remove") {
+        return tc_remove()
+    }
+    if(sub == "which") {
+        return tc_which()
+    }
+    printl("usage: roll toolchain <list | install <ver> --from <dir> | default <ver> | remove <ver> | which>")
+    return 1
+}
+fn tc_list() -> Int {
+    let inst = installed_toolchains()
+    if inst.len() == 0 {
+        printl("no toolchains installed")
+        return 0
+    }
+    let def = default_toolchain()
+    printl(("installed toolchains (" + (sys::target() + "):")))
+    var i = 0
+    while i < inst.len() {
+        var mark = "  "
+        if(inst[i] == def) {
+            mark = "* "
+        }
+        // * = default
+        printl((mark + inst[i]))
+        i = i + 1
+    }
+    return 0
+}
+// `roll toolchain install <ver> --build [--src <repo>]`: compile a complete toolchain (noric + roll +
+// runtime + std + tools) from source with the current noric, and install it into the store.
+fn tc_build_install(ver: Str, src: Str) -> Int {
+    var root = src
+    if(root == "") {
+        root = nori_home()
+    }
+    // default: the active NORI_HOME (a repo checkout in dev)
+    let entry = (root + "/compiler/src/noric.nori")
+    if !os::path_exists(entry) {
+        printl(("roll: no compiler source at " + entry))
+        printl("  pass the repo root explicitly:  roll toolchain install <ver> --build --src <repo>")
+        return 1
+    }
+    let nc = noric_path()
+    if !os::path_exists(nc) {
+        printl(("roll: need a previous noric to build with (none at " + (nc + ")")))
+        return 1
+    }
+    let dest = tc_dir(ver)
+    let bdir = (nori_root() + ("/.build-" + ver)) // scratch: keep .mlir/.ll artifacts out of the toolchain
+    printl(("building toolchain " + (ver + ("  from " + root))))
+    os::remove_tree(dest) os::remove_tree(bdir)
+    os::make_dir_p((dest + "/compiler")) os::make_dir_p((dest + "/bin")) os::make_dir_p(bdir)
+
+    // 1. noric: built with the current noric from the given source
+    printl("  building noric ...")
+    var c1: Vec<Str> = vec()
+    c1.push(copy nc) c1.push("--build") c1.push(entry) c1.push((bdir + "/noric"))
+    c1.push("--import-root") c1.push(copy root) c1.push("--quiet")
+    if os::run(c1) != 0 {
+        printl("roll: building noric failed")
+        os::remove_tree(dest)
+        os::remove_tree(bdir)
+        return 1
+    }
+
+    // 2. roll: through the native back end, like any project; paths resolved under `root`
+    printl("  building roll ...")
+    var c2: Vec<Str> = vec()
+    c2.push(copy nc) c2.push("--build") c2.push((root + "/roll/src/main.nori")) c2.push((bdir + "/roll"))
+    c2.push((root + "/compiler/runtime.nori")) c2.push("--import-root") c2.push(copy root) c2.push("--quiet")
+    if os::run(c2) != 0 {
+        printl("roll: building roll failed")
+        os::remove_tree(dest)
+        os::remove_tree(bdir)
+        return 1
+    }
+
+    // 3. assemble the toolchain layout: binaries (copied as is) + runtime + std + tools
+    write_file((dest + "/noric"), read_file((bdir + "/noric")))
+    write_file((dest + "/bin/roll"), read_file((bdir + "/roll")))
+    write_file((dest + "/compiler/runtime.nori"), read_file((root + "/compiler/runtime.nori")))
+    write_file((dest + "/compiler/rt_shim.c"), read_file((root + "/compiler/rt_shim.c")))
+    // …and the libc-free floors beside it. The default back end links no libc: it takes _start, the
+    // heap and the syscalls from these, so a toolchain shipped without them compiles nothing at all.
+    // (nolibc_host = a program that reaches a shared library; _bare = --freestanding; _win = Windows.)
+    var fl = 0
+    let floors = ["nolibc.nori", "nolibc_host.nori", "nolibc_bare.nori", "nolibc_win.nori"]
+    while fl < floors.len() {
+        let fsrc = (root + ("/compiler/" + floors[fl]))
+        if os::path_exists(fsrc) { write_file((dest + ("/compiler/" + floors[fl])), read_file(fsrc)) }
+        fl = fl + 1
+    }
+    vendor_copy((root + "/std"), (dest + "/std"))
+    if os::path_exists((root + "/tools")) {
+        vendor_copy((root + "/tools"), (dest + "/tools"))
+    }
+    os::make_exec((dest + "/noric")) os::make_exec((dest + "/bin/roll"))
+    os::remove_tree(bdir)
+    write_file((dest + "/toolchain.toml"), ("version = " + (ver + ("\ntarget = " + (sys::target() + "\n")))))
+    if(default_toolchain() == "") {
+        set_default_toolchain(ver)
+    }
+    printl(("installed toolchain " + (ver + ("  (" + (sys::target() + ", built from source)")))))
+    return 0
+}
+fn tc_install() -> Int {
+    var ver = ""
+    var from = ""
+    var src = ""
+    var dobuild = false
+    var k = 2
+    while k < argc() {
+        if(arg(k) == "--from") {
+            k = k + 1
+            if k < argc() {
+                from = arg(k)
+            }
+        }
+        else if(arg(k) == "--src") {
+            k = k + 1
+            if k < argc() {
+                src = arg(k)
+            }
+        }
+        else if(arg(k) == "--build") {
+            dobuild = true
+        }
+        else {
+            ver = arg(k)
+        }
+        k = k + 1
+    }
+    if(ver == "") {
+        printl("usage: roll toolchain install <ver|stable|latest> [--from <dir> | --build [--src <repo>]]")
+        return 1
+    }
+    if dobuild {
+        return tc_build_install(ver, src)
+    }
+    // --build: compile the toolchain from source
+    if(from == "") {
+        return net_install(ver, false)
+    }
+    // no --from: fetch a published binary from the index
+    if !os::path_exists(from) {
+        printl(("roll: source not found: " + from))
+        return 1
+    }
+    let dest = tc_dir(ver)
+    os::remove_tree(dest)
+    os::make_dir_p(dest)
+    vendor_copy(from, dest) // recursive copy, byte for byte
+    os::make_exec((dest + "/noric")) // copies drop the exec bit, so restore it
+    let bindir = (dest + "/bin")
+    if os::path_exists(bindir) {
+        let bins = os::list_tree(bindir)
+        var i = 0
+        while i < bins.len() {
+            os::make_exec(bins[i])
+            i = i + 1
+        }
+    }
+    write_file((dest + "/toolchain.toml"), ("version = " + (ver + ("\ntarget = " + (sys::target() + "\n")))))
+    printl(("installed toolchain " + (ver + ("  (" + (sys::target() + ")")))))
+    if(default_toolchain() == "") {
+        set_default_toolchain(ver)
+        printl(("set as default: " + ver))
+    }
+    return 0
+}
+fn tc_set_default_cmd() -> Int {
+    if argc() < 3 {
+        printl("usage: roll toolchain default <ver>")
+        return 1
+    }
+    let ver = arg(2)
+    if(match_installed(ver) == "") {
+        printl(("roll: toolchain " + (ver + " is not installed")))
+        return 1
+    }
+    set_default_toolchain(ver)
+    printl(("default toolchain set to " + ver))
+    return 0
+}
+fn tc_remove() -> Int {
+    if argc() < 3 {
+        printl("usage: roll toolchain remove <ver>")
+        return 1
+    }
+    let ver = arg(2)
+    let d = tc_dir(ver)
+    if !os::path_exists(d) {
+        printl(("roll: toolchain " + (ver + " is not installed")))
+        return 1
+    }
+    os::remove_tree(d)
+    printl(("removed toolchain " + ver))
+    return 0
+}
+fn tc_which() -> Int {
+    if !store_mode() {
+        printl(("dev mode — using $NORI_HOME (" + (nori_home() + "); no toolchain store active")))
+        return 0
+    }
+    let want = resolve_want()
+    printl(("requested: " + want))
+    let inst = match_installed(want)
+    if(inst == "") {
+        printl("active:    (none installed — a build will prompt to install)")
+    }
+    else {
+        printl(("active:    " + (inst + ("   " + tc_dir(inst)))))
+    }
+    return 0
+}

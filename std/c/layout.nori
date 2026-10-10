@@ -1,0 +1,113 @@
+// Record layout under the x86-64 System V ABI as GCC and clang implement it.
+//
+// Offsets are tracked in bits. An ordinary member is placed at the next multiple of its alignment.
+// A bitfield of declared type T stays at the current bit if it fits in the T-sized unit that bit
+// falls in (units start at multiples of T's alignment), and otherwise starts at the next unit. A
+// zero-width bitfield moves to the next unit of its type; neither it nor any unnamed bitfield raises
+// the record's alignment. `packed` makes every member's alignment 1 (bitfields then run on without
+// unit boundaries) unless the member asks for more with `aligned`; `#pragma pack(N)` caps member
+// alignment at N.
+//
+// For the Windows target bitfields follow the layout mingw-w64 GCC uses by default: a bitfield joins
+// the open unit only when its declared type has the unit's size and its bits still fit; otherwise the
+// unit is closed at its full size and the bitfield opens a new one at its type's alignment. Any
+// ordinary member closes the unit too, a zero-width bitfield does nothing but close it, and every
+// bitfield that opens a unit, unnamed ones included, raises the record's alignment.
+
+fn cly_align_up(v: Int, a: Int) -> Int {
+    if a <= 1 { return v }
+    return ((v + a - 1) / a) * a
+}
+
+fn cly_layout(inout s: St, r: Int, names: Vec<Str>, tys: Vec<Int>, widths: Vec<Int>, aligns: Vec<Int>, packs: Vec<Bool>, packed: Bool, ralign: Int, pack: Int) {
+    var fields: Vec<Field> = vec()
+    let is_union = s.unit.records[r].is_union
+    var off = 0
+    var size_bits = 0
+    var max_align = 1
+    // the open bitfield unit of the Windows layout: its declared type's size in bytes (0 when the
+    // previous member was not a bitfield), and where it starts in bits
+    var ms_unit = 0
+    var ms_start = 0
+    var i = 0
+    while i < names.len() {
+        let ty = tys[i]
+        let width = widths[i]
+        let fsize = sizeof(s.unit, ty)
+        var nat = alignof(s.unit, ty)
+        var fal = nat
+        if aligns[i] > fal { fal = aligns[i] }
+        if packed || packs[i] {
+            fal = 1
+            if aligns[i] > 0 { fal = aligns[i] }
+        }
+        if pack > 0 && fal > pack { fal = pack }
+        if pack > 0 && nat > pack { nat = pack }
+        var place = 0
+        if s.win && !is_union {
+            // a bitfield continues the open unit only when its type has the unit's size and its bits
+            // fit; anything else closes the unit, and a zero-width bitfield only closes it
+            let fits = ms_unit == fsize && width > 0 && off + width <= ms_start + ms_unit * 8
+            if !fits && ms_unit > 0 { off = ms_start + ms_unit * 8  ms_unit = 0 }
+            if width > 0 && !fits {
+                off = cly_align_up(off, fal * 8)
+                ms_start = off
+                ms_unit = fsize
+            }
+        }
+        if s.win && !is_union && width >= 0 {
+            place = off
+            if width > 0 {
+                if fal > max_align { max_align = fal }
+                off = place + width
+            }
+        } else if width >= 0 {
+            if is_union { place = 0 }
+            else if width == 0 {
+                off = cly_align_up(off, nat * 8)
+                place = off
+            } else if packed || packs[i] {
+                place = off
+            } else {
+                let unit_bits = fsize * 8
+                let al = fal * 8
+                let unit_start = off - (off % al)
+                if off + width > unit_start + unit_bits { off = cly_align_up(off, al) }
+                place = off
+            }
+            if width > 0 && names[i].len() > 0 && fal > max_align { max_align = fal }
+            if !is_union { off = place + width }
+            if is_union && width > size_bits { size_bits = width }
+        } else {
+            if is_union { place = 0 } else {
+                off = cly_align_up(off, fal * 8)
+                place = off
+            }
+            if fal > max_align { max_align = fal }
+            let rt = resolve(s.unit, ty)
+            var bits = fsize * 8
+            if s.unit.types[rt].kind == K_ARRAY && s.unit.types[rt].len < 0 { bits = 0 }
+            if is_union { if bits > size_bits { size_bits = bits } } else { off = place + bits }
+        }
+        fields.push(Field { name: copy names[i], ty: ty, offset: place, width: width })
+        // an anonymous struct or union member: its fields are reachable from here, at their offsets
+        if names[i].len() == 0 && width < 0 {
+            let at = s.unit.types[resolve(s.unit, ty)]
+            if at.kind == K_RECORD {
+                foreach f in s.unit.records[at.ref].fields {
+                    if f.name.len() > 0 { fields.push(Field { name: copy f.name, ty: f.ty, offset: place + f.offset, width: f.width, promoted: true }) }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if s.win && ms_unit > 0 { off = ms_start + ms_unit * 8 }
+    if !is_union { size_bits = off }
+    if ralign > max_align { max_align = ralign }
+    let size = cly_align_up((size_bits + 7) / 8, max_align)
+    s.unit.records[r].fields = sink fields
+    s.unit.records[r].size = size
+    s.unit.records[r].align = max_align
+    s.unit.records[r].packed = packed
+    s.unit.records[r].complete = true
+}

@@ -1,0 +1,66 @@
+//! std/background: ask the system to run this program later, even if it is not running.
+//!
+//!     import "std/background" as bg
+//!
+//!     fn main() {
+//!         if bg::woken() { check_for_updates()  return }     // started by the scheduler
+//!         bg::every_hours(6)                                 // ask to be woken from now on
+//!         ...the program...
+//!     }
+//!
+//! That `if` is the whole interface. The program is entered the same way either way, so whatever
+//! it does when woken is written once, in Nori, and shares every function with the rest of it,
+//! with no second copy of the logic in another language.
+//!
+//! On Android this is not reachable from native code: a job hours from now is started by the
+//! framework, and the framework starts classes. There is no C entry point for "wake up later".
+//! So `roll` packages one small generic Java class that does nothing but load the program and
+//! enter it. It is the same class for every program. Ask for it with `background = true` in the
+//! manifest's [native.android] section.
+//!
+//! If the program is already running, the wake-up is refused rather than entered: two runs in one
+//! process share a heap and a scheduler, and entering twice at once corrupts both. A program that
+//! is open does not need waking anyway, since it can check whenever it likes.
+import "std/flag" as flag
+
+extern fn nori_bg_woken() -> Int
+extern fn nori_bg_schedule(Int) -> Int
+extern fn nori_bg_cancel() -> Int
+
+/// Was this run started by the scheduler rather than by a person?
+///
+/// Also true when the program was given `--nori-woken` on the command line, which is how a desktop
+/// timer says so, and which lets this path be exercised without waiting six hours for a phone.
+pub fn woken() -> Bool {
+    var n = 0
+    unsafe { n = nori_bg_woken() }
+    if n != 0 { return true }
+    let a = flag::argv()
+    var i = 0
+    while i < a.len() {
+        if a[i] == "--nori-woken" { return true }
+        i = i + 1
+    }
+    return false
+}
+
+/// Ask to be woken about every `hours` hours. The system decides when, batches wake-ups
+/// with other apps' and defers them while the device is idle, so this is a request and never a
+/// promise. Asking again replaces the previous request rather than adding one.
+///
+/// Ok(hours) when the request was accepted, Err(why) when there is nothing to accept it.
+pub fn every_hours(hours: Int) -> Result<Int> {
+    if hours < 1 { return Result::Err("a wake-up interval under an hour is not something a phone will honour") }
+    var r = 0
+    unsafe { r = nori_bg_schedule(hours) }
+    if r == 1 { return Result::Ok(hours) }
+    if r == 0 - 2 { return Result::Err("no scheduler on this platform") }
+    return Result::Err("the system would not take the request")
+}
+
+/// Stop being woken. True when there was something to stop.
+pub fn cancel() -> Bool {
+    var r = 0
+    unsafe { r = nori_bg_cancel() }
+    return r == 1
+}

@@ -1,0 +1,62 @@
+// Tests for std/encoding. Run with
+//   noric --test std/encoding/encoding_test.nori compiler/runtime.nori --import-root .
+import "std/encoding" as enc
+
+fn test_hex() {
+    assert_streq(enc::hex_encode("Hi"), "4869")
+    assert_streq(enc::hex_encode(""), "")
+    assert_streq(enc::hex_decode("4869"), "Hi")
+    assert_streq(enc::hex_decode("48 69"), "Hi") // whitespace ignored
+    assert_streq(enc::hex_decode(enc::hex_encode("round-trip!")), "round-trip!")
+}
+
+fn test_base64() {
+    assert_streq(enc::b64_encode("Man"), "TWFu") // classic, no padding
+    assert_streq(enc::b64_encode("Hi"), "SGk=") // one pad
+    assert_streq(enc::b64_encode("M"), "TQ==") // two pads
+    assert_streq(enc::b64_encode(""), "")
+    assert_streq(enc::b64_decode("TWFu"), "Man")
+    assert_streq(enc::b64_decode("SGk="), "Hi")
+    assert_streq(enc::b64_decode("TQ=="), "M")
+}
+
+fn test_base64_roundtrip() {
+    let s = "The quick brown fox jumps over the lazy dog."
+    assert_streq(enc::b64_decode(enc::b64_encode(s)), s)
+    assert_streq(enc::hex_decode(enc::hex_encode(s)), s)
+}
+
+// ---- laws: round-trips (fuzzed by `noric --fuzz-laws` / `roll law`) ----
+law hex_roundtrip(s: Str) {
+    assert(enc::hex_decode(enc::hex_encode(s)) == s)
+}
+law b64_roundtrip(s: Str) {
+    assert(enc::b64_decode(enc::b64_encode(s)) == s)
+}
+
+// ---- base64url (RFC 4648 §5) ---------------------------------------------------
+
+fn test_b64url_swaps_both_characters() {
+    // 0xfb 0xef encodes to "++8=" and 0xff 0xef to "/+8=", so between them these two
+    // vectors exercise both substitutions and the dropped padding
+    assert_true(enc::b64_encode(enc::hex_decode("fbef")) == "++8=")
+    assert_true(enc::b64url_encode(enc::hex_decode("fbef")) == "--8")
+    assert_true(enc::b64_encode(enc::hex_decode("ffef")) == "/+8=")
+    assert_true(enc::b64url_encode(enc::hex_decode("ffef")) == "_-8")
+}
+
+fn test_b64url_has_no_padding() {
+    assert_true(enc::b64url_encode("a") == "YQ")        // "YQ==" in standard base64
+    assert_true(enc::b64url_encode("ab") == "YWI")      // "YWI="
+    assert_true(enc::b64url_encode("abc") == "YWJj")    // no padding either way
+}
+
+fn test_b64url_decode_accepts_what_it_is_sent() {
+    assert_true(enc::b64url_decode("YQ") == "a")               // unpadded, as emitted
+    assert_true(enc::b64url_decode("YQ==") == "a")             // padded
+    assert_true(enc::b64url_decode("++8=") == enc::hex_decode("fbef"))   // standard alphabet
+}
+
+law b64url_roundtrip(s: Str) {
+    assert(enc::b64url_decode(enc::b64url_encode(s)) == s)
+}

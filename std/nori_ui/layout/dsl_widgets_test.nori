@@ -1,0 +1,634 @@
+// Native .nori tests for layout/dsl_widgets.nori, run with
+//   noric --test std/nori_ui/layout/dsl_widgets_test.nori compiler/runtime.nori --import-root .
+// A root file of std/nori_ui/layout, so it shares the module scope and can call the parser
+// directly.
+import "std/nori_ui" as ui
+
+// ---- helpers (must not be named test_*) ----
+
+/// parse `src` as a whole document and return its root node; asserts the parse succeeded.
+fn dwt_root(src: Str) -> ui::layout::UiNode {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    return sink r.doc.tree
+}
+/// parse `src`, assert it failed, and assert the message contains `needle`.
+fn dwt_err(src: Str, needle: Str) {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_false(r.ok)
+    assert_true(ui::layout::nui_contains(r.err, needle))
+}
+/// lay `src`'s root out in a `w` x `h` viewport at the origin.
+fn dwt_lay(src: Str, w: Float, h: Float) -> ui::layout::ComputedOverlay {
+    var root = dwt_root(src)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(w, h))
+    return ui::layout::layout_overlay(root, vp)
+}
+/// the n-th primitive of kind `k` (0 fill / 1 border / 2 text).
+fn dwt_prim(ov: ui::layout::ComputedOverlay, k: Int, n: Int) -> ui::layout::PaintPrimitive {
+    var seen = 0
+    var i = 0
+    var found = -1
+    while i < ov.prims.len() {
+        if ov.prims[i].kind == k {
+            if seen == n { if found < 0 { found = i } }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    assert_true(found >= 0)
+    if found < 0 { return ui::layout::pp_dup(ov.prims[0]) }
+    return ui::layout::pp_dup(ov.prims[found])
+}
+fn dwt_q() -> Str { return ("" + chr(34)) }
+
+// =========================================================================
+// divider (sugar for a Rect with an implicit class)
+// =========================================================================
+
+fn test_dw_divider_minimal() {
+    var n = dwt_root("divider { }")
+    assert_eq(n.kind, ui::layout::nk_rect())           // divider has no kind of its own
+    assert_true(n.fill_w)
+    assert_false(n.fill_h)
+    assert_eq(n.w.unit, 0)
+    assert_feq(n.w.value, 0.0, 0.001)
+    assert_eq(n.h.unit, 0)
+    assert_feq(n.h.value, 1.0, 0.001)                  // parse default Px(1.0), not Px(0.0)
+    assert_eq(n.classes.len(), 1)
+    assert_streq(n.classes[0], "divider")
+    assert_false(n.has_color)
+    assert_feq(n.radius, 0.0, 0.001)
+    assert_streq(ui::layout::ui_kind_tag(n.kind), "rect")
+}
+
+fn test_dw_divider_every_attr() {
+    var n = dwt_root("divider { h: 3 color: [10,20,30,40] classes: [thick, faint] radius: 2.5 }")
+    assert_feq(n.h.value, 3.0, 0.001)
+    assert_true(n.has_color)
+    assert_eq(ui::core::rgba_color(n.color).r, 10)
+    assert_eq(ui::core::rgba_color(n.color).g, 20)
+    assert_eq(ui::core::rgba_color(n.color).b, 30)
+    assert_eq(ui::core::rgba_color(n.color).a, 40)
+    assert_feq(n.radius, 2.5, 0.001)
+    // classes appends to the pre-seeded ["divider"]; it does not replace it
+    assert_eq(n.classes.len(), 3)
+    assert_streq(n.classes[0], "divider")
+    assert_streq(n.classes[1], "thick")
+    assert_streq(n.classes[2], "faint")
+}
+
+fn test_dw_divider_classes_append_twice() {
+    var n = dwt_root("divider { classes: [a] classes: [b, c] }")
+    assert_eq(n.classes.len(), 4)
+    assert_streq(n.classes[0], "divider")
+    assert_streq(n.classes[3], "c")
+    // a hex colour, quoted or bare, is also accepted
+    var n2 = dwt_root("divider { color: #ff8800 }")
+    assert_eq(ui::core::rgba_color(n2.color).r, 255)
+    assert_eq(ui::core::rgba_color(n2.color).g, 136)
+}
+
+fn test_dw_divider_length_units() {
+    // divider's `h` is a full UiLength (parse_length_value), unlike every other
+    // height in this family; see the sibling test_dw_slider_percent_height_error.
+    var n = dwt_root("divider { h: 50% }")
+    assert_eq(n.h.unit, 1)                             // percent
+    assert_feq(n.h.value, 50.0, 0.001)
+    var n2 = dwt_root("divider { h: 2vh }")
+    assert_eq(n2.h.unit, 3)
+    var n3 = dwt_root("divider { h: 4ui }")
+    assert_eq(n3.h.unit, 4)
+    // the quoted / ident form goes through ui_length_parse
+    var n4 = dwt_root("divider { h: " + dwt_q() + "20%" + dwt_q() + " }")
+    assert_eq(n4.h.unit, 1)
+    assert_feq(n4.h.value, 20.0, 0.001)
+    var n5 = dwt_root("divider { h: -2 }")
+    assert_feq(n5.h.value, -2.0, 0.001)
+}
+
+fn test_dw_divider_errors() {
+    dwt_err("divider { foo: 1 }", "unknown divider field " + dwt_q() + "foo" + dwt_q())
+    dwt_err("divider { h 3 }", "expected `:` in divider node")          // Style A
+    dwt_err("divider { child { } }", "expected `:` in divider node")    // no child elements
+    dwt_err("divider { radius: yes }", "radius must be a number")
+    dwt_err("divider { classes: nope }", "classes must be [...]")
+    dwt_err("divider { classes: [1] }", "class names must be strings or identifiers")
+    dwt_err("divider { h: bogus }", "invalid length: " + dwt_q() + "bogus" + dwt_q())
+    // divider has neither `id` nor the singular `class`
+    dwt_err("divider { id: d1 }", "unknown divider field " + dwt_q() + "id" + dwt_q())
+    dwt_err("divider { class: thin }", "unknown divider field " + dwt_q() + "class" + dwt_q())
+    // ...and neither bind. The divider parser has four arms, full stop,
+    // and the Rect it desugars to hardcodes `bind_visible: None`. Adding binds here would make the
+    // divider a superset of its documented attributes. A conditionally-shown
+    // separator wraps in a bound container, which is the documented shape.
+    dwt_err("divider { bind_visible: v }", "unknown divider field " + dwt_q() + "bind_visible" + dwt_q())
+    dwt_err("divider { bind_disabled: v }", "unknown divider field " + dwt_q() + "bind_disabled" + dwt_q())
+    var wrapped = dwt_root("column { bind_visible: sep divider { } }")
+    assert_streq(wrapped.bind_visible, "sep")
+    assert_eq(wrapped.children.len(), 1)
+}
+
+fn test_dw_divider_layout() {
+    // fill_w + h:3 in a 200x40 viewport: a plain rect, so only ui_emit_chrome paints it.
+    var ov = dwt_lay("divider { h: 3 color: [200,0,0,255] }", 200.0, 40.0)
+    var r = dwt_prim(ov, 0, 0)
+    assert_feq(r.rect.width(), 200.0, 0.01)
+    assert_eq(r.color.r, 200)
+    assert_eq(ov.hits.len(), 0)
+}
+
+// =========================================================================
+// checkbox
+// =========================================================================
+
+fn test_dw_checkbox_minimal() {
+    var n = dwt_root("checkbox { id: agree }")
+    assert_eq(n.kind, ui::layout::nk_checkbox())
+    assert_streq(n.id, "agree")
+    assert_streq(n.text, "")                           // defaults to ""
+    assert_false(n.checked)
+    assert_true(n.fill_w)                              // parse default true
+    assert_feq(n.h.value, 28.0, 0.001)                 // parse default 28
+    assert_eq(n.h.unit, 0)
+    assert_eq(n.classes.len(), 0)
+    assert_false(n.has_tab_index)
+    assert_streq(ui::layout::ui_kind_tag(n.kind), "checkbox")
+}
+
+fn test_dw_checkbox_every_attr() {
+    var src = "checkbox { bind: b1 bind_visible: bv bind_disabled: bd id: c1 label: Agree checked: true"
+    src = src + " classes: [x, y] height: 40 fill_w: false align_self: center tab_index: 7 }"
+    var n = dwt_root(src)
+    assert_streq(n.bind, "b1")
+    assert_streq(n.bind_visible, "bv")
+    assert_streq(n.bind_disabled, "bd")
+    assert_streq(n.id, "c1")
+    assert_streq(n.text, "Agree")
+    assert_true(n.checked)
+    assert_eq(n.classes.len(), 2)
+    assert_streq(n.classes[1], "y")
+    assert_feq(n.h.value, 40.0, 0.001)
+    assert_false(n.fill_w)
+    assert_true(n.has_align_self)
+    assert_eq(n.align_self, ui::layout::cross_center())
+    assert_true(n.has_tab_index)
+    assert_eq(n.tab_index, 7)
+    // aliases: h == height, focus_order == tab_index; `class` replaces `classes`
+    var n2 = dwt_root("checkbox { id: c2 h: 12 focus_order: 3 classes: [a, b] class: solo checked: 1 }")
+    assert_feq(n2.h.value, 12.0, 0.001)
+    assert_eq(n2.tab_index, 3)
+    assert_eq(n2.classes.len(), 1)
+    assert_streq(n2.classes[0], "solo")
+    assert_true(n2.checked)                            // value_bool coerces a number
+}
+
+fn test_dw_checkbox_errors() {
+    dwt_err("checkbox { }", "checkbox requires id:")
+    dwt_err("checkbox { label: hi }", "checkbox requires id:")
+    dwt_err("checkbox { id: c foo: 1 }", "unknown checkbox field " + dwt_q() + "foo" + dwt_q())
+    dwt_err("checkbox { id: c padding: 4 }", "unknown checkbox field " + dwt_q() + "padding" + dwt_q())
+    // Style B `:` enforcement: the expect-colon check, with single-quoted chars
+    dwt_err("checkbox { id c }", "expected ':', found 'c'")
+    dwt_err("checkbox { kid { } }", "expected ':', found '{'")
+    dwt_err("checkbox { id", "expected ':', found end of file")
+    // wrong value types
+    dwt_err("checkbox { id: 3 }", "checkbox id must be string or ident")
+    dwt_err("checkbox { id: c label: 3 }", "checkbox label must be string or ident")
+    dwt_err("checkbox { id: c checked: nope }", "checked must be true or false")
+    dwt_err("checkbox { id: c height: tall }", "height must be a number")
+    dwt_err("checkbox { id: c fill_w: sure }", "fill_w must be true or false")
+    dwt_err("checkbox { id: c class: [a] }", "class must be string or ident")
+    dwt_err("checkbox { id: c align_self: sideways }", "unknown cross_align " + dwt_q() + "sideways" + dwt_q())
+}
+
+fn test_dw_checkbox_layout() {
+    // 300x28 viewport. widget.nori: box = 18px centred vertically at the row origin.
+    var ov = dwt_lay("checkbox { id: c1 label: On checked: true }", 300.0, 28.0)
+    var box = dwt_prim(ov, 0, 0)
+    assert_feq(box.rect.min.x, 0.0, 0.01)
+    assert_feq(box.rect.min.y, 5.0, 0.01)              // (28 - 18) / 2
+    assert_feq(box.rect.width(), 18.0, 0.01)
+    assert_feq(box.rect.height(), 18.0, 0.01)
+    assert_eq(box.color.r, 92)                         // checked fill [92,150,92,255]
+    assert_feq(box.radius, 3.0, 0.01)
+    var tick = dwt_prim(ov, 0, 1)                      // 4px inset tick
+    assert_feq(tick.rect.min.x, 4.0, 0.01)
+    assert_feq(tick.rect.width(), 10.0, 0.01)
+    var border = dwt_prim(ov, 1, 0)
+    assert_eq(border.color.r, 120)
+    var lab = dwt_prim(ov, 2, 0)
+    assert_feq(lab.pos.x, 28.0, 0.01)                  // box.max.x (18) + item_spacing.x (10)
+    assert_feq(lab.pos.y, 6.0, 0.01)                   // (28 - 16) / 2
+    assert_streq(lab.text, "On")
+    // the event string carries the toggled value
+    assert_eq(ov.hits.len(), 1)
+    assert_streq(ov.hits[0].on_click, "check:c1:false")
+    assert_feq(ov.hits[0].rect.width(), 300.0, 0.01)
+    var ov2 = dwt_lay("checkbox { id: c1 }", 300.0, 28.0)
+    assert_streq(ov2.hits[0].on_click, "check:c1:true")
+}
+
+// =========================================================================
+// slider
+// =========================================================================
+
+fn test_dw_slider_minimal() {
+    var n = dwt_root("slider { id: vol }")
+    assert_eq(n.kind, ui::layout::nk_slider())
+    assert_streq(n.id, "vol")
+    assert_feq(n.value_f, 0.0, 0.001)
+    assert_true(n.fill_w)
+    assert_feq(n.h.value, 32.0, 0.001)                 // parse default 32
+    assert_false(n.has_track_h)
+    assert_false(n.has_knob_r)
+    assert_false(n.has_track_color)
+    assert_streq(ui::layout::ui_kind_tag(n.kind), "slider")
+}
+
+fn test_dw_slider_every_attr() {
+    var src = "slider { id: s1 value: 0.25 height: 44 track_h: 10 knob_r: 9 track_color: [1,2,3,4]"
+    src = src + " fill_color: #00ff00 knob_color: [9,9,9,9] classes: [a, b] fill_w: false align_self: end"
+    src = src + " bind: bb bind_visible: bv bind_disabled: bd }"
+    var n = dwt_root(src)
+    assert_streq(n.id, "s1")
+    assert_feq(n.value_f, 0.25, 0.0001)
+    assert_feq(n.h.value, 44.0, 0.001)
+    assert_true(n.has_track_h)
+    assert_feq(n.track_h, 10.0, 0.001)
+    assert_true(n.has_knob_r)
+    assert_feq(n.knob_r, 9.0, 0.001)
+    assert_true(n.has_track_color)
+    assert_eq(ui::core::rgba_color(n.track_color).a, 4)
+    assert_true(n.has_fill_color)
+    assert_eq(ui::core::rgba_color(n.fill_color).g, 255)
+    assert_true(n.has_knob_color)
+    assert_eq(ui::core::rgba_color(n.knob_color).r, 9)
+    assert_eq(n.classes.len(), 2)
+    assert_false(n.fill_w)
+    assert_eq(n.align_self, ui::layout::cross_end())
+    assert_streq(n.bind, "bb")
+    assert_streq(n.bind_visible, "bv")
+    assert_streq(n.bind_disabled, "bd")
+    var n2 = dwt_root("slider { id: s2 h: 20 class: solo }")
+    assert_feq(n2.h.value, 20.0, 0.001)
+    assert_eq(n2.classes.len(), 1)
+    assert_streq(n2.classes[0], "solo")
+}
+
+fn test_dw_slider_no_parse_clamp() {
+    // `value` is documented 0..1 but stored unclamped; `knob_r` is not floored at
+    // parse time either; both are clamped at paint.
+    var n = dwt_root("slider { id: s value: 5 knob_r: 1 }")
+    assert_feq(n.value_f, 5.0, 0.001)
+    assert_feq(n.knob_r, 1.0, 0.001)
+    var n2 = dwt_root("slider { id: s value: -2 }")
+    assert_feq(n2.value_f, -2.0, 0.001)
+}
+
+fn test_dw_slider_percent_height_error() {
+    // slider's `h` is a plain f32: the `%` is never consumed, so the next loop turn
+    // fails on parse_ident, while `divider { h: 50% }` is valid (test_dw_divider_length_units).
+    dwt_err("slider { id: s h: 50% }", "expected identifier")
+    var ok = dwt_root("divider { h: 50% }")
+    assert_eq(ok.h.unit, 1)
+}
+
+fn test_dw_slider_errors() {
+    dwt_err("slider { }", "slider requires id:")
+    dwt_err("slider { value: 0.5 }", "slider requires id:")
+    dwt_err("slider { id: s foo: 1 }", "unknown slider field " + dwt_q() + "foo" + dwt_q())
+    dwt_err("slider { id: s padding: 4 }", "unknown slider field " + dwt_q() + "padding" + dwt_q())
+    // slider has neither label nor tab_index (the `.ui` slider has no tab_index field)
+    dwt_err("slider { id: s label: L }", "unknown slider field " + dwt_q() + "label" + dwt_q())
+    dwt_err("slider { id: s tab_index: 1 }", "unknown slider field " + dwt_q() + "tab_index" + dwt_q())
+    dwt_err("slider { id s }", "expected `:` in slider node")           // Style A
+    dwt_err("slider { kid { } }", "expected `:` in slider node")
+    dwt_err("slider { id: 3 }", "slider id must be string or ident")
+    dwt_err("slider { id: s value: yes }", "slider value must be a number")
+    dwt_err("slider { id: s height: tall }", "slider height must be a number")
+    dwt_err("slider { id: s track_h: tall }", "track_h must be a number")
+    dwt_err("slider { id: s knob_r: big }", "knob_r must be a number")
+    dwt_err("slider { id: s class: [a] }", "class must be string or ident")
+    // fill_w is Bool-only here: no number coercion, unlike checkbox's
+    dwt_err("slider { id: s fill_w: 1 }", "fill_w must be true or false")
+    dwt_err("slider { id: s track_color: 4 }", "expected [r,g,b,a] or #RRGGBB/#RRGGBBAA")
+}
+
+fn test_dw_slider_layout() {
+    // 200x32 viewport, value 0.5, default track_h 6 and knob_r 6*1.8 = 10.8.
+    var ov = dwt_lay("slider { id: s value: 0.5 }", 200.0, 32.0)
+    var track = dwt_prim(ov, 0, 0)
+    assert_feq(track.rect.min.x, 0.0, 0.01)
+    assert_feq(track.rect.min.y, 13.0, 0.01)           // (32 - 6) / 2
+    assert_feq(track.rect.width(), 200.0, 0.01)
+    assert_feq(track.rect.height(), 6.0, 0.01)
+    assert_eq(track.color.r, 52)                       // [52,50,72,255]
+    var fill = dwt_prim(ov, 0, 1)
+    assert_feq(fill.rect.width(), 100.0, 0.01)         // max(0.5 * 200, 12)
+    assert_eq(fill.color.r, 100)                       // [100,140,220,255]
+    var knob = dwt_prim(ov, 0, 2)
+    assert_feq(knob.rect.width(), 21.6, 0.01)          // 2 * max(6*1.8, 5)
+    assert_feq(knob.rect.min.x, 89.2, 0.01)            // 0.5 * (200 - 21.6)
+    assert_feq(knob.rect.min.y, 6.0, 0.01)             // (32 - min(32,20)) / 2
+    assert_feq(knob.rect.height(), 20.0, 0.01)         // min(32-4, 20)
+    assert_eq(knob.color.r, 230)                       // [230,236,255,255]
+    // Largest (track) pushed first, smallest (knob) second, so the backwards walk
+    // in overlay_hit_test lands on the knob.
+    assert_eq(ov.hits.len(), 2)
+    assert_streq(ov.hits[0].on_click, "s:0.5")
+    assert_feq(ov.hits[0].rect.width(), 200.0, 0.01)
+    assert_feq(ov.hits[1].rect.width(), 21.6, 0.01)
+    var hit = ui::layout::overlay_hit_test(ov, ui::core::vec2(95.0, 16.0))
+    assert_feq(hit.rect.width(), 21.6, 0.01)
+    // out-of-range value is clamped at paint
+    var ov2 = dwt_lay("slider { id: s value: 5 }", 200.0, 32.0)
+    assert_feq(dwt_prim(ov2, 0, 1).rect.width(), 200.0, 0.01)
+}
+
+// =========================================================================
+// dropdown
+// =========================================================================
+
+fn test_dw_dropdown_minimal() {
+    var n = dwt_root("dropdown { id: mode }")
+    assert_eq(n.kind, ui::layout::nk_dropdown())
+    assert_streq(n.id, "mode")
+    assert_eq(n.options.len(), 0)
+    assert_eq(n.selected, 0)
+    assert_false(n.open)
+    assert_true(n.fill_w)
+    assert_feq(n.h.value, 38.0, 0.001)                 // parse default 38
+    assert_true(n.has_item_height)
+    assert_feq(n.item_height, 34.0, 0.001)             // parse default 34
+    assert_streq(ui::layout::ui_kind_tag(n.kind), "dropdown")
+}
+
+fn test_dw_dropdown_every_attr() {
+    var src = "dropdown { bind: bb bind_visible: bv bind_disabled: bd id: d1 options: [Low, " + dwt_q() + "Med" + dwt_q() + ", High]"
+    src = src + " selected: 2 open: true height: 50 item_height: 22 classes: [a, b] fill_w: false"
+    src = src + " align_self: start tab_index: 4 }"
+    var n = dwt_root(src)
+    assert_streq(n.bind, "bb")
+    assert_streq(n.bind_visible, "bv")
+    assert_streq(n.bind_disabled, "bd")
+    assert_streq(n.id, "d1")
+    assert_eq(n.options.len(), 3)
+    assert_streq(n.options[0], "Low")
+    assert_streq(n.options[1], "Med")
+    assert_streq(n.options[2], "High")
+    assert_eq(n.selected, 2)
+    assert_true(n.open)
+    assert_feq(n.h.value, 50.0, 0.001)
+    assert_feq(n.item_height, 22.0, 0.001)
+    assert_eq(n.classes.len(), 2)
+    assert_false(n.fill_w)
+    assert_eq(n.align_self, ui::layout::cross_start())
+    assert_true(n.has_tab_index)
+    assert_eq(n.tab_index, 4)
+    var n2 = dwt_root("dropdown { id: d2 h: 12 focus_order: 1 class: solo open: 1 }")
+    assert_feq(n2.h.value, 12.0, 0.001)
+    assert_eq(n2.tab_index, 1)
+    assert_eq(n2.classes.len(), 1)
+    assert_true(n2.open)                               // open takes a number too
+}
+
+fn test_dw_dropdown_selected_saturates() {
+    // a negative (and NaN) is saturated to 0, as a signed Nori Int
+    // would otherwise store -3.
+    var n = dwt_root("dropdown { id: d options: [a, b, c] selected: -3 }")
+    assert_eq(n.selected, 0)
+    // it truncates toward zero, and is not bounds-checked upward
+    var n2 = dwt_root("dropdown { id: d options: [a] selected: 2.9 }")
+    assert_eq(n2.selected, 2)
+    var n3 = dwt_root("dropdown { id: d selected: -0.5 }")
+    assert_eq(n3.selected, 0)
+}
+
+fn test_dw_dropdown_errors() {
+    dwt_err("dropdown { }", "dropdown requires id:")
+    dwt_err("dropdown { options: [a] }", "dropdown requires id:")
+    dwt_err("dropdown { id: d foo: 1 }", "unknown dropdown field " + dwt_q() + "foo" + dwt_q())
+    dwt_err("dropdown { id: d padding: 4 }", "unknown dropdown field " + dwt_q() + "padding" + dwt_q())
+    dwt_err("dropdown { id: d label: L }", "unknown dropdown field " + dwt_q() + "label" + dwt_q())
+    dwt_err("dropdown { id d }", "expected `:` in dropdown node")       // Style A
+    dwt_err("dropdown { kid { } }", "expected `:` in dropdown node")
+    dwt_err("dropdown { id: 3 }", "dropdown id must be string or ident")
+    dwt_err("dropdown { id: d options: nope }", "dropdown options must be an array")
+    dwt_err("dropdown { id: d options: [1, 2] }", "dropdown options must be strings")
+    dwt_err("dropdown { id: d selected: two }", "selected must be a number")
+    dwt_err("dropdown { id: d open: maybe }", "open must be true or false")
+    dwt_err("dropdown { id: d height: tall }", "height must be a number")
+    dwt_err("dropdown { id: d item_height: tall }", "item_height must be a number")
+    dwt_err("dropdown { id: d class: [a] }", "class must be string or ident")
+    dwt_err("dropdown { id: d fill_w: 1 }", "fill_w must be true or false")
+}
+
+fn test_dw_dropdown_layout() {
+    var ov = dwt_lay("dropdown { id: d options: [Low, High] selected: 1 }", 260.0, 38.0)
+    var trig = dwt_prim(ov, 0, 0)
+    assert_feq(trig.rect.width(), 260.0, 0.01)
+    assert_feq(trig.rect.height(), 38.0, 0.01)
+    assert_feq(trig.radius, 6.0, 0.01)
+    var border = dwt_prim(ov, 1, 0)
+    assert_eq(border.color.r, 70)
+    var lab = dwt_prim(ov, 2, 0)
+    assert_feq(lab.pos.x, 10.0, 0.01)                  // button_padding.x
+    assert_feq(lab.pos.y, 11.0, 0.01)                  // (38 - 16) / 2
+    assert_streq(lab.text, "High ▾")
+    // closed: exactly one hit, the trigger, emitting the bare id
+    assert_eq(ov.hits.len(), 1)
+    assert_streq(ov.hits[0].on_click, "d")
+    // open flips the arrow and opens the list (see the popup tests below)
+    var ov2 = dwt_lay("dropdown { id: d options: [Low, High] selected: 1 open: true }", 260.0, 300.0)
+    assert_streq(dwt_prim(ov2, 2, 0).text, "High ▴")
+    // an out-of-range selected renders an empty label rather than erroring
+    var ov3 = dwt_lay("dropdown { id: d options: [Low] selected: 9 }", 260.0, 38.0)
+    assert_streq(dwt_prim(ov3, 2, 0).text, " ▾")
+}
+
+// =========================================================================
+// measure: the widget.nori width formulas
+// =========================================================================
+
+fn test_dw_measure() {
+    var ctx = ui::layout::LayoutLengthContext { viewport_w: 800.0, viewport_h: 600.0, ui_scale: 1.0, parent_inner_w: 800.0, parent_inner_h: 600.0 }
+    var cb = dwt_root("checkbox { id: c label: Hi }")
+    var m = ui::layout::ui_measure(cb, ctx)
+    assert_feq(m.y, 28.0, 0.01)
+    // widget.nori: checkbox_size() + item_spacing.x + label width
+    assert_feq(m.x, 18.0 + 10.0 + ui::layout::overlay_text_width("Hi", cb.size_px), 0.01)
+    var sl = dwt_root("slider { id: s }")
+    var ms = ui::layout::ui_measure(sl, ctx)
+    assert_feq(ms.y, 32.0, 0.01)
+    assert_feq(ms.x, 40.0, 0.01)                       // widget.nori track floor
+    var dd = dwt_root("dropdown { id: d options: [Low] selected: 0 }")
+    var md = ui::layout::ui_measure(dd, ctx)
+    assert_feq(md.y, 38.0, 0.01)
+    assert_feq(md.x, ui::layout::overlay_text_width("Low ▾", dd.size_px) + 20.0, 0.01)
+    // the explicit heights survive measure
+    var sl2 = dwt_root("slider { id: s h: 64 }")
+    assert_feq(ui::layout::ui_measure(sl2, ctx).y, 64.0, 0.01)
+}
+
+// =========================================================================
+// the dropdown popup: the `.ui` language has no other popup layout, so
+// these tests are the specification of this extension.
+// =========================================================================
+
+/// the last kind-0 prim whose rect starts at or below `y`, i.e. the first popup panel prim.
+/// The popup layer is appended to `prims` last (overlay_flush_popups), so scanning forwards from
+/// the first such prim walks the popup in emission order.
+fn dwt_first_prim_at_or_below(ov: ui::layout::ComputedOverlay, k: Int, y: Float) -> Int {
+    var i = 0
+    var found = -1
+    while i < ov.prims.len() {
+        if ov.prims[i].kind == k && ov.prims[i].rect.min.y >= y - 0.001 { if found < 0 { found = i } }
+        i = i + 1
+    }
+    return found
+}
+fn dwt_hit_at(ov: ui::layout::ComputedOverlay, x: Float, y: Float) -> ui::layout::HitRegion {
+    return ui::layout::overlay_hit_test(ov, ui::core::vec2(x, y))
+}
+/// wrap `inner` in a gapless column, so the widget gets its natural height at the top of the
+fn dwt_col(inner: Str) -> Str { return ("column { gap: 0 " + (inner + " }")) }
+
+fn test_dw_dropdown_popup_hits() {
+    // three options, open: the trigger hit plus one hit per option row, in order, emitting "id:N".
+    var ov = dwt_lay(dwt_col("dropdown { id: d options: [Low, Mid, High] selected: 1 open: true }"), 260.0, 400.0)
+    assert_eq(ov.hits.len(), 4)
+    assert_streq(ov.hits[0].on_click, "d")             // the trigger, still first
+    assert_streq(ov.hits[1].on_click, "d:0")
+    assert_streq(ov.hits[2].on_click, "d:1")
+    assert_streq(ov.hits[3].on_click, "d:2")
+    assert_streq(ov.hits[3].id, "d")
+    // closed: exactly one, no matter how many options there are
+    var shut = dwt_lay(dwt_col("dropdown { id: d options: [Low, Mid, High] selected: 1 }"), 260.0, 400.0)
+    assert_eq(shut.hits.len(), 1)
+    // an open dropdown with no options has no list at all
+    var none = dwt_lay(dwt_col("dropdown { id: d open: true }"), 260.0, 400.0)
+    assert_eq(none.hits.len(), 1)
+}
+
+fn test_dw_dropdown_popup_geometry() {
+    // the trigger is 38 tall at y=0; each option row is item_height tall, stacked from 2px below it
+    var ov = dwt_lay(dwt_col("dropdown { id: d options: [Low, Mid, High] selected: 0 open: true item_height: 20 }"), 260.0, 400.0)
+    assert_eq(ov.hits.len(), 4)
+    assert_feq(ov.hits[1].rect.min.y, 40.0, 0.01)      // 38 (trigger) + 2 (gap)
+    assert_feq(ov.hits[1].rect.height(), 20.0, 0.01)
+    assert_feq(ov.hits[2].rect.min.y, 60.0, 0.01)
+    assert_feq(ov.hits[3].rect.min.y, 80.0, 0.01)
+    assert_feq(ov.hits[3].rect.max.y, 100.0, 0.01)
+    assert_feq(ov.hits[1].rect.min.x, 0.0, 0.01)       // full trigger width
+    assert_feq(ov.hits[1].rect.max.x, 260.0, 0.01)
+    // the panel itself: one opaque rect covering all three rows, below the trigger
+    var pi = dwt_first_prim_at_or_below(ov, 0, 40.0)
+    assert_true(pi >= 0)
+    var panel = ov.prims[pi]
+    assert_feq(panel.rect.min.y, 40.0, 0.01)
+    assert_feq(panel.rect.max.y, 100.0, 0.01)
+    assert_eq(panel.color.a, 255)                      // opaque, or it would not cover anything
+    // the default item_height is 34.0
+    var dflt = dwt_lay(dwt_col("dropdown { id: d options: [Low, Mid] open: true }"), 260.0, 400.0)
+    assert_feq(dflt.hits[1].rect.height(), 34.0, 0.01)
+    assert_feq(dflt.hits[2].rect.min.y, 74.0, 0.01)
+    // the option text is one prim per row, inset by button_padding.x
+    var t0 = dwt_prim(ov, 2, 1)                        // 0 is the trigger label
+    assert_streq(t0.text, "Low")
+    assert_feq(t0.pos.x, 10.0, 0.01)
+    assert_streq(dwt_prim(ov, 2, 2).text, "Mid")
+    assert_streq(dwt_prim(ov, 2, 3).text, "High")
+}
+
+fn test_dw_dropdown_popup_selected_row_is_marked() {
+    // selected: 1 of 3, rows 20 tall from y=40 -> the marked row is [60, 80)
+    var ov = dwt_lay(dwt_col("dropdown { id: d options: [Low, Mid, High] selected: 1 open: true item_height: 20 }"), 260.0, 400.0)
+    // panel, then the highlight for row 1 only: exactly one fill prim strictly inside the panel
+    var marks = 0
+    var mark_y = -1.0
+    var i = 0
+    while i < ov.prims.len() {
+        var pr = ov.prims[i]
+        if pr.kind == 0 && pr.rect.min.y > 40.001 && pr.rect.max.y < 99.999 { marks = marks + 1  mark_y = pr.rect.min.y }
+        i = i + 1
+    }
+    assert_eq(marks, 1)
+    assert_feq(mark_y, 62.0, 0.01)                     // row 1 top (60) + the 2px inset
+    // with selected: 0 the mark moves to the first row
+    var ov0 = dwt_lay(dwt_col("dropdown { id: d options: [Low, Mid, High] selected: 0 open: true item_height: 20 }"), 260.0, 400.0)
+    var m0 = -1.0
+    var j = 0
+    while j < ov0.prims.len() {
+        if ov0.prims[j].kind == 0 && ov0.prims[j].rect.min.y > 40.001 && ov0.prims[j].rect.max.y < 99.999 { m0 = ov0.prims[j].rect.min.y }
+        j = j + 1
+    }
+    assert_feq(m0, 42.0, 0.01)
+    // an out-of-range selected marks nothing
+    var ovx = dwt_lay(dwt_col("dropdown { id: d options: [Low, Mid, High] selected: 9 open: true item_height: 20 }"), 260.0, 400.0)
+    var mx = 0
+    var q = 0
+    while q < ovx.prims.len() {
+        if ovx.prims[q].kind == 0 && ovx.prims[q].rect.min.y > 40.001 && ovx.prims[q].rect.max.y < 99.999 { mx = mx + 1 }
+        q = q + 1
+    }
+    assert_eq(mx, 0)
+}
+
+fn test_dw_dropdown_popup_flips_up_when_there_is_no_room_below() {
+    // viewport only 60 tall: the trigger fills 0..38 and a 3x20 list would end at 100. There is
+    // room above only if the trigger is not at the top, so put a 100px spacer above it first.
+    var src = "column { gap: 0 rect { h: 100 } dropdown { id: d options: [Low, Mid, High] open: true item_height: 20 } }"
+    var ov = dwt_lay(src, 260.0, 150.0)
+    // trigger at y=100..138; below would end at 200 > 150, and 100 - 2 - 60 = 38 >= 0 -> flip up
+    assert_eq(ov.hits.len(), 4)
+    assert_feq(ov.hits[1].rect.min.y, 38.0, 0.01)
+    assert_feq(ov.hits[3].rect.max.y, 98.0, 0.01)      // ends 2px above the trigger
+    // with room below it stays below
+    var ov2 = dwt_lay(src, 260.0, 400.0)
+    assert_feq(ov2.hits[1].rect.min.y, 140.0, 0.01)
+    // no room either way (trigger at the top of a short viewport) -> it stays below and overflows,
+    // rather than being drawn off the top edge where nothing could reach it
+    var ov3 = dwt_lay(dwt_col("dropdown { id: d options: [Low, Mid, High] open: true item_height: 20 }"), 260.0, 60.0)
+    assert_feq(ov3.hits[1].rect.min.y, 40.0, 0.01)
+}
+
+fn test_dw_dropdown_popup_escapes_a_scroll_viewport() {
+    // A 60px-tall scroll viewport with the dropdown as its only child. The trigger is 38 tall, so
+    // a 3 x 20 option list runs from y=40 to y=100, 40px past the viewport's bottom edge.
+    // merge_clipped_overlay would intersect an ordinary prim down to 20px and drop the two rows
+    // whose rects fall outside; the popup layer must come through whole.
+    var src = "scroll_column { id: sc h: 60 dropdown { id: d options: [Low, Mid, High] open: true item_height: 20 } }"
+    var ov = dwt_lay(src, 260.0, 400.0)
+    assert_eq(ov.hits.len(), 4)
+    assert_feq(ov.hits[1].rect.min.y, 40.0, 0.01)
+    assert_feq(ov.hits[3].rect.max.y, 100.0, 0.01)     // the last row survives in full
+    // the panel prim is un-intersected and carries no clip rect
+    var pi = dwt_first_prim_at_or_below(ov, 0, 40.0)
+    assert_true(pi >= 0)
+    assert_false(ov.prims[pi].has_clip)
+    assert_feq(ov.prims[pi].rect.max.y, 100.0, 0.01)
+    // ...while the trigger, which is inside the viewport, did go through the clip
+    assert_true(ov.prims[0].has_clip)
+    // and an overflow: hidden ancestor is escaped by the same route
+    var hid = dwt_lay("column { overflow_y: hidden h: 60 dropdown { id: d options: [Low, Mid, High] open: true item_height: 20 } }", 260.0, 400.0)
+    var hi = dwt_first_prim_at_or_below(hid, 0, 40.0)
+    assert_true(hi >= 0)
+    assert_false(hid.prims[hi].has_clip)
+    assert_feq(hid.prims[hi].rect.max.y, 100.0, 0.01)
+}
+
+fn test_dw_dropdown_popup_hits_win_over_what_is_under_them() {
+    // a button sitting exactly where the option list will fall. overlay_hit_test walks backwards,
+    // and the popup layer is appended last, so the option row wins at every point they share.
+    var src = "column { gap: 0 dropdown { id: d options: [Low, Mid, High] open: true item_height: 20 } button { id: b label: \"Under\" h: 100 on_click: pressed } }"
+    var ov = dwt_lay(src, 260.0, 400.0)
+    // the button occupies 38..138; the list occupies 40..100; they overlap
+    assert_streq(dwt_hit_at(ov, 130.0, 50.0).on_click, "d:0")
+    assert_streq(dwt_hit_at(ov, 130.0, 70.0).on_click, "d:1")
+    assert_streq(dwt_hit_at(ov, 130.0, 90.0).on_click, "d:2")
+    // past the list's bottom edge the button is reachable again
+    assert_streq(dwt_hit_at(ov, 130.0, 120.0).on_click, "pressed")
+    // and the trigger itself is unaffected
+    assert_streq(dwt_hit_at(ov, 130.0, 10.0).on_click, "d")
+}

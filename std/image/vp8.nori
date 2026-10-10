@@ -1,0 +1,852 @@
+// std/image: VP8 key frames (WebP's lossy images), written from RFC 6386 ("VP8 Data Format and Decoding
+// Guide"). A WebP lossy image is one VP8 key frame; inter frames are not decoded here.
+//
+//   §7      the boolean entropy decoder (split = 1 + ((range - 1) * prob >> 8), renormalised to range >= 128);
+//   §9, §19 the frame header: the frame tag and key-frame start code, the size (14 bits each); colour space,
+//           clamping, segmentation (§9.3: the map's tree probabilities, quantizer and filter values per segment,
+//           absolute or delta: 1 is absolute, as the annex's table says), the loop filter (§9.4: type, level,
+//           sharpness, the reference/mode deltas), the token partitions (§9.5: 1, 2, 4 or 8, their sizes in
+//           3-byte little-endian words after the first partition), the quantizer indices (§9.6), the token
+//           probability updates (§13.4), and mb_no_skip_coeff/prob_skip_false (§9.11);
+//   §10-11  per macroblock: the segment id, the skip flag, the luma mode (kf_ymode_tree), the sixteen subblock
+//           modes of B_PRED (their probabilities chosen by the modes above and to the left: outside the frame,
+//           and for macroblocks not in B_PRED, the implied B_DC/B_VE/B_HE/B_TM), the chroma mode;
+//   §13     the coefficient tokens: the tree, the bands, the three contexts (the neighbours' "has coefficients"
+//           flags, then the size of the last coefficient), no EOB after a zero, the categories' extra bits, the
+//           sign; block types 0 (Y after Y2), 1 (Y2), 2 (chroma), 3 (Y with its DC); the zig-zag order;
+//   §14     dequantization (dc_qlookup/ac_qlookup; Y2's DC doubled, its AC times 155/100 and at least 8, chroma's
+//           DC at most 132), the inverse WHT of Y2 into the Y blocks' DCs, the inverse DCT, the sum clamped;
+//   §12     intra prediction: the 16x16 and chroma modes (DC with its edge rules, V, H, TM), the ten 4x4 modes;
+//           pixels outside the frame are 127 above (the corner too) and 129 to the left; the above-right pixels
+//           of the right column of subblocks are those of the macroblock row above (127 on the first row, the
+//           last pixel of the row above repeated for the last macroblock);
+//   §15     the loop filter, on the whole frame after it is reconstructed (intra prediction reads unfiltered
+//           pixels): simple or normal, per macroblock its left edge, its inner vertical edges, its top edge, its
+//           inner horizontal edges, the inner ones skipped for a macroblock without coefficients that is not
+//           B_PRED; the limits from the level and sharpness (§15.4), the level from the segment and the deltas.
+//
+// The planes are kept with a border (one row above, four columns each side) holding the out-of-frame values, so
+// prediction reads them like any other pixel. The output is YUV 4:2:0, cropped to the frame's size.
+
+struct BoolD { p: Int, end: Int, val: Int, cnt: Int, rng: Int }
+
+fn bd_new(p: Int, n: Int) -> BoolD {
+    var b = BoolD { p: p, end: p + n, val: 0, cnt: 0 - 8, rng: 255 }
+    bd_fill(b)
+    return b
+}
+fn bd_fill(inout b: BoolD) {
+    while b.cnt < 40 {
+        var byte = 0
+        if b.p < b.end { unsafe { byte = peek8(b.p) }  b.p = b.p + 1 }
+        b.val = (b.val << 8) | byte
+        b.cnt = b.cnt + 8
+    }
+}
+fn bd_read(inout b: BoolD, prob: Int) -> Int {
+    let split = 1 + (((b.rng - 1) * prob) >> 8)
+    let bigs = split << b.cnt
+    var bit = 0
+    if b.val >= bigs { b.rng = b.rng - split  b.val = b.val - bigs  bit = 1 } else { b.rng = split }
+    while b.rng < 128 { b.rng = b.rng << 1  b.cnt = b.cnt - 1 }
+    if b.cnt < 0 { bd_fill(b) }
+    return bit
+}
+fn bd_lit(inout b: BoolD, n: Int) -> Int {
+    var v = 0
+    var i = 0
+    while i < n { v = (v << 1) | bd_read(b, 128)  i = i + 1 }
+    return v
+}
+/// a flag, then a magnitude of n bits and a sign (0 when the flag is clear)
+fn bd_signed(inout b: BoolD, n: Int) -> Int {
+    if bd_read(b, 128) == 0 { return 0 }
+    let v = bd_lit(b, n)
+    if bd_read(b, 128) == 1 { return 0 - v }
+    return v
+}
+
+/// a decoded frame: YUV 4:2:0, w x h, planes at y/u/v with strides ys/uvs (the buffers: base, freed by vp8_free)
+struct V8Out { y: Int, u: Int, v: Int, ys: Int, uvs: Int, w: Int, h: Int, base: Int, err: Str }
+
+fn v8_fail(s: Str) -> V8Out { return V8Out { y: 0, u: 0, v: 0, ys: 0, uvs: 0, w: 0, h: 0, base: 0, err: "VP8: " + s } }
+fn vp8_free(inout o: V8Out) { if o.base != 0 { unsafe { free(o.base) } }  o.base = 0  o.y = 0 }
+
+fn v8_clamp255(v: Int) -> Int { if v < 0 { return 0 }  if v > 255 { return 255 }  return v }
+fn v8_qclamp(q: Int) -> Int { if q < 0 { return 0 }  if q > 127 { return 127 }  return q }
+
+/// decode the VP8 key frame of `n` bytes at `p`
+fn vp8_decode(p: Int, n: Int) -> V8Out {
+    if n < 10 { return v8_fail("truncated frame header") }
+    var b0 = 0  var b1 = 0  var b2 = 0
+    unsafe { b0 = peek8(p)  b1 = peek8(p + 1)  b2 = peek8(p + 2) }
+    let tag = b0 | (b1 << 8) | (b2 << 16)
+    if (tag & 1) != 0 { return v8_fail("not a key frame") }
+    let first_size = (tag >> 5) & 524287
+    var sc0 = 0  var sc1 = 0  var sc2 = 0
+    unsafe { sc0 = peek8(p + 3)  sc1 = peek8(p + 4)  sc2 = peek8(p + 5) }
+    if sc0 != 157 || sc1 != 1 || sc2 != 42 { return v8_fail("no start code") }
+    var w = 0  var h = 0
+    unsafe { w = (peek8(p + 6) | (peek8(p + 7) << 8)) & 16383  h = (peek8(p + 8) | (peek8(p + 9) << 8)) & 16383 }
+    if w == 0 || h == 0 || w * h > ANIM_MAX_PX() { return v8_fail("size " + to_str(w) + "x" + to_str(h)) }
+    if 10 + first_size > n { return v8_fail("the first partition runs past the data") }
+    var bd = bd_new(p + 10, first_size)
+    let _cs = bd_lit(bd, 1)
+    let _clamp = bd_lit(bd, 1)
+    // segmentation
+    var seg_on = bd_lit(bd, 1)
+    var seg_map = 0
+    var seg_abs = 0
+    var seg_q: Vec<Int> = [0, 0, 0, 0]
+    var seg_lf: Vec<Int> = [0, 0, 0, 0]
+    var seg_p: Vec<Int> = [255, 255, 255]
+    if seg_on == 1 {
+        seg_map = bd_lit(bd, 1)
+        let upd_data = bd_lit(bd, 1)
+        if upd_data == 1 {
+            seg_abs = bd_lit(bd, 1)
+            var i = 0
+            while i < 4 { seg_q[i] = bd_signed(bd, 7)  i = i + 1 }
+            i = 0
+            while i < 4 { seg_lf[i] = bd_signed(bd, 6)  i = i + 1 }
+        }
+        if seg_map == 1 {
+            var i = 0
+            while i < 3 { if bd_lit(bd, 1) == 1 { seg_p[i] = bd_lit(bd, 8) }  i = i + 1 }
+        }
+    }
+    let filter_simple = bd_lit(bd, 1)
+    let lf_level = bd_lit(bd, 6)
+    let sharp = bd_lit(bd, 3)
+    var ref_delta: Vec<Int> = [0, 0, 0, 0]
+    var mode_delta: Vec<Int> = [0, 0, 0, 0]
+    let lf_adj = bd_lit(bd, 1)
+    if lf_adj == 1 {
+        if bd_lit(bd, 1) == 1 {
+            var i = 0
+            while i < 4 { if bd_lit(bd, 1) == 1 { let m = bd_lit(bd, 6)  if bd_lit(bd, 1) == 1 { ref_delta[i] = 0 - m } else { ref_delta[i] = m } }  i = i + 1 }
+            i = 0
+            while i < 4 { if bd_lit(bd, 1) == 1 { let m = bd_lit(bd, 6)  if bd_lit(bd, 1) == 1 { mode_delta[i] = 0 - m } else { mode_delta[i] = m } }  i = i + 1 }
+        }
+    }
+    let nparts = 1 << bd_lit(bd, 2)
+    // quantizer indices
+    let qbase = bd_lit(bd, 7)
+    let dq_ydc = bd_signed(bd, 4)
+    let dq_y2dc = bd_signed(bd, 4)
+    let dq_y2ac = bd_signed(bd, 4)
+    let dq_uvdc = bd_signed(bd, 4)
+    let dq_uvac = bd_signed(bd, 4)
+    let _refresh = bd_lit(bd, 1)
+    // token probabilities: the defaults, updated
+    let upd = v8t_coeff_update_probs()
+    let defp = v8t_default_coeff_probs()
+    var probs = 0
+    unsafe { probs = malloc(1056) }
+    var i = 0
+    unsafe {
+        while i < 1056 {
+            var pv = defp[i]
+            if bd_read(bd, upd[i]) == 1 { pv = bd_lit(bd, 8) }
+            poke8(probs + i, pv)
+            i = i + 1
+        }
+    }
+    let skip_on = bd_lit(bd, 1)
+    var skip_p = 0
+    if skip_on == 1 { skip_p = bd_lit(bd, 8) }
+    // the token partitions
+    let pstart = 10 + first_size
+    let sizes_at = pstart
+    var part_p: Vec<Int> = vec()
+    var part_n: Vec<Int> = vec()
+    var off = pstart + 3 * (nparts - 1)
+    if off > n { unsafe { free(probs) }  return v8_fail("the partition sizes run past the data") }
+    i = 0
+    while i < nparts {
+        var sz = 0
+        if i < nparts - 1 { unsafe { sz = peek8(p + sizes_at + i * 3) | (peek8(p + sizes_at + i * 3 + 1) << 8) | (peek8(p + sizes_at + i * 3 + 2) << 16) } }
+        else { sz = n - off }
+        if sz < 0 || off + sz > n { unsafe { free(probs) }  return v8_fail("partition " + to_str(i) + " runs past the data") }
+        part_p.push(p + off)
+        part_n.push(sz)
+        off = off + sz
+        i = i + 1
+    }
+    var parts: Vec<BoolD> = vec()
+    i = 0
+    while i < nparts { parts.push(bd_new(part_p[i], part_n[i]))  i = i + 1 }
+
+    // the dequantization factors per segment: ydc yac y2dc y2ac uvdc uvac
+    let dcq = v8t_dc_qlookup()
+    let acq = v8t_ac_qlookup()
+    var dq: Vec<Int> = vec()
+    var s = 0
+    while s < 4 {
+        var q = qbase
+        if seg_on == 1 { if seg_abs == 1 { q = seg_q[s] } else { q = q + seg_q[s] } }
+        q = v8_qclamp(q)
+        dq.push(dcq[v8_qclamp(q + dq_ydc)])
+        dq.push(acq[q])
+        dq.push(dcq[v8_qclamp(q + dq_y2dc)] * 2)
+        var y2ac = acq[v8_qclamp(q + dq_y2ac)] * 155 / 100
+        if y2ac < 8 { y2ac = 8 }
+        dq.push(y2ac)
+        var uvdc = dcq[v8_qclamp(q + dq_uvdc)]
+        if uvdc > 132 { uvdc = 132 }
+        dq.push(uvdc)
+        dq.push(acq[v8_qclamp(q + dq_uvac)])
+        s = s + 1
+    }
+
+    // the planes, with their borders
+    let mbw = (w + 15) / 16
+    let mbh = (h + 15) / 16
+    let ys = mbw * 16 + 8
+    let uvs = mbw * 8 + 8
+    let ysize = ys * (mbh * 16 + 1)
+    let uvsize = uvs * (mbh * 8 + 1)
+    var base = 0
+    unsafe { base = malloc(ysize + 2 * uvsize) }
+    if base == 0 { unsafe { free(probs) }  return v8_fail("no memory") }
+    let yp = base + ys + 4
+    let up = base + ysize + uvs + 4
+    let vp = base + ysize + uvsize + uvs + 4
+    v8_borders(yp, ys, mbw * 16, mbh * 16)
+    v8_borders(up, uvs, mbw * 8, mbh * 8)
+    v8_borders(vp, uvs, mbw * 8, mbh * 8)
+
+    // per macroblock state kept for the loop filter: its filter level, whether its inner edges are filtered
+    var mb_lf = 0
+    var mb_inner = 0
+    unsafe { mb_lf = malloc(mbw * mbh)  mb_inner = malloc(mbw * mbh) }
+    // contexts: above per macroblock column (9 flags: 4 Y, 2 U, 2 V, Y2), left (9); B_PRED modes above (4 per
+    // column) and left (4)
+    var actx = 0
+    var abm = 0
+    unsafe { actx = calloc(mbw * 9, 1)  abm = calloc(mbw * 4, 1) }
+    var lctx: Vec<Int> = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var lbm: Vec<Int> = [0, 0, 0, 0]
+    var coef = 0
+    unsafe { coef = malloc(25 * 16 * 8) }
+    let bmp = v8t_kf_bmode_prob()
+    let zz: Vec<Int> = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15]
+    let bands: Vec<Int> = [0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7]
+    var bmodes: Vec<Int> = vec()
+    i = 0
+    while i < 16 { bmodes.push(0)  i = i + 1 }
+    var good = true
+    var my = 0
+    while my < mbh && good {
+        i = 0
+        while i < 9 { lctx[i] = 0  i = i + 1 }
+        i = 0
+        while i < 4 { lbm[i] = 0  i = i + 1 }
+        var tp = copy parts[my & (nparts - 1)]
+        var mx = 0
+        while mx < mbw {
+            // the macroblock header (first partition)
+            var seg = 0
+            if seg_map == 1 {
+                if bd_read(bd, seg_p[0]) == 0 { seg = bd_read(bd, seg_p[1]) } else { seg = 2 + bd_read(bd, seg_p[2]) }
+            }
+            var skip = 0
+            if skip_on == 1 { skip = bd_read(bd, skip_p) }
+            // kf_ymode_tree: B_PRED "0", DC "100", V "101", H "110", TM "111"; modes 0 DC 1 V 2 H 3 TM 4 B
+            var ymode = 4
+            if bd_read(bd, 145) == 1 {
+                if bd_read(bd, 156) == 0 { ymode = bd_read(bd, 163) } else { ymode = 2 + bd_read(bd, 128) }
+            }
+            if ymode == 4 {
+                var k = 0
+                while k < 16 {
+                    var above = 0
+                    var left = 0
+                    unsafe { above = peek8(abm + mx * 4 + (k & 3)) }
+                    if (k & 3) == 0 { left = lbm[k >> 2] } else { left = bmodes[k - 1] }
+                    if k >= 4 { above = bmodes[k - 4] }
+                    let m = v8_bmode(bd, bmp, (above * 10 + left) * 9)
+                    bmodes[k] = m
+                    k = k + 1
+                }
+            } else {
+                // the implied subblock mode for the neighbours' contexts: DC->B_DC, V->B_VE, H->B_HE, TM->B_TM
+                var im = 0
+                if ymode == 1 { im = 2 } else if ymode == 2 { im = 3 } else if ymode == 3 { im = 1 }
+                var k = 0
+                while k < 16 { bmodes[k] = im  k = k + 1 }
+            }
+            unsafe { var k = 0  while k < 4 { poke8(abm + mx * 4 + k, bmodes[12 + k])  lbm[k] = bmodes[k * 4 + 3]  k = k + 1 } }
+            // uv_mode_tree: DC "0", V "10", H "110", TM "111"
+            var uvmode = 0
+            if bd_read(bd, 142) == 1 { if bd_read(bd, 114) == 0 { uvmode = 1 } else { uvmode = 2 + bd_read(bd, 183) } }
+
+            // the residue (its token partition)
+            let dqo = seg * 6
+            var nz = 0
+            unsafe { var k = 0  while k < 25 * 16 { poke(coef + k * 8, 0)  k = k + 1 } }
+            let has_y2 = ymode != 4
+            if skip == 0 {
+                var first = 0
+                var yt = 3
+                if has_y2 {
+                    var ac = 0
+                    unsafe { ac = peek8(actx + mx * 9 + 8) }
+                    let f = v8_block(tp, probs, 1, ac + lctx[8], 0, dq[dqo + 2], dq[dqo + 3], coef + 24 * 128, zz, bands)
+                    unsafe { poke8(actx + mx * 9 + 8, f) }
+                    lctx[8] = f
+                    nz = nz | f
+                    first = 1
+                    yt = 0
+                }
+                var k = 0
+                while k < 16 {
+                    let bx = k & 3
+                    let by = k >> 2
+                    var ac = 0
+                    unsafe { ac = peek8(actx + mx * 9 + bx) }
+                    let f = v8_block(tp, probs, yt, ac + lctx[by], first, dq[dqo], dq[dqo + 1], coef + k * 128, zz, bands)
+                    unsafe { poke8(actx + mx * 9 + bx, f) }
+                    lctx[by] = f
+                    nz = nz | f
+                    k = k + 1
+                }
+                k = 16
+                while k < 24 {
+                    let c = (k - 16) & 3
+                    let pl = (k - 16) >> 2                       // 0 U, 1 V
+                    let bx = c & 1
+                    let by = c >> 1
+                    var ac = 0
+                    unsafe { ac = peek8(actx + mx * 9 + 4 + pl * 2 + bx) }
+                    let f = v8_block(tp, probs, 2, ac + lctx[4 + pl * 2 + by], 0, dq[dqo + 4], dq[dqo + 5], coef + k * 128, zz, bands)
+                    unsafe { poke8(actx + mx * 9 + 4 + pl * 2 + bx, f) }
+                    lctx[4 + pl * 2 + by] = f
+                    nz = nz | f
+                    k = k + 1
+                }
+            } else {
+                // a skipped macroblock: its blocks are empty (the Y2 context only if it has a Y2)
+                var k = 0
+                while k < 8 { unsafe { poke8(actx + mx * 9 + k, 0) }  lctx[k] = 0  k = k + 1 }
+                if has_y2 { unsafe { poke8(actx + mx * 9 + 8, 0) }  lctx[8] = 0 }
+            }
+            if has_y2 && nz != 0 { v8_iwht(coef + 24 * 128, coef) }
+
+            // the prediction and the residue
+            let ydst = yp + my * 16 * ys + mx * 16
+            if ymode == 4 {
+                var k = 0
+                while k < 16 {
+                    let d = ydst + (k >> 2) * 4 * ys + (k & 3) * 4
+                    v8_bpred(d, ys, bmodes[k], k, ydst)
+                    v8_idct_add(coef + k * 128, d, ys)
+                    k = k + 1
+                }
+            } else {
+                v8_mbpred(ydst, ys, 16, ymode, mx, my)
+                var k = 0
+                while k < 16 { v8_idct_add(coef + k * 128, ydst + (k >> 2) * 4 * ys + (k & 3) * 4, ys)  k = k + 1 }
+            }
+            let udst = up + my * 8 * uvs + mx * 8
+            let vdst = vp + my * 8 * uvs + mx * 8
+            v8_mbpred(udst, uvs, 8, uvmode, mx, my)
+            v8_mbpred(vdst, uvs, 8, uvmode, mx, my)
+            var k = 0
+            while k < 4 {
+                v8_idct_add(coef + (16 + k) * 128, udst + (k >> 1) * 4 * uvs + (k & 1) * 4, uvs)
+                v8_idct_add(coef + (20 + k) * 128, vdst + (k >> 1) * 4 * uvs + (k & 1) * 4, uvs)
+                k = k + 1
+            }
+            // the filter's level for this macroblock (§9.3, §9.4, §10)
+            var lvl = lf_level
+            if seg_on == 1 { if seg_abs == 1 { lvl = seg_lf[seg] } else { lvl = lvl + seg_lf[seg] } }
+            if lvl < 0 { lvl = 0 }
+            if lvl > 63 { lvl = 63 }
+            if lf_adj == 1 {
+                lvl = lvl + ref_delta[0]
+                if ymode == 4 { lvl = lvl + mode_delta[0] }
+                if lvl < 0 { lvl = 0 }
+                if lvl > 63 { lvl = 63 }
+            }
+            var inner = 1
+            if ymode != 4 && nz == 0 { inner = 0 }
+            unsafe { poke8(mb_lf + my * mbw + mx, lvl)  poke8(mb_inner + my * mbw + mx, inner) }
+            mx = mx + 1
+        }
+        parts[my & (nparts - 1)] = copy tp
+        // the right border of this macroblock row: its last pixel repeated (the next row's above-right)
+        v8_right_border(yp, ys, mbw * 16, my * 16 + 15)
+        my = my + 1
+    }
+    if lf_level > 0 { v8_loopfilter(yp, up, vp, ys, uvs, mbw, mbh, mb_lf, mb_inner, filter_simple, sharp) }
+    unsafe {
+        free(probs)
+        free(mb_lf)
+        free(mb_inner)
+        free(actx)
+        free(abm)
+        free(coef)
+    }
+    if bd.p > bd.end + 8 { unsafe { free(base) }  return v8_fail("the first partition ends early") }
+    return V8Out { y: yp, u: up, v: vp, ys: ys, uvs: uvs, w: w, h: h, base: base, err: "" }
+}
+
+/// the border of a plane at `p` (stride s, w x h inside): the row above all 127, the column to the left 129
+fn v8_borders(p: Int, s: Int, w: Int, h: Int) {
+    unsafe {
+        var x = 0 - 4
+        while x < w + 4 { poke8(p - s + x, 127)  x = x + 1 }
+        var y = 0
+        while y < h { poke8(p + y * s - 1, 129)  y = y + 1 }
+    }
+}
+fn v8_right_border(p: Int, s: Int, w: Int, y: Int) {
+    unsafe {
+        let v = peek8(p + y * s + w - 1)
+        var x = 0
+        while x < 4 { poke8(p + y * s + w + x, v)  x = x + 1 }
+    }
+}
+/// a subblock mode through bmode_tree with the probabilities at `bmp[o..o+9]`
+/// modes: 0 B_DC 1 B_TM 2 B_VE 3 B_HE 4 B_LD 5 B_RD 6 B_VR 7 B_VL 8 B_HD 9 B_HU
+fn v8_bmode(inout b: BoolD, bmp: Vec<Int>, o: Int) -> Int {
+    if bd_read(b, bmp[o]) == 0 { return 0 }
+    if bd_read(b, bmp[o + 1]) == 0 { return 1 }
+    if bd_read(b, bmp[o + 2]) == 0 { return 2 }
+    if bd_read(b, bmp[o + 3]) == 0 {
+        if bd_read(b, bmp[o + 4]) == 0 { return 3 }
+        if bd_read(b, bmp[o + 5]) == 0 { return 5 }
+        return 6
+    }
+    if bd_read(b, bmp[o + 6]) == 0 { return 4 }
+    if bd_read(b, bmp[o + 7]) == 0 { return 7 }
+    if bd_read(b, bmp[o + 8]) == 0 { return 8 }
+    return 9
+}
+
+/// one block's tokens (§13): dequantized coefficients into `out` (16 Ints, natural order); 1 if any is nonzero
+fn v8_block(inout b: BoolD, probs: Int, pt: Int, ctx: Int, first: Int, dqdc: Int, dqac: Int, out: Int, zz: Vec<Int>, bands: Vec<Int>) -> Int {
+    var i = first
+    var c3 = ctx
+    var prevzero = false
+    var nz = 0
+    while i < 16 {
+        let pp = probs + ((pt * 8 + bands[i]) * 3 + c3) * 11
+        var p0 = 0  var p1 = 0
+        unsafe { p0 = peek8(pp)  p1 = peek8(pp + 1) }
+        if !prevzero { if bd_read(b, p0) == 0 { return nz } }
+        if bd_read(b, p1) == 0 { c3 = 0  prevzero = true  i = i + 1 }
+        else {
+            var v = 0
+            var p2 = 0
+            unsafe { p2 = peek8(pp + 2) }
+            if bd_read(b, p2) == 0 { v = 1 }
+            else {
+                var q = 0
+                unsafe { q = peek8(pp + 3) }
+                if bd_read(b, q) == 0 {
+                    unsafe { q = peek8(pp + 4) }
+                    if bd_read(b, q) == 0 { v = 2 }
+                    else { unsafe { q = peek8(pp + 5) }  v = 3 + bd_read(b, q) }
+                } else {
+                    unsafe { q = peek8(pp + 6) }
+                    if bd_read(b, q) == 0 {
+                        unsafe { q = peek8(pp + 7) }
+                        if bd_read(b, q) == 0 { v = 5 + bd_read(b, 159) }
+                        else { v = 7 + 2 * bd_read(b, 165)  v = v + bd_read(b, 145) }
+                    } else {
+                        unsafe { q = peek8(pp + 8) }
+                        if bd_read(b, q) == 0 {
+                            unsafe { q = peek8(pp + 9) }
+                            if bd_read(b, q) == 0 { v = 11 + v8_extra(b, 0) } else { v = 19 + v8_extra(b, 1) }
+                        } else {
+                            unsafe { q = peek8(pp + 10) }
+                            if bd_read(b, q) == 0 { v = 35 + v8_extra(b, 2) } else { v = 67 + v8_extra(b, 3) }
+                        }
+                    }
+                }
+            }
+            if bd_read(b, 128) == 1 { v = 0 - v }
+            var dqf = dqac
+            if i == 0 { dqf = dqdc }
+            unsafe { poke(out + zz[i] * 8, v * dqf) }
+            if v == 1 || v == 0 - 1 { c3 = 1 } else { c3 = 2 }
+            nz = 1
+            prevzero = false
+            i = i + 1
+        }
+    }
+    return nz
+}
+/// the extra bits of categories 3..6 (§13.2's Pcat3..Pcat6)
+fn v8_extra(inout b: BoolD, cat: Int) -> Int {
+    var v = 0
+    if cat == 0 { v = bd_read(b, 173)  v = v * 2 + bd_read(b, 148)  v = v * 2 + bd_read(b, 140) }
+    else if cat == 1 { v = bd_read(b, 176)  v = v * 2 + bd_read(b, 155)  v = v * 2 + bd_read(b, 140)  v = v * 2 + bd_read(b, 135) }
+    else if cat == 2 { v = bd_read(b, 180)  v = v * 2 + bd_read(b, 157)  v = v * 2 + bd_read(b, 141)  v = v * 2 + bd_read(b, 134)  v = v * 2 + bd_read(b, 130) }
+    else {
+        let p6: Vec<Int> = [254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129]
+        var k = 0
+        while k < 11 { v = v * 2 + bd_read(b, p6[k])  k = k + 1 }
+    }
+    return v
+}
+
+/// the inverse WHT (§14.3) of the Y2 block at `src`; its outputs become the DCs of the 16 Y blocks at `ys`
+fn v8_iwht(src: Int, ys: Int) {
+    var t: Vec<Int> = vec()
+    var i = 0
+    while i < 16 { t.push(0)  i = i + 1 }
+    unsafe {
+        i = 0
+        while i < 4 {
+            let i0 = peek(src + i * 8)
+            let i4 = peek(src + (4 + i) * 8)
+            let i8 = peek(src + (8 + i) * 8)
+            let i12 = peek(src + (12 + i) * 8)
+            let a1 = i0 + i12
+            let b1 = i4 + i8
+            let c1 = i4 - i8
+            let d1 = i0 - i12
+            t[i] = a1 + b1
+            t[4 + i] = c1 + d1
+            t[8 + i] = a1 - b1
+            t[12 + i] = d1 - c1
+            i = i + 1
+        }
+        i = 0
+        while i < 4 {
+            let a1 = t[i * 4] + t[i * 4 + 3]
+            let b1 = t[i * 4 + 1] + t[i * 4 + 2]
+            let c1 = t[i * 4 + 1] - t[i * 4 + 2]
+            let d1 = t[i * 4] - t[i * 4 + 3]
+            poke(ys + (i * 4) * 128, sar(a1 + b1 + 3, 3))
+            poke(ys + (i * 4 + 1) * 128, sar(c1 + d1 + 3, 3))
+            poke(ys + (i * 4 + 2) * 128, sar(a1 - b1 + 3, 3))
+            poke(ys + (i * 4 + 3) * 128, sar(d1 - c1 + 3, 3))
+            i = i + 1
+        }
+    }
+}
+
+/// the inverse DCT (§14.4) of the block at `src`, added to the 4x4 pixels at `dst` and clamped
+fn v8_idct_add(src: Int, dst: Int, s: Int) {
+    var any = 0
+    unsafe { var k = 0  while k < 16 { any = any | peek(src + k * 8)  k = k + 1 } }
+    if any == 0 { return }
+    var t: Vec<Int> = vec()
+    var i = 0
+    while i < 16 { t.push(0)  i = i + 1 }
+    unsafe {
+        i = 0
+        while i < 4 {
+            let i0 = peek(src + i * 8)
+            let i4 = peek(src + (4 + i) * 8)
+            let i8 = peek(src + (8 + i) * 8)
+            let i12 = peek(src + (12 + i) * 8)
+            let a1 = i0 + i8
+            let b1 = i0 - i8
+            let c1 = sar(i4 * 35468, 16) - (i12 + sar(i12 * 20091, 16))
+            let d1 = (i4 + sar(i4 * 20091, 16)) + sar(i12 * 35468, 16)
+            t[i] = a1 + d1
+            t[12 + i] = a1 - d1
+            t[4 + i] = b1 + c1
+            t[8 + i] = b1 - c1
+            i = i + 1
+        }
+        i = 0
+        while i < 4 {
+            let r = i * 4
+            let a1 = t[r] + t[r + 2]
+            let b1 = t[r] - t[r + 2]
+            let c1 = sar(t[r + 1] * 35468, 16) - (t[r + 3] + sar(t[r + 3] * 20091, 16))
+            let d1 = (t[r + 1] + sar(t[r + 1] * 20091, 16)) + sar(t[r + 3] * 35468, 16)
+            let row = dst + i * s
+            poke8(row, v8_clamp255(peek8(row) + sar(a1 + d1 + 4, 3)))
+            poke8(row + 3, v8_clamp255(peek8(row + 3) + sar(a1 - d1 + 4, 3)))
+            poke8(row + 1, v8_clamp255(peek8(row + 1) + sar(b1 + c1 + 4, 3)))
+            poke8(row + 2, v8_clamp255(peek8(row + 2) + sar(b1 - c1 + 4, 3)))
+            i = i + 1
+        }
+    }
+}
+
+/// a whole-block prediction (§12.2, §12.3): `n` x `n` at `d` (16 luma, 8 chroma), mode 0 DC 1 V 2 H 3 TM
+fn v8_mbpred(d: Int, s: Int, n: Int, mode: Int, mx: Int, my: Int) {
+    unsafe {
+        if mode == 0 {
+            var sum = 0
+            var cnt = 0
+            if my > 0 { var x = 0  while x < n { sum = sum + peek8(d - s + x)  x = x + 1 }  cnt = cnt + n }
+            if mx > 0 { var y = 0  while y < n { sum = sum + peek8(d + y * s - 1)  y = y + 1 }  cnt = cnt + n }
+            var v = 128
+            if cnt > 0 {
+                var shf = 3
+                if cnt == 16 { shf = 4 } else if cnt == 32 { shf = 5 }
+                v = (sum + (1 << (shf - 1))) >> shf
+            }
+            var y = 0
+            while y < n { var x = 0  while x < n { poke8(d + y * s + x, v)  x = x + 1 }  y = y + 1 }
+        } else if mode == 1 {
+            var y = 0
+            while y < n { var x = 0  while x < n { poke8(d + y * s + x, peek8(d - s + x))  x = x + 1 }  y = y + 1 }
+        } else if mode == 2 {
+            var y = 0
+            while y < n { let l = peek8(d + y * s - 1)  var x = 0  while x < n { poke8(d + y * s + x, l)  x = x + 1 }  y = y + 1 }
+        } else {
+            let pc = peek8(d - s - 1)
+            var y = 0
+            while y < n {
+                let l = peek8(d + y * s - 1) - pc
+                var x = 0
+                while x < n { poke8(d + y * s + x, v8_clamp255(l + peek8(d - s + x)))  x = x + 1 }
+                y = y + 1
+            }
+        }
+    }
+}
+
+fn v8_avg3(x: Int, y: Int, z: Int) -> Int { return (x + y + y + z + 2) >> 2 }
+fn v8_avg2(x: Int, y: Int) -> Int { return (x + y + 1) >> 1 }
+
+/// a 4x4 subblock prediction (§12.3) at `d`: subblock k of the macroblock at `mb` (for the above-right pixels)
+fn v8_bpred(d: Int, s: Int, mode: Int, k: Int, mb: Int) {
+    // A[0..7] above (the last four: above-right), L[0..3] left, P the corner
+    var a: Vec<Int> = vec()
+    var l: Vec<Int> = vec()
+    var pc = 0
+    unsafe {
+        var i = 0
+        while i < 4 { a.push(peek8(d - s + i))  i = i + 1 }
+        // the above-right: for the right column (3, 7, 11, 15) those above-right of the macroblock
+        var ar = d - s + 4
+        if (k & 3) == 3 { ar = mb - s + 16 }
+        i = 0
+        while i < 4 { a.push(peek8(ar + i))  i = i + 1 }
+        i = 0
+        while i < 4 { l.push(peek8(d + i * s - 1))  i = i + 1 }
+        pc = peek8(d - s - 1)
+    }
+    var bv: Vec<Int> = vec()
+    var i = 0
+    while i < 16 { bv.push(0)  i = i + 1 }
+    // E: L[3] L[2] L[1] L[0] P A[0] A[1] A[2] A[3]
+    let e: Vec<Int> = [l[3], l[2], l[1], l[0], pc, a[0], a[1], a[2], a[3]]
+    if mode == 0 {
+        var v = 4
+        i = 0
+        while i < 4 { v = v + a[i] + l[i]  i = i + 1 }
+        v = v >> 3
+        i = 0
+        while i < 16 { bv[i] = v  i = i + 1 }
+    } else if mode == 1 {
+        var r = 0
+        while r < 4 { var c = 0  while c < 4 { bv[r * 4 + c] = v8_clamp255(l[r] + a[c] - pc)  c = c + 1 }  r = r + 1 }
+    } else if mode == 2 {
+        var c = 0
+        while c < 4 {
+            var lft = pc
+            if c > 0 { lft = a[c - 1] }
+            let v = v8_avg3(lft, a[c], a[c + 1])
+            var r = 0
+            while r < 4 { bv[r * 4 + c] = v  r = r + 1 }
+            c = c + 1
+        }
+    } else if mode == 3 {
+        var r = 0
+        while r < 4 {
+            var v = 0
+            if r == 3 { v = v8_avg3(l[2], l[3], l[3]) }
+            else {
+                var up = pc
+                if r > 0 { up = l[r - 1] }
+                v = v8_avg3(up, l[r], l[r + 1])
+            }
+            var c = 0
+            while c < 4 { bv[r * 4 + c] = v  c = c + 1 }
+            r = r + 1
+        }
+    } else if mode == 4 {
+        // B_LD: avg3p(A + j) for j = 1..6, the last avg3(A6, A7, A7)
+        var r = 0
+        while r < 4 {
+            var c = 0
+            while c < 4 {
+                let j = r + c + 1
+                if j == 7 { bv[r * 4 + c] = v8_avg3(a[6], a[7], a[7]) } else { bv[r * 4 + c] = v8_avg3(a[j - 1], a[j], a[j + 1]) }
+                c = c + 1
+            }
+            r = r + 1
+        }
+    } else if mode == 5 {
+        // B_RD: B[r][c] = avg3p(E + 4 - r + c)
+        var r = 0
+        while r < 4 {
+            var c = 0
+            while c < 4 { let j = 4 - r + c  bv[r * 4 + c] = v8_avg3(e[j - 1], e[j], e[j + 1])  c = c + 1 }
+            r = r + 1
+        }
+    } else if mode == 6 {
+        // B_VR
+        bv[12] = v8_avg3(e[1], e[2], e[3])
+        bv[8] = v8_avg3(e[2], e[3], e[4])
+        bv[13] = v8_avg3(e[3], e[4], e[5])  bv[4] = bv[13]
+        bv[9] = v8_avg2(e[4], e[5])  bv[0] = bv[9]
+        bv[14] = v8_avg3(e[4], e[5], e[6])  bv[5] = bv[14]
+        bv[10] = v8_avg2(e[5], e[6])  bv[1] = bv[10]
+        bv[15] = v8_avg3(e[5], e[6], e[7])  bv[6] = bv[15]
+        bv[11] = v8_avg2(e[6], e[7])  bv[2] = bv[11]
+        bv[7] = v8_avg3(e[6], e[7], e[8])
+        bv[3] = v8_avg2(e[7], e[8])
+    } else if mode == 7 {
+        // B_VL
+        bv[0] = v8_avg2(a[0], a[1])
+        bv[4] = v8_avg3(a[0], a[1], a[2])
+        bv[8] = v8_avg2(a[1], a[2])  bv[1] = bv[8]
+        bv[5] = v8_avg3(a[1], a[2], a[3])  bv[12] = bv[5]
+        bv[9] = v8_avg2(a[2], a[3])  bv[2] = bv[9]
+        bv[13] = v8_avg3(a[2], a[3], a[4])  bv[6] = bv[13]
+        bv[10] = v8_avg2(a[3], a[4])  bv[3] = bv[10]
+        bv[14] = v8_avg3(a[3], a[4], a[5])  bv[7] = bv[14]
+        bv[11] = v8_avg3(a[4], a[5], a[6])
+        bv[15] = v8_avg3(a[5], a[6], a[7])
+    } else if mode == 8 {
+        // B_HD
+        bv[12] = v8_avg2(e[0], e[1])
+        bv[13] = v8_avg3(e[0], e[1], e[2])
+        bv[8] = v8_avg2(e[1], e[2])  bv[14] = bv[8]
+        bv[9] = v8_avg3(e[1], e[2], e[3])  bv[15] = bv[9]
+        bv[10] = v8_avg2(e[2], e[3])  bv[4] = bv[10]
+        bv[11] = v8_avg3(e[2], e[3], e[4])  bv[5] = bv[11]
+        bv[6] = v8_avg2(e[3], e[4])  bv[0] = bv[6]
+        bv[7] = v8_avg3(e[3], e[4], e[5])  bv[1] = bv[7]
+        bv[2] = v8_avg3(e[4], e[5], e[6])
+        bv[3] = v8_avg3(e[5], e[6], e[7])
+    } else {
+        // B_HU
+        bv[0] = v8_avg2(l[0], l[1])
+        bv[1] = v8_avg3(l[0], l[1], l[2])
+        bv[2] = v8_avg2(l[1], l[2])  bv[4] = bv[2]
+        bv[3] = v8_avg3(l[1], l[2], l[3])  bv[5] = bv[3]
+        bv[6] = v8_avg2(l[2], l[3])  bv[8] = bv[6]
+        bv[7] = v8_avg3(l[2], l[3], l[3])  bv[9] = bv[7]
+        bv[10] = l[3]  bv[11] = l[3]  bv[12] = l[3]  bv[13] = l[3]  bv[14] = l[3]  bv[15] = l[3]
+    }
+    unsafe {
+        var r = 0
+        while r < 4 { var c = 0  while c < 4 { poke8(d + r * s + c, bv[r * 4 + c])  c = c + 1 }  r = r + 1 }
+    }
+}
+
+// ---- the loop filter (§15) -----------------------------------------------------------------------------------
+
+fn v8_c(v: Int) -> Int { if v < 0 - 128 { return 0 - 128 }  if v > 127 { return 127 }  return v }
+fn v8_abs(v: Int) -> Int { if v < 0 { return 0 - v }  return v }
+
+/// the common adjustment (§15.2) on the segment at `p` (step `st` across the edge); returns `a`
+fn v8_common(p: Int, st: Int, outer: Bool) -> Int {
+    var p1 = 0  var p0 = 0  var q0 = 0  var q1 = 0
+    unsafe { p1 = peek8(p - 2 * st) - 128  p0 = peek8(p - st) - 128  q0 = peek8(p) - 128  q1 = peek8(p + st) - 128 }
+    var a = 3 * (q0 - p0)
+    if outer { a = a + v8_c(p1 - q1) }
+    a = v8_c(a)
+    let b = sar(v8_c(a + 3), 3)
+    a = sar(v8_c(a + 4), 3)
+    unsafe { poke8(p, v8_c(q0 - a) + 128)  poke8(p - st, v8_c(p0 + b) + 128) }
+    return a
+}
+
+/// one segment of the edge at `p` (the first pixel after the edge; `st` the step across it). kind 0 simple,
+/// 1 normal subblock, 2 normal macroblock edge.
+fn v8_seg(p: Int, st: Int, kind: Int, elim: Int, ilim: Int, hevt: Int) {
+    var p3 = 0  var p2 = 0  var p1 = 0  var p0 = 0  var q0 = 0  var q1 = 0  var q2 = 0  var q3 = 0
+    unsafe { p1 = peek8(p - 2 * st)  p0 = peek8(p - st)  q0 = peek8(p)  q1 = peek8(p + st) }
+    if v8_abs(p0 - q0) * 2 + v8_abs(p1 - q1) / 2 > elim { return }
+    if kind == 0 { let _a = v8_common(p, st, true)  return }
+    unsafe { p3 = peek8(p - 4 * st)  p2 = peek8(p - 3 * st)  q2 = peek8(p + 2 * st)  q3 = peek8(p + 3 * st) }
+    if v8_abs(p3 - p2) > ilim || v8_abs(p2 - p1) > ilim || v8_abs(p1 - p0) > ilim { return }
+    if v8_abs(q3 - q2) > ilim || v8_abs(q2 - q1) > ilim || v8_abs(q1 - q0) > ilim { return }
+    let hv = v8_abs(p1 - p0) > hevt || v8_abs(q1 - q0) > hevt
+    if kind == 1 {
+        let a = sar(v8_common(p, st, hv) + 1, 1)
+        if !hv { unsafe { poke8(p + st, v8_c(q1 - 128 - a) + 128)  poke8(p - 2 * st, v8_c(p1 - 128 + a) + 128) } }
+        return
+    }
+    if hv { let _b = v8_common(p, st, true)  return }
+    let sp2 = p2 - 128  let sp1 = p1 - 128  let sp0 = p0 - 128
+    let sq0 = q0 - 128  let sq1 = q1 - 128  let sq2 = q2 - 128
+    let w = v8_c(v8_c(sp1 - sq1) + 3 * (sq0 - sp0))
+    var a = v8_c(sar(27 * w + 63, 7))
+    unsafe { poke8(p, v8_c(sq0 - a) + 128)  poke8(p - st, v8_c(sp0 + a) + 128) }
+    a = v8_c(sar(18 * w + 63, 7))
+    unsafe { poke8(p + st, v8_c(sq1 - a) + 128)  poke8(p - 2 * st, v8_c(sp1 + a) + 128) }
+    a = v8_c(sar(9 * w + 63, 7))
+    unsafe { poke8(p + 2 * st, v8_c(sq2 - a) + 128)  poke8(p - 3 * st, v8_c(sp2 + a) + 128) }
+}
+
+/// an edge of `len` segments starting at `p`: across it `st`, along it `along`
+fn v8_edge(p: Int, st: Int, along: Int, len: Int, kind: Int, elim: Int, ilim: Int, hevt: Int) {
+    var i = 0
+    while i < len { v8_seg(p + i * along, st, kind, elim, ilim, hevt)  i = i + 1 }
+}
+
+fn v8_loopfilter(yp: Int, up: Int, vp: Int, ys: Int, uvs: Int, mbw: Int, mbh: Int, mblf: Int, mbin: Int, simple: Int, sharp: Int) {
+    var my = 0
+    while my < mbh {
+        var mx = 0
+        while mx < mbw {
+            var lvl = 0
+            var inner = 0
+            unsafe { lvl = peek8(mblf + my * mbw + mx)  inner = peek8(mbin + my * mbw + mx) }
+            if lvl > 0 {
+                var il = lvl
+                if sharp > 0 {
+                    if sharp > 4 { il = il >> 2 } else { il = il >> 1 }
+                    if il > 9 - sharp { il = 9 - sharp }
+                }
+                if il < 1 { il = 1 }
+                var hevt = 0
+                if lvl >= 40 { hevt = 2 } else if lvl >= 15 { hevt = 1 }
+                let mbl = (lvl + 2) * 2 + il
+                let sbl = lvl * 2 + il
+                let y0 = yp + my * 16 * ys + mx * 16
+                let u0 = up + my * 8 * uvs + mx * 8
+                let v0 = vp + my * 8 * uvs + mx * 8
+                if simple == 1 {
+                    if mx > 0 { v8_edge(y0, 1, ys, 16, 0, mbl, il, hevt) }
+                    if inner == 1 { v8_edge(y0 + 4, 1, ys, 16, 0, sbl, il, hevt)  v8_edge(y0 + 8, 1, ys, 16, 0, sbl, il, hevt)  v8_edge(y0 + 12, 1, ys, 16, 0, sbl, il, hevt) }
+                    if my > 0 { v8_edge(y0, ys, 1, 16, 0, mbl, il, hevt) }
+                    if inner == 1 { v8_edge(y0 + 4 * ys, ys, 1, 16, 0, sbl, il, hevt)  v8_edge(y0 + 8 * ys, ys, 1, 16, 0, sbl, il, hevt)  v8_edge(y0 + 12 * ys, ys, 1, 16, 0, sbl, il, hevt) }
+                } else {
+                    if mx > 0 {
+                        v8_edge(y0, 1, ys, 16, 2, mbl, il, hevt)
+                        v8_edge(u0, 1, uvs, 8, 2, mbl, il, hevt)
+                        v8_edge(v0, 1, uvs, 8, 2, mbl, il, hevt)
+                    }
+                    if inner == 1 {
+                        v8_edge(y0 + 4, 1, ys, 16, 1, sbl, il, hevt)
+                        v8_edge(y0 + 8, 1, ys, 16, 1, sbl, il, hevt)
+                        v8_edge(y0 + 12, 1, ys, 16, 1, sbl, il, hevt)
+                        v8_edge(u0 + 4, 1, uvs, 8, 1, sbl, il, hevt)
+                        v8_edge(v0 + 4, 1, uvs, 8, 1, sbl, il, hevt)
+                    }
+                    if my > 0 {
+                        v8_edge(y0, ys, 1, 16, 2, mbl, il, hevt)
+                        v8_edge(u0, uvs, 1, 8, 2, mbl, il, hevt)
+                        v8_edge(v0, uvs, 1, 8, 2, mbl, il, hevt)
+                    }
+                    if inner == 1 {
+                        v8_edge(y0 + 4 * ys, ys, 1, 16, 1, sbl, il, hevt)
+                        v8_edge(y0 + 8 * ys, ys, 1, 16, 1, sbl, il, hevt)
+                        v8_edge(y0 + 12 * ys, ys, 1, 16, 1, sbl, il, hevt)
+                        v8_edge(u0 + 4 * uvs, uvs, 1, 8, 1, sbl, il, hevt)
+                        v8_edge(v0 + 4 * uvs, uvs, 1, 8, 1, sbl, il, hevt)
+                    }
+                }
+            }
+            mx = mx + 1
+        }
+        my = my + 1
+    }
+}

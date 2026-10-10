@@ -1,0 +1,191 @@
+import "std/regex" as re
+
+// ---- literals ----
+fn test_literals() {
+    assert_true(re::matches("abc", "abc"))
+    assert_true(re::matches("abc", "xxabcyy"))
+    assert_false(re::matches("abc", "abx"))
+    var r = re::compile("abc")
+    assert_true(r.full("abc"))
+    assert_false(r.full("abcd"))
+    assert_false(r.full("ab"))
+}
+
+// ---- '.' any char ----
+fn test_dot() {
+    var r = re::compile("a.c")
+    assert_true(r.full("axc"))
+    assert_true(r.full("a c"))
+    assert_false(r.full("ac"))
+    assert_false(r.full("axxc"))
+    // '.' does not match newline
+    assert_false(r.full("a\nc"))
+}
+
+// ---- star ----
+fn test_star() {
+    var r = re::compile("a*")
+    assert_true(r.full(""))
+    assert_true(r.full("a"))
+    assert_true(r.full("aaaa"))
+    assert_false(r.full("aaab"))
+    var r2 = re::compile("ab*c")
+    assert_true(r2.full("ac"))
+    assert_true(r2.full("abc"))
+    assert_true(r2.full("abbbbc"))
+    assert_false(r2.full("abx"))
+}
+
+// ---- plus ----
+fn test_plus() {
+    var r = re::compile("a+")
+    assert_false(r.full(""))
+    assert_true(r.full("a"))
+    assert_true(r.full("aaa"))
+    var r2 = re::compile("ab+c")
+    assert_false(r2.full("ac"))
+    assert_true(r2.full("abc"))
+    assert_true(r2.full("abbbc"))
+}
+
+// ---- opt ----
+fn test_opt() {
+    var r = re::compile("ab?c")
+    assert_true(r.full("ac"))
+    assert_true(r.full("abc"))
+    assert_false(r.full("abbc"))
+}
+
+// ---- char classes ----
+fn test_class_set() {
+    var r = re::compile("[abc]")
+    assert_true(r.full("a"))
+    assert_true(r.full("b"))
+    assert_true(r.full("c"))
+    assert_false(r.full("d"))
+    assert_false(r.full("ab"))
+}
+fn test_class_range() {
+    var r = re::compile("[a-z]+")
+    assert_true(r.full("hello"))
+    assert_false(r.full("Hello"))
+    assert_false(r.full("h3llo"))
+    var d = re::compile("[0-9]+")
+    assert_true(d.full("12345"))
+    assert_false(d.full("12a45"))
+}
+fn test_class_negated() {
+    var r = re::compile("[^0-9]+")
+    assert_true(r.full("abc"))
+    assert_false(r.full("ab3"))
+    assert_false(r.full("123"))
+}
+
+// ---- escapes ----
+fn test_escape_classes() {
+    assert_true(re::compile("\\d+").full("2026"))
+    assert_false(re::compile("\\d+").full("20a6"))
+    assert_true(re::compile("\\w+").full("hello_99"))
+    assert_false(re::compile("\\w+").full("hi there"))
+    assert_true(re::compile("\\s").full(" "))
+    assert_true(re::compile("\\s").full("\t"))
+    assert_false(re::compile("\\s").full("x"))
+    // negated escapes
+    assert_true(re::compile("\\D+").full("abc"))
+    assert_false(re::compile("\\D+").full("a1c"))
+    assert_true(re::compile("\\S+").full("abc"))
+    assert_false(re::compile("\\S").full(" "))
+}
+fn test_escaped_metachars() {
+    var r = re::compile("a\\.b")
+    assert_true(r.full("a.b"))
+    assert_false(r.full("axb"))
+    var s = re::compile("\\*")
+    assert_true(s.full("*"))
+    var bs = re::compile("a\\\\b")
+    assert_true(bs.full("a\\b"))
+}
+
+// ---- anchors ----
+fn test_anchors() {
+    var r = re::compile("^abc")
+    assert_true(r.test("abcdef"))
+    assert_false(r.test("xabc"))
+    var r2 = re::compile("abc$")
+    assert_true(r2.test("xxabc"))
+    assert_false(r2.test("abcx"))
+    var r3 = re::compile("^abc$")
+    assert_true(r3.test("abc"))
+    assert_false(r3.test("abcd"))
+    assert_false(r3.test("xabc"))
+}
+
+// ---- alternation ----
+fn test_alt() {
+    var r = re::compile("cat|dog")
+    assert_true(r.test("cat"))
+    assert_true(r.test("dog"))
+    assert_true(r.test("hotdog"))
+    assert_false(r.test("bird"))
+    var anc = re::compile("^cat|dog$")
+    assert_true(anc.test("category"))     // ^cat
+    assert_true(anc.test("hotdog"))       // dog$
+    assert_false(anc.test("xcatx"))       // neither anchored alt holds
+}
+
+// ---- grouping ----
+fn test_group() {
+    var r = re::compile("(ab)+")
+    assert_true(r.full("ab"))
+    assert_true(r.full("abab"))
+    assert_true(r.full("ababab"))
+    assert_false(r.full("aba"))
+    assert_false(r.full(""))
+    var r2 = re::compile("(a|b)c")
+    assert_true(r2.full("ac"))
+    assert_true(r2.full("bc"))
+    assert_false(r2.full("cc"))
+    var r3 = re::compile("(ab)*c")
+    assert_true(r3.full("c"))
+    assert_true(r3.full("ababc"))
+}
+
+// ---- realistic pattern ----
+fn test_email_like() {
+    var r = re::compile("^[a-z]+@[a-z]+\\.[a-z]+$")
+    assert_true(r.full("a@b.com"))
+    assert_true(r.full("user@host.org"))
+    assert_false(r.full("nope"))
+    assert_false(r.full("a@b"))
+    assert_false(r.full("a@b.com.x.fail9"))
+    assert_false(r.full("A@b.com"))
+}
+
+// ---- find returns index ----
+fn test_find() {
+    var r = re::compile("cat")
+    assert_eq(r.find("xx cat yy"), 3)
+    assert_eq(r.find("cat"), 0)
+    assert_eq(r.find("nope"), 0 - 1)
+    var d = re::compile("[0-9]+")
+    assert_eq(d.find("abc123"), 3)
+}
+
+// ---- full vs test distinction ----
+fn test_full_vs_test() {
+    var r = re::compile("abc")
+    assert_true(r.test("xxabcyy"))
+    assert_false(r.full("xxabcyy"))
+    assert_true(r.full("abc"))
+}
+
+// ---- backtracking across quantifier + suffix ----
+fn test_backtrack() {
+    // a* must give back an 'a' so the trailing 'a' can match
+    assert_true(re::compile("a*a").full("aaa"))
+    assert_true(re::compile("a*a").full("a"))
+    assert_false(re::compile("a*a").full(""))
+    // .* greedily eats then backtracks for the literal
+    assert_true(re::compile(".*c").full("aabc"))
+    assert_true(re::compile("a.*z").full("a___z"))
+}

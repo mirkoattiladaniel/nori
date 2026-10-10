@@ -1,0 +1,60 @@
+//! std/heap: a binary min-heap / priority queue of `Int` (smallest comes out first). For a max-heap or a
+//! keyed priority, store negated / encoded priorities. O(log n) insert and pop, O(1) peek.
+//!   import "std/heap" as heap
+//!   var h = heap::new()
+//!   h.insert(5)  h.insert(1)  h.insert(3)
+//!   h.pop_min()         // 1
+//!
+//! The operations are methods on `Heap`, as in std/set: `insert` is a built-in's name, and a top-level
+//! function wearing one is a function nothing can call.
+
+pub struct Heap { items: Vec<Int> }
+
+fn swap(inout v: Vec<Int>, a: Int, b: Int) { let t = v[a]  v[a] = v[b]  v[b] = t }
+
+/// a new empty heap.
+pub fn new() -> Heap { var v: Vec<Int> = vec()  return Heap { items: v } }
+
+impl Heap {
+    /// number of elements.
+    fn size(self) -> Int { return self.items.len() }
+    /// is the heap empty?
+    fn is_empty(self) -> Bool { return self.items.len() == 0 }
+    /// the current minimum without removing it (call only when non-empty).
+    fn peek_min(self) -> Int { return self.items[0] }
+
+    /// insert `x`, restoring the heap property (sift up).
+    fn insert(inout self, x: Int) {
+        self.items.push(x)
+        var i = self.items.len() - 1
+        var going = true
+        while going {
+            if i == 0 { going = false } else {
+                let parent = (i - 1) / 2
+                if self.items[parent] <= self.items[i] { going = false } else { swap(self.items, i, parent)  i = parent }
+            }
+        }
+    }
+
+    /// remove and return the minimum (call only when non-empty).
+    fn pop_min(inout self) -> Int {
+        let top = self.items[0]
+        let last = self.items[self.items.len() - 1]
+        self.items.pop()
+        let n = self.items.len()
+        if n > 0 {
+            self.items[0] = last
+            var i = 0
+            var going = true
+            while going {
+                let l = 2 * i + 1
+                let r = 2 * i + 2
+                var sm = i
+                if l < n { if self.items[l] < self.items[sm] { sm = l } }
+                if r < n { if self.items[r] < self.items[sm] { sm = r } }
+                if sm == i { going = false } else { swap(self.items, i, sm)  i = sm }
+            }
+        }
+        return top
+    }
+}

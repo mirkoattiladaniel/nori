@@ -1,0 +1,1016 @@
+//! std/os: environment variables, directories, cwd, existence, and process spawn with an explicit
+//! argument vector. No shell: arguments are passed as given, so spaces / quotes / `;` / `$` are safe.
+//!
+//! Built on the unsafe subset (extern libc + raw memory). The spawn primitive (fork/exec/wait) is
+//! provided by the runtime as nori_spawn_argv; all platform-specific code lives there.
+import "std/sort" as sort
+extern fn malloc(Int) -> Int
+extern fn free(Int)
+extern fn getenv(Int) -> Int           // libc:  char* getenv(const char*)
+extern fn mkdir(Int, Int) -> I32       // POSIX: int   mkdir(const char* path, mode_t mode)
+extern fn getcwd(Int, Int) -> Int      // POSIX: char* getcwd(char* buf, size_t size)
+extern fn access(Int, Int) -> I32      // POSIX: int   access(const char* path, int mode); F_OK = 0
+extern fn nori_res_register(Int)   // register an open user fd (snapshot() safe-subset check)
+extern fn nori_res_unregister(Int) // unregister on close
+extern fn nori_spawn_argv(Int) -> Int // runtime: spawn a NUL/NULL-terminated argv[], wait, return exit code
+extern fn nori_spawn_pipe(Int, Int) -> Int // runtime: spawn argv[] with pipes, without waiting; out[3] = pid, stdin_w, stdout_r
+extern fn nori_proc_poll(Int) -> Int   // runtime: -1 running, exit code once finished, -2 not ours
+extern fn nori_proc_kill(Int) -> Int   // runtime: SIGTERM a child
+extern fn nori_watch_open(Int) -> Int  // runtime: inotify_init1(flags) -> fd, or -1 where unsupported
+extern fn nori_watch_add(Int, Int, Int) -> Int // runtime: inotify_add_watch(fd, path, mask) -> wd, or -1
+extern fn nori_watch_rm(Int, Int) -> Int       // runtime: inotify_rm_watch(fd, wd)
+extern fn nori_remove_tree(Int) -> Int // runtime: recursively delete a file/dir tree (rm -rf), 0 = ok
+extern fn nori_list_tree(Int) -> Int   // runtime: newline-joined list of all files under a dir (malloc'd C str)
+extern fn rename(Int, Int) -> I32      // POSIX: int rename(const char* old, const char* new)
+extern fn chmod(Int, Int) -> I32       // POSIX: int chmod(const char* path, mode_t mode)
+// `-> I32` on everything here that C declares `int`, and on read/write, which POSIX declares ssize_t
+// and Windows declares int. The return type is not decoration: it is how many bits of RAX the callee
+// promises to set. Declared `-> Int`, a C `int` hands back EAX and leaves the upper half as whatever
+// was there, so -1 can arrive as 0x00000000FFFFFFFF, four billion. glibc happens to set all 64 bits
+// and nothing on Linux notices; the Windows CRT does not, and a non-blocking read that returns -1
+// can then look like +4294967295 and defeat a `got <= 0` check. Declared I32, the compiler calls it
+// as i32 and sign-extends, which is what C meant.
+// (read/write as I32 lose nothing: Linux, macOS and Windows all cap one call below 2^31 bytes.)
+extern fn read(Int, Int, Int) -> I32   // POSIX: ssize_t read(int fd, void* buf, size_t n)
+extern fn write(Int, Int, Int) -> I32  // POSIX: ssize_t write(int fd, const void* buf, size_t n)
+extern fn isatty(Int) -> I32           // POSIX: int isatty(int fd); 1 if fd is a terminal
+extern fn chdir(Int) -> I32            // POSIX: int chdir(const char* path)
+extern fn open(Int, Int, Int) -> I32   // POSIX: int open(const char* path, int flags, mode_t mode); mode used only with O_CREAT
+extern fn close(Int) -> I32            // POSIX: int close(int fd)
+extern fn dup(Int) -> I32              // POSIX: int dup(int fd); lowest free fd duplicating fd
+extern fn dup2(Int, Int) -> I32        // POSIX: int dup2(int oldfd, int newfd)
+extern fn opendir(Int) -> Int          // POSIX: DIR* opendir(const char* name)
+extern fn readdir(Int) -> Int          // POSIX: struct dirent* readdir(DIR*); 0 at end
+extern fn closedir(Int) -> I32         // POSIX: int closedir(DIR*)
+cfg(linux) { extern fn stat(Int, Int) -> I32 }      // POSIX: int stat(const char* path, struct stat* buf)
+cfg(macos) { extern fn stat(Int, Int) -> I32 }
+cfg(bare) { extern fn stat(Int, Int) -> I32 }
+cfg(windows) { extern fn _stat64(Int, Int) -> I32 } // int _stat64(const char* path, struct _stat64* buf)
+
+/// read at most `n` bytes from the start of a file (a partial read, for sniffing headers of large
+/// files without loading them, e.g. font name tables). "" if the file cannot be opened.
+pub fn read_file_head(path: Str, n: Int) -> Str {
+    let c = os_cstr(path)
+    var fd = 0
+    // Binary, like every other open here: what this reads is a font's tables and a file header, and
+    // msvcrt in text mode rewrites CRLF pairs and stops dead at the first 0x1A, which in a binary
+    // file is a byte like any other.
+    unsafe { fd = to_int(open(c, os_bin_flag(), 0)) }
+    free(c)
+    if fd < 0 { return "" }
+    let buf = malloc(n)
+    var got = 0
+    unsafe {
+        var off = 0
+        var going = true
+        while going && off < n {
+            let r = to_int(read(fd, buf + off, n - off))
+            if r <= 0 { going = false } else { off = off + r }
+        }
+        got = off
+    }
+    var out = ""
+    unsafe {
+        var i = 0
+        while i < got { out = out + chr(peek8(buf + i))  i = i + 1 }
+    }
+    free(buf)
+    let _c2 = to_int(close(fd))
+    return out
+}
+
+cfg(linux)   { extern fn lseek(Int, Int, Int) -> Int }     // POSIX: off_t lseek(int fd, off_t off, int whence)
+cfg(macos)   { extern fn lseek(Int, Int, Int) -> Int }
+cfg(bare)    { extern fn lseek(Int, Int, Int) -> Int }
+cfg(windows) { extern fn _lseeki64(Int, Int, Int) -> Int } // msvcrt: __int64 _lseeki64(int fd, __int64 off, int whence)
+cfg(linux)   { fn os_seek_set(fd: Int, off: Int) -> Int { var r = 0  unsafe { r = lseek(fd, off, 0) }  return r } }
+cfg(linux)   { fn os_seek_end(fd: Int) -> Int { var r = 0  unsafe { r = lseek(fd, 0, 2) }  return r } }
+cfg(macos)   { fn os_seek_end(fd: Int) -> Int { var r = 0  unsafe { r = lseek(fd, 0, 2) }  return r } }
+cfg(bare)    { fn os_seek_end(fd: Int) -> Int { var r = 0  unsafe { r = lseek(fd, 0, 2) }  return r } }
+cfg(windows) { fn os_seek_end(fd: Int) -> Int { var r = 0  unsafe { r = _lseeki64(fd, 0, 2) }  return r } }
+cfg(macos)   { fn os_seek_set(fd: Int, off: Int) -> Int { var r = 0  unsafe { r = lseek(fd, off, 0) }  return r } }
+cfg(bare)    { fn os_seek_set(fd: Int, off: Int) -> Int { var r = 0  unsafe { r = lseek(fd, off, 0) }  return r } }
+cfg(windows) { fn os_seek_set(fd: Int, off: Int) -> Int { var r = 0  unsafe { r = _lseeki64(fd, off, 0) }  return r } }
+
+/// read at most `n` bytes of a file starting at byte `off` (a partial read from anywhere; the
+/// tables a font discovery needs can sit at the end of a 20 MB collection). "" if the file cannot be
+/// opened or the offset cannot be reached; shorter than `n` at the end of the file.
+pub fn read_file_range(path: Str, off: Int, n: Int) -> Str {
+    if n <= 0 || off < 0 { return "" }
+    let c = os_cstr(path)
+    var fd = 0
+    unsafe { fd = to_int(open(c, os_bin_flag(), 0)) }
+    free(c)
+    if fd < 0 { return "" }
+    if os_seek_set(fd, off) != off { let _c = to_int(close(fd))  return "" }
+    let buf = malloc(n)
+    var got = 0
+    unsafe {
+        var going = true
+        while going && got < n {
+            let r = to_int(read(fd, buf + got, n - got))
+            if r <= 0 { going = false } else { got = got + r }
+        }
+    }
+    var out = ""
+    unsafe { out = str_from_buf(buf, got) }
+    free(buf)
+    let _c2 = to_int(close(fd))
+    return out
+}
+
+/// read `n` bytes at byte `off` of the open file `fd` into `buf` (a seek, then reads until `n` or the end): the
+/// count read, -1 when the offset cannot be reached. For a reader that walks a large file by offset (a video's
+/// container) without opening it again for every read.
+pub fn read_at(fd: Int, buf: Int, off: Int, n: Int) -> Int {
+    if n <= 0 { return 0 }
+    if off < 0 || os_seek_set(fd, off) != off { return 0 - 1 }
+    var got = 0
+    unsafe {
+        var going = true
+        while going && got < n {
+            let r = to_int(read(fd, buf + got, n - got))
+            if r <= 0 { going = false } else { got = got + r }
+        }
+    }
+    return got
+}
+
+/// the size in bytes of the open file `fd` (its end, by seeking there), -1 when it cannot be sought
+pub fn size_fd(fd: Int) -> Int { return os_seek_end(fd) }
+
+// --- open flags: combine with `|`, e.g. O_WRONLY() | O_CREAT() | O_TRUNC() ---
+// These are the platform's own values, so they differ per OS: Linux O_CREAT is 0o100 while msvcrt's is
+// 0x100, and Linux O_APPEND (0o2000) collides with msvcrt's _O_EXCL. Always compose with these
+// functions rather than hard-coding a number, or a file opens with entirely different semantics.
+/// open for reading only.
+pub fn O_RDONLY() -> Int { return 0 }
+/// open for writing only.
+pub fn O_WRONLY() -> Int { return 1 }
+/// open for reading and writing.
+pub fn O_RDWR() -> Int { return 2 }
+cfg(linux) {
+/// create the file if it doesn't exist (needs a `mode`, e.g. 0644 = 420). Platform-specific value:
+/// always call this rather than writing the number, since Linux/macOS/Windows disagree (Linux 0o100,
+/// macOS 0x200, msvcrt 0x100), and a hard-coded 64 means `_O_TEMPORARY` on Windows.
+pub fn O_CREAT() -> Int { return 64 }
+/// truncate the file to zero length on open. Platform-specific value: call, don't hard-code.
+pub fn O_TRUNC() -> Int { return 512 }
+/// append: every write goes to the end of the file. Platform-specific value: call, don't hard-code
+/// (Linux 0o2000 collides with msvcrt's `_O_EXCL`).
+pub fn O_APPEND() -> Int { return 1024 }
+fn os_bin_flag() -> Int { return 0 }                 // POSIX has no text/binary distinction
+}
+cfg(macos) {
+/// create the file if it doesn't exist (needs a `mode`, e.g. 0644 = 420).
+pub fn O_CREAT() -> Int { return 512 }               // Darwin: O_CREAT is 0x0200, not the Linux 0o100
+/// truncate the file to zero length on open.
+pub fn O_TRUNC() -> Int { return 1024 }              // 0x0400
+/// append: every write goes to the end of the file.
+pub fn O_APPEND() -> Int { return 8 }                // 0x0008
+fn os_bin_flag() -> Int { return 0 }
+}
+cfg(windows) {
+/// create the file if it doesn't exist (needs a `mode`, e.g. 0644 = 420).
+pub fn O_CREAT() -> Int { return 256 }               // msvcrt _O_CREAT 0x0100
+/// truncate the file to zero length on open.
+pub fn O_TRUNC() -> Int { return 512 }               // _O_TRUNC 0x0200
+/// append: every write goes to the end of the file.
+pub fn O_APPEND() -> Int { return 8 }                // _O_APPEND 0x0008
+fn os_bin_flag() -> Int { return 32768 }             // _O_BINARY: without it msvcrt CRLF-translates
+}
+
+/// open `path` with `flags` (see O_* above) and `mode` (permission bits for a freshly O_CREAT'd file,
+/// e.g. 0644 = 420; ignored otherwise). Returns the fd, or a negative errno on failure. Safe wrapper:
+/// no `unsafe` needed at the call site, so creating a new file (O_CREAT) does not require raw open.
+pub fn open_file(path: Str, flags: Int, mode: Int) -> Int {
+    let c = os_cstr(path)
+    var fd = 0
+    unsafe { fd = to_int(open(c, flags | os_bin_flag(), mode)) }
+    // libc `open` is variadic; passing the mode through a fixed-arity extern doesn't reach it (the file
+    // would be created with mode 0), so set the permission bits explicitly when we created the file.
+    if fd >= 0 { if (flags & O_CREAT()) != 0 { if mode != 0 { let _m = to_int(chmod(c, mode)) } } }
+    free(c)
+    if fd >= 0 { nori_res_register(fd) }              // track this open file for snapshot()'s safe-subset check
+    return fd
+}
+/// close a file descriptor. Returns 0 on success.
+pub fn close_fd(fd: Int) -> Int { nori_res_unregister(fd)  return to_int(close(fd)) }
+/// read up to `n` bytes from `fd` into the raw buffer `buf`; returns the count (0 = EOF, <0 = error).
+/// `buf` is a raw address (from `malloc`), so this is an unsafe-subset building block; for a safe
+/// whole-file copy use `io::copy_file`.
+pub fn read_fd(fd: Int, buf: Int, n: Int) -> Int { var r = 0  unsafe { r = to_int(read(fd, buf, n)) }  return r }
+/// write exactly `n` bytes from the raw buffer `buf` to `fd` (looping over short writes). Returns the
+/// number of bytes written, or <0 on error.
+pub fn write_fd(fd: Int, buf: Int, n: Int) -> Int {
+    var off = 0
+    unsafe {
+        while off < n {
+            let k = to_int(write(fd, buf + off, n - off))
+            if k <= 0 { return 0 - 1 }
+            off = off + k
+        }
+    }
+    return off
+}
+
+/// A re-establishable open file. Unlike the bare fd from `open_file` (which `snapshot()`
+/// treats as an opaque resource and refuses over), a `File` carries its reopen metadata, so snapshot()/
+/// resume() serialize {path, flags, mode, current offset} and re-open the file on resume; a `File`
+/// held in a global survives a program image. Field order is fixed: the runtime's `nori_file_ser`/
+/// `nori_file_de` read fd@0, path@1, flags@2, mode@3.
+pub struct File { fd: Int, path: Str, flags: Int, mode: Int }
+
+/// open a re-establishable File. flags/mode are the platform's own open values (see the O_* helpers).
+/// On Windows the binary flag is added automatically, so a restored offset always matches the bytes.
+pub fn file_open(path: Str, flags: Int, mode: Int) -> File {
+    let c = os_cstr(path)
+    var fd = 0
+    unsafe { fd = to_int(open(c, flags | os_bin_flag(), mode)) }   // raw open: not in the refuse-registry (re-establishable)
+    if fd >= 0 { if (flags & O_CREAT()) != 0 { if mode != 0 { let _m = to_int(chmod(c, mode)) } } }
+    free(c)
+    return File { fd: fd, path: copy path, flags: flags, mode: mode }
+}
+/// true if the file opened successfully.
+pub fn file_ok(f: File) -> Bool { return f.fd >= 0 }
+/// the raw fd (for interop with the fd-based read_fd/write_fd building blocks).
+pub fn file_fd(f: File) -> Int { return f.fd }
+/// read up to `n` bytes into the raw buffer `buf`; returns the count (0 = EOF, <0 = error).
+pub fn file_read(f: File, buf: Int, n: Int) -> Int { return read_fd(f.fd, buf, n) }
+/// write `n` bytes from the raw buffer `buf`; returns bytes written or <0.
+pub fn file_write(f: File, buf: Int, n: Int) -> Int { return write_fd(f.fd, buf, n) }
+/// close the file.
+pub fn file_close(f: File) -> Int { return to_int(close(f.fd)) }
+
+/// is stdout a terminal? (it gates colored output so piped/captured output stays plain).
+pub fn is_tty() -> Bool { return to_int(isatty(1)) == 1 }
+
+/// Str -> a malloc'd, NUL-terminated C string (the caller frees it).
+pub fn os_cstr(s: Str) -> Int {
+    let n = s.len()
+    let p = malloc(n + 1)
+    unsafe {
+        var i = 0
+        while i < n { poke8(p + i, s.at(i))  i = i + 1 }
+        poke8(p + n, 0)
+    }
+    return p
+}
+/// a NUL-terminated C string -> Str (reads bytes up to the NUL).
+pub fn os_from_cstr(p: Int) -> Str {
+    var s = ""
+    unsafe {
+        var i = 0
+        while peek8(p + i) != 0 { s = (s + chr(peek8(p + i)))  i = i + 1 }
+    }
+    return s
+}
+
+/// the value of environment variable `name`, or "" if it is unset.
+pub fn env(name: Str) -> Str {
+    let c = os_cstr(name)
+    let r = getenv(c)
+    free(c)
+    if r == 0 { return "" }
+    return os_from_cstr(r)
+}
+/// `name`'s value, or `dflt` if unset/empty.
+pub fn env_or(name: Str, dflt: Str) -> Str {
+    let v = env(name)
+    if v.len() == 0 { return copy dflt }
+    return v
+}
+/// create directory `path` (mode 0755). Returns 0 on success.
+pub fn make_dir(path: Str) -> Int {
+    let c = os_cstr(path)
+    let r = to_int(mkdir(c, 493))               // 493 = 0o755
+    free(c)
+    return r
+}
+/// create `path` and any missing parent directories.
+pub fn make_dir_p(path: Str) -> Int {
+    var i = 1
+    let n = path.len()
+    while i < n {
+        if ord(path.at(i)) == 47 { make_dir(path.slice(0, i)) }   // 47 = '/'
+        i = i + 1
+    }
+    return make_dir(path)
+}
+/// does `path` exist?
+pub fn path_exists(path: Str) -> Bool {
+    let c = os_cstr(path)
+    let r = to_int(access(c, 0))                // F_OK
+    free(c)
+    return r == 0
+}
+/// the current working directory.
+pub fn cwd() -> Str {
+    let buf = malloc(4096)
+    let r = getcwd(buf, 4096)
+    if r == 0 { free(buf)  return "" }
+    let s = os_from_cstr(buf)
+    free(buf)
+    return s
+}
+/// change the process's current working directory to `path`. Returns 0 on success.
+pub fn set_cwd(path: Str) -> Int {
+    let c = os_cstr(path)
+    let r = to_int(chdir(c))
+    free(c)
+    return r
+}
+cfg(linux) { extern fn setenv(Int, Int, Int) -> Int }   // libc: int setenv(name, value, overwrite)
+cfg(macos) { extern fn setenv(Int, Int, Int) -> Int }
+cfg(windows) { extern fn _putenv(Int) -> Int }          // msvcrt has no setenv; only _putenv("NAME=VALUE")
+
+cfg(linux) {
+/// set environment variable `name` to `val` (overwriting); spawned children inherit it. Returns 0 on success.
+pub fn set_env(name: Str, val: Str) -> Int {
+    let cn = os_cstr(name)
+    let cv = os_cstr(val)
+    var r = 0
+    unsafe { r = setenv(cn, cv, 1) }
+    free(cn)  free(cv)
+    return r
+}
+}
+cfg(macos) {
+/// set environment variable `name` to `val` (overwriting); spawned children inherit it. Returns 0 on success.
+pub fn set_env(name: Str, val: Str) -> Int {
+    let cn = os_cstr(name)
+    let cv = os_cstr(val)
+    var r = 0
+    unsafe { r = setenv(cn, cv, 1) }
+    free(cn)  free(cv)
+    return r
+}
+}
+cfg(windows) {
+/// set environment variable `name` to `val` (overwriting); spawned children inherit it. Returns 0 on success.
+pub fn set_env(name: Str, val: Str) -> Int {
+    let c = os_cstr(name + ("=" + val))                 // _putenv takes one "NAME=VALUE" string
+    var r = 0
+    unsafe { r = _putenv(c) }
+    free(c)
+    return r
+}
+}
+/// mark `path` executable (mode 0755). Returns 0 on success.
+pub fn make_exec(path: Str) -> Int {
+    let c = os_cstr(path)
+    let r = to_int(chmod(c, 493))                  // 493 = 0o755
+    free(c)
+    return r
+}
+/// Append exact bytes to a file, creating it if it does not exist. Returns true when all of it was
+/// written, which is the point, as with `write_out`: for a stream arriving in pieces, a partial
+/// write is not a shorter file, it is a corrupt one, and the caller has to know the difference.
+/// NUL-safe: the length written is the string's, not strlen's.
+pub fn append_file(path: Str, s: Str) -> Bool {
+    let f = file_open(path, O_WRONLY() | (O_CREAT() | O_APPEND()), 420)   // 420 = 0o644
+    if f.fd < 0 { return false }
+    let n = s.len()
+    var ok = true
+    if n > 0 {
+        let p = os_cstr(s)
+        var off = 0
+        while off < n && ok {
+            let w = write_fd(f.fd, p + off, n - off)
+            if w <= 0 { ok = false } else { off = off + w }
+        }
+        free(p)
+    }
+    let _ = file_close(f)
+    return ok
+}
+
+/// mark `path` private to its owner (mode 0600). Returns 0 on success. For anything that is a
+/// credential (a stored session, a key, a password file), where the default 0644 would leave it
+/// readable by every account on the machine.
+pub fn make_private(path: Str) -> Int {
+    let c = os_cstr(path)
+    let r = to_int(chmod(c, 384))                  // 384 = 0o600
+    free(c)
+    return r
+}
+/// read one line from stdin (without the trailing newline); "" on EOF.
+pub fn read_line() -> Str {
+    let buf = malloc(1)
+    var s = ""
+    var done = false
+    unsafe {
+        while !done {
+            let k = to_int(read(0, buf, 1))
+            if k <= 0 { done = true } else { let c = peek8(buf)  if c == 10 { done = true } else { s = (s + chr(c)) } }
+        }
+    }
+    free(buf)
+    return s
+}
+/// read up to `n` bytes from stdin (fd 0); returns what was read ("" on immediate EOF). For length-framed
+/// protocols (e.g. LSP message bodies) where you must read an exact byte count, not a line.
+pub fn read_n(n: Int) -> Str {
+    let buf = malloc(1)
+    var s = ""
+    var got = 0
+    var done = false
+    unsafe {
+        while got < n && !done {
+            let k = to_int(read(0, buf, 1))
+            if k <= 0 { done = true } else { s = (s + chr(peek8(buf)))  got = got + 1 }
+        }
+    }
+    free(buf)
+    return s
+}
+/// write `s` to stdout (fd 1) as exact bytes, with no trailing newline (unlike printl). For binary/framed
+/// output. Returns true when all of it was written.
+///
+/// The return value is the point: this exists for framed output, where a partial write is not a
+/// smaller message but a corrupt stream; a length-prefixed frame cut in half desynchronises the
+/// reader for good. It does not trap, because a closed stdout (the reader went away, a pipe to
+/// `head`) is an ordinary end to a program, not a bug in it. The caller decides which it is.
+pub fn write_out(s: Str) -> Bool {
+    let n = s.len()
+    let p = os_cstr(s)
+    var off = 0
+    unsafe {
+        var failed = false
+        while off < n && !failed {
+            let k = to_int(write(1, p + off, n - off))
+            if k <= 0 { failed = true } else { off = off + k }
+        }
+    }
+    free(p)
+    return off == n
+}
+/// rename/move a file or directory (same filesystem). Returns 0 on success.
+pub fn move_path(from: Str, to: Str) -> Int {
+    let a = os_cstr(from)
+    let b = os_cstr(to)
+    let r = to_int(rename(a, b))
+    free(a)  free(b)
+    return r
+}
+/// recursively delete a file or directory tree. Returns 0 on success.
+pub fn remove_tree(path: Str) -> Int {
+    let c = os_cstr(path)
+    let r = nori_remove_tree(c)
+    free(c)
+    return r
+}
+/// every file under `path`, recursively, as a Vec of paths (directories are descended, not listed),
+/// sorted. Empty Vec if the path is missing. Sorted because the filesystem's own order differs
+/// between checkouts of one tree, so a build that imports sources in that order would depend on
+/// where the tree was checked out.
+pub fn list_tree(path: Str) -> Vec<Str> {
+    let c = os_cstr(path)
+    let p = nori_list_tree(c)
+    free(c)
+    var out: Vec<Str> = vec()
+    if p == 0 { return out }
+    let s = os_from_cstr(p)
+    free(p)
+    var start = 0
+    var i = 0
+    let n = s.len()
+    while i < n {
+        if ord(s.at(i)) == 10 { if i > start { out.push(s.slice(start, i)) }  start = i + 1 }
+        i = i + 1
+    }
+    if n > start { out.push(s.slice(start, n)) }
+    return sort::sort_str(out)
+}
+/// where `d_name` sits inside `struct dirent`, which is not the same shape on every platform.
+///
+/// Linux x86-64: `d_ino`(8) `d_off`(8) `d_reclen`(2) `d_type`(1), so 19. mingw-w64: `d_ino` is a
+/// `long`, which is four bytes under LLP64, then `d_reclen`(2) and `d_namlen`(2), so 8. Reading the
+/// Linux offset on Windows skips eleven characters of every name: `file_tree.dll` comes back as
+/// `ll` and `project.dll` as the empty string, so a directory of plugins looks like it holds
+/// nothing loadable. The macOS number is from its own `struct dirent` (`d_ino`(8) `d_seekoff`(8)
+/// `d_reclen`(2) `d_namlen`(2) `d_type`(1)) and is untested, like the rest of that port.
+cfg(linux)   { fn dirent_name_off() -> Int { return 19 } }
+cfg(windows) { fn dirent_name_off() -> Int { return 8 } }
+cfg(macos)   { fn dirent_name_off() -> Int { return 21 } }
+cfg(bare)    { fn dirent_name_off() -> Int { return 19 } }
+
+/// the immediate entries of directory `path` (names only, excluding "." and ".."). Filesystem order;
+/// sort if you need determinism. Empty Vec if `path` can't be opened.
+pub fn read_dir(path: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let c = os_cstr(path)
+    var d = 0
+    unsafe { d = opendir(c) }
+    free(c)
+    if d == 0 { return out }
+    var done = false
+    while !done {
+        var e = 0
+        unsafe { e = readdir(d) }
+        if e == 0 { done = true } else {
+            let name = os_from_cstr(e + dirent_name_off())
+            var skip = false
+            if name.len() == 1 { if ord(name.at(0)) == 46 { skip = true } }
+            if name.len() == 2 { if ord(name.at(0)) == 46 { if ord(name.at(1)) == 46 { skip = true } } }
+            if !skip { out.push(name) }
+        }
+    }
+    unsafe { to_int(closedir(d)) }
+    return out
+}
+
+// ---- watching directories for change -------------------------------------------------------------
+//
+// The alternative is to re-read a tree on a timer, which is work done to find out that nothing
+// happened, and it grows with the project. A watch inverts that: register the directories once, then
+// ask whether anything arrived. Nothing arrives, nothing costs.
+//
+// What it is not: recursive. inotify watches a directory, not a tree, so a caller adds
+// every directory it cares about and adds a watch for each new one as it appears. It is also not a
+// guarantee: the kernel queue can overflow under a burst, and `watch_overflowed` reports that
+// so the caller can fall back to a full re-scan. A watcher that cannot re-scan is a watcher
+// that will eventually be wrong, so the fallback is not optional.
+//
+// Availability. Linux only. macOS has FSEvents, Windows ReadDirectoryChangesW, the BSDs kqueue;
+// `watch_open` reports `ok = false` everywhere else rather than pretending, and a caller that keeps
+// a polling path works unchanged on those platforms.
+
+/// IN_NONBLOCK: a read with nothing pending returns at once instead of blocking.
+pub fn WATCH_NONBLOCK() -> Int { return 2048 }
+/// IN_CLOEXEC: the descriptor does not survive an exec.
+pub fn WATCH_CLOEXEC() -> Int { return 524288 }
+
+/// IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF.
+///
+/// The events that change the shape of a tree. Not IN_MODIFY: a file being written to
+/// does not add, remove or rename anything, and a file browser that redrew on every keystroke of a
+/// build's output would be a worse version of polling.
+pub fn WATCH_TREE() -> Int { return 256 + 512 + 64 + 128 + 1024 + 2048 }
+
+/// WATCH_TREE and IN_CLOSE_WRITE: the tree's shape, and a file written and closed in it, such as a saved file,
+/// whether the editor wrote it in place or (as most do) beside it and renamed it over. For a program that
+/// applies a configuration when it is saved; still not IN_MODIFY, which fires for every write().
+pub fn WATCH_SAVES() -> Int { return WATCH_TREE() + 8 }
+
+/// IN_Q_OVERFLOW, reported against wd -1 when the kernel dropped events.
+fn WATCH_Q_OVERFLOW() -> Int { return 16384 }
+
+/// how many bytes of events are read at a time. Plus slack, because the length field of the last
+/// event is read with an 8-byte load that may reach a few bytes past it.
+fn watch_bufsz() -> Int { return 32768 }
+
+/// an open watch: the inotify fd, its read buffer, and whether the kernel dropped anything.
+pub struct Watch { fd: Int, buf: Int, ok: Bool, overflow: Bool }
+
+/// open a watch. `ok` is false where the platform has no inotify; check it and keep a fallback.
+pub fn watch_open() -> Watch {
+    let fd = nori_watch_open(WATCH_NONBLOCK() + WATCH_CLOEXEC())
+    if fd < 0 { return Watch { fd: 0 - 1, buf: 0, ok: false, overflow: false } }
+    nori_res_register(fd)
+    var b = 0
+    unsafe { b = malloc(watch_bufsz() + 16) }
+    return Watch { fd: fd, buf: b, ok: true, overflow: false }
+}
+
+/// is this watch usable?
+pub fn watch_ok(w: Watch) -> Bool { return w.ok }
+
+/// did the kernel drop events since the last `watch_take`? A caller seeing this should re-scan from
+/// scratch rather than trust what it has.
+pub fn watch_overflowed(w: Watch) -> Bool { return w.overflow }
+
+/// watch one directory. Returns a watch descriptor, or -1, which is not fatal: a directory may have
+/// vanished between listing and watching, or the per-user watch limit
+/// (/proc/sys/fs/inotify/max_user_watches) may be reached, and the watches already held still work.
+pub fn watch_add(w: Watch, path: Str) -> Int {
+    if !w.ok { return 0 - 1 }
+    let c = os_cstr(path)
+    let wd = nori_watch_add(w.fd, c, WATCH_TREE())
+    free(c)
+    return wd
+}
+
+/// watch one directory for its shape and for files saved in it (WATCH_SAVES): -1 as watch_add.
+pub fn watch_add_saves(w: Watch, path: Str) -> Int {
+    if !w.ok { return 0 - 1 }
+    let c = os_cstr(path)
+    let wd = nori_watch_add(w.fd, c, WATCH_SAVES())
+    free(c)
+    return wd
+}
+
+/// stop watching one descriptor.
+pub fn watch_rm(w: Watch, wd: Int) -> Int {
+    if !w.ok || wd < 0 { return 0 - 1 }
+    return nori_watch_rm(w.fd, wd)
+}
+
+/// drain whatever the kernel has queued and report whether anything happened.
+///
+/// Coalescing is the point: a caller that re-scans on change wants one answer per look, not one per
+/// event; copying a directory in produces hundreds, and they all mean the same thing. Returns false
+/// immediately when the queue is empty, which is the ordinary case and costs one syscall.
+pub fn watch_take(inout w: Watch) -> Bool {
+    if !w.ok { return false }
+    var any = false
+    var draining = true
+    while draining {
+        let n = read_fd(w.fd, w.buf, watch_bufsz())
+        if n <= 0 { draining = false }
+        else {
+            // walk the events: struct inotify_event { s32 wd; u32 mask; u32 cookie; u32 len; char name[len] }
+            //
+            // Only the events asked for count as a change. The kernel also sends IN_IGNORED when a
+            // watch goes away (which `watch_rm` causes), and counting every arriving
+            // event would make removing a watch look like a directory change, once, immediately after it
+            // was removed. IN_UNMOUNT is the same shape of thing.
+            var off = 0
+            while off + 16 <= n {
+                var mask = 0
+                var nlen = 0
+                unsafe {
+                    mask = peek(w.buf + off + 4) & 0xFFFFFFFF
+                    nlen = peek(w.buf + off + 12) & 0xFFFFFFFF
+                }
+                if (mask & WATCH_Q_OVERFLOW()) != 0 { w.overflow = true  any = true }
+                if (mask & WATCH_SAVES()) != 0 { any = true }       // IN_CLOSE_WRITE comes only when it was asked for
+                off = off + 16 + nlen
+            }
+            // a short read means the queue is drained; a full one may have more behind it
+            if n < watch_bufsz() { draining = false }
+        }
+    }
+    return any
+}
+
+/// clear the overflow flag, once the caller has done the full re-scan it asks for.
+pub fn watch_clear_overflow(inout w: Watch) { w.overflow = false }
+
+/// close the watch and release its buffer. Every watch descriptor goes with the fd.
+pub fn watch_close(inout w: Watch) {
+    if w.buf != 0 { unsafe { free(w.buf) }  w.buf = 0 }
+    if w.ok && w.fd >= 0 { nori_res_unregister(w.fd)  let _c = to_int(close(w.fd)) }
+    w.ok = false
+    w.fd = 0 - 1
+}
+
+/// the result of stat_path: whether it succeeded, plus directory-ness, byte size, mtime and raw mode.
+pub struct Stat { ok: Bool, is_dir: Bool, size: Int, mtime: Int, mode: Int }
+
+// Where the fields are, which is not the same struct on every platform.
+//
+// Linux x86-64: st_mode@24 (4 bytes), st_size@48, st_mtime@88. mingw's `_stat64` is a different
+// shape entirely: st_mode@6 (two bytes), st_size@24, st_mtime@40, 56 bytes in all. Reading the
+// Linux offsets there returns the size where the mode should be, a timestamp where the size should
+// be, and, at +88, whatever was in the malloc'd block past the end of the struct. A caller that
+// keys change detection on size and mtime (as a hot-reload does) would then see every file as just
+// rebuilt, on every check.
+cfg(windows) {
+    // `_stat64` fills the 56-byte `struct _stat64`: st_mode an `unsigned short` at 6, st_size a 64-bit
+    // `__int64` at 24, and the three 64-bit times at 32 (atime), 40 (mtime) and 48 (ctime). The plain
+    // `stat` symbol's struct holds a 32-bit `_off_t` size, which cannot say how big a file past 4 GiB is.
+    fn stat_mode_off() -> Int { return 6 }
+    fn stat_mode_mask() -> Int { return 0xFFFF }
+    fn stat_size_off() -> Int { return 24 }
+    fn stat_size_mask() -> Int { return 0 - 1 }
+    fn stat_mtime_off() -> Int { return 40 }
+    fn stat_dir_bit() -> Int { return 0x4000 }       // _S_IFDIR, same value as S_IFDIR
+    fn os_stat(c: Int, buf: Int) -> Int { unsafe { return to_int(_stat64(c, buf)) } }
+}
+cfg(linux) {
+    fn stat_size_mask() -> Int { return 0 - 1 }      // a full 64-bit st_size
+    fn os_stat(c: Int, buf: Int) -> Int { unsafe { return to_int(stat(c, buf)) } }
+    fn stat_mode_off() -> Int { return 24 }
+    fn stat_mode_mask() -> Int { return 0xFFFFFFFF }
+    fn stat_size_off() -> Int { return 48 }
+    fn stat_mtime_off() -> Int { return 88 }
+    fn stat_dir_bit() -> Int { return 0x4000 }
+}
+cfg(macos) {
+    fn stat_size_mask() -> Int { return 0 - 1 }      // a full 64-bit st_size
+    fn os_stat(c: Int, buf: Int) -> Int { unsafe { return to_int(stat(c, buf)) } }
+    fn stat_mode_off() -> Int { return 4 }           // darwin: st_dev(4) st_mode(2) st_nlink(2) …
+    fn stat_mode_mask() -> Int { return 0xFFFF }
+    fn stat_size_off() -> Int { return 96 }
+    fn stat_mtime_off() -> Int { return 32 }
+    fn stat_dir_bit() -> Int { return 0x4000 }
+}
+cfg(bare) {
+    fn stat_size_mask() -> Int { return 0 - 1 }      // a full 64-bit st_size
+    fn os_stat(c: Int, buf: Int) -> Int { unsafe { return to_int(stat(c, buf)) } }
+    fn stat_mode_off() -> Int { return 24 }
+    fn stat_mode_mask() -> Int { return 0xFFFFFFFF }
+    fn stat_size_off() -> Int { return 48 }
+    fn stat_mtime_off() -> Int { return 88 }
+    fn stat_dir_bit() -> Int { return 0x4000 }
+}
+
+/// stat `path`: existence, directory-ness, byte size, mtime (unix seconds) and raw st_mode. ok=false
+/// if the path can't be stat'd.
+pub fn stat_path(path: Str) -> Stat {
+    let c = os_cstr(path)
+    var okf = false
+    var dir = false
+    var sz = 0
+    var mt = 0
+    var md = 0
+    unsafe {
+        let st = malloc(144)
+        if os_stat(c, st) == 0 {
+            okf = true
+            md = (peek(st + stat_mode_off()) & stat_mode_mask())
+            dir = ((md & 0xF000) == stat_dir_bit())
+            sz = peek(st + stat_size_off()) & stat_size_mask()
+            mt = peek(st + stat_mtime_off())
+        }
+        free(st)
+    }
+    free(c)
+    return Stat { ok: okf, is_dir: dir, size: sz, mtime: mt, mode: md }
+}
+
+/// a directory this process may write scratch files into, without a trailing slash.
+///
+/// `/tmp` is not a place on Windows. A program that shells out and writes an intermediate file to
+/// `/tmp/...` fails there, so the directory is taken from the environment: TMPDIR is the
+/// POSIX spelling, TEMP and TMP the Windows ones, and the last resort is the platform's usual place.
+pub fn temp_dir() -> Str {
+    let t = env_or("TMPDIR", "")
+    if t.len() > 0 { return trim_trailing_sep(t) }
+    let w = env_or("TEMP", "")
+    if w.len() > 0 { return trim_trailing_sep(w) }
+    let w2 = env_or("TMP", "")
+    if w2.len() > 0 { return trim_trailing_sep(w2) }
+    // One return per target. `cfg(windows) { return … }` followed by a plain `return` is, on Windows,
+    // a return after a return, and the checker reports it as unreachable code.
+    var last = "/tmp"
+    cfg(windows) { last = "C:/Windows/Temp" }
+    return last
+}
+
+/// the current user's home directory, without a trailing slash ("" when the platform names none).
+///
+/// Windows does not set `HOME`; it names the same directory USERPROFILE, so a program that reads
+/// only HOME writes its settings nowhere a user will find them again, or, with a `/tmp` fallback,
+/// loses them at the next reboot.
+pub fn home_dir() -> Str {
+    let h = env_or("HOME", "")
+    if h.len() > 0 { return trim_trailing_sep(h) }
+    let u = env_or("USERPROFILE", "")
+    if u.len() > 0 { return trim_trailing_sep(u) }
+    let hd = env_or("HOMEDRIVE", "")
+    let hp = env_or("HOMEPATH", "")
+    if hd.len() > 0 && hp.len() > 0 { return trim_trailing_sep(hd + hp) }
+    return ""
+}
+
+/// where `app` keeps what it remembers between runs (settings, layout, history, keys) without a
+/// trailing slash. The directory is not created; `make_dir_p` it before writing.
+///
+///   | platform | directory |
+///   |---|---|
+///   | any, `XDG_STATE_HOME` set | `$XDG_STATE_HOME/<app>` |
+///   | Windows | `%LOCALAPPDATA%\<app>` (then `%APPDATA%`, then `<home>/AppData/Local`) |
+///   | macOS   | `~/Library/Application Support/<app>` |
+///   | Linux   | `~/.local/state/<app>` |
+///
+/// Never beside the program. An install directory is replaced whole by an update, and everything a
+/// program had written into it goes with it, settings and keys included. And never relative to the
+/// working directory: `HOME` is not set on Windows, and `env_or("HOME", ".") + "/.local/state"` quietly
+/// becomes a folder inside whatever directory the program was started from.
+///
+/// With no home directory at all, the answer is under `temp_dir()`: it will not survive a reboot,
+/// but it is a place that exists, which "" is not.
+pub fn state_dir(app: Str) -> Str {
+    let x = env_or("XDG_STATE_HOME", "")
+    if x.len() > 0 { return trim_trailing_sep(x) + ("/" + app) }
+    cfg(windows) {
+        // Windows joins with its own separator, as std/path writes: `C:\Users\me\AppData\Local\app`
+        let la = env_or("LOCALAPPDATA", "")
+        if la.len() > 0 { return trim_trailing_sep(la) + ("\\" + app) }
+        let ra = env_or("APPDATA", "")
+        if ra.len() > 0 { return trim_trailing_sep(ra) + ("\\" + app) }
+    }
+    let h = home_dir()
+    // one return per target, as temp_dir does: a `cfg` block that returns before common code makes
+    // that code unreachable on the platform, which the checker reports.
+    var sep = "/"
+    var under = "/.local/state/"
+    cfg(windows) { sep = "\\"  under = "\\AppData\\Local\\" }
+    cfg(macos) { under = "/Library/Application Support/" }
+    if h.len() == 0 { return temp_dir() + (sep + app) }
+    return h + (under + app)
+}
+
+/// `dir` without a trailing `/` or `\`; joining adds its own.
+fn trim_trailing_sep(dir: Str) -> Str {
+    // Leaves at least one character, so that "/" and "C:\\" stay paths rather than becoming "".
+    //
+    // The loop ends by returning rather than by parking `n` past the end as a sentinel: the `n > 1`
+    // condition does not test for one, and the next turn would read `dir.at(dir.len())` and trap.
+    var n = dir.len()
+    while n > 1 {
+        let c = ord(dir.at(n - 1))
+        if !(c == 47 || c == 92) { return dir.slice(0, n) }
+        n = n - 1
+    }
+    return dir.slice(0, n)
+}
+
+/// a scratch file path: `temp_dir()` joined to `name`.
+pub fn temp_path(name: Str) -> Str { return temp_dir() + ("/" + name) }
+
+/// is `path` an existing directory?
+pub fn is_dir(path: Str) -> Bool { let s = stat_path(path)  return s.ok && s.is_dir }
+/// is `path` an existing regular file, something you could open or run, as against a directory?
+///
+/// `path_exists` is also true for a directory, so a lookup for a program or a data file that stops
+/// at `path_exists` accepts a directory of the same name and fails later, at the open or the exec,
+/// with an error that blames the path.
+pub fn is_file(path: Str) -> Bool { let s = stat_path(path)  return s.ok && (s.mode & 0xF000) == 0x8000 }
+/// byte size of `path` (0 if it can't be stat'd).
+pub fn file_size(path: Str) -> Int { return stat_path(path).size }
+
+/// run a program with an explicit argument vector (argv[0] is the program, PATH-searched). No shell is
+/// involved; each argument is passed as given. Returns the program's exit code (-1 on spawn failure).
+pub fn run(argv: Vec<Str>) -> Int {
+    let n = argv.len()
+    let arr = malloc((n + 1) * 8)
+    var rc = 0
+    unsafe {
+        var i = 0
+        while i < n { poke(arr + i * 8, os_cstr(argv[i]))  i = i + 1 }
+        poke(arr + n * 8, 0)            // NULL terminator
+        rc = nori_spawn_argv(arr)
+        i = 0
+        while i < n { free(peek(arr + i * 8))  i = i + 1 }
+    }
+    free(arr)
+    return rc
+}
+
+/// like `run`, but the child's stdout+stderr are sent to /dev/null (the parent temporarily redirects
+/// fd 1/2 across the fork, then restores them). For spawning helpers whose output you don't want, e.g.
+/// probing whether a build compiles. Falls back to a normal `run` if /dev/null can't be opened.
+///
+/// Caveat: the redirect is process-wide for its duration. Anything already sitting in the stdout
+/// buffer, including a line another task wrote a moment ago, is flushed to /dev/null when it
+/// drains, and is simply gone. In a program with concurrent tasks that print, prefer `run` unless
+/// the child is genuinely noisy.
+pub fn run_silent(argv: Vec<Str>) -> Int {
+    var rc = 0
+    unsafe {
+        let dn_c = os_cstr("/dev/null")
+        let dn = to_int(open(dn_c, 1, 0))              // O_WRONLY
+        free(dn_c)
+        if dn < 0 { return run(argv) }
+        let s1 = to_int(dup(1))
+        let s2 = to_int(dup(2))
+        let _a = to_int(dup2(dn, 1))
+        let _b = to_int(dup2(dn, 2))
+        rc = run(argv)                         // the forked child inherits the redirected fd 1/2
+        let _c = to_int(dup2(s1, 1))                    // restore the parent's streams
+        let _d = to_int(dup2(s2, 2))
+        let _e = to_int(close(s1))
+        let _f = to_int(close(s2))
+        let _g = to_int(close(dn))
+    }
+    return rc
+}
+
+// ---- long-lived child processes ----------------------------------------------------------------
+// `run` and `run_silent` above fork, exec and wait. They hand back an exit code and nothing else:
+// the caller cannot read what the child said, cannot say anything to it, and cannot do anything at
+// all while it runs. That is right for invoking a compiler once, but not for a program that wants
+// a language server, a build whose output arrives as it goes, or a test runner it can cancel.
+//
+// `child_spawn` is the other shape. It returns as soon as the child is running, with a pipe each way, and
+// nothing here ever blocks: `child_read` on a silent child returns "" immediately, and `child_poll`
+// on a running one returns RUNNING. A caller drives it from its own loop (a frame, a tick, a
+// select) and stays responsive throughout.
+//
+// The child's stderr is joined to its stdout, in order. See the note on nori_spawn_pipe.
+
+/// a running child: its pid, and the two ends the parent kept.
+pub struct Child { pid: Int, stdin: Int, stdout: Int, alive: Bool }
+
+/// `child_poll`'s answer while the child is still running.
+pub fn PROC_RUNNING() -> Int { return 0 - 1 }
+/// `child_poll`'s answer for a child that is not ours to wait for: already reaped, or never spawned.
+pub fn PROC_GONE() -> Int { return 0 - 2 }
+
+/// a Child that never started.
+pub fn child_none() -> Child { return Child { pid: 0, stdin: 0 - 1, stdout: 0 - 1, alive: false } }
+
+/// start `argv` (argv[0] is the program, PATH-searched) without waiting for it.
+///
+/// Named `child_spawn` rather than `spawn` because `spawn` is a keyword, one of Nori's parallelism
+/// forms, so `fn spawn` does not parse. It also puts it in the same family as the calls below.
+///
+/// No shell is involved and each argument is passed as given. The returned Child has `alive` false
+/// if the spawn failed, which is the one thing a caller must check; every other call here is a
+/// no-op on a dead Child rather than a trap.
+pub fn child_spawn(argv: Vec<Str>) -> Child {
+    let n = argv.len()
+    if n == 0 { return child_none() }
+    let arr = malloc((n + 1) * 8)
+    let out = malloc(3 * 8)
+    var rc = 0
+    unsafe {
+        var i = 0
+        while i < n { poke(arr + i * 8, os_cstr(argv[i]))  i = i + 1 }
+        poke(arr + n * 8, 0)
+        poke(out, 0)  poke(out + 8, 0)  poke(out + 16, 0)
+        rc = nori_spawn_pipe(arr, out)
+        i = 0
+        while i < n { free(peek(arr + i * 8))  i = i + 1 }
+    }
+    free(arr)
+    if rc != 0 { free(out)  return child_none() }
+    var c = child_none()
+    unsafe {
+        c = Child { pid: peek(out), stdin: peek(out + 8), stdout: peek(out + 16), alive: true }
+    }
+    free(out)
+    nori_res_register(c.stdin)
+    nori_res_register(c.stdout)
+    return c
+}
+
+/// whatever the child has said since the last call, or "" if it has said nothing YET.
+///
+/// "" is not end-of-output: a child that is thinking and a child that has finished both read empty,
+/// and only `child_poll` tells them apart. Reading is non-blocking, so calling this every frame
+/// costs a syscall that returns immediately.
+///
+/// Text only. The chunk is read back through `os_from_cstr`, which stops at the first NUL, so a
+/// child emitting binary is truncated at its first zero byte. Every caller this exists for (a
+/// language server, a compiler, a test runner) speaks text.
+pub fn child_read(c: Child) -> Str {
+    if !c.alive { return "" }
+    if c.stdout < 0 { return "" }
+    let cap = 65536
+    let buf = malloc(cap + 1)
+    var got = 0
+    unsafe { got = to_int(read(c.stdout, buf, cap)) }
+    if got <= 0 { free(buf)  return "" }
+    var s = ""
+    unsafe { poke8(buf + got, 0)  s = os_from_cstr(buf) }
+    free(buf)
+    return s
+}
+
+/// send `t` to the child's stdin. Returns the bytes written, or -1.
+///
+/// A child that has already exited reports -1 rather than killing this process: SIGPIPE is ignored
+/// from the first `child_spawn` onward, precisely so that a dead server is a failed write and not a
+/// crashed editor.
+pub fn child_write(c: Child, t: Str) -> Int {
+    if !c.alive { return 0 - 1 }
+    if c.stdin < 0 { return 0 - 1 }
+    let p = os_cstr(t)
+    var wrote = 0
+    unsafe { wrote = to_int(write(c.stdin, p, t.len())) }
+    free(p)
+    return wrote
+}
+
+/// PROC_RUNNING while it runs, the exit code once it has finished, PROC_GONE if it is not ours.
+pub fn child_poll(c: Child) -> Int {
+    if !c.alive { return PROC_GONE() }
+    var r = 0
+    unsafe { r = nori_proc_poll(c.pid) }
+    return r
+}
+
+/// close the child's stdin, which is how most line-oriented programs are told there is no more
+/// input. The child usually exits shortly after; `child_poll` says when.
+pub fn child_close_stdin(inout c: Child) {
+    if c.stdin < 0 { return }
+    nori_res_unregister(c.stdin)
+    unsafe { let _r = to_int(close(c.stdin)) }
+    c.stdin = 0 - 1
+}
+
+/// ask the child to stop (SIGTERM). It may take a moment; poll for the exit code.
+pub fn child_kill(c: Child) -> Int {
+    if !c.alive { return 0 - 1 }
+    var r = 0
+    unsafe { r = nori_proc_kill(c.pid) }
+    return r
+}
+
+/// close both pipe ends. Call once the child has exited, or the fds leak.
+///
+/// This does not reap the child; `child_poll` does that, and a caller who closes without polling
+/// leaves a zombie until the process exits.
+pub fn child_close(inout c: Child) {
+    child_close_stdin(c)
+    if c.stdout >= 0 {
+        nori_res_unregister(c.stdout)
+        unsafe { let _r = to_int(close(c.stdout)) }
+        c.stdout = 0 - 1
+    }
+    c.alive = false
+}

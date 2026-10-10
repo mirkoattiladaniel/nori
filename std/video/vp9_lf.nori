@@ -1,0 +1,185 @@
+// std/video/vp9_lf.nori: VP9's loop filter (spec §8.8): superblocks in raster order, for each plane its vertical
+// edges (pass 0) then its horizontal ones (pass 1), the edges left to right (top to bottom) at 4-sample steps. The
+// decisions of §8.8.2 (which edges, the filter size, the strength from the block's segment, reference and mode) are
+// made once for each run of 8 samples along an edge that lies in one 8x8 block; the masks and the narrow, 8-tap and
+// 16-tap filters of §8.8.5 are made for each sample.
+
+fn v9_loop_filter(d: V9) {
+    let dp = raddr(d)
+    // the planes do not touch each other: on threads, luma on one and both chroma planes on another (each in the
+    // spec's superblock order)
+    if d.threads > 1 {
+        parallel {
+            let _y = v9_lf_planes(dp, 0, 0)
+            let _uv = v9_lf_planes(dp, 1, 2)
+        }
+        return
+    }
+    let _all = v9_lf_planes(dp, 0, 2)
+}
+
+/// the planes p0..p1, superblock by superblock in raster order, each its vertical edges then its horizontal ones
+fn v9_lf_planes(dp: Int, p0: Int, p1: Int) -> Int {
+    unsafe {
+        let d = rview(V9, dp)
+        var row = 0
+        while row < d.mi_rows {
+            var col = 0
+            while col < d.mi_cols {
+                var plane = p0
+                while plane <= p1 {
+                    v9_lf_sb(d, plane, 0, row, col)
+                    v9_lf_sb(d, plane, 1, row, col)
+                    plane = plane + 1
+                }
+                col = col + 8
+            }
+            row = row + 8
+        }
+    }
+    return 0
+}
+
+/// the superblock loop filter process (§8.8.2) for one plane and pass
+fn v9_lf_sb(d: V9, plane: Int, pass: Int, row: Int, col: Int) {
+    var subx = 0
+    var suby = 0
+    if plane > 0 { subx = 1  suby = 1 }
+    let fb = fb_of(d.cur)
+    var base = fb.y
+    var stride = fb.ys
+    if plane == 1 { base = fb.u  stride = fb.uvs }
+    if plane == 2 { base = fb.v  stride = fb.uvs }
+    var sub = subx
+    var elen = 64 >> suby
+    var step = 1
+    if pass == 1 { sub = suby  elen = 64 >> subx  step = stride }
+    let nedge = 16 >> sub
+    var edge = 0
+    while edge < nedge {
+        var i0 = 0
+        while i0 < elen {
+            // the run's first sample: its place in luma, its 8x8 block
+            var x = 0
+            var y = 0
+            if pass == 0 { x = col * 8 + edge * (4 << subx)  y = row * 8 + (i0 << suby) }
+            else { x = col * 8 + (i0 << subx)  y = row * 8 + edge * (4 << suby) }
+            if x < 8 * d.mi_cols && y < 8 * d.mi_rows && !(pass == 0 && x == 0) && !(pass == 1 && y == 0) {
+                let lc = ((x >> 3) >> subx) << subx
+                let lr = ((y >> 3) >> suby) << suby
+                let m = d.mi + (lr * d.mi_cols + lc) * MI_BYTES()
+                var misize = 0
+                var txs = 0
+                var skip = 0
+                var ref0 = 0
+                var mode = 0
+                var seg = 0
+                unsafe { misize = peek8(m)  txs = peek8(m + 2)  skip = peek8(m + 1)  ref0 = peek8(m + 5)  mode = peek8(m + 3)  seg = peek8(m + 4) }
+                var txsz = txs
+                if plane > 0 { if misize < 3 { txsz = 0 } else { let mt = max_tx(uv_bsize(misize))  if txs < mt { txsz = txs } else { txsz = mt } } }
+                var sbsize = misize
+                if sub == 1 && misize < 6 { sbsize = 6 }
+                let is_intra = ref0 == 0
+                var block_edge = false
+                if pass == 0 && x % (8 * n8w(sbsize)) == 0 { block_edge = true }
+                if pass == 1 && y % (8 * n8h(sbsize)) == 0 { block_edge = true }
+                let tx_edge = (edge % (1 << txsz)) == 0
+                // §8.8.2 step 11's exception: a chroma horizontal edge at an odd edge reaching past an odd MiCols
+                let tx_exc = pass == 1 && subx == 1 && (d.mi_cols & 1) == 1 && (edge & 1) == 1
+                let e32 = (edge % 8) == 0
+                // the filter size (§8.8.3)
+                var bsz = txsz
+                if txsz == 0 && e32 { bsz = 1 } else if txsz > 2 { bsz = 2 }
+                var fsize = bsz
+                if pass == 0 && subx == 1 && bsz == 2 && (x >> 3) == d.mi_cols - 1 { fsize = 1 }
+                if pass == 1 && suby == 1 && bsz == 2 && (y >> 3) == d.mi_rows - 1 { fsize = 1 }
+                // the strength (§8.8.4)
+                var mtype = 0
+                if mode == 10 || mode == 11 || mode == 13 { mtype = 1 }
+                var rr = ref0
+                if rr > 3 { rr = 0 }
+                let lvl = d.lvl[seg * 8 + rr * 2 + mtype]
+                if lvl > 0 && (block_edge || (tx_edge && (is_intra || skip == 0))) {
+                    var shift = 0
+                    if d.lf_sharp > 4 { shift = 2 } else if d.lf_sharp > 0 { shift = 1 }
+                    var limit = lvl >> shift
+                    if d.lf_sharp > 0 { if limit > 9 - d.lf_sharp { limit = 9 - d.lf_sharp } }
+                    if limit < 1 { limit = 1 }
+                    let blimit = 2 * (lvl + 2) + limit
+                    let thresh = lvl >> 4
+                    // the run's samples (each still checked against the frame's edge)
+                    var i = i0
+                    while i < i0 + 8 && i < elen {
+                        var xs = 0
+                        var ys = 0
+                        if pass == 0 { xs = x  ys = row * 8 + (i << suby) } else { xs = col * 8 + (i << subx)  ys = y }
+                        var on = xs < 8 * d.mi_cols && ys < 8 * d.mi_rows
+                        if on && !block_edge && tx_exc && (xs + 8) >= d.mi_cols * 8 { on = false }
+                        if on {
+                            let p = base + (ys >> suby) * stride + (xs >> subx)
+                            v9_lf_sample(p, step, limit, blimit, thresh, fsize)
+                        }
+                        i = i + 1
+                    }
+                }
+            }
+            i0 = i0 + 8
+        }
+        edge = edge + 1
+    }
+}
+
+fn iabs(v: Int) -> Int { if v < 0 { return 0 - v }  return v }
+fn fclamp(v: Int) -> Int { if v < 0 - 128 { return 0 - 128 }  if v > 127 { return 127 }  return v }
+
+/// the sample filtering process (§8.8.5) at `p` (the first sample past the edge; `st` the step across it)
+fn v9_lf_sample(p: Int, st: Int, limit: Int, blimit: Int, thresh: Int, fsize: Int) {
+    var q0 = 0  var q1 = 0  var q2 = 0  var q3 = 0  var p0 = 0  var p1 = 0  var p2 = 0  var p3 = 0
+    unsafe {
+        q0 = peek8(p)  q1 = peek8(p + st)  q2 = peek8(p + 2 * st)  q3 = peek8(p + 3 * st)
+        p0 = peek8(p - st)  p1 = peek8(p - 2 * st)  p2 = peek8(p - 3 * st)  p3 = peek8(p - 4 * st)
+    }
+    // the filter mask
+    if iabs(p3 - p2) > limit || iabs(p2 - p1) > limit || iabs(p1 - p0) > limit || iabs(q1 - q0) > limit ||
+       iabs(q2 - q1) > limit || iabs(q3 - q2) > limit || iabs(p0 - q0) * 2 + iabs(p1 - q1) / 2 > blimit { return }
+    let hev = iabs(p1 - p0) > thresh || iabs(q1 - q0) > thresh
+    var flat = false
+    if fsize >= 1 {
+        flat = iabs(p1 - p0) <= 1 && iabs(q1 - q0) <= 1 && iabs(p2 - p0) <= 1 && iabs(q2 - q0) <= 1 && iabs(p3 - p0) <= 1 && iabs(q3 - q0) <= 1
+    }
+    if fsize == 0 || !flat { v9_lf_narrow(p, st, hev, p1, p0, q0, q1)  return }
+    var flat2 = false
+    if fsize >= 2 {
+        var q4 = 0  var q5 = 0  var q6 = 0  var q7 = 0  var p4 = 0  var p5 = 0  var p6 = 0  var p7 = 0
+        unsafe {
+            q4 = peek8(p + 4 * st)  q5 = peek8(p + 5 * st)  q6 = peek8(p + 6 * st)  q7 = peek8(p + 7 * st)
+            p4 = peek8(p - 5 * st)  p5 = peek8(p - 6 * st)  p6 = peek8(p - 7 * st)  p7 = peek8(p - 8 * st)
+        }
+        flat2 = iabs(p7 - p0) <= 1 && iabs(q7 - q0) <= 1 && iabs(p6 - p0) <= 1 && iabs(q6 - q0) <= 1 &&
+                iabs(p5 - p0) <= 1 && iabs(q5 - q0) <= 1 && iabs(p4 - p0) <= 1 && iabs(q4 - q0) <= 1
+    }
+    if fsize == 1 || !flat2 { v9_lf_wide8(p, st) } else { v9_lf_wide16(p, st) }
+}
+
+/// the narrow filter (§8.8.5.2)
+fn v9_lf_narrow(p: Int, st: Int, hev: Bool, p1: Int, p0: Int, q0: Int, q1: Int) {
+    let ps1 = p1 - 128
+    let ps0 = p0 - 128
+    let qs0 = q0 - 128
+    let qs1 = q1 - 128
+    var f = 0
+    if hev { f = fclamp(ps1 - qs1) }
+    f = fclamp(f + 3 * (qs0 - ps0))
+    let f1 = sar_(fclamp(f + 4), 3)
+    let f2 = sar_(fclamp(f + 3), 3)
+    unsafe {
+        poke8(p, fclamp(qs0 - f1) + 128)
+        poke8(p - st, fclamp(ps0 + f2) + 128)
+        if !hev {
+            let f3 = sar_(f1 + 1, 1)
+            poke8(p + st, fclamp(qs1 - f3) + 128)
+            poke8(p - 2 * st, fclamp(ps1 + f3) + 128)
+        }
+    }
+}
+

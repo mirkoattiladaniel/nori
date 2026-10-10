@@ -1,0 +1,450 @@
+// std/window/__native_linux.nori: the `nori_win_*` seam of window.nori on Linux, in Nori, for a program
+// built with `noric --build --native`. That build has no C compiler, so window_dispatch.c,
+// window_wayland.c and window_x11.c cannot be linked; this module answers the same calls instead.
+//
+// The `__` prefix keeps these files out of what `import "std/window"` gathers from the directory.
+// It is a runtime-floor module, compiled with `--runtime --cfg native` like the native build's libc layer
+// and linked beside it: window.nori keeps its `extern fn nori_win_*` declarations untouched, and the
+// native link resolves them here. Everything is raw memory (records laid out with `cstruct`, the
+// wire protocols encoded by hand) and every syscall goes through that layer's wrappers.
+//
+// Both display servers are spoken directly over their Unix sockets: Wayland in __native_wayland.nori
+// (keymaps decoded by __native_xkb.nori) and the X11 core protocol in __native_x11.nori. Which one serves
+// a window is decided when it opens, exactly as window_dispatch.c decides it: NORI_WINDOW_BACKEND
+// forces one, otherwise WAYLAND_DISPLAY picks Wayland, and a backend that cannot connect hands over
+// to the other before `open` gives up.
+import "__native_wayland.nori"
+import "__native_wayland_shell.nori"
+import "__native_xkb.nori"
+import "__native_x11.nori"
+
+extern fn malloc(Int) -> Int
+extern fn calloc(Int, Int) -> Int
+extern fn realloc(Int, Int) -> Int
+extern fn free(Int)
+extern fn memcpy(Int, Int, Int) -> Int
+extern fn memmove(Int, Int, Int) -> Int
+extern fn memcmp(Int, Int, Int) -> Int
+extern fn strlen(Int) -> Int
+extern fn getenv(Int) -> Int
+extern fn socket(Int, Int, Int) -> Int
+extern fn connect(Int, Int, Int) -> Int
+extern fn close(Int) -> Int
+extern fn read(Int, Int, Int) -> Int
+extern fn write(Int, Int, Int) -> Int
+extern fn open(Int, Int) -> Int
+extern fn poll(Int, Int, Int) -> Int
+extern fn sendmsg(Int, Int, Int) -> Int
+extern fn recvmsg(Int, Int, Int) -> Int
+extern fn memfd_create(Int, Int) -> Int
+extern fn ftruncate(Int, Int) -> Int
+extern fn mmap(Int, Int, Int, Int, Int, Int) -> Int
+extern fn munmap(Int, Int) -> Int
+extern fn pipe(Int) -> Int
+extern fn signal(Int, Int) -> Int
+extern fn clock_gettime(Int, Int) -> Int
+extern fn usleep(Int) -> Int
+extern fn uname(Int) -> Int
+extern fn nori_cstr(Int) -> Int
+extern fn nori_str_ptr(Int) -> Int
+
+// ---- helpers shared by both backends ---------------------------------------------------------------
+
+// a 32-bit field read back as the signed value it encodes (peek32 zero-extends)
+fn nwu_s32(v: Int) -> Int { if v >= 2147483648 { return v - 4294967296 }  return v }
+
+// The POSIX records, declared as `cstruct`s so the compiler computes the offsets: a timespec
+// (tv_sec@0, tv_nsec@8), a sockaddr_un (sun_family@0, sun_path@2, 108 bytes in the ABI; the
+// buffers below keep a little slack), and a pollfd (fd@0, events@4, revents@6; 8 bytes). They sit at
+// top level because a `cstruct` must, cfg block or no.
+cstruct Timespec { sec: I64, nsec: I64 }
+cstruct SockaddrUn { family: U16, path: [Byte; 108] }
+cstruct Pollfd { fd: I32, events: U16, revents: U16 }
+
+fn nwu_now_ms() -> Int {
+    let ts: Timespec = malloc(16)
+    clock_gettime(1, ts)                                        // CLOCK_MONOTONIC
+    let ms = ts.sec * 1000 + ts.nsec / 1000000
+    free(ts)
+    return ms
+}
+
+// the value of environment variable `name`, as a C string owned by the environment (0 when unset)
+fn nwu_getenv(name: Str) -> Int {
+    let cn = nori_cstr(name)
+    let v = getenv(cn)
+    free(cn)
+    return v
+}
+
+// do the `n` bytes at `p` spell `lit` exactly?
+fn nwu_mem_eq(p: Int, n: Int, lit: Str) -> Int {
+    if n != lit.len() { return 0 }
+    let q = nori_str_ptr(lit)
+    var i = 0
+    while i < n { if peek8(p + i) != peek8(q + i) { return 0 }  i = i + 1 }
+    return 1
+}
+// do the `n` bytes at `p` begin with `lit`?
+fn nwu_mem_starts(p: Int, n: Int, lit: Str) -> Int {
+    if n < lit.len() { return 0 }
+    return nwu_mem_eq(p, lit.len(), lit)
+}
+fn nwu_cstr_eq(p: Int, lit: Str) -> Int { if p == 0 { return 0 }  return nwu_mem_eq(p, strlen(p), lit) }
+
+// a malloc'd copy of the C string `p` ("" for a null pointer)
+fn nwu_strdup(p: Int) -> Int {
+    var n = 0
+    if p != 0 { n = strlen(p) }
+    let r = malloc(n + 1)
+    if n > 0 { memcpy(r, p, n) }
+    poke8(r + n, 0)
+    return r
+}
+
+fn nwu_stderr(msg: Str) { write(2, nori_str_ptr(msg), msg.len()) }
+
+// write all of `n` bytes to `fd`, stopping at the first failed write (a reader that went away)
+fn nwu_write_all(fd: Int, p: Int, n: Int) {
+    var off = 0
+    var going = 1
+    while going == 1 && off < n {
+        let k = write(fd, p + off, n - off)
+        if k <= 0 { going = 0 } else { off = off + k }
+    }
+}
+
+// connect a stream socket to the Unix socket at the `n` bytes of `path`. `abstract` = 1 names it in
+// the abstract namespace (a leading NUL instead of a file). Returns the fd, or -1.
+fn nwu_unix_connect(path: Int, n: Int, abstract: Int) -> Int {
+    if n + abstract > 107 { return 0 - 1 }
+    let fd = socket(1, 524289, 0)                               // AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC
+    if fd < 0 { return 0 - 1 }
+    let sa: SockaddrUn = calloc(1, 112)
+    sa.family = 1                                               // sun_family = AF_UNIX
+    memcpy(sa.path + abstract, path, n)
+    let r = connect(fd, sa, 2 + abstract + n + 1 - abstract)
+    free(sa)
+    if r < 0 { close(fd)  return 0 - 1 }
+    return fd
+}
+
+// wait up to `ms` for `fd` to become readable: 1 readable (or hung up), 0 not
+fn nwu_readable(fd: Int, ms: Int) -> Int {
+    let pfd: Pollfd = malloc(8)
+    pfd.fd = fd  pfd.events = 1  pfd.revents = 0                // POLLIN
+    var t = ms
+    if t < 0 { t = 0 }
+    let r = poll(pfd, 1, t)
+    let rev = pfd.revents
+    free(pfd)
+    if r > 0 && rev != 0 { return 1 }
+    return 0
+}
+
+// ---- dispatch ----------------------------------------------------------------------------------------
+
+// A window carries the backend that opened it, so two windows under two servers route correctly.
+cstruct NwinRec { backend: Int, h: Int }
+
+// 0 = compositor surface (Wayland), 1 = X11: NORI_WINDOW_BACKEND forces one, WAYLAND_DISPLAY picks
+// Wayland, and X11 is the fallback.
+fn nwin_preferred() -> Int {
+    let forced = nwu_getenv("NORI_WINDOW_BACKEND")
+    if forced != 0 && peek8(forced) != 0 {
+        if nwu_cstr_eq(forced, "x11") == 1 { return 1 }
+        if nwu_cstr_eq(forced, "wayland") == 1 || nwu_cstr_eq(forced, "surface") == 1 { return 0 }
+    }
+    let wl = nwu_getenv("WAYLAND_DISPLAY")
+    if wl != 0 && peek8(wl) != 0 { return 0 }
+    return 1
+}
+
+fn nwin_try(backend: Int, title: Int, w: Int, h: Int) -> Int {
+    if backend == 0 { return nwl_open(title, w, h) }
+    return nx_open(title, w, h)
+}
+
+fn nori_win_open(title: Int, w: Int, h: Int) -> Int {
+    let want = nwin_preferred()
+    var got = want
+    var inner = nwin_try(want, title, w, h)
+    if inner == 0 {
+        got = 1 - want
+        inner = nwin_try(got, title, w, h)
+    }
+    if inner == 0 { return 0 }
+    let nw: NwinRec = calloc(1, sizeof(NwinRec))
+    nw.backend = got
+    nw.h = inner
+    return nw
+}
+
+fn nwin_is_x11(h: Int) -> Int { let nw: NwinRec = h  return nw.backend }
+fn nwin_inner(h: Int) -> Int { let nw: NwinRec = h  return nw.h }
+
+fn nori_win_backend(h: Int) -> Int { if h == 0 { return 0 }  return nwin_is_x11(h) }
+
+fn nori_win_poll_event(h: Int, out: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return nx_poll_event(nwin_inner(h), out) }
+    return nwl_poll_event(nwin_inner(h), out)
+}
+fn nori_win_mouse(h: Int, out: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return nx_mouse(nwin_inner(h), out) }
+    return nwl_mouse(nwin_inner(h), out)
+}
+fn nori_win_mouse_x(h: Int) -> Int {
+    if h == 0 { return 0 - 1 }
+    if nwin_is_x11(h) == 1 { return nx_mouse_x(nwin_inner(h)) }
+    return nwl_mouse_x(nwin_inner(h))
+}
+// where the pointer is now, a tap latched or not (window::pointer_at)
+fn nori_win_pointer_x(h: Int) -> Int {
+    if h == 0 { return 0 - 1 }
+    if nwin_is_x11(h) == 1 { let x: NxWin = nwin_inner(h)  return x.px }
+    let w: NwlWin = nwin_inner(h)
+    return w.px
+}
+fn nori_win_pointer_y(h: Int) -> Int {
+    if h == 0 { return 0 - 1 }
+    if nwin_is_x11(h) == 1 { let x: NxWin = nwin_inner(h)  return x.py }
+    let w: NwlWin = nwin_inner(h)
+    return w.py
+}
+fn nori_win_mouse_y(h: Int) -> Int {
+    if h == 0 { return 0 - 1 }
+    if nwin_is_x11(h) == 1 { return nx_mouse_y(nwin_inner(h)) }
+    return nwl_mouse_y(nwin_inner(h))
+}
+fn nori_win_mouse_down(h: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return nx_mouse_down(nwin_inner(h)) }
+    return nwl_mouse_down(nwin_inner(h))
+}
+fn nori_win_mouse_middle(h: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return nx_mouse_middle(nwin_inner(h)) }
+    return nwl_mouse_middle(nwin_inner(h))
+}
+fn nori_win_pointer_held(h: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return nx_pointer_held(nwin_inner(h)) }
+    return nwl_pointer_held(nwin_inner(h))
+}
+fn nori_win_scale120(h: Int) -> Int {
+    if h == 0 { return 120 }
+    if nwin_is_x11(h) == 1 { return nx_scale120(nwin_inner(h)) }
+    return nwl_scale120(nwin_inner(h))
+}
+// A desktop window owns its whole rectangle, the pointer can hover, and a wheel notch is four logical
+// pixels, on both servers, so these need no backend.
+fn nori_win_inset_top(h: Int) -> Int { return 0 }
+fn nori_win_scroll_unit_1000(h: Int) -> Int { return 4000 }
+fn nori_win_has_hover(h: Int) -> Int { return 1 }
+fn nori_win_soft_keyboard(h: Int, show: Int) { }
+fn nori_win_catch_back(h: Int, on: Int) -> Int { return 0 }
+fn nori_win_drag_finished(h: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return 0 }
+    return nwl_drag_finished(nwin_inner(h))
+}
+fn nori_win_closed(h: Int) -> Int {
+    if h == 0 { return 1 }
+    if nwin_is_x11(h) == 1 { return nx_closed(nwin_inner(h)) }
+    return nwl_closed(nwin_inner(h))
+}
+fn nori_win_drawable(h: Int) -> Int {
+    if h == 0 { return 0 }
+    return 1 - nori_win_closed(h)
+}
+fn nori_win_w(h: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return nx_w(nwin_inner(h)) }
+    return nwl_w(nwin_inner(h))
+}
+fn nori_win_h(h: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return nx_h(nwin_inner(h)) }
+    return nwl_h(nwin_inner(h))
+}
+fn nori_win_clipboard_get(h: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return nx_clipboard_get(nwin_inner(h)) }
+    return nwl_clipboard_get(nwin_inner(h))
+}
+// X11 has no drag-and-drop here (XDND is not spoken), so a drop is never delivered there.
+fn nori_win_drop_text(h: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return 0 }
+    return nwl_drop_text(nwin_inner(h))
+}
+// There is no C display object behind either backend: the connection record and the protocol id of
+// the drawable (a wl_surface object id, an X window id) stand in for them.
+fn nori_win_display(h: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return nx_display(nwin_inner(h)) }
+    return nwl_display(nwin_inner(h))
+}
+fn nori_win_surface(h: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return nx_surface(nwin_inner(h)) }
+    return nwl_surface(nwin_inner(h))
+}
+fn nori_win_shm_present(h: Int, pixels: Int, ww: Int, hh: Int) {
+    if h == 0 { return }
+    if nwin_is_x11(h) == 1 { nx_shm_present(nwin_inner(h), pixels, ww, hh)  return }
+    nwl_shm_present(nwin_inner(h), pixels, ww, hh)
+}
+fn nori_win_frame_wait(h: Int, timeout_ms: Int) {
+    if h == 0 { return }
+    if nwin_is_x11(h) == 1 { nx_frame_wait(nwin_inner(h), timeout_ms)  return }
+    nwl_frame_wait(nwin_inner(h), timeout_ms)
+}
+fn nori_win_set_cursor(h: Int, shape: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return nx_set_cursor(nwin_inner(h), shape) }
+    return nwl_set_cursor(nwin_inner(h), shape)
+}
+fn nori_win_apply_viewport(h: Int) {
+    if h == 0 { return }
+    if nwin_is_x11(h) == 1 { return }
+    nwl_apply_viewport(nwin_inner(h))
+}
+fn nori_win_clipboard_set(h: Int, text: Int) {
+    if h == 0 { return }
+    if nwin_is_x11(h) == 1 { nx_clipboard_set(nwin_inner(h), text)  return }
+    nwl_clipboard_set(nwin_inner(h), text)
+}
+fn nori_win_start_drag(h: Int, text: Int) {
+    if h == 0 { return }
+    if nwin_is_x11(h) == 1 { return }
+    nwl_start_drag(nwin_inner(h), text)
+}
+fn nori_win_start_drag_files(h: Int, uris: Int, plain: Int) {
+    if h == 0 { return }
+    if nwin_is_x11(h) == 1 { return }
+    nwl_start_drag_files(nwin_inner(h), uris, plain)
+}
+fn nori_win_lock_pointer(h: Int, on: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return nx_lock_pointer(nwin_inner(h), on) }
+    return nwl_lock_pointer(nwin_inner(h), on)
+}
+fn nori_win_inhibit_shortcuts(h: Int, on: Int) -> Int {
+    if h == 0 || nwin_is_x11(h) == 1 { return 0 }
+    return nwl_inhibit_shortcuts(nwin_inner(h), on)
+}
+fn nori_win_pointer_locked(h: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return nx_pointer_locked(nwin_inner(h)) }
+    return nwl_pointer_locked(nwin_inner(h))
+}
+fn nori_win_pointer_delta(h: Int, out: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return nx_pointer_delta(nwin_inner(h), out) }
+    return nwl_pointer_delta(nwin_inner(h), out)
+}
+// The descriptor a window's events arrive on, for a program that waits on several sources at once
+// (-1 once the connection is gone).
+fn nori_win_fd(h: Int) -> Int {
+    if h == 0 { return 0 - 1 }
+    if nwin_is_x11(h) == 1 { return nx_fd(nwin_inner(h)) }
+    return nwl_fd(nwin_inner(h))
+}
+// read without waiting, decode into the window's queue; how many events poll has to hand out (-1: gone)
+fn nori_win_dispatch(h: Int) -> Int {
+    if h == 0 { return 0 - 1 }
+    if nwin_is_x11(h) == 1 { return nx_dispatch(nwin_inner(h)) }
+    return nwl_dispatch_pending(nwin_inner(h))
+}
+
+// A translucent window (ARGB8888, premultiplied: Wayland's shm format 0). X11 keeps its visual's format.
+fn nori_win_set_alpha(h: Int, on: Int) {
+    if h == 0 { return }
+    if nwin_is_x11(h) == 1 { return }
+    nwl_set_alpha(nwin_inner(h), on)
+}
+// 1 when the compositor has shown the last presented frame (no frame callback outstanding)
+fn nori_win_frame_done(h: Int) -> Int {
+    if h == 0 { return 1 }
+    if nwin_is_x11(h) == 1 { return 1 }
+    return nwl_frame_done(nwin_inner(h))
+}
+// 1 while the window has the keyboard (X11: not tracked, so 1)
+fn nori_win_has_keyboard(h: Int) -> Int {
+    if h == 0 { return 0 }
+    if nwin_is_x11(h) == 1 { return 1 }
+    return nwl_has_keyboard(nwin_inner(h))
+}
+// the keymap decoder (__native_xkb.nori) for a program that reads a Wayland keyboard of its own (window::keymap_parse)
+fn nori_win_keymap_parse(p: Int, n: Int) -> Int { if p == 0 || n <= 0 { return 0 }  return nxkb_parse(p, n) }
+fn nori_win_keymap_keysym(km: Int, code: Int, mods: Int) -> Int { if km == 0 { return 0 }  return nxkb_keysym(km, code, mods) }
+fn nori_win_keymap_keysym_group(km: Int, code: Int, mods: Int, group: Int) -> Int { if km == 0 { return 0 }  return nxkb_keysym_group(km, code, mods, group) }
+fn nori_win_keymap_free(km: Int) { if km != 0 { nxkb_free(km) } }
+// ms until a held key's next synthesized repeat, -1 none (X11 repeats on the server: its events come on the socket)
+fn nori_win_next_timeout_ms(h: Int) -> Int {
+    if h == 0 { return 0 - 1 }
+    if nwin_is_x11(h) == 1 { return 0 - 1 }
+    return nwl_next_timeout_ms(nwin_inner(h))
+}
+// an xdg_activation_v1 token (malloc'd; empty where there is none: X11, or a compositor without it)
+// the window's title and application id (a toplevel's; a layer surface has neither)
+fn nori_win_set_title(h: Int, title: Int) {
+    if h == 0 { return }
+    if nwin_is_x11(h) == 1 { nx_set_title(nwin_inner(h), title)  return }
+    nwl_set_title(nwin_inner(h), title)
+}
+fn nori_win_set_app_id(h: Int, id: Int) {
+    if h == 0 { return }
+    if nwin_is_x11(h) == 1 { nx_set_app_id(nwin_inner(h), id)  return }
+    nwl_set_app_id(nwin_inner(h), id)
+}
+fn nori_win_activation_token(h: Int, app_id: Int) -> Int {
+    if h == 0 { return nwu_strdup(0) }
+    if nwin_is_x11(h) == 1 { return nwu_strdup(0) }
+    return nwl_activation_token(nwin_inner(h), app_id)
+}
+
+// ---- the desktop shell's protocols (window_shell.nori) --------------------------------------------------------
+//
+// Wayland only: X11 has no layer surfaces and no foreign-toplevel list (its window managers keep such
+// things in EWMH properties, which nothing here speaks), so these answer 0 there, the same "not
+// available" a compositor without the protocols gets.
+
+// a layer surface (see nwl_open_layer for `spec`); 0 when no compositor answers or it has no layer shell
+fn nori_win_open_layer(ns: Int, spec: Int) -> Int {
+    let inner = nwl_open_layer(ns, spec)
+    if inner == 0 { return 0 }
+    let nw: NwinRec = calloc(1, sizeof(NwinRec))
+    nw.backend = 0
+    nw.h = inner
+    return nw
+}
+
+fn nori_win_layer_keyboard(h: Int, mode: Int) { if h != 0 && nwin_is_x11(h) == 0 { nwl_layer_keyboard(nwin_inner(h), mode) } }
+fn nori_win_layer_size(h: Int, width: Int, height: Int) { if h != 0 && nwin_is_x11(h) == 0 { nwl_layer_size(nwin_inner(h), width, height) } }
+fn nori_win_input_none(h: Int, none: Int) { if h != 0 && nwin_is_x11(h) == 0 { nwl_input_none(nwin_inner(h), none) } }
+fn nori_win_tl_open() -> Int { return nwlt_open() }
+fn nori_win_tl_caps(h: Int) -> Int { if h == 0 { return 0 }  return nwlt_caps(h) }
+fn nori_win_tl_fd(h: Int) -> Int { if h == 0 { return 0 - 1 }  return nwlt_fd(h) }
+fn nori_win_tl_dispatch(h: Int) -> Int { if h == 0 { return 0 - 1 }  return nwlt_dispatch(h) }
+fn nori_win_tl_count(h: Int) -> Int { if h == 0 { return 0 }  return nwlt_count(h) }
+fn nori_win_tl_uid(h: Int, k: Int) -> Int { if h == 0 { return 0 }  return nwlt_uid(h, k) }
+fn nori_win_tl_state(h: Int, k: Int) -> Int { if h == 0 { return 0 }  return nwlt_state(h, k) }
+fn nori_win_tl_str(h: Int, k: Int, which: Int) -> Int { if h == 0 { return 0 }  return nwlt_str(h, k, which) }
+fn nori_win_tl_act(h: Int, uid: Int, act: Int) -> Int { if h == 0 { return 0 }  return nwlt_act(h, uid, act) }
+fn nori_win_tl_close(h: Int) { if h != 0 { nwlt_close(h) } }
+fn nori_win_ws_count(h: Int) -> Int { if h == 0 { return 0 }  return nwlw_count(h) }
+fn nori_win_ws_uid(h: Int, k: Int) -> Int { if h == 0 { return 0 }  return nwlw_uid(h, k) }
+fn nori_win_ws_state(h: Int, k: Int) -> Int { if h == 0 { return 0 }  return nwlw_state(h, k) }
+fn nori_win_ws_str(h: Int, k: Int, which: Int) -> Int { if h == 0 { return 0 }  return nwlw_str(h, k, which) }
+fn nori_win_ws_act(h: Int, uid: Int, act: Int) -> Int { if h == 0 { return 0 }  return nwlw_act(h, uid, act) }
+
+// close frees the dispatch record too, so the handle is dead after it.
+fn nori_win_close(h: Int) {
+    if h == 0 { return }
+    if nwin_is_x11(h) == 1 { nx_close(nwin_inner(h)) } else { nwl_close(nwin_inner(h)) }
+    free(h)
+}

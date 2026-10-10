@@ -1,0 +1,199 @@
+// .nori tests for DEFLATE compression, run with
+//   noric --test std/archive/deflate_test.nori compiler/runtime.nori --import-root .
+//
+// The property under test is round-tripping: this module's own `inflate_zlib` is tested separately
+// (see inflate_test.nori), so anything `deflate_zlib` produces must come back
+// out of it byte for byte. The project's test suite also hands the same streams to Python's zlib, so
+// conformance does not rest on our inflater agreeing with our deflater.
+import "std/archive" as ar
+
+fn d_inflated_str(b: ar::Inflated) -> Str {
+    var s = ""
+    unsafe { s = str_from_buf(ar::inflated_ptr(b), ar::inflated_len(b)) }
+    return s
+}
+// deflate `s`, inflate it back, and assert the bytes survived. Returns the compressed size.
+fn d_roundtrip(s: Str) -> Int {
+    let z = ar::deflate_zlib(s)
+    var back = ar::inflate_zlib(z)
+    let got = d_inflated_str(back)
+    ar::inflated_free(back)
+    assert_eq(got.len(), s.len())
+    assert_streq(got, s)
+    return z.len()
+}
+// a cheap deterministic PRNG (xorshift-ish over 31 bits) so "random" is reproducible
+fn d_rand_bytes(n: Int, seed: Int) -> Str {
+    var s = ""
+    var x = seed
+    var i = 0
+    while i < n {
+        x = (x * 1103515245 + 12345) & 2147483647
+        s = s + chr((x >> 16) & 255)
+        i = i + 1
+    }
+    return s
+}
+fn d_repeat(unit: Str, times: Int) -> Str {
+    var s = ""
+    var i = 0
+    while i < times { s = s + unit  i = i + 1 }
+    return s
+}
+
+fn test_empty() {
+    let z = ar::deflate_zlib("")
+    var back = ar::inflate_zlib(z)
+    assert_eq(ar::inflated_len(back), 0)
+    ar::inflated_free(back)
+}
+
+fn test_one_byte() {
+    let n = d_roundtrip("A")
+    assert_true(n < 16)
+}
+
+fn test_short_text() {
+    let _n = d_roundtrip("hello, deflate")
+}
+
+// every byte value, including NUL and the high half; a Str is a byte string here
+fn test_all_byte_values() {
+    var s = ""
+    var i = 0
+    while i < 256 { s = s + chr(i)  i = i + 1 }
+    let _n = d_roundtrip(s)
+}
+
+// highly repetitive: this is what LZ77 is for, so it must also actually compress
+fn test_repetitive_compresses() {
+    let s = d_repeat("the quick brown fox jumps over the lazy dog\n", 400)
+    let n = d_roundtrip(s)
+    assert_true(n * 20 < s.len())                     // better than 20:1
+}
+
+// a single byte repeated: the longest-possible matches, distance 1
+fn test_run_of_one_byte() {
+    let s = d_repeat("a", 5000)
+    let n = d_roundtrip(s)
+    assert_true(n < 100)
+}
+
+// Incompressible input must come out stored, not expanded. The whole overhead is the zlib header (2)
+// + adler (4) + 5 bytes per stored block, and a block covers at most 32768 symbols, so 40000 bytes of
+// noise costs 6 + 2*5 = 16 bytes. (A fixed-Huffman block would have added ~4%.)
+fn test_incompressible_does_not_expand() {
+    let s = d_rand_bytes(40000, 7)
+    let n = d_roundtrip(s)
+    assert_true(n <= s.len() + 16)
+    assert_true(n >= s.len())                          // ...and it really is stored, not luckily compressed
+}
+
+// larger than the 32 KB window, so the match finder's cyclic chain array wraps
+fn test_larger_than_window() {
+    let s = d_repeat("0123456789abcdef", 6000)         // 96000 bytes
+    let n = d_roundtrip(s)
+    assert_true(n * 100 < s.len())
+}
+
+// a match that starts before the 32 KB window boundary and is found after it: 40000 bytes of noise
+// with the very first 300 bytes repeated at the end, at a distance well inside 32768.
+fn test_match_spanning_window_boundary() {
+    let noise = d_rand_bytes(40000, 11)
+    let tail = noise.slice(20000, 20300)
+    let _n = d_roundtrip(noise + tail)
+}
+
+// mixed content: compressible and incompressible regions in one stream, which forces the per-block
+// stored/fixed/dynamic choice to change mid-stream.
+fn test_mixed_blocks() {
+    let s = (d_repeat("aaaabbbbcccc", 3000) + d_rand_bytes(30000, 3)) + d_repeat("xyz", 9000)
+    let _n = d_roundtrip(s)
+}
+
+// `n` bytes with a skewed distribution over many distinct values. A builder, like d_repeat and
+// d_rand_bytes above, and for the same reason: the accumulator never leaves this frame, so
+// `s = s + …` appends in place. Built inline in the test body it also escapes to d_roundtrip, which
+// takes a raw interior pointer (nori_str_ptr), so the compiler cannot prove the argument is only
+// read, the append falls back to copying the whole string every iteration, and the copies are never
+// dropped: 1.8 GB allocated and 30,000 strings stranded, to build 30 KB.
+fn d_skewed(n: Int) -> Str {
+    var s = ""
+    var i = 0
+    while i < n {
+        if (i % 7) == 0 { s = s + chr(65 + (i % 26)) } else { s = s + chr(32) }
+        i = i + 1
+    }
+    return s
+}
+
+// many distinct byte values with a skewed distribution, the case dynamic Huffman is for
+fn test_skewed_alphabet() {
+    let s = d_skewed(30000)
+    let n = d_roundtrip(s)
+    assert_true(n * 4 < s.len())
+}
+
+// raw deflate (no zlib wrapper) is the same stream with the header and trailer removed
+fn test_raw_matches_zlib_body() {
+    let s = d_repeat("raw deflate body check ", 200)
+    let raw = ar::deflate(s)
+    let z = ar::deflate_zlib(s)
+    assert_eq(z.len(), raw.len() + 6)
+    assert_eq(ord(z.at(0)), 120)
+    assert_eq(ord(z.at(1)), 156)
+    assert_streq(z.slice(2, 2 + raw.len()), raw)
+}
+
+// the zlib header must satisfy RFC 1950's (CMF*256+FLG) % 31 == 0, and the trailer the Adler-32
+fn test_zlib_framing() {
+    let s = "framing"
+    let z = ar::deflate_zlib(s)
+    assert_eq((ord(z.at(0)) * 256 + ord(z.at(1))) % 31, 0)
+    let ad = ar::adler32(s)
+    let n = z.len()
+    assert_eq(ord(z.at(n - 4)), (ad >> 24) & 255)
+    assert_eq(ord(z.at(n - 3)), (ad >> 16) & 255)
+    assert_eq(ord(z.at(n - 2)), (ad >> 8) & 255)
+    assert_eq(ord(z.at(n - 1)), ad & 255)
+}
+
+fn test_adler32_known_values() {
+    assert_eq(ar::adler32(""), 1)
+    assert_eq(ar::adler32("a"), 6422626)               // 0x00620062
+    assert_eq(ar::adler32("Wikipedia"), 300286872)     // 0x11E60398
+}
+
+// a real file from the repository, which is the input the ratio actually matters on
+fn test_source_file_roundtrip() {
+    let s = read_file("std/archive/archive.nori")
+    let n = d_roundtrip(s)
+    assert_true(n * 2 < s.len())                       // better than 2:1 on Nori source
+}
+
+// gzip: what gunzip_checked reads back, byte for byte, with RFC 1952's fixed header (no name, MTIME 0,
+// OS unknown) and the CRC-32 and size trailer it checks. The project's test suite also hands the same member to
+// Python's gzip, so this is not only our inflater agreeing with our deflater.
+fn d_gunzipped(z: Str) -> Str {
+    let r = ar::gunzip_checked(z, 0)
+    assert_true(r.ok)
+    let got = d_inflated_str(r.data)
+    ar::inflated_free(r.data)
+    return got
+}
+fn test_gzip_roundtrip() {
+    let s = read_file("std/archive/archive.nori")
+    let z = ar::gzip(s)
+    assert_eq(ord(z.at(0)), 31)
+    assert_eq(ord(z.at(1)), 139)
+    assert_eq(ord(z.at(2)), 8)
+    assert_eq(ord(z.at(3)), 0)                          // no name, no comment, no extra
+    assert_eq(ord(z.at(9)), 255)
+    assert_true(z.len() * 2 < s.len())
+    assert_streq(d_gunzipped(z), s)
+}
+fn test_gzip_empty_and_binary() {
+    assert_eq(d_gunzipped(ar::gzip("")).len(), 0)
+    let r = d_rand_bytes(70000, 7)
+    assert_streq(d_gunzipped(ar::gzip(r)), r)
+}

@@ -1,0 +1,339 @@
+//! std/video: video files decoded on the CPU in Nori: the containers Matroska/WebM (mkv.nori) and MP4/ISO
+//! BMFF (mp4.nori), read by offset (a packet at a time, never the whole file), and the VP9 codec (vp9*.nori).
+//!   import "std/video" as video
+//!   var v = video::video_open("clip.webm")
+//!   if video::video_ok(v) {
+//!       while video::video_next(v) {                       // decodes until the next frame to show
+//!           video::video_to_xrgb(v, buffer, stride)        // the frame, converted to XRGB
+//!           wait(video::video_frame_ms(v))                 // its duration
+//!       }
+//!       video::video_rewind(v)                             // and again from the first frame
+//!   } else { say(video::video_error(v)) }                  // e.g. "H.264 video: not supported yet"
+//!   video::video_close(v)
+//! A file whose codec this decoder lacks opens (its container is read) and says so: video_codec names it, video_ok is
+//! false, and video_error says "H.264 video: not supported yet". Only VP9 is decoded; AV1, H.264 and H.265 are not.
+//!
+//! Threads. Decoding (video_next) and converting (video_to_xrgb) share their work out with fork/join (`parallel`): a
+//! frame's tile columns, the loop filter's planes, the conversion's rows. That makes them, and the functions calling
+//! them, suspendable, so call them in a statement (not a `while` condition) from a function that takes no struct by
+//! parameter and returns none (keep the Video in a global).
+
+import "std/os" as os
+import "std/time" as time
+
+extern fn malloc(Int) -> Int
+extern fn free(Int)
+extern fn realloc(Int, Int) -> Int
+extern fn memcpy(Int, Int, Int) -> Int
+
+/// an open video
+pub struct Video {
+    fd: Int, size: Int, kind: Int,            // kind: 1 Matroska/WebM, 2 MP4
+    codec: Str, w: Int, h: Int, okf: Bool, err: Str,
+    // Matroska: the segment, the track, the cluster being read, a block's laced frames
+    seg0: Int, seg_end: Int, tscale: Int, track: Int, default_dur: Int, first_cluster: Int,
+    cl_pos: Int, cl_end: Int, cl_time: Int, pos: Int, lace_off: Vec<Int>, lace_len: Vec<Int>, lace_i: Int, lace_time: Int,
+    // MP4: the moov box (in memory), the video track's sample tables, the next sample
+    moov: Int, moov_n: Int, timescale: Int, stts: Int, stts_n: Int, stsc: Int, stsc_n: Int, stsz: Int, stsz_fixed: Int,
+    stsz_n: Int, stco: Int, stco_n: Int, co64: Bool,
+    sample: Int, chunk: Int, in_chunk: Int, chunk_off: Int, stsc_i: Int, stts_i: Int, stts_left: Int, dts: Int,
+    // the packet read last: its bytes (pkt, pkt_n) and time (ms)
+    pkt: Int, pkt_cap: Int, pkt_n: Int, pkt_ms: Int,
+    // the decoder and the frame it showed last
+    vp9: V9, has_dec: Bool, frame_ms: Int, frame_dur: Int, frames: Int, last_pkt_ms: Int,
+    dec_us: Int
+}
+
+fn video_blank() -> Video {
+    return Video { fd: 0 - 1, size: 0, kind: 0, codec: "", w: 0, h: 0, okf: false, err: "",
+                   seg0: 0, seg_end: 0, tscale: 1000000, track: 0 - 1, default_dur: 0, first_cluster: 0,
+                   cl_pos: 0, cl_end: 0, cl_time: 0, pos: 0, lace_off: vec(), lace_len: vec(), lace_i: 0, lace_time: 0,
+                   moov: 0, moov_n: 0, timescale: 0, stts: 0, stts_n: 0, stsc: 0, stsc_n: 0, stsz: 0, stsz_fixed: 0,
+                   stsz_n: 0, stco: 0, stco_n: 0, co64: false,
+                   sample: 0, chunk: 0, in_chunk: 0, chunk_off: 0, stsc_i: 0, stts_i: 0, stts_left: 0, dts: 0,
+                   pkt: 0, pkt_cap: 0, pkt_n: 0, pkt_ms: 0,
+                   vp9: rnull(V9), has_dec: false, frame_ms: 0, frame_dur: 0, frames: 0, last_pkt_ms: 0, dec_us: 0 }
+}
+
+/// read `n` bytes at `off` into the packet buffer's scratch; the bytes as a Str ("" past the end)
+fn vread(v: Video, off: Int, n: Int) -> Str {
+    if n <= 0 || off < 0 || off >= v.size { return "" }
+    var m = n
+    if off + m > v.size { m = v.size - off }
+    var buf = 0
+    unsafe { buf = malloc(m) }
+    let got = os::read_at(v.fd, buf, off, m)
+    var s = ""
+    unsafe { if got > 0 { s = str_from_buf(buf, got) }  free(buf) }
+    return s
+}
+fn sb(s: Str, i: Int) -> Int { if i < 0 || i >= s.len() { return 0 }  return ord(s.at(i)) }
+fn sbe(s: Str, i: Int, n: Int) -> Int { var v = 0  var k = 0  while k < n { v = v * 256 + sb(s, i + k)  k = k + 1 }  return v }
+
+/// open a video file: its container read (the track, its codec, its size), its decoder made when the codec is one
+/// this module decodes
+pub fn video_open(path: Str) -> Video {
+    if path.len() == 0 { var none = video_blank()  none.err = "no file"  return none }
+    let fd = os::open_file(path, os::O_RDONLY(), 0)
+    if fd < 0 { var bad = video_blank()  bad.err = "cannot be opened"  return bad }
+    return video_open_fd(fd)
+}
+
+/// the same over a file already open (a sandboxed reader handed it as a descriptor); video_close closes it
+pub fn video_open_fd(fd: Int) -> Video {
+    var v = video_blank()
+    v.fd = fd
+    v.size = os::size_fd(v.fd)
+    let head = vread(v, 0, 64)
+    if head.len() < 12 { v.err = "not a video file"  return v }
+    if sb(head, 0) == 26 && sb(head, 1) == 69 && sb(head, 2) == 223 && sb(head, 3) == 163 { v.kind = 1  mkv_open(v) }
+    else if head.slice(4, 8) == "ftyp" || head.slice(4, 8) == "moov" || head.slice(4, 8) == "mdat" || head.slice(4, 8) == "free" || head.slice(4, 8) == "wide" { v.kind = 2  mp4_open(v) }
+    else { v.err = "not a video this reads (WebM, Matroska, MP4)"  return v }
+    if v.err.len() > 0 { return v }
+    if v.codec == "vp9" {
+        v.vp9 = vp9_new()
+        v.has_dec = true
+        v.okf = true
+    } else { v.err = codec_name(v.codec) + " video: not supported yet" }
+    return v
+}
+
+/// the codec's name as people know it
+fn codec_name(c: Str) -> Str {
+    if c == "h264" { return "H.264" }
+    if c == "hevc" { return "H.265" }
+    if c == "av1" { return "AV1" }
+    if c == "vp8" { return "VP8" }
+    if c == "mpeg4" { return "MPEG-4 Part 2" }
+    if c.len() == 0 { return "An unknown" }
+    return copy c
+}
+
+/// can its frames be decoded?
+pub fn video_ok(v: Video) -> Bool { return v.okf }
+/// why not (or why the last frame did not decode)
+pub fn video_error(v: Video) -> Str { return copy v.err }
+/// the codec: "vp9", "vp8", "av1", "h264", "hevc", "mpeg4" or what the container calls it
+pub fn video_codec(v: Video) -> Str { return copy v.codec }
+/// the container: "webm" (Matroska), "mp4", or ""
+pub fn video_container(v: Video) -> Str { if v.kind == 1 { return "webm" }  if v.kind == 2 { return "mp4" }  return "" }
+/// the size the container says (the frames may say otherwise; video_frame_w/h are what was decoded)
+pub fn video_width(v: Video) -> Int { return v.w }
+pub fn video_height(v: Video) -> Int { return v.h }
+/// the shown frame's time and duration (ms)
+pub fn video_frame_ms(v: Video) -> Int { return v.frame_dur }
+pub fn video_pts_ms(v: Video) -> Int { return v.frame_ms }
+/// frames shown since it was opened (or rewound)
+pub fn video_frames(v: Video) -> Int { return v.frames }
+/// the decoded frame's size
+pub fn video_frame_w(v: Video) -> Int { if v.frames == 0 { return v.w }  return vp9_out_w(v.vp9) }
+pub fn video_frame_h(v: Video) -> Int { if v.frames == 0 { return v.h }  return vp9_out_h(v.vp9) }
+/// the time spent decoding since the last call (microseconds)
+pub fn video_take_decode_us(inout v: Video) -> Int { let u = v.dec_us  v.dec_us = 0  return u }
+/// decode tiles on this many threads
+pub fn video_set_threads(v: Video, n: Int) { if v.has_dec { vp9_set_threads(v.vp9, n) } }
+
+/// the packet buffer grown to `n` bytes
+fn pkt_room(inout v: Video, n: Int) -> Bool {
+    if n <= v.pkt_cap { return true }
+    var c = v.pkt_cap * 2
+    if c < n { c = n + 65536 }
+    unsafe { if v.pkt == 0 { v.pkt = malloc(c) } else { v.pkt = realloc(v.pkt, c) } }
+    v.pkt_cap = c
+    return v.pkt != 0
+}
+/// `n` bytes at `off` into the packet buffer
+fn pkt_read(inout v: Video, off: Int, n: Int) -> Bool {
+    if n <= 0 || off < 0 || off + n > v.size { return false }
+    if !pkt_room(v, n + 16) { return false }
+    let got = os::read_at(v.fd, v.pkt, off, n)
+    v.pkt_n = got
+    return got == n
+}
+
+/// the next packet of the video track into v.pkt (false at the end)
+fn next_packet(inout v: Video) -> Bool {
+    if v.kind == 1 { return mkv_next(v) }
+    if v.kind == 2 { return mp4_next(v) }
+    return false
+}
+
+/// decode until the next frame to show. false at the end of the file or on an error (video_error says).
+pub fn video_next(inout v: Video) -> Bool {
+    if !v.okf { return false }
+    var guard = 0
+    while guard < 64 {
+        guard = guard + 1
+        if !next_packet(v) { return false }
+        let t0 = clock_us()
+        let r = vp9_decode(v.vp9, v.pkt, v.pkt_n)
+        v.dec_us = v.dec_us + clock_us() - t0
+        if r < 0 { v.err = vp9_error(v.vp9)  return false }
+        if r > 0 {
+            // the frame's duration: to this packet's time from the last shown one's, else the track's default
+            // (the first frame: the track's default, else the last play's interval, else 33 ms)
+            var dur = v.pkt_ms - v.last_pkt_ms
+            if v.frames == 0 || dur <= 0 { dur = v.default_dur / 1000000  if dur <= 0 { dur = v.frame_dur } }
+            if dur <= 0 { dur = 33 }
+            v.frame_dur = dur
+            v.frame_ms = v.pkt_ms
+            v.last_pkt_ms = v.pkt_ms
+            v.frames = v.frames + 1
+            return true
+        }
+    }
+    v.err = "no frame shown in 64 packets"
+    return false
+}
+fn clock_us() -> Int { return time::now_ns() / 1000 }
+
+/// back to the first frame (Matroska: the first cluster the Cues point at; MP4: sample 0). The decoder starts again
+/// at the first key frame.
+pub fn video_rewind(inout v: Video) -> Bool {
+    if v.kind == 1 { mkv_rewind(v) } else if v.kind == 2 { mp4_rewind(v) }
+    v.frames = 0
+    v.last_pkt_ms = 0
+    return v.okf
+}
+
+/// let everything go
+pub fn video_close(inout v: Video) {
+    if v.fd >= 0 { let _c = os::close_fd(v.fd) }
+    v.fd = 0 - 1
+    unsafe {
+        if v.pkt != 0 { free(v.pkt) }
+        if v.moov != 0 { free(v.moov) }
+    }
+    v.pkt = 0
+    v.moov = 0
+    if v.has_dec { vp9_free(v.vp9)  v.has_dec = false }
+    v.okf = false
+}
+
+/// the shown frame converted to XRGB words (0x00RRGGBB) at `dst` (rows `stride` bytes apart): BT.709 for HD and
+/// larger frames, BT.601 for smaller ones (VP9's own color_space when it says one), limited range unless the frame
+/// says full; chroma interpolated from the four nearest samples
+pub fn video_to_xrgb(v: Video, dst: Int, stride: Int) {
+    if !v.okf || v.frames == 0 { return }
+    let d = v.vp9
+    let w = vp9_out_w(d)
+    let h = vp9_out_h(d)
+    var cs = d.color_space
+    if cs == 0 { if h >= 720 { cs = 2 } else { cs = 1 } }
+    yuv420_to_xrgb(vp9_out_y(d), vp9_out_u(d), vp9_out_v(d), vp9_out_ystride(d), vp9_out_uvstride(d), w, h, cs == 2 || cs == 5, d.color_range == 1, dst, stride)
+}
+
+/// 4:2:0 to XRGB. bt709: the HD matrix, else BT.601; full: 0-255 range, else 16-235/16-240. The products are looked
+/// up (a table per term), the chroma interpolated between its two nearest rows (3:1) and then its two nearest columns
+/// (3:1), and the rows shared out between four threads.
+pub fn yuv420_to_xrgb(yp: Int, up: Int, vp: Int, ys: Int, uvs: Int, w: Int, h: Int, bt709: Bool, full: Bool, dst: Int, stride: Int) {
+    // fixed point (16 bits): Y gain, R from V, G from U and V, B from U
+    var yk = 76309
+    var off = 16
+    var rv = 104597
+    var gu = 25675
+    var gv = 53279
+    var bu = 132201
+    if bt709 { rv = 117489  gu = 13975  gv = 34925  bu = 138438 }
+    if full {
+        yk = 65536
+        off = 0
+        if bt709 { rv = 103206  gu = 12276  gv = 30679  bu = 121609 } else { rv = 91881  gu = 22554  gv = 46802  bu = 116130 }
+    }
+    // the tables: Y (with the rounding and an offset keeping every sum positive), V->R, U->G + V->G split, U->B
+    var tb = 0
+    unsafe { tb = malloc(5 * 256 * 8 + 128) }
+    var i = 0
+    unsafe {
+        while i < 256 {
+            poke(tb + i * 8, (i - off) * yk + 32768 + 1073741824)
+            poke(tb + 2048 + i * 8, rv * (i - 128))
+            poke(tb + 4096 + i * 8, 0 - gu * (i - 128))
+            poke(tb + 6144 + i * 8, 0 - gv * (i - 128))
+            poke(tb + 8192 + i * 8, bu * (i - 128))
+            i = i + 1
+        }
+        // the parameters the workers read
+        let pb = tb + 10240
+        poke(pb, yp)  poke(pb + 8, up)  poke(pb + 16, vp)  poke(pb + 24, ys)  poke(pb + 32, uvs)  poke(pb + 40, w)
+        poke(pb + 48, h)  poke(pb + 56, dst)  poke(pb + 64, stride)  poke(pb + 72, tb)
+        if h >= 64 {
+            let q = (h / 4) & (0 - 2)
+            parallel {
+                let _a = yuv_rows(pb, 0, q)
+                let _b = yuv_rows(pb, q, 2 * q)
+                let _c = yuv_rows(pb, 2 * q, 3 * q)
+                let _d = yuv_rows(pb, 3 * q, h)
+            }
+        } else { let _e = yuv_rows(pb, 0, h) }
+        free(tb)
+    }
+}
+
+/// rows y0..y1 of the conversion whose parameters are at pb
+fn yuv_rows(pb: Int, y0: Int, y1: Int) -> Int {
+    unsafe {
+        let yp = peek(pb)  let up = peek(pb + 8)  let vp = peek(pb + 16)  let ys = peek(pb + 24)  let uvs = peek(pb + 32)
+        let w = peek(pb + 40)  let h = peek(pb + 48)  let dst = peek(pb + 56)  let stride = peek(pb + 64)  let tb = peek(pb + 72)
+        let cw = (w + 1) / 2
+        let ch = (h + 1) / 2
+        // a chroma row blended vertically (U then V, scaled by 4) and the same horizontally per pixel (scaled by 16)
+        let vu = malloc((cw + 2) * 8)
+        let vv = malloc((cw + 2) * 8)
+        var y = y0
+        while y < y1 {
+            let cy = y >> 1
+            var cy2 = cy - 1
+            if (y & 1) == 1 { cy2 = cy + 1 }
+            if cy2 < 0 { cy2 = 0 }
+            if cy2 >= ch { cy2 = ch - 1 }
+            let u0 = up + cy * uvs
+            let u1 = up + cy2 * uvs
+            let v0 = vp + cy * uvs
+            let v1 = vp + cy2 * uvs
+            var c = 0
+            while c < cw {
+                poke(vu + (c + 1) * 8, 3 * peek8(u0 + c) + peek8(u1 + c))
+                poke(vv + (c + 1) * 8, 3 * peek8(v0 + c) + peek8(v1 + c))
+                c = c + 1
+            }
+            // the edges repeated (a column before the first, one after the last)
+            poke(vu, peek(vu + 8))  poke(vv, peek(vv + 8))
+            poke(vu + (cw + 1) * 8, peek(vu + cw * 8))  poke(vv + (cw + 1) * 8, peek(vv + cw * 8))
+            let yrow = yp + y * ys
+            let orow = dst + y * stride
+            var x = 0
+            while x < w {
+                let cx = (x >> 1) + 1
+                var nb = cx - 1
+                if (x & 1) == 1 { nb = cx + 1 }
+                let u = (3 * peek(vu + cx * 8) + peek(vu + nb * 8) + 8) >> 4
+                let v = (3 * peek(vv + cx * 8) + peek(vv + nb * 8) + 8) >> 4
+                let yy = peek(tb + peek8(yrow + x) * 8)
+                var r = (yy + peek(tb + 2048 + v * 8)) >> 16
+                var g = (yy + peek(tb + 4096 + u * 8) + peek(tb + 6144 + v * 8)) >> 16
+                var b = (yy + peek(tb + 8192 + u * 8)) >> 16
+                // the offset 2^30 >> 16 = 16384 taken back, then clamped
+                r = r - 16384  g = g - 16384  b = b - 16384
+                if r < 0 { r = 0 } else if r > 255 { r = 255 }
+                if g < 0 { g = 0 } else if g > 255 { g = 255 }
+                if b < 0 { b = 0 } else if b > 255 { b = 255 }
+                poke32(orow + x * 4, (r << 16) | (g << 8) | b)
+                x = x + 1
+            }
+            y = y + 1
+        }
+        free(vu)
+        free(vv)
+    }
+    return 0
+}
+
+/// what a file is, without decoding anything: "webm vp9 1920x1080", "mp4 h264 1280x720", or "" with why in `why`
+pub fn video_probe(path: Str) -> Str {
+    var v = video_open(path)
+    var s = ""
+    if v.kind != 0 { s = video_container(v) + " " + v.codec + " " + to_str(v.w) + "x" + to_str(v.h) }
+    video_close(v)
+    return s
+}

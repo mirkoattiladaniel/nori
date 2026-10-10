@@ -1,0 +1,703 @@
+import "std/c" as c
+import "std/os" as os
+import "std/time" as time
+
+fn pt(src: Str) -> c::Unit { return c::parse_text(src, "t.h", c::bare_options()) }
+
+fn ival(u: c::Unit, name: Str) -> Int {
+    let i = c::find_constant(u, name)
+    if i < 0 { return 0 - 999999 }
+    return u.constants[i].ivalue
+}
+
+fn rsize(u: c::Unit, name: Str) -> Int {
+    let r = c::find_record(u, name)
+    if r < 0 { return 0 - 1 }
+    return u.records[r].size
+}
+
+fn ralign(u: c::Unit, name: Str) -> Int {
+    let r = c::find_record(u, name)
+    if r < 0 { return 0 - 1 }
+    return u.records[r].align
+}
+
+// the bit offset of member `f` of record `r`, or -1
+fn foff(u: c::Unit, r: Str, f: Str) -> Int {
+    let ri = c::find_record(u, r)
+    if ri < 0 { return 0 - 1 }
+    let fi = c::find_field(u, ri, f)
+    if fi < 0 { return 0 - 1 }
+    return u.records[ri].fields[fi].offset
+}
+
+fn nparams(u: c::Unit, name: Str) -> Int {
+    let f = c::find_function(u, name)
+    if f < 0 { return 0 - 1 }
+    return u.functions[f].params.len()
+}
+
+fn var_decl(u: c::Unit, name: Str) -> Str {
+    foreach v in u.variables { if v.name == name { return c::decl_str(u, v.ty, v.name) } }
+    return "<none>"
+}
+
+fn td_type(u: c::Unit, name: Str) -> Int {
+    let t = c::find_typedef(u, name)
+    if t < 0 { return 0 }
+    return u.typedefs[t].ty
+}
+
+fn has_note(u: c::Unit, part: Str) -> Bool {
+    foreach n in u.notes {
+        var i = 0
+        while i + part.len() <= n.reason.len() {
+            if n.reason.slice(i, i + part.len()) == part { return true }
+            i = i + 1
+        }
+    }
+    return false
+}
+
+// a fresh scratch directory
+fn scratch(tag: Str) -> Str {
+    let d = os::temp_dir() + "/std_c_test_" + tag + "_" + to_str(time::now_ns())
+    os::make_dir_p(d)
+    return d
+}
+
+// ── macros ───────────────────────────────────────────────────────────────────────────────────────
+
+fn test_object_macros_and_constants() {
+    let u = pt("#define A 5\n#define B (A * 2 + 1)\n#define EMPTY\n#define NOTCONST int\n")
+    assert_eq(ival(u, "A"), 5)
+    assert_eq(ival(u, "B"), 11)
+    assert_eq(c::find_constant(u, "EMPTY"), 0 - 1)
+    assert_eq(c::find_constant(u, "NOTCONST"), 0 - 1)
+}
+
+fn test_function_macro_args_expand_before_substitution() {
+    let u = pt("#define N 3\n#define TWICE(x) ((x) + (x))\n#define SIX TWICE(N)\n#define ADD(a, b) ((a) + (b))\n#define NESTED ADD(TWICE(1), ADD(2, (3, 4)))\n")
+    assert_eq(ival(u, "SIX"), 6)
+    assert_eq(ival(u, "NESTED"), 8)
+}
+
+fn test_stringify() {
+    let u = pt("#define S(x) #x\n#define T S(a   +  \"q\\n\")\n#define XS(x) S(x)\n#define V 42\n#define U XS(V)\n#define W S(V)\n")
+    let t = c::find_constant(u, "T")
+    assert_true(t >= 0)
+    assert_eq(u.constants[t].kind, c::CONST_STRING)
+    assert_streq(u.constants[t].svalue, "a + \"q\\n\"")
+    assert_streq(u.constants[c::find_constant(u, "U")].svalue, "42")
+    assert_streq(u.constants[c::find_constant(u, "W")].svalue, "V")
+}
+
+fn test_paste() {
+    let u = pt("#define CAT(a, b) a ## b\n#define V 7\nint CAT(get, _x)(void);\n#define NUM CAT(1, 2)\n#define NOEXP CAT(V, 1)\nint CAT(V, 1);\n")
+    assert_true(c::find_function(u, "get_x") >= 0)
+    assert_eq(ival(u, "NUM"), 12)
+    assert_eq(u.variables.len(), 1)
+    assert_streq(u.variables[0].name, "V1")
+}
+
+fn test_variadic_macros() {
+    let src = "#define DECL(r, n, ...) r n(__VA_ARGS__);\n"
+        + "DECL(int, h, int, char *)\n"
+        + "#define OPT(n, ...) int n(int x __VA_OPT__(,) __VA_ARGS__);\n"
+        + "OPT(k)\nOPT(m, long y)\n"
+        + "#define GNU(n, ...) int n(int a, ## __VA_ARGS__);\n"
+        + "GNU(p)\nGNU(q, int b, int c)\n"
+        + "#define NAMED(n, args...) int n(args);\n"
+        + "NAMED(r, int, int, int)\n"
+    let u = pt(src)
+    assert_eq(nparams(u, "h"), 2)
+    assert_eq(nparams(u, "k"), 1)
+    assert_eq(nparams(u, "m"), 2)
+    assert_eq(nparams(u, "p"), 1)
+    assert_eq(nparams(u, "q"), 3)
+    assert_eq(nparams(u, "r"), 3)
+}
+
+fn test_recursion_guard() {
+    let u = pt("enum { foo = 3 };\n#define foo foo\n#define V foo * 2\n#define a b\n#define b a\nint a;\n#define f(x) f(x) + 1\n#define CALLS f(2)\n")
+    assert_eq(ival(u, "V"), 6)
+    assert_eq(u.variables.len(), 1)
+    assert_streq(u.variables[0].name, "a")
+    assert_eq(c::find_constant(u, "CALLS"), 0 - 1)
+}
+
+fn test_function_macro_name_without_call() {
+    let u = pt("#define g(x) x\nint g;\nint (g)(int);\n")
+    assert_eq(u.variables.len(), 1)
+    assert_true(c::find_function(u, "g") >= 0)
+}
+
+fn test_undef_and_redefine() {
+    let u = pt("#define X 1\n#undef X\n#define X 2\n#define Y 3\n#undef Y\n")
+    assert_eq(ival(u, "X"), 2)
+    assert_eq(c::find_constant(u, "Y"), 0 - 1)
+}
+
+// ── conditionals ─────────────────────────────────────────────────────────────────────────────────
+
+fn test_conditionals() {
+    let src = "#define ONE 1\n"
+        + "#if ONE == 1\nint a1;\n#elif 1\nint bad1;\n#else\nint bad2;\n#endif\n"
+        + "#if 0\n#error don't stop here\nit's not C at all\n#if 1\nint bad3;\n#endif\n#else\nint a2;\n#endif\n"
+        + "#ifdef ONE\nint a3;\n#endif\n#ifndef ONE\nint bad4;\n#endif\n"
+        + "#if defined ONE && defined(ONE) && !defined TWO\nint a4;\n#endif\n"
+        + "#if 0\n#elif 0\n#elifdef ONE\nint a5;\n#else\nint bad5;\n#endif\n"
+        + "#if 0\n#elifndef TWO\nint a6;\n#endif\n"
+        + "#if 1\n#if 0\nint bad6;\n#else\nint a7;\n#endif\n#else\nint bad7;\n#endif\n"
+    let u = pt(src)
+    assert_eq(u.variables.len(), 7)
+    foreach v in u.variables { assert_true(v.name.slice(0, 1) == "a") }
+    assert_eq(u.notes.len(), 0)
+}
+
+fn test_if_arithmetic() {
+    let src = "#if -1 > 0u\nint unsigned_compare;\n#endif\n"
+        + "#if (1 << 62) * 2 < 0\nint wraps;\n#endif\n"
+        + "#if 0x7fffffffffffffff + 0 > 0 && 10 / 3 == 3 && -7 % 3 == -1\nint arith;\n#endif\n"
+        + "#if 1 ? 2 : (1 / 0)\nint lazy;\n#endif\n"
+        + "#if 'A' == 65 && '\\n' == 10\nint chars;\n#endif\n"
+        + "#if UNDEFINED_NAME == 0\nint zero;\n#endif\n"
+        + "#if __has_attribute(packed) && !__has_attribute(no_such_thing) && __has_builtin(__builtin_expect)\nint has;\n#endif\n"
+        + "#if defined(__x86_64__) && __SIZEOF_POINTER__ == 8 && __STDC_VERSION__ >= 201710L\nint predefined;\n#endif\n"
+    let u = pt(src)
+    assert_eq(u.variables.len(), 8)
+}
+
+fn test_if_unknown_operator_reads_as_zero() {
+    let u = pt("#if !defined(NOPE) || __building_module(X)\nint yes;\n#endif\n")
+    assert_eq(u.variables.len(), 1)
+    assert_eq(u.notes.len(), 0)
+}
+
+fn test_line_warning_and_builtin_macros() {
+    let src = "#line 100 \"other.c\"\n#warning just a warning\n#ident \"x\"\n"
+        + "#define L __LINE__\n#define C0 __COUNTER__\n#define C1 __COUNTER__\n"
+        + "int line_arr[__LINE__];\n#define ALIGNOF_LL _Alignof(long long)\n#define SZ_PTR sizeof(void *)\n"
+    let u = pt(src)
+    assert_eq(u.notes.len(), 0)
+    assert_eq(ival(u, "L"), 4)
+    assert_eq(ival(u, "C1") - ival(u, "C0"), 1)
+    assert_eq(u.types[u.variables[0].ty].len, 7)
+    assert_eq(ival(u, "ALIGNOF_LL"), 8)
+    assert_eq(ival(u, "SZ_PTR"), 8)
+}
+
+fn test_error_in_live_branch_is_noted() {
+    let u = pt("#if 1\n#error stop\n#endif\nint after;\n")
+    assert_true(has_note(u, "#error stop"))
+    assert_eq(u.variables.len(), 1)
+}
+
+// ── includes ─────────────────────────────────────────────────────────────────────────────────────
+
+fn test_include_guard_pragma_once_and_quoted_search() {
+    let d = scratch("inc")
+    write_file(d + "/guarded.h", "#ifndef GUARDED_H\n#define GUARDED_H\ntypedef int gint;\n#endif\n")
+    write_file(d + "/once.h", "#pragma once\n#ifdef SEEN_ONCE\nint included_twice;\n#endif\n#define SEEN_ONCE 1\nint once_var;\n")
+    write_file(d + "/main.h", "#include \"guarded.h\"\n#include \"guarded.h\"\n#include \"once.h\"\n#include \"once.h\"\ngint g;\n")
+    let u = c::parse_file(d + "/main.h", c::bare_options())
+    assert_eq(u.typedefs.len(), 1)
+    assert_eq(u.variables.len(), 2)
+    assert_eq(u.notes.len(), 0)
+    os::remove_tree(d)
+}
+
+fn test_angled_include_search_and_include_next() {
+    let d = scratch("next")
+    os::make_dir_p(d + "/first")
+    os::make_dir_p(d + "/second")
+    write_file(d + "/first/n.h", "int from_first;\n#include_next <n.h>\n")
+    write_file(d + "/second/n.h", "int from_second;\n")
+    var o = c::bare_options()
+    o.include_dirs.push(d + "/first")
+    o.system_dirs.push(d + "/second")
+    let u = c::parse_text("#include <n.h>\n#if __has_include(<n.h>) && !__has_include(<missing.h>)\nint has_include;\n#endif\n#define HDR <n.h>\n", "main.h", o)
+    assert_eq(u.variables.len(), 3)
+    let u2 = c::parse_text("#include <nowhere.h>\nint still;\n", "main.h", o)
+    assert_true(has_note(u2, "include not found: nowhere.h"))
+    assert_eq(u2.variables.len(), 1)
+    os::remove_tree(d)
+}
+
+fn test_translation_tokens_and_macros() {
+    let d = scratch("xlate")
+    write_file(d + "/h.h", "#define TWICE(x) ((x) + (x))\n#define LIMIT 10 /* c */\n")
+    var o = c::bare_options()
+    o.predefined = false
+    let t = c::translate_text("#include \"h.h\"\n#include \"gone.h\"\nint f(int a, ...) {\n  return TWICE(a) + LIMIT;\n}\nchar *s = L\"w\" \"v\";\n#undef LIMIT\n", d + "/main.c", o)
+    assert_eq(t.unit.functions.len(), 1)
+    assert_true(has_note(t.unit, "include not found: \"gone.h\""))
+    var spelled = ""
+    foreach w in t.texts { spelled = spelled + w + " " }
+    assert_true(spelled == "int f ( int a , ... ) { return ( ( a ) + ( a ) ) + 10 ; } char * s = L\"w\" \"v\" ; ")
+    assert_eq(t.kinds[0], c::TOK_IDENT)
+    assert_eq(t.kinds[6], c::TOK_PUNCT)
+    assert_eq(t.kinds[20], c::TOK_NUMBER)
+    assert_eq(t.kinds[27], c::TOK_STRING)
+    // a token from an expansion sits on the line of the macro's use
+    assert_eq(t.lines[10], 4)
+    assert_true(t.unit.files[t.files[10]] == d + "/main.c")
+    assert_true(t.spaced[1])
+    assert_true(!t.spaced[2])
+    assert_eq(t.macros.len(), 1)
+    assert_true(t.macros[0].name == "TWICE")
+    assert_true(t.macros[0].function)
+    assert_true(t.macros[0].params[0] == "x")
+    assert_true(t.macros[0].body == "((x) + (x))")
+    assert_true(t.unit.files[t.macros[0].file] == d + "/h.h")
+    os::remove_tree(d)
+}
+
+fn test_include_through_macro() {
+    let d = scratch("macinc")
+    write_file(d + "/m.h", "int via_macro;\n")
+    var o = c::bare_options()
+    o.include_dirs.push(copy d)
+    let u = c::parse_text("#define HDR <m.h>\n#include HDR\n", "main.h", o)
+    assert_eq(u.variables.len(), 1)
+    os::remove_tree(d)
+}
+
+fn test_defines_and_undefines_options() {
+    var o = c::bare_options()
+    o.defines.push("FEATURE")
+    o.defines.push("LEVEL=3")
+    o.undefines.push("__linux__")
+    let u = c::parse_text("#if defined FEATURE && LEVEL == 3 && !defined __linux__\nint yes;\n#endif\n", "t.h", o)
+    assert_eq(u.variables.len(), 1)
+}
+
+// ── declarators ──────────────────────────────────────────────────────────────────────────────────
+
+fn test_declarator_shapes() {
+    let src = "void (*(*f)(int))(void);\n"
+        + "int (*table[4])(char);\n"
+        + "int (*pa)[3];\n"
+        + "int (*fr(void))[5];\n"
+        + "char *const *volatile cpp;\n"
+        + "void (*signal(int sig, void (*handler)(int)))(int);\n"
+        + "int grid[2][3];\n"
+    let u = pt(src)
+    assert_streq(var_decl(u, "f"), "void (*(*f)(int))(void)")
+    assert_streq(var_decl(u, "table"), "int (*table[4])(char)")
+    assert_streq(var_decl(u, "pa"), "int (*pa)[3]")
+    assert_streq(var_decl(u, "cpp"), "char *const *volatile cpp")
+    assert_streq(var_decl(u, "grid"), "int grid[2][3]")
+    let fr = c::find_function(u, "fr")
+    assert_true(fr >= 0)
+    assert_streq(c::prototype_str(u, u.functions[fr]), "int (*fr(void))[5]")
+    let sg = c::find_function(u, "signal")
+    assert_streq(c::prototype_str(u, u.functions[sg]), "void (*signal(int sig, void (*handler)(int)))(int)")
+    assert_eq(c::sizeof(u, u.variables[0].ty), 8)
+    assert_eq(c::sizeof(u, u.variables[1].ty), 32)
+}
+
+fn test_function_pointer_members_and_forward_struct_pointer() {
+    let src = "typedef struct vfs vfs;\n"
+        + "struct io { const struct io_methods *pMethods; };\n"
+        + "struct vfs { void (*(*xDlSym)(vfs*, void*, const char *zSymbol))(void); int n; };\n"
+        + "struct io_methods { int iVersion; };\n"
+    let u = pt(src)
+    assert_eq(rsize(u, "io"), 8)
+    assert_eq(rsize(u, "vfs"), 16)
+    assert_eq(foff(u, "vfs", "n"), 64)
+    assert_true(u.records[c::find_record(u, "io_methods")].complete)
+    assert_eq(u.notes.len(), 0)
+}
+
+fn test_parameters_variadic_void_and_decay() {
+    let u = pt("int printf(const char *fmt, ...);\nint none(void);\nint unspecified();\nvoid arr(int a[10], int fn(int));\n")
+    let p = u.functions[c::find_function(u, "printf")]
+    assert_true(p.variadic)
+    assert_eq(p.params.len(), 1)
+    assert_streq(p.params[0].name, "fmt")
+    assert_eq(nparams(u, "none"), 0)
+    assert_eq(nparams(u, "unspecified"), 0)
+    let a = u.functions[c::find_function(u, "arr")]
+    assert_eq(u.types[a.params[0].ty].kind, c::K_POINTER)
+    assert_eq(u.types[a.params[1].ty].kind, c::K_POINTER)
+}
+
+fn test_typedef_chains_and_resolve() {
+    let u = pt("typedef unsigned long ul;\ntypedef ul size;\ntypedef const size csize;\ntypedef csize *pcs;\n")
+    let t = td_type(u, "csize")
+    assert_eq(c::resolve(u, td_type(u, "size")), c::K_ULONG)
+    assert_eq(u.types[c::resolve(u, t)].kind, c::K_ULONG)
+    assert_eq(c::quals_of(u, t) & c::Q_CONST, c::Q_CONST)
+    assert_true(c::is_unsigned(u, t))
+    assert_eq(c::sizeof(u, td_type(u, "pcs")), 8)
+    assert_streq(c::type_str(u, td_type(u, "pcs")), "csize *")
+}
+
+fn test_qualifiers_storage_and_function_specifiers() {
+    let src = "extern const volatile int cv;\nstatic int hidden;\n__thread int tls;\n_Thread_local int tls2;\n"
+        + "extern inline __inline __inline__ int il(int);\n_Noreturn void die(void);\nregister int r;\n"
+        + "int * restrict __restrict __restrict__ rp;\n_Atomic int at;\n_Atomic(long) at2;\n"
+    let u = pt(src)
+    assert_eq(u.variables.len(), 8)
+    assert_true(u.variables[0].is_extern)
+    assert_eq(c::quals_of(u, u.variables[0].ty), c::Q_CONST | c::Q_VOLATILE)
+    assert_true(u.variables[1].is_static)
+    assert_true(c::find_function(u, "il") >= 0)
+    assert_true(c::find_function(u, "die") >= 0)
+    assert_eq(u.notes.len(), 0)
+}
+
+fn test_attributes_asm_extension_static_assert() {
+    let src = "extern int foo(int) __attribute__((nonnull(1), warn_unused_result)) __asm__(\"\" \"bar\");\n"
+        + "__extension__ typedef long long ll;\n"
+        + "_Static_assert(sizeof(ll) == 8, \"ll\");\nstatic_assert(1, \"one\");\n"
+        + "__attribute__((visibility(\"default\"))) int vis(void);\n"
+        + "int __attribute__((unused)) between;\n"
+        + "struct __attribute__((packed)) P1 { char a; int b; };\n"
+        + "[[deprecated]] int c23attr;\n"
+    let u = pt(src)
+    assert_true(c::find_function(u, "foo") >= 0)
+    assert_true(c::find_function(u, "vis") >= 0)
+    assert_true(c::find_typedef(u, "ll") >= 0)
+    assert_eq(rsize(u, "P1"), 5)
+    assert_eq(u.variables.len(), 2)
+    assert_eq(u.notes.len(), 0)
+}
+
+fn test_inline_bodies_skipped() {
+    let u = pt("static inline int sq(int x) { if (x) { return x * x; } return 0; }\nint after(void);\nextern __inline int g(void) { struct { int y; } s = { 1 }; return s.y; }\nint last;\n")
+    let s = c::find_function(u, "sq")
+    assert_true(s >= 0)
+    assert_true(u.functions[s].definition)
+    assert_true(u.functions[s].is_static)
+    assert_true(c::find_function(u, "after") >= 0)
+    assert_true(c::find_function(u, "g") >= 0)
+    assert_eq(u.variables.len(), 1)
+}
+
+fn test_typeof() {
+    let u = pt("extern int v;\n__typeof__(v) w;\ntypedef __typeof__(int *) ip;\ntypeof(1L) lv;\n__typeof(v + 1.0) dv;\n")
+    assert_eq(c::resolve(u, u.variables[1].ty), c::K_INT)
+    assert_eq(u.types[c::resolve(u, td_type(u, "ip"))].kind, c::K_POINTER)
+    assert_eq(u.variables[2].ty, c::K_LONG)
+    assert_true(has_note(u, "__typeof__"))
+}
+
+fn test_builtin_types() {
+    let u = pt("typedef __builtin_va_list va;\nvoid vf(const char *, va ap);\n__int128 i128;\nunsigned __int128 u128;\n_Float128 f128;\nlong double ld;\n__uint128_t u2;\n_Complex double cd;\n")
+    assert_eq(c::sizeof(u, td_type(u, "va")), 24)
+    assert_eq(c::alignof(u, td_type(u, "va")), 8)
+    let vf = u.functions[c::find_function(u, "vf")]
+    assert_eq(u.types[vf.params[1].ty].kind, c::K_POINTER)
+    assert_eq(c::sizeof(u, u.variables[0].ty), 16)
+    assert_eq(c::alignof(u, u.variables[0].ty), 16)
+    assert_eq(u.variables[1].ty, c::K_UINT128)
+    assert_eq(c::sizeof(u, u.variables[2].ty), 16)
+    assert_eq(c::sizeof(u, u.variables[3].ty), 16)
+    assert_eq(u.variables[4].ty, c::K_UINT128)
+    assert_eq(c::sizeof(u, u.variables[5].ty), 16)
+}
+
+// ── records ──────────────────────────────────────────────────────────────────────────────────────
+
+fn test_struct_padding_union_nested_and_forward_use() {
+    let src = "struct later;\nstruct later *lp;\n"
+        + "struct later { char c; double d; short s; };\n"
+        + "union u { char c; int i; double d; char buf[9]; };\n"
+        + "struct outer { char tag; struct inner { int a; char b; } in; long tail; };\n"
+    let u = pt(src)
+    assert_eq(rsize(u, "later"), 24)
+    assert_eq(foff(u, "later", "d"), 64)
+    assert_eq(foff(u, "later", "s"), 128)
+    assert_eq(rsize(u, "u"), 16)
+    assert_eq(ralign(u, "u"), 8)
+    assert_eq(rsize(u, "inner"), 8)
+    assert_eq(foff(u, "outer", "in"), 32)
+    assert_eq(foff(u, "outer", "tail"), 128)
+    assert_eq(rsize(u, "outer"), 24)
+}
+
+fn test_incomplete_record() {
+    let u = pt("struct opaque;\ntypedef struct opaque *handle;\n")
+    let r = c::find_record(u, "opaque")
+    assert_true(r >= 0)
+    assert_false(u.records[r].complete)
+    assert_eq(u.records[r].size, 0)
+}
+
+fn test_anonymous_members_promoted() {
+    let u = pt("struct A { int a; union { int b; float c; }; struct { char d; short e; }; };\ntypedef struct { int x; } anon_t;\n")
+    let r = c::find_record(u, "A")
+    assert_eq(u.records[r].size, 12)
+    assert_eq(foff(u, "A", "b"), 32)
+    assert_eq(foff(u, "A", "c"), 32)
+    assert_eq(foff(u, "A", "d"), 64)
+    assert_eq(foff(u, "A", "e"), 80)
+    let fi = c::find_field(u, r, "e")
+    assert_true(u.records[r].fields[fi].promoted)
+    assert_false(u.records[r].fields[c::find_field(u, r, "a")].promoted)
+    let at = td_type(u, "anon_t")
+    assert_eq(u.types[at].kind, c::K_RECORD)
+    assert_true(u.records[u.types[at].ref].anonymous)
+}
+
+fn test_bitfield_layouts() {
+    // sizes and alignments as clang lays these out on x86-64
+    let src = "struct A { char a; int :0; char b; };\n"
+        + "struct B { char a; int b:3; };\n"
+        + "struct C { char a; long long b:40; char c; };\n"
+        + "struct D { char a:4; int b:30; };\n"
+        + "struct E { char a; int :4; };\n"
+        + "struct G { char a; int :0; };\n"
+        + "struct H { int a:3; char b:7; char c:7; };\n"
+        + "struct I { short a:9; short b:9; char c; };\n"
+        + "struct N { char a:1; long :0; char b; };\n"
+        + "union U { char a:3; int b:17; };\n"
+        + "struct Q { unsigned char a:7; unsigned char b:7; unsigned int c:31; unsigned int d:2; };\n"
+    let u = pt(src)
+    assert_eq(rsize(u, "A"), 5)
+    assert_eq(ralign(u, "A"), 1)
+    assert_eq(foff(u, "A", "b"), 32)
+    assert_eq(rsize(u, "B"), 4)
+    assert_eq(foff(u, "B", "b"), 8)
+    assert_eq(rsize(u, "C"), 8)
+    assert_eq(foff(u, "C", "c"), 48)
+    assert_eq(rsize(u, "D"), 8)
+    assert_eq(foff(u, "D", "b"), 32)
+    assert_eq(rsize(u, "E"), 2)
+    assert_eq(ralign(u, "E"), 1)
+    assert_eq(rsize(u, "G"), 4)
+    assert_eq(rsize(u, "H"), 4)
+    assert_eq(foff(u, "H", "b"), 8)
+    assert_eq(foff(u, "H", "c"), 16)
+    assert_eq(rsize(u, "I"), 6)
+    assert_eq(foff(u, "I", "b"), 16)
+    assert_eq(foff(u, "I", "c"), 32)
+    assert_eq(rsize(u, "N"), 9)
+    assert_eq(rsize(u, "U"), 4)
+    assert_eq(rsize(u, "Q"), 12)
+    assert_eq(foff(u, "Q", "d"), 64)
+    let q = c::find_record(u, "Q")
+    assert_eq(u.records[q].fields[c::find_field(u, q, "c")].width, 31)
+}
+
+fn test_packed_aligned_and_pragma_pack() {
+    let src = "struct F { char a; int b:4; } __attribute__((packed));\n"
+        + "struct P2 { char a; int b; } __attribute__((__packed__));\n"
+        + "struct M { char a; int b __attribute__((aligned(16))); };\n"
+        + "struct AL { char a; _Alignas(8) char b; };\n"
+        + "struct RA { char a; } __attribute__((aligned(32)));\n"
+        + "#pragma pack(push, 1)\nstruct J { char a; int b:4; int c; };\n#pragma pack(pop)\n"
+        + "struct AfterPop { char a; int b; };\n"
+        + "#pragma pack(2)\nstruct K2 { char a; int b; };\n#pragma pack()\n"
+        + "typedef struct { void *p[4]; } T16 __attribute__((__aligned__));\n"
+    let u = pt(src)
+    assert_eq(rsize(u, "F"), 2)
+    assert_eq(rsize(u, "P2"), 5)
+    assert_eq(ralign(u, "P2"), 1)
+    assert_eq(rsize(u, "M"), 32)
+    assert_eq(foff(u, "M", "b"), 128)
+    assert_eq(foff(u, "AL", "b"), 64)
+    assert_eq(rsize(u, "RA"), 32)
+    assert_eq(rsize(u, "J"), 6)
+    assert_eq(foff(u, "J", "c"), 16)
+    assert_eq(rsize(u, "AfterPop"), 8)
+    assert_eq(rsize(u, "K2"), 6)
+    let t = td_type(u, "T16")
+    assert_eq(c::sizeof(u, t), 32)
+    assert_eq(c::alignof(u, t), 16)
+}
+
+fn test_flexible_array_and_constant_lengths() {
+    let src = "#define FOO 4\nstruct L { char a; int b[]; };\n"
+        + "struct S2 { int a[sizeof(int) * 2 / sizeof(short)]; char b[FOO * 2]; char c[(1 << 2) + 1]; };\n"
+        + "extern char name[];\n"
+    let u = pt(src)
+    assert_eq(rsize(u, "L"), 4)
+    assert_eq(foff(u, "L", "b"), 32)
+    let l = c::find_record(u, "L")
+    let bt = u.records[l].fields[c::find_field(u, l, "b")].ty
+    assert_eq(u.types[bt].len, 0 - 1)
+    assert_eq(rsize(u, "S2"), 32)
+    assert_eq(foff(u, "S2", "c"), 192)
+    assert_eq(u.types[u.variables[0].ty].len, 0 - 1)
+}
+
+fn test_mode_and_vector_size_attributes() {
+    let u = pt("typedef int i8 __attribute__((__mode__(__QI__)));\ntypedef unsigned int u64m __attribute__((mode(DI)));\ntypedef float xmm __attribute__((__vector_size__(16)));\n")
+    assert_eq(c::sizeof(u, td_type(u, "i8")), 1)
+    assert_eq(c::sizeof(u, td_type(u, "u64m")), 8)
+    assert_true(c::is_unsigned(u, td_type(u, "u64m")))
+    assert_eq(c::sizeof(u, td_type(u, "xmm")), 16)
+    assert_eq(c::alignof(u, td_type(u, "xmm")), 16)
+}
+
+// ── enums and constants ──────────────────────────────────────────────────────────────────────────
+
+fn test_enums_with_expressions() {
+    let src = "enum flags { X = 1 << 3, Y, Z = X | Y, W = sizeof(int) * 2, NEG = -5, N2, CH = 'a', CAST = (unsigned char)-1 };\n"
+        + "enum big { HUGE = 0x100000000 };\nenum high { HIGH = 0x80000000 };\n"
+        + "enum later_tag;\nenum later_tag { LT0 };\n"
+        + "#define USES_ENUM (Z + 1)\n"
+    let u = pt(src)
+    assert_eq(c::enum_value(u, "X", 0), 8)
+    assert_eq(c::enum_value(u, "Y", 0), 9)
+    assert_eq(c::enum_value(u, "Z", 0), 9)
+    assert_eq(c::enum_value(u, "W", 0), 8)
+    assert_eq(c::enum_value(u, "NEG", 0), 0 - 5)
+    assert_eq(c::enum_value(u, "N2", 0), 0 - 4)
+    assert_eq(c::enum_value(u, "CH", 0), 97)
+    assert_eq(c::enum_value(u, "CAST", 0), 255)
+    let f = c::find_enum(u, "flags")
+    assert_eq(u.enums[f].size, 4)
+    assert_false(u.enums[f].unsigned)
+    assert_eq(u.enums[c::find_enum(u, "big")].size, 8)
+    let h = c::find_enum(u, "high")
+    assert_eq(u.enums[h].size, 4)
+    assert_true(u.enums[h].unsigned)
+    assert_true(u.enums[c::find_enum(u, "later_tag")].complete)
+    assert_eq(ival(u, "USES_ENUM"), 10)
+}
+
+fn test_integer_constant_typing() {
+    let src = "#define U32MAX 0xFFFFFFFF\n#define NEG1 (-1)\n#define SHIFT (1 << 31)\n#define USHIFT (1U << 31)\n"
+        + "#define ULL (~0ULL)\n#define LONGV 5000000000\n#define OCT 0777\n#define BIN 0b1010\n"
+        + "#define CAST8 ((unsigned char)300)\n#define SCHAR ((signed char)200)\n#define DIV (7 / 2)\n"
+        + "#define COND (sizeof(long) == 8 ? 64 : 32)\n#define CHARV '\\xff'\n#define WIDE L'\\x3b1'\n"
+    let u = pt(src)
+    assert_eq(ival(u, "U32MAX"), 4294967295)
+    assert_true(u.constants[c::find_constant(u, "U32MAX")].unsigned)
+    assert_eq(ival(u, "NEG1"), 0 - 1)
+    assert_eq(ival(u, "SHIFT"), 0 - 2147483648)
+    assert_eq(ival(u, "USHIFT"), 2147483648)
+    assert_eq(ival(u, "ULL"), 0 - 1)
+    assert_true(u.constants[c::find_constant(u, "ULL")].unsigned)
+    assert_eq(ival(u, "LONGV"), 5000000000)
+    assert_eq(ival(u, "OCT"), 511)
+    assert_eq(ival(u, "BIN"), 10)
+    assert_eq(ival(u, "CAST8"), 44)
+    assert_eq(ival(u, "SCHAR"), 0 - 56)
+    assert_eq(ival(u, "DIV"), 3)
+    assert_eq(ival(u, "COND"), 64)
+    assert_eq(ival(u, "CHARV"), 0 - 1)
+    assert_eq(ival(u, "WIDE"), 945)
+}
+
+fn test_float_and_string_constants() {
+    let u = pt("#define PI 3.5\n#define HALF (1.0f / 2)\n#define NEGF -2.5e1\n#define GREETING \"hello\" \" \" \"world\"\n#define ESC \"a\\tb\"\n#define FN (foo())\n")
+    let p = c::find_constant(u, "PI")
+    assert_eq(u.constants[p].kind, c::CONST_FLOAT)
+    assert_feq(u.constants[p].fvalue, 3.5, 0.000001)
+    assert_feq(u.constants[c::find_constant(u, "HALF")].fvalue, 0.5, 0.000001)
+    assert_feq(u.constants[c::find_constant(u, "NEGF")].fvalue, 0.0 - 25.0, 0.000001)
+    let g = c::find_constant(u, "GREETING")
+    assert_eq(u.constants[g].kind, c::CONST_STRING)
+    assert_streq(u.constants[g].svalue, "hello world")
+    assert_eq(u.constants[c::find_constant(u, "ESC")].svalue.len(), 3)
+    assert_eq(c::find_constant(u, "FN"), 0 - 1)
+}
+
+fn test_offsetof_constant() {
+    let u = pt("struct s { char a; int b; struct { short c[3]; } in; };\n#define OFF __builtin_offsetof(struct s, in.c[2])\n")
+    assert_eq(ival(u, "OFF"), 12)
+}
+
+// ── tolerance ────────────────────────────────────────────────────────────────────────────────────
+
+fn test_unreadable_declarations_are_noted_and_skipped() {
+    let src = "int ok1;\nint x y z;\nint ok2;\nstruct broken { int a; int b c; int d; };\nint ok3;\n"
+        + "#weird directive\nint main(argc, argv) int argc; char **argv; { return 0; }\nint ok4;\n"
+        + "__auto_type au = 1;\nint ok5;\n"
+    let u = pt(src)
+    var names = ""
+    foreach v in u.variables { names = names + v.name + " " }
+    assert_streq(names, "ok1 ok2 ok3 ok4 ok5 ")
+    assert_true(has_note(u, "declaration skipped"))
+    assert_true(has_note(u, "member of broken skipped"))
+    assert_true(has_note(u, "unknown directive"))
+    assert_true(rsize(u, "broken") >= 4)
+    foreach n in u.notes { assert_true(n.line > 0) }
+}
+
+fn test_unterminated_conditional_noted() {
+    let u = pt("#if 1\nint inside;\n")
+    assert_true(has_note(u, "unterminated conditional"))
+    assert_eq(u.variables.len(), 1)
+}
+
+fn test_missing_file() {
+    let u = c::parse_file("/nonexistent/std_c/nothing.h", c::bare_options())
+    assert_eq(u.notes.len(), 1)
+    assert_true(has_note(u, "cannot read"))
+}
+
+// ── the host ─────────────────────────────────────────────────────────────────────────────────────
+
+fn test_default_options_search_path() {
+    let o = c::default_options()
+    var usr = false
+    foreach d in o.system_dirs { if d == "/usr/include" { usr = true } }
+    assert_true(usr)
+    assert_eq(o.include_dirs.len(), 0)
+}
+
+fn test_system_headers_when_present() {
+    if !os::path_exists("/usr/include/stdio.h") { return }
+    let u = c::parse_text("#include <stdio.h>\n#include <stdarg.h>\n#include <stdint.h>\n", "t.h", c::default_options())
+    assert_eq(u.notes.len(), 0)
+    let pf = c::find_function(u, "printf")
+    assert_true(pf >= 0)
+    assert_true(u.functions[pf].variadic)
+    assert_eq(c::sizeof(u, td_type(u, "va_list")), 24)
+    assert_eq(c::sizeof(u, td_type(u, "int64_t")), 8)
+    assert_eq(c::sizeof(u, td_type(u, "uint8_t")), 1)
+    assert_true(c::find_record(u, "_IO_FILE") >= 0)
+    assert_true(c::find_constant(u, "EOF") >= 0)
+    assert_eq(ival(u, "EOF"), 0 - 1)
+}
+
+fn test_zlib_when_present() {
+    if !os::path_exists("/usr/include/zlib.h") { return }
+    let u = c::parse_file("/usr/include/zlib.h", c::default_options())
+    assert_eq(u.notes.len(), 0)
+    assert_true(c::find_function(u, "deflate") >= 0)
+    assert_true(c::find_function(u, "compressBound") >= 0)
+    assert_true(c::find_function(u, "adler32") >= 0)
+    assert_eq(rsize(u, "z_stream_s"), 112)
+}
+
+fn pt_windows(src: Str) -> c::Unit {
+    var o = c::bare_options()
+    o.target = "windows"
+    return c::parse_text(src, "t.h", o)
+}
+
+fn test_windows_llp64_model() {
+    let src = "struct s { char c; long l; unsigned long ul; };\n#define SL sizeof(long)\n#define SUF sizeof(1L)\n#define WS sizeof(L\"ab\")\n#if defined(_WIN64) && !defined(__linux__)\n#define ON_WIN 1\n#endif\n"
+    let w = pt_windows(src)
+    assert_eq(w.long_size, 4)
+    assert_eq(ival(w, "SL"), 4)
+    assert_eq(ival(w, "SUF"), 4)
+    assert_eq(ival(w, "WS"), 6)
+    assert_eq(ival(w, "ON_WIN"), 1)
+    assert_eq(w.records[c::find_record(w, "s")].size, 12)
+    let l = pt(src)
+    assert_eq(ival(l, "SL"), 8)
+    assert_eq(ival(l, "SUF"), 8)
+    assert_eq(ival(l, "WS"), 12)
+    assert_eq(c::find_constant(l, "ON_WIN"), 0 - 1)
+    assert_eq(l.records[c::find_record(l, "s")].size, 24)
+}
+
+fn test_windows_bitfields() {
+    let src = "struct m { char a : 3; int b : 5; char c : 4; };\nstruct z { char x; int : 0; char y; };\n"
+    let w = pt_windows(src)
+    let r = c::find_record(w, "m")
+    assert_eq(w.records[r].size, 12)
+    assert_eq(w.records[r].fields[c::find_field(w, r, "b")].offset, 32)
+    assert_eq(w.records[c::find_record(w, "z")].size, 2)
+    let l = pt(src)
+    assert_eq(l.records[c::find_record(l, "m")].size, 4)
+    assert_eq(l.records[c::find_record(l, "z")].size, 5)
+}

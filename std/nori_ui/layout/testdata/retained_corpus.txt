@@ -1,0 +1,95 @@
+document { style: dark tree column { text { text: hi } } }
+=====
+column { number { id
+=====
+column { padding: 0 number { id: a } text_input { id: b } text_area { id: c } picker { id: d } }
+=====
+code_editor { id: s wobble: 13 }
+=====
+image { }
+=====
+column { rect { w: bogus h: 1 } }
+=====
+column { rect { w: "abc%" h: 1 } }
+=====
+column { rect { w: "xxvh" h: 1 } }
+=====
+column { rect { w: "1.2.3" h: 1 } }
+=====
+column { rect { w: "1e" h: 1 } }
+=====
+column { rect { w: "50%" h: "2vh" } }
+=====
+row { padding: 4 gap: 6 text { id: clock text: "12:00" } text { text: "hello" } button { label: "Go" on_click: go } }
+=====
+column { gap: 0 padding: 0 text { text: abc size_px: 12 } }
+=====
+column { gap: 0 padding: 0 text { text: abc size_px: 12 letter_spacing: 2 } }
+=====
+column { padding: 4 text { id: "msg" text: "old" class: "big" } }
+=====
+column { gap: 0 text { text: "" span { text: "x" text_outline_color: [0, 0, 255, 255] text_outline_width_px: 40 } } }
+=====
+column { gap: 0 text { text: "" text_outline_color: [9, 9, 9, 255] text_outline_width_px: 2 span { text: "x" } } }
+=====
+column { wizard { } }
+=====
+text { rect { } }
+=====
+   // just a comment
+=====
+rect { w: 1e h: 2 color: #f00 }
+=====
+rect { w: 1, h: 1 }
+=====
+rect { w: 1 h: 1 color: [1 2 3 4] }
+=====
+rect { w: 1 h: 1 color: [1, 2, 3, 4] }
+=====
+column { text { text: hi wrap: 1 } }
+=====
+column { fill_w: yes rect { w: 1 h: 1 } }
+=====
+column { cross_align: middle }
+=====
+column { main_align: stretch }
+=====
+column { rect { w: 50% h: 40vh } surface { id: cam w: 30vw h: 2ui } }
+=====
+column { rect { w: fill h: 1 } }
+=====
+column { w: fill }
+=====
+column { rect { fill: true h: 1 } }
+=====
+column { row { rect { w: 1 h: 1 } } }
+=====
+scroll_column { text { text: x } }
+=====
+scroll_row { text { text: x } }
+=====
+button { label: "ok" on_click: go }
+=====
+button { label: "ok" }
+=====
+button { label: ok on_click: go }
+=====
+column { text { size_px: 12 } }
+=====
+button { label: a on_click: b rect { w: 1 h: 1 } }
+=====
+column { pad_x: 10 pad_y: 4 rect { w: 20 h: 8 color: #f00 } }
+=====
+style: light rect { w: 1 h: 1 color: #f00 } stylesheet { tag t { radius: 1 } }
+=====
+stylesheet { } stylesheet { } rect { w: 1 h: 1 }
+=====
+rect { w: 1 h: 1 } rect { w: 1 h: 1 }
+=====
+stylesheet { tag t { bold: true } }
+=====
+column { align_items: center justify_content: space_between text { text: hi text_color: #0f0 flex: 2 focus_order: 3 height: 20 } }
+=====
+column { rect { w: 1 h: 1 class: one_class } }
+=====
+column { rect { w: 1 h: 1 classes: solo } }

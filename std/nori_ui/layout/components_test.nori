@@ -1,0 +1,255 @@
+// Native tests for std/nori_ui/layout/components (`.ui` components and imports) and a retained
+// document's files: hot reload through imports, errors that keep the last good document. Run with
+//   noric --test std/nori_ui/layout/components_test.nori compiler/runtime.nori --import-root .
+import "std/nori_ui" as ui
+import "std/os" as os
+
+fn q() -> Str { return chr(34) + "" }
+fn btn_comp() -> Str {
+    return "component tb(title, state = " + q() + q() + ") {\n" +
+        "    column { classes: [tb, $state] padding: 4\n" +
+        "        text { text: $title }\n" +
+        "        slot { } } }\n"
+}
+fn root_of(src: Str) -> ui::layout::UiNode {
+    var r = ui::layout::dsl_parse_document(src)
+    if !r.ok { printl(r.err) }
+    assert_true(r.ok)
+    return sink r.doc.tree
+}
+fn err_of(src: Str) -> ui::layout::DslParseResult {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_false(r.ok)
+    return r
+}
+
+fn test_a_component_is_an_element_with_parameters() {
+    let src = btn_comp() + "row { tb { id: files title: Files }  tb { title: " + q() + "Terminal" + q() + " state: urgent  text { id: badge text: " + q() + "3" + q() + " } } }"
+    let root = root_of(src)
+    assert_eq(root.children.len(), 2)
+    let a = root.children[0]
+    assert_eq(a.kind, ui::layout::nk_column())
+    assert_streq(a.id, "files")
+    assert_feq(a.padding, 4.0, 0.001)
+    assert_streq(a.children[0].text, "Files")
+    // the empty `state` class is dropped; the component's own name is a class (here the same one)
+    assert_eq(a.classes.len(), 1)
+    assert_streq(a.classes[0], "tb")
+    let b = root.children[1]
+    assert_streq(b.children[0].text, "Terminal")
+    assert_true(ui::layout::strs_has(b.classes, "urgent"))
+    // the use's children went into the slot
+    assert_eq(b.children.len(), 2)
+    assert_streq(b.children[1].id, "badge")
+}
+
+fn test_components_use_components_and_pass_parameters_on() {
+    let src = btn_comp() +
+        "component bar(clock) { row { gap: 2  tb { title: Start }  slot { }  text { id: clock text: $clock } } }\n" +
+        "bar { clock: " + q() + "12:00" + q() + "  tb { title: Files } }"
+    let root = root_of(src)
+    assert_eq(root.kind, ui::layout::nk_row())
+    assert_eq(root.children.len(), 3)
+    assert_streq(root.children[0].children[0].text, "Start")
+    assert_streq(root.children[1].children[0].text, "Files")
+    assert_streq(root.children[2].text, "12:00")
+}
+
+fn test_component_errors_say_where() {
+    // a missing parameter, an unknown one, children with nowhere to go: at the use
+    let r1 = err_of(btn_comp() + "row { tb { } }")
+    assert_true(ui::layout::nui_contains(r1.emsg, "tb needs `title`"))
+    assert_eq(r1.eline, 5)
+    let r2 = err_of(btn_comp() + "row { tb { title: x colour: red } }")
+    assert_true(ui::layout::nui_contains(r2.emsg, "unknown tb parameter"))
+    let r3 = err_of("component plain(t) { text { text: $t } }\nrow { plain { t: x  text { text: y } } }")
+    assert_true(ui::layout::nui_contains(r3.emsg, "takes no children"))
+    // an error in the body is reported in the body, for the use that hit it
+    let r4 = err_of("component bad(t) {\n  text {\n    text: $t\n    size_px: $t\n  }\n}\nrow { bad { t: big } }")
+    assert_true(ui::layout::nui_contains(r4.emsg, "size_px"))
+    assert_eq(r4.eline, 4)
+    // $name outside a body, an unknown one inside it
+    let r5 = err_of("text { text: $t }")
+    assert_true(ui::layout::nui_contains(r5.emsg, "component parameter"))
+    let r6 = err_of("component c(a) { text { text: $b } }\nc { a: 1 }")
+    assert_true(ui::layout::nui_contains(r6.emsg, "unknown parameter `$b`"))
+    // a component that uses itself stops
+    let r7 = err_of("component loop(a) { column { loop { a: 1 } } }\nloop { a: 1 }")
+    assert_true(ui::layout::nui_contains(r7.emsg, "nest more than 32"))
+    // a component named like an element, and the same name twice
+    assert_true(ui::layout::nui_contains(err_of("component row(a) { text { } }\nrow { }").emsg, "element of its own"))
+    assert_true(ui::layout::nui_contains(err_of("component c(a) { text { } }\ncomponent c(b) { text { } }\nc { a: 1 }").emsg, "defined twice"))
+    // an import with no file to be relative to
+    assert_true(ui::layout::nui_contains(err_of("import " + q() + "x.ui" + q() + "\ncolumn { }").emsg, "needs the document to be a file"))
+}
+
+// ---- files -----------------------------------------------------------------------------------------------
+
+fn scratch(name: Str) -> Str {
+    let d = os::temp_dir() + ("/nori_ui_components_test_" + name)
+    let _m = os::make_dir_p(d)
+    return d
+}
+fn write_to(path: Str, text: Str) { assert_eq(write_file(path, text), 0) }
+fn find(rn: ui::layout::RNode, id: Str) -> ui::layout::UiNode {
+    if rn.cur.id == id { return ui::layout::ui_node_dup_shallow(rn.cur) }
+    var i = 0
+    while i < rn.kids.len() {
+        let n = find(rn.kids[i], id)
+        if n.id == id { return n }
+        i = i + 1
+    }
+    return ui::layout::ui_node_blank(ui::layout::nk_spacer())
+}
+fn node_of(d: ui::layout::RDoc, id: Str) -> ui::layout::UiNode { return find(d.tree[0], id) }
+
+fn write_desktop(dir: Str) {
+    write_to(dir + "/tokens.style", "vars { --accent: #3b82f6  --surface: #111827 }\n")
+    write_to(dir + "/theme.style", "import " + q() + "tokens.style" + q() + "\n.bar { bg: --surface }\n.tb { bg: --accent radius: 6 }\n.tb.urgent { bg: #ef4444 }\n")
+    write_to(dir + "/button.ui", "import " + q() + "theme.style" + q() + "\n" + btn_comp())
+    write_to(dir + "/taskbar.ui", "import " + q() + "button.ui" + q() + "\nrow { id: bar classes: [bar] padding: 4 gap: 4\n  tb { id: files title: Files }\n  tb { id: term title: Terminal }\n  spacer { }\n  text { id: clock text: " + q() + "12:00" + q() + " } }\n")
+}
+
+fn test_load_a_document_with_imports() {
+    let dir = scratch("load")
+    write_desktop(dir)
+    var d = ui::layout::rdoc_new()
+    let e = ui::layout::rdoc_load(d, dir + "/taskbar.ui")
+    if e.msg.len() > 0 { printl(ui::layout::ui_error_text(e)) }
+    assert_streq(e.msg, "")
+    ui::layout::rdoc_set_viewport(d, 600.0, 40.0)
+    let f = ui::layout::rdoc_frame(d, 0.0)
+    assert_true(f.changed)
+    assert_eq(ui::core::rgba_color(node_of(d, "files").bg).r, 59)                   // the imported theme's token
+    assert_eq(ui::core::rgba_color(node_of(d, "bar").bg).r, 17)
+    // every file is watched
+    assert_eq(d.watch.len(), 4)
+    // a host-set state class restyles through the imported rule
+    ui::layout::rdoc_add_class(d, "term", "urgent")
+    let _g = ui::layout::rdoc_frame(d, 1.0)
+    assert_eq(ui::core::rgba_color(node_of(d, "term").bg).r, 239)
+}
+
+fn test_hot_reload_follows_imports() {
+    let dir = scratch("reload")
+    write_desktop(dir)
+    var d = ui::layout::rdoc_new()
+    assert_streq(ui::layout::rdoc_load(d, dir + "/taskbar.ui").msg, "")
+    ui::layout::rdoc_set_viewport(d, 600.0, 40.0)
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    assert_false(ui::layout::rdoc_poll(d))                    // nothing changed: two stats a file
+    // a token two imports deep changes: the document that imports the file that imports it restyles
+    // (a different length: the stamp is size and mtime in seconds; see rdoc_reload)
+    write_to(dir + "/tokens.style", "vars { --accent: #22c55e  --surface: #111827 }  // green\n")
+    assert_true(ui::layout::rdoc_poll(d))
+    let f1 = ui::layout::rdoc_frame(d, 1.0)
+    assert_true(f1.changed)
+    assert_eq(ui::core::rgba_color(node_of(d, "files").bg).r, 34)
+    assert_eq(ui::core::rgba_color(node_of(d, "files").bg).g, 197)
+    // the component's file changes: every use of it follows
+    write_to(dir + "/button.ui", "import " + q() + "theme.style" + q() + "\ncomponent tb(title, state = " + q() + q() + ") { column { classes: [tb, $state] padding: 9 text { text: $title } } }\n")
+    assert_true(ui::layout::rdoc_poll(d))
+    let _f2 = ui::layout::rdoc_frame(d, 2.0)
+    assert_feq(node_of(d, "files").padding, 9.0, 0.001)
+    assert_feq(node_of(d, "term").padding, 9.0, 0.001)
+    assert_false(ui::layout::rdoc_poll(d))
+    // the same length, the same second: a host that was told the file changed reloads outright
+    write_to(dir + "/tokens.style", "vars { --accent: #ff0000  --surface: #111827 }  // green\n")
+    ui::layout::rdoc_reload(d)
+    let _f3 = ui::layout::rdoc_frame(d, 3.0)
+    assert_eq(ui::core::rgba_color(node_of(d, "files").bg).r, 255)
+    assert_eq(ui::layout::rdoc_watch_list(d).len(), 4)
+    assert_eq(ui::layout::rdoc_watch_dirs(d).len(), 1)
+}
+
+fn test_a_broken_file_keeps_the_last_good_document() {
+    let dir = scratch("broken")
+    write_desktop(dir)
+    var d = ui::layout::rdoc_new()
+    assert_streq(ui::layout::rdoc_load(d, dir + "/taskbar.ui").msg, "")
+    ui::layout::rdoc_set_viewport(d, 600.0, 40.0)
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    let before = ui::layout::rdoc_overlay(d).prims.len()
+    // a typo in the theme, two files away: reported in that file, at its line and column
+    write_to(dir + "/theme.style", "import " + q() + "tokens.style" + q() + "\n.bar { bg: --surface }\n.tb { bg: --accent radius: six }\n")
+    assert_true(ui::layout::rdoc_poll(d))
+    let e = ui::layout::rdoc_error(d)
+    assert_true(ui::layout::nui_ends_with(e.file, "theme.style"))
+    assert_eq(e.line, 3)
+    assert_true(e.col > 1)
+    assert_true(ui::layout::nui_contains(e.msg, "radius"))
+    let f1 = ui::layout::rdoc_frame(d, 1.0)
+    assert_false(f1.changed)                                  // the desktop did not blank
+    assert_eq(ui::layout::rdoc_overlay(d).prims.len(), before)
+    assert_eq(ui::core::rgba_color(node_of(d, "files").bg).r, 59)
+    // an undefined token is caught when the styles compile, and is just as harmless
+    write_to(dir + "/theme.style", "import " + q() + "tokens.style" + q() + "\n.bar { bg: --surface }\n.tb { bg: --acent }\n")
+    assert_true(ui::layout::rdoc_poll(d))
+    assert_true(ui::layout::nui_contains(ui::layout::rdoc_error(d).msg, "--acent"))
+    assert_eq(ui::core::rgba_color(node_of(d, "files").bg).r, 59)
+    // a broken document
+    write_to(dir + "/taskbar.ui", "import " + q() + "button.ui" + q() + "\nrow { tb { id: files title: Files }\n  tb { title: } }\n")
+    assert_true(ui::layout::rdoc_poll(d))
+    let e2 = ui::layout::rdoc_error(d)
+    assert_true(ui::layout::nui_ends_with(e2.file, "taskbar.ui"))
+    assert_eq(e2.line, 3)
+    let f2 = ui::layout::rdoc_frame(d, 2.0)
+    assert_false(f2.changed)
+    // fixed: it comes back
+    write_desktop(dir)
+    write_to(dir + "/taskbar.ui", "import " + q() + "button.ui" + q() + "\nrow { id: bar classes: [bar] padding: 4 gap: 4\n  tb { id: files title: Files }\n  spacer { } }\n")
+    assert_true(ui::layout::rdoc_poll(d))
+    assert_streq(ui::layout::rdoc_error(d).msg, "")
+    let f3 = ui::layout::rdoc_frame(d, 3.0)
+    assert_true(f3.changed)
+    assert_eq(ui::core::rgba_color(node_of(d, "files").bg).r, 59)
+}
+
+fn test_import_errors() {
+    let dir = scratch("imports")
+    write_to(dir + "/a.ui", "import " + q() + "b.ui" + q() + "\ncomponent ca(x) { text { text: $x } }\n")
+    write_to(dir + "/b.ui", "import " + q() + "a.ui" + q() + "\n")
+    write_to(dir + "/main.ui", "import " + q() + "a.ui" + q() + "\ncolumn { }\n")
+    var d = ui::layout::rdoc_new()
+    let e = ui::layout::rdoc_load(d, dir + "/main.ui")
+    assert_true(ui::layout::nui_contains(e.msg, "import cycle"))
+    assert_true(ui::layout::nui_ends_with(e.file, "b.ui"))
+    write_to(dir + "/main2.ui", "import " + q() + "nope.ui" + q() + "\ncolumn { }\n")
+    let e2 = ui::layout::rdoc_load(d, dir + "/main2.ui")
+    assert_true(ui::layout::nui_contains(e2.msg, "cannot import"))
+    assert_eq(e2.line, 1)
+    write_to(dir + "/withroot.ui", "column { }\n")
+    write_to(dir + "/main3.ui", "import " + q() + "withroot.ui" + q() + "\ncolumn { }\n")
+    let e3 = ui::layout::rdoc_load(d, dir + "/main3.ui")
+    assert_true(ui::layout::nui_contains(e3.msg, "not a root element"))
+    // a file imported twice (a diamond) is read once
+    write_to(dir + "/s.style", ".x { radius: 2 }\n")
+    write_to(dir + "/l.ui", "import " + q() + "s.style" + q() + "\n")
+    write_to(dir + "/r.ui", "import " + q() + "s.style" + q() + "\n")
+    write_to(dir + "/main4.ui", "import " + q() + "l.ui" + q() + "\nimport " + q() + "r.ui" + q() + "\ncolumn { }\n")
+    var r = ui::layout::dsl_parse_document_file(read_file(dir + "/main4.ui"), dir + "/main4.ui")
+    assert_true(r.ok)
+    assert_eq(r.doc.rich.rules.len(), 1)
+    assert_eq(r.deps.len(), 3)
+}
+
+fn test_a_plugin_re_rendering_components_costs_the_change() {
+    // a plugin sends the whole document every time something changes; components and all
+    var d = ui::layout::rdoc_new()
+    let a = btn_comp() + "row { tb { id: files title: Files } tb { id: term title: Terminal } text { id: clock text: " + q() + "12:00" + q() + " } }"
+    let b = btn_comp() + "row { tb { id: files title: Files } tb { id: term title: Terminal } text { id: clock text: " + q() + "12:01" + q() + " } }"
+    assert_streq(ui::layout::rdoc_set_source(d, a, "plugin://taskbar").msg, "")
+    ui::layout::rdoc_set_viewport(d, 600.0, 40.0)
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    assert_streq(ui::layout::rdoc_set_source(d, b, "plugin://taskbar").msg, "")
+    let f = ui::layout::rdoc_frame(d, 1.0)
+    assert_true(f.changed)
+    assert_eq(f.laid, 1)
+    // and a broken render from the plugin leaves its last good one up
+    let e = ui::layout::rdoc_set_source(d, btn_comp() + "row { tb { title: } }", "plugin://taskbar")
+    assert_streq(e.file, "plugin://taskbar")
+    assert_eq(e.line, 5)
+    let g = ui::layout::rdoc_frame(d, 2.0)
+    assert_false(g.changed)
+    assert_streq(node_of(d, "clock").text, "12:01")
+}

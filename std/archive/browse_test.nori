@@ -1,0 +1,735 @@
+// .nori tests for std/archive browsing (browse.nori), run with
+//   bash std/archive/make_browse_testdata.sh build       # once: host-tool fixtures
+//   noric --test std/archive/browse_test.nori compiler/runtime.nori --import-root .
+//
+// What is checked. Against a host-tool oracle: every fixture's listing (path, size,
+// kind) must match what the archive's own reader reports (`tar -tvf`, `unzip -l`,
+// `bsdtar -tvf`), with the .expected files written by
+// make_browse_testdata.sh. archive_read of every regular file must return the
+// original bytes. Beyond the oracle: implicit directories synthesized; hard links
+// and symlinks classified; extraction of a file and a whole subtree; path traversal
+// (`..`, absolute names) and escaping symlinks refused; truncated archives (every
+// prefix) are an error, never a crash; and small ISO 9660 images written by hand
+// from ECMA-119 in this file (plain with no extensions, Joliet-only, Rock Ridge
+// with chained NM + PX + SL, and multi-extent) parse and read correctly.
+
+import "std/archive" as ar
+import "std/os" as os
+
+// ---- fixture plumbing ------------------------------------------------------
+fn bt_p(n: Str) -> Str { return "build/browse_testdata/" + n }
+fn bt_dest(n: Str) -> Str { return "build/bt_" + n }
+fn bt_mk(path: Str) { let _ = os::make_dir_p(path) }
+fn bt_rm(path: Str) { let _ = os::remove_tree(path) }
+
+struct BtExp { path: Str, size: Int, kind: Int }
+// parse "path\tsize\tkind" (or "path\tsize\tkind\tmode") lines.
+fn bt_load(name: Str) -> Vec<BtExp> {
+    var out: Vec<BtExp> = vec()
+    var f = read_file(bt_p(name))
+    var st = 0
+    var i = 0
+    let n = f.len()
+    while i <= n {
+        if i == n || ord(f.at(i)) == 10 {
+            if i > st {
+                let line = f.slice(st, i)
+                if !(line.len() == 0) {
+                    var t1 = 0 - 1
+                    var t2 = 0 - 1
+                    var t3 = line.len()                 // the kind is the third column: a fourth may follow
+                    var k = 0
+                    while k < line.len() {
+                        if ord(line.at(k)) == 9 { if t1 < 0 { t1 = k } else if t2 < 0 { t2 = k } else if t3 == line.len() { t3 = k } }
+                        k = k + 1
+                    }
+                    if t1 > 0 && t2 > 0 {
+                        out.push(BtExp {
+                            path: copy line.slice(0, t1),
+                            size: parse_int_or(line.slice(t1 + 1, t2), 0),
+                            kind: parse_int_or(line.slice(t2 + 1, t3), 0)
+                        })
+                    }
+                }
+            }
+            st = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+// the source tree's symlink map ("path\ttarget"; the archives were made from it)
+fn bt_symlinks() -> Vec<BtExp> {
+    var out: Vec<BtExp> = vec()
+    var f = read_file(bt_p("symlinks.list"))
+    var st = 0
+    var i = 0
+    let n = f.len()
+    while i <= n {
+        if i == n || ord(f.at(i)) == 10 {
+            if i > st {
+                let line = f.slice(st, i)
+                var tab = 0 - 1
+                var k = 0
+                while k < line.len() { if ord(line.at(k)) == 9 { tab = k  k = line.len() } else { k = k + 1 } }
+                if tab > 0 { out.push(BtExp { path: copy line.slice(0, tab), size: 0, kind: 0 }) }
+            }
+            st = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+fn bt_is_symlink(m: Vec<BtExp>, p: Str) -> Bool {
+    var i = 0
+    while i < m.len() { if m[i].path == p { return true }  i = i + 1 }
+    return false
+}
+fn bt_find(v: Vec<ar::Entry>, p: Str) -> Int {
+    var i = 0
+    while i < v.len() { if v[i].path == p { return i }  i = i + 1 }
+    return 0 - 1
+}
+fn bt_orig(p: Str) -> Str { return bt_p("original/") + p }
+fn bt_symlink_target(p: Str) -> Str {
+    var f = read_file(bt_p("symlinks.list"))
+    var st = 0
+    var i = 0
+    var res = ""
+    let n = f.len()
+    while i <= n {
+        if i == n || ord(f.at(i)) == 10 {
+            if i > st {
+                let line = f.slice(st, i)
+                var tab = 0 - 1
+                var k = 0
+                while k < line.len() { if ord(line.at(k)) == 9 { tab = k  k = line.len() } else { k = k + 1 } }
+                if tab > 0 && line.slice(0, tab) == p { res = line.slice(tab + 1, line.len()) }
+            }
+            st = i + 1
+        }
+        i = i + 1
+    }
+    return res
+}
+
+// ---- kind sniffing ---------------------------------------------------------
+fn test_archive_kind() {
+    assert_eq(ar::archive_kind(bt_p("t1.tar")), 1)
+    assert_eq(ar::archive_kind(bt_p("oldv7.tar")), 1)
+    assert_eq(ar::archive_kind(bt_p("t1.tar.gz")), 2)
+    assert_eq(ar::archive_kind(bt_p("t1.tar.zst")), 3)
+    assert_eq(ar::archive_kind(bt_p("t1.zip")), 4)
+    assert_eq(ar::archive_kind(bt_p("stored.zip")), 4)
+    assert_eq(ar::archive_kind(bt_p("many.zip")), 4)
+    assert_eq(ar::archive_kind(bt_p("t1.iso")), 5)
+    assert_eq(ar::archive_kind(bt_p("original/hello.txt")), 0 - 1)
+    assert_eq(ar::archive_kind(bt_p("no_such_file_x")), 0 - 1)
+    assert_eq(ar::archive_kind(bt_p("original/")), 0 - 1)
+}
+
+// ---- the listing oracle ----------------------------------------------------
+// `zipsym`: Info-ZIP `-y` stores a symlink as a file whose bytes are the target,
+// and unzip can't see it is a symlink, so those entries are checked separately.
+fn bt_check_list(dirlist: Str, archive: Str, zipsym: Bool) {
+    let want = bt_load(dirlist)
+    let syms = bt_symlinks()
+    let got = ar::archive_list(bt_p(archive))
+    assert_true(got.len() > 0)
+    // every tool-listed entry is present with the tool's fields
+    var i = 0
+    while i < want.len() {
+        let w = want[i]
+        let j = bt_find(got, w.path)
+        assert_true(j >= 0)
+        if j >= 0 {
+            if w.kind == 2 {
+                assert_eq(got[j].kind, 2)
+                assert_true(bt_is_symlink(syms, w.path))
+                assert_streq(got[j].link, bt_symlink_target(w.path))
+            } else if w.kind == 3 {
+                assert_eq(got[j].kind, 3)
+                assert_true(got[j].link.len() > 0)
+            } else if zipsym && bt_is_symlink(syms, w.path) {
+                assert_eq(got[j].kind, 2)
+                assert_streq(ar::archive_read(bt_p(archive), w.path), bt_symlink_target(w.path))
+                assert_eq(got[j].size, w.size)
+            } else {
+                assert_eq(got[j].size, w.size)
+                assert_eq(got[j].kind, w.kind)
+            }
+        }
+        i = i + 1
+    }
+    // and nothing is listed that the tool did not list, except implicitly
+    // synthesized directories (this archive's dirs are all explicit, so that
+    // checks synthesis does not add junk)
+    var k = 0
+    while k < got.len() {
+        let g = got[k]
+        var known = bt_find(want, g.path) >= 0
+        if g.kind == 1 && !known {
+            // an implicitly-synthesized directory is legal
+        } else {
+            assert_true(known)
+        }
+        k = k + 1
+    }
+}
+// byte-wise "<": the language has no Str comparison operator, so the sorted
+// check is done with an explicit lexicographic compare.
+fn bt_str_lt(a: Str, b: Str) -> Bool {
+    var i = 0
+    while i < a.len() && i < b.len() {
+        let ca = ord(a.at(i))
+        let cb = ord(b.at(i))
+        if ca != cb { return ca < cb }
+        i = i + 1
+    }
+    return a.len() < b.len()
+}
+fn bt_check_sorted(archive: Str) {
+    let got = ar::archive_list(bt_p(archive))
+    var i = 1
+    while i < got.len() {
+        assert_true(bt_str_lt(got[i - 1].path, got[i].path) || got[i - 1].path == got[i].path)
+        i = i + 1
+    }
+}
+
+fn test_list_matches_tar() {
+    bt_check_list("t1.list", "t1.tar", false)
+    bt_check_sorted("t1.tar")
+}
+fn test_list_matches_tar_gz() { bt_check_list("t1.list", "t1.tar.gz", false) }
+fn test_list_matches_tar_zst() { bt_check_list("t1.list", "t1.tar.zst", false) }
+fn test_list_matches_oldv7() { bt_check_list("oldv7.list", "oldv7.tar", false) }
+fn test_list_matches_zip() { bt_check_list("t1z.list", "t1.zip", true) }
+fn test_list_matches_stored_zip() { bt_check_list("stored.list", "stored.zip", true) }
+fn test_list_matches_iso() { bt_check_list("t1i.list", "t1.iso", false) }
+
+// GNU long-name entries and the space/unicode name must survive
+fn test_long_and_unicode_names() {
+    let e = ar::archive_list(bt_p("t1.tar"))
+    let long = "this_is_a_long_filename_that_has_to_be_longer_than_one_hundred_and_twenty_chars_to_force_gnu_long_name_records.txt"
+    let j = bt_find(e, long)
+    assert_true(j >= 0)
+    assert_eq(e[j].size, 18)
+    assert_true(bt_find(e, "with space ü.txt") >= 0)
+    assert_streq(ar::archive_read(bt_p("t1.tar"), long), "long name content\n")
+    assert_streq(ar::archive_read(bt_p("t1.zip"), long), "long name content\n")
+    assert_streq(ar::archive_read(bt_p("t1.iso"), long), "long name content\n")
+}
+
+// ---- reads -----------------------------------------------------------------
+fn bt_check_byte_reads(archive: Str) {
+    let got = ar::archive_list(bt_p(archive))
+    var i = 0
+    while i < got.len() {
+        let e = got[i]
+        if e.kind == 0 {
+            let data = ar::archive_read(bt_p(archive), e.path)
+            let orig = read_file(bt_orig(e.path))
+            assert_eq(data.len(), orig.len())
+            assert_streq(data, orig)
+        }
+        i = i + 1
+    }
+}
+fn test_reads_tar()   { bt_check_byte_reads("t1.tar") }
+fn test_reads_targz() { bt_check_byte_reads("t1.tar.gz") }
+fn test_reads_tarzst() { bt_check_byte_reads("t1.tar.zst") }
+fn test_reads_zip()   { bt_check_byte_reads("t1.zip") }
+fn test_reads_iso()   { bt_check_byte_reads("t1.iso") }
+fn test_reads_stored_zip() {
+    let data = ar::archive_read(bt_p("stored.zip"), "deep/a/b/repetitive.txt")
+    assert_streq(data, read_file(bt_orig("deep/a/b/repetitive.txt")))
+}
+fn test_read_missing_is_empty() {
+    assert_eq(ar::archive_read(bt_p("t1.tar"), "no/such.file").len(), 0)
+    assert_eq(ar::archive_read(bt_p("t1.zip"), "no/such.file").len(), 0)
+    assert_eq(ar::archive_read(bt_p("t1.iso"), "no/such.file").len(), 0)
+    assert_eq(ar::archive_read(bt_p("original/hello.txt"), "x").len(), 0)
+}
+fn test_zip_read_only_touches_its_entry() {
+    // a zip entry outside the one asked for is never decoded; the read itself
+    // simply succeeds; a torn archive read would trap instead of returning bytes
+    let d = ar::archive_read(bt_p("t1.zip"), "sub/random.bin")
+    assert_streq(d, read_file(bt_orig("sub/random.bin")))
+}
+
+// ---- implicit directories --------------------------------------------------
+fn test_implicit_dirs_zip() {
+    // nodirs.zip was built with `zip -D`: file records only
+    let got = ar::archive_list(bt_p("nodirs.zip"))
+    assert_true(bt_find(got, "deep") >= 0)
+    assert_true(bt_find(got, "deep/a") >= 0)
+    assert_true(bt_find(got, "deep/a/b") >= 0)
+    let j = bt_find(got, "deep/a/b/repetitive.txt")
+    assert_true(j >= 0)
+    assert_eq(got[j].size, 13200)
+    assert_eq(got[bt_find(got, "deep")].kind, 1)
+    assert_streq(ar::archive_read(bt_p("nodirs.zip"), "deep/a/b/repetitive.txt"),
+                 read_file(bt_orig("deep/a/b/repetitive.txt")))
+}
+// a hand-built tar holding only `a/b/c.txt`, with no `a/` or `a/b/` records
+fn test_implicit_dirs_tar() {
+    let f = bt_p("implix.tar")
+    write_file(f, bt_tar_one("a/b/c.txt", "deeper than the headers\n"))
+    let got = ar::archive_list(f)
+    assert_eq(got.len(), 3)
+    assert_streq(got[0].path, "a")
+    assert_streq(got[1].path, "a/b")
+    assert_streq(got[2].path, "a/b/c.txt")
+    assert_eq(got[0].kind, 1)
+    assert_eq(got[2].kind, 0)
+    assert_streq(ar::archive_read(f, "a/b/c.txt"), "deeper than the headers\n")
+}
+
+// ---- tar writer helpers (for traversal / implicit-dir fixtures) ------------
+fn bt_pad(n: Int) -> Str {
+    var s = ""
+    var i = 0
+    while i < n { s = s + chr(0)  i = i + 1 }
+    return s
+}
+fn bt_one(b: Int) -> Str { var s = ""  s = s + chr(b)  return s }
+fn bt_oct(v: Int, width: Int, term: Int) -> Str {
+    var s = ""
+    var x = v
+    while x > 0 { s = bt_one(48 + (x % 8)) + s  x = x / 8 }
+    while s.len() < width - 1 { s = "0" + s }
+    if term == 0 { s = s + chr(0) } else { s = s + chr(32) }
+    return s
+}
+fn bt_setc(s: Str, at: Int, v: Str) -> Str {
+    return s.slice(0, at) + v + s.slice(at + v.len(), s.len())
+}
+fn bt_tar_header(name: Str, link: Str, mode: Int, size: Int, typ: Int) -> Str {
+    var h = bt_pad(512)
+    var i = 0
+    while i < name.len() && i < 100 { h = bt_setc(h, i, bt_one(ord(name.at(i))))  i = i + 1 }
+    i = 0
+    while i < link.len() && i < 100 { h = bt_setc(h, 157 + i, bt_one(ord(link.at(i))))  i = i + 1 }
+    h = bt_setc(h, 100, bt_oct(mode, 8, 1))
+    h = bt_setc(h, 108, bt_oct(0, 8, 1))
+    h = bt_setc(h, 116, bt_oct(0, 8, 1))
+    h = bt_setc(h, 124, bt_oct(size, 12, 0))
+    h = bt_setc(h, 136, bt_oct(0, 12, 0))
+    var k = 148
+    while k < 156 { h = bt_setc(h, k, " ")  k = k + 1 }
+    h = bt_setc(h, 156, bt_one(typ))
+    i = 0
+    while i < 5 { h = bt_setc(h, 257 + i, bt_one(ord("ustar".at(i))))  i = i + 1 }
+    h = bt_setc(h, 263, bt_one(0))
+    h = bt_setc(h, 264, "0")
+    h = bt_setc(h, 265, "0")
+    var sum = 0
+    i = 0
+    while i < 512 {
+        if i >= 148 && i < 156 { sum = sum + 32 } else { sum = sum + ord(h.at(i)) }
+        i = i + 1
+    }
+    h = bt_setc(h, 148, bt_oct(sum, 8, 0))
+    h = bt_setc(h, 155, " ")
+    return h
+}
+fn bt_tar_block(header: Str, data: Str) -> Str {
+    var out = header + data
+    var npad = 512 - (data.len() % 512)
+    if npad < 512 { out = out + bt_pad(npad) }
+    return out + bt_pad(1024)
+}
+fn bt_tar_one(name: Str, data: Str) -> Str {
+    return bt_tar_block(bt_tar_header(name, "", 420, data.len(), 48), data)
+}
+
+// ---- extraction ------------------------------------------------------------
+fn test_extract_one_file() {
+    let d = bt_dest("x1")
+    bt_rm(d)
+    bt_mk(d)
+    assert_eq(ar::archive_extract(bt_p("t1.tar"), "sub/run.sh", d), 0)
+    assert_streq(read_file(d + "/sub/run.sh"), read_file(bt_orig("sub/run.sh")))
+}
+fn test_extract_subtree() {
+    let d = bt_dest("x2")
+    bt_rm(d)
+    bt_mk(d)
+    assert_eq(ar::archive_extract(bt_p("t1.tar"), "sub", d), 0)
+    assert_streq(read_file(d + "/sub/random.bin"), read_file(bt_orig("sub/random.bin")))
+    let z = bt_dest("x2z")
+    bt_rm(z)
+    bt_mk(z)
+    assert_eq(ar::archive_extract(bt_p("t1.zip"), "deep", z), 0)
+    assert_streq(read_file(z + "/deep/a/b/repetitive.txt"), read_file(bt_orig("deep/a/b/repetitive.txt")))
+    let i = bt_dest("x2i")
+    bt_rm(i)
+    bt_mk(i)
+    assert_eq(ar::archive_extract(bt_p("t1.iso"), "sub", i), 0)
+    assert_streq(read_file(i + "/sub/random.bin"), read_file(bt_orig("sub/random.bin")))
+    assert_streq(read_file(i + "/sub/run.sh"), read_file(bt_orig("sub/run.sh")))
+}
+fn test_extract_symlink_inside() {
+    let d = bt_dest("x3")
+    bt_rm(d)
+    bt_mk(d)
+    assert_eq(ar::archive_extract(bt_p("t1.tar"), "link_hello", d), 0)
+    // a link is extracted as a link (to hello.txt beside it); with its target extracted too, it resolves
+    // inside dest: the target is readable through it
+    assert_eq(ar::archive_extract(bt_p("t1.tar"), "hello.txt", d), 0)
+    assert_streq(read_file(d + "/link_hello"), read_file(bt_orig("hello.txt")))
+}
+fn test_extract_from_compressed() {
+    let d = bt_dest("x4")
+    bt_rm(d)
+    bt_mk(d)
+    assert_eq(ar::archive_extract(bt_p("t1.tar.gz"), "hello.txt", d), 0)
+    assert_streq(read_file(d + "/hello.txt"), read_file(bt_orig("hello.txt")))
+    let d2 = bt_dest("x4z")
+    bt_rm(d2)
+    bt_mk(d2)
+    assert_eq(ar::archive_extract(bt_p("t1.tar.zst"), "hello.txt", d2), 0)
+    assert_streq(read_file(d2 + "/hello.txt"), read_file(bt_orig("hello.txt")))
+}
+fn test_extract_missing_entry() {
+    let d = bt_dest("x5")
+    bt_rm(d)
+    bt_mk(d)
+    assert_eq(ar::archive_extract(bt_p("t1.tar"), "nope/nothing", d), 2)
+}
+
+// ---- path traversal is refused ---------------------------------------------
+fn test_extract_refuses_traversal_tar() {
+    let h1 = bt_tar_header("../evil.txt", "", 420, 4, 48)
+    let h2 = bt_tar_header("/abs.txt", "", 420, 3, 48)
+    let f = bt_p("evil.tar")
+    write_file(f, bt_tar_block(h1, "evil") + bt_tar_block(h2, "abs"))
+    let d = bt_dest("x6")
+    bt_rm(d)
+    bt_mk(d)
+    assert_eq(ar::archive_extract(f, "../evil.txt", d), 1)
+    assert_eq(ar::archive_extract(f, "/abs.txt", d), 1)
+    assert_true(!os::path_exists(bt_dest("") + "/evil.txt"))
+    assert_true(!os::path_exists(d + "/evil.txt"))
+}
+fn test_extract_refuses_traversal_zip() {
+    let f = bt_p("evil.zip")
+    write_file(f, bt_evil_zip("../evil.txt"))
+    let d = bt_dest("x7")
+    bt_rm(d)
+    bt_mk(d)
+    assert_eq(ar::archive_extract(f, "../evil.txt", d), 1)
+    assert_true(!os::path_exists(bt_dest("") + "/evil.txt"))
+}
+fn test_extract_refuses_escaping_symlink() {
+    let d = bt_dest("x8")
+    bt_rm(d)
+    bt_mk(d)
+    // a relative target that walks out of dest
+    write_file(bt_p("bad1.tar"), bt_tar_block(bt_tar_header("escape", "../../out.txt", 511, 0, 50), ""))
+    assert_eq(ar::archive_extract(bt_p("bad1.tar"), "escape", d), 1)
+    assert_true(!os::path_exists(d + "/escape"))
+    // an absolute target
+    write_file(bt_p("bad2.tar"), bt_tar_block(bt_tar_header("escape2", "/etc/passwd", 511, 0, 50), ""))
+    assert_eq(ar::archive_extract(bt_p("bad2.tar"), "escape2", d), 1)
+    assert_true(!os::path_exists(d + "/escape2"))
+}
+// a minimal stored zip holding one entry with the given (possibly hostile) name
+fn bt_evil_zip(name: Str) -> Str {
+    var lh = bt_one(80) + bt_one(75) + bt_one(3) + bt_one(4)
+    lh = lh + chr(20) + chr(0)
+    lh = lh + chr(0) + chr(0)
+    lh = lh + chr(0) + chr(0)
+    var i = 0
+    while i < 10 { lh = lh + chr(0)  i = i + 1 }             // time date crc
+    lh = lh + chr(4) + chr(0) + chr(0) + chr(0)               // csize 4
+    lh = lh + chr(4) + chr(0) + chr(0) + chr(0)               // usize 4
+    lh = lh + chr(name.len() & 255) + chr((name.len() >> 8) & 255)
+    lh = lh + chr(0) + chr(0)                                 // extra len 0
+    var cc = bt_one(80) + bt_one(75) + bt_one(1) + bt_one(2)
+    cc = cc + chr(3) + chr(3)                                 // unix 3.0 / needed 20
+    cc = cc + chr(20) + chr(0)
+    cc = cc + chr(0) + chr(0)
+    cc = cc + chr(0) + chr(0)
+    i = 0
+    while i < 12 { cc = cc + chr(0)  i = i + 1 }
+    cc = cc + chr(4) + chr(0) + chr(0) + chr(0)
+    cc = cc + chr(4) + chr(0) + chr(0) + chr(0)
+    cc = cc + chr(name.len() & 255) + chr((name.len() >> 8) & 255)
+    cc = cc + chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0)
+    cc = cc + chr(0) + chr(0) + chr(0) + chr(0)
+    cc = cc + chr(0) + chr(0) + chr(0) + chr(0)
+    var body = lh + name + "evil"
+    var e = bt_one(80) + bt_one(75) + bt_one(5) + bt_one(6)
+    e = e + chr(0) + chr(0) + chr(0) + chr(0)
+    e = e + chr(1) + chr(0) + chr(1) + chr(0)
+    var cssz = cc.len()
+    e = e + chr(cssz & 255) + chr((cssz >> 8) & 255) + chr((cssz >> 16) & 255) + chr((cssz >> 24) & 255)
+    var csoff = body.len()
+    e = e + chr(csoff & 255) + chr((csoff >> 8) & 255) + chr((csoff >> 16) & 255) + chr((csoff >> 24) & 255)
+    e = e + chr(0) + chr(0)
+    return body + cc + e
+}
+
+// ---- truncation is an error, never a crash ---------------------------------
+fn test_truncated_archives_give_errors_not_crashes() {
+    let names: Vec<Str> = vec()
+    names.push("t1.tar")
+    names.push("t1.tar.gz")
+    names.push("t1.tar.zst")
+    names.push("t1.zip")
+    names.push("t1.iso")
+    let d = bt_dest("tr")
+    bt_rm(d)
+    bt_mk(d)
+    var a = 0
+    while a < names.len() {
+        let full = read_file(bt_p(names[a]))
+        var i = 1
+        while i < full.len() && i < 20000 {
+            write_file(d + "/trunc.bin", full.slice(0, i))
+            let l = ar::archive_list(d + "/trunc.bin")
+            assert_true(l.len() <= 500)
+            let _r = ar::archive_read(d + "/trunc.bin", "hello.txt")
+            let x = ar::archive_extract(d + "/trunc.bin", "hello.txt", d)
+            assert_true(x >= 0)
+            i = i + 97
+        }
+        a = a + 1
+    }
+    let junk = d + "/junk.bin"
+    write_file(junk, "this is not any archive format at all")
+    assert_eq(ar::archive_kind(junk), 0 - 1)
+    assert_eq(ar::archive_list(junk).len(), 0)
+    assert_eq(ar::archive_read(junk, "x").len(), 0)
+    assert_eq(ar::archive_extract(junk, "x", d), 1)
+    let empty = d + "/empty.bin"
+    write_file(empty, "")
+    assert_eq(ar::archive_kind(empty), 0 - 1)
+    assert_eq(ar::archive_list(empty).len(), 0)
+}
+
+// ============================================================================
+// hand-built ISO 9660 images (ECMA-119), byte by byte
+// ============================================================================
+fn bt_both32(v: Int) -> Str {
+    return bt_one(v & 255) + bt_one((v >> 8) & 255) + bt_one((v >> 16) & 255) + bt_one((v >> 24) & 255) +
+           bt_one((v >> 24) & 255) + bt_one((v >> 16) & 255) + bt_one((v >> 8) & 255) + bt_one(v & 255)
+}
+fn bt_sector(b: Str) -> Str {
+    var s = b
+    var i = s.len()
+    while i < 2048 { s = s + chr(0)  i = i + 1 }
+    return copy s
+}
+// a directory record. After the identifier the system-use area begins at
+// 33+namelen, padded to an even boundary, the same offsets browse.nori reads.
+fn bt_irec(loc: Int, dlen: Int, flags: Int, nm: Str, su: Str) -> Str {
+    var r = bt_one(0)                                     // length, patched at the end
+    r = r + chr(0)                                     // extended attr length
+    r = r + bt_both32(loc)
+    r = r + bt_both32(dlen)
+    r = r + chr(100) + chr(1) + chr(1) + chr(0) + chr(0) + chr(0) + chr(0)
+    r = r + chr(flags)
+    r = r + chr(0) + chr(0) + chr(0) + chr(0) + chr(1) + chr(0)
+    r = r + chr(nm.len())
+    r = r + nm
+    if (33 + nm.len()) & 1 != 0 { r = r + chr(0) }
+    r = r + su
+    return bt_one(r.len()) + r.slice(1, r.len())
+}
+fn bt_ucs2(s: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < s.len() { out = out + chr(0) + chr(ord(s.at(i)))  i = i + 1 }
+    return out
+}
+// a volume descriptor (PVD / SVD / terminator). The root record at offset 156.
+fn bt_vd(typ: Int, label: Str, jesc: Bool, root_ext: Int, root_len: Int) -> Str {
+    var b = chr(typ) + "CD001" + chr(1)
+    b = b + bt_pad(33)                                // 7..39
+    var lab = label
+    while lab.len() < 16 { lab = lab + " " }
+    b = b + lab                                        // 40..55
+    b = b + bt_pad(24)                                // 56..79
+    b = b + bt_both32(30)                             // 80..87 volume space size
+    var esc = bt_pad(3)
+    if jesc { esc = "%" + "/" + "@" }
+    b = b + esc + bt_pad(37)                           // 88..127 (escape at 88..90)
+    b = b + chr(0) + chr(8) + chr(0) + chr(0)          // 128 block size LSB 2048
+    b = b + chr(0) + chr(0) + chr(8) + chr(0)          // 132 .. 135 MSB
+    b = b + bt_pad(20)                                // 136..155
+    b = b + bt_irec(root_ext, root_len, 2, bt_one(0), "")   // root record
+    return bt_sector(b)                                // pad to 2048
+}
+fn bt_ised(n: Int) -> Str {                            // `n` empty sectors
+    var s = ""
+    var i = 0
+    while i < n { s = s + bt_sector("")  i = i + 1 }
+    return s
+}
+fn bt_iso_join(parts: Vec<Str>) -> Str {
+    var out = ""
+    var i = 0
+    while i < parts.len() { out = out + parts[i]  i = i + 1 }
+    return out
+}
+
+// ---- a plain ISO 9660 (no extensions) --------------------------------------
+fn test_handbuilt_plain_iso() {
+    let f = bt_p("hand_plain.iso")
+    let root = bt_irec(19, 2048, 2, bt_one(0), "") + bt_irec(19, 2048, 2, bt_one(1), "") +
+               bt_irec(20, 2048, 2, "SUB", "") + bt_irec(21, 15, 0, "HELLO.TXT;1", "")
+    let sub = bt_irec(19, 2048, 2, bt_one(0), "") + bt_irec(19, 2048, 2, bt_one(1), "") +
+              bt_irec(22, 10, 0, "INNER.TXT;1", "")
+    var parts: Vec<Str> = vec()
+    parts.push(bt_ised(16))
+    parts.push(bt_vd(1, "PLAIN", false, 19, 2048))
+    parts.push(bt_vd(255, "", false, 19, 2048))
+    parts.push(bt_sector("        root dir padding to 2048-pad position"))
+    parts.push(bt_sector(root))
+    parts.push(bt_sector(sub))
+    parts.push(bt_sector("hello iso 9660!"))
+    parts.push(bt_sector("inner file"))
+    parts.push(bt_ised(6))
+    write_file(f, bt_iso_join(parts))
+    assert_eq(ar::archive_kind(f), 5)
+    let e = ar::archive_list(f)
+    assert_eq(e.len(), 3)
+    let j = bt_find(e, "HELLO.TXT")
+    assert_true(j >= 0)
+    assert_eq(e[j].size, 15)
+    assert_eq(e[bt_find(e, "SUB")].kind, 1)
+    assert_true(bt_find(e, "SUB/INNER.TXT") >= 0)
+    assert_streq(ar::archive_read(f, "HELLO.TXT"), "hello iso 9660!")
+    assert_streq(ar::archive_read(f, "SUB/INNER.TXT"), "inner file")
+    assert_eq(ar::archive_read(f, "NOPE").len(), 0)
+}
+
+// ---- a Joliet-only ISO: the UCS-2 names are preferred ----------------------
+fn test_handbuilt_joliet_iso() {
+    let f = bt_p("hand_joliet.iso")
+    let isoroot = bt_irec(19, 2048, 2, bt_one(0), "") + bt_irec(19, 2048, 2, bt_one(1), "") +
+                  bt_irec(20, 2048, 2, "SUB", "") + bt_irec(21, 15, 0, "HELLO.TXT;1", "")
+    let isosub = bt_irec(19, 2048, 2, bt_one(0), "") + bt_irec(19, 2048, 2, bt_one(1), "") +
+                 bt_irec(22, 10, 0, "INNER.TXT;1", "")
+    let jroot = bt_irec(26, 2048, 2, bt_one(0), "") + bt_irec(26, 2048, 2, bt_one(1), "") +
+                bt_irec(27, 2048, 2, bt_ucs2("sub"), "") + bt_irec(21, 15, 0, bt_ucs2("hello.txt"), "")
+    let jsub = bt_irec(26, 2048, 2, bt_one(0), "") + bt_irec(26, 2048, 2, bt_one(1), "") +
+               bt_irec(22, 10, 0, bt_ucs2("inner.txt"), "")
+    var parts: Vec<Str> = vec()
+    parts.push(bt_ised(16))
+    parts.push(bt_vd(1, "JOLIET", false, 19, 2048))
+    parts.push(bt_vd(2, "JOLIET", true, 26, 2048))
+    parts.push(bt_vd(255, "", false, 26, 2048))     // 18
+    parts.push(bt_sector(isoroot))     // 19
+    parts.push(bt_sector(isosub))      // 20
+    parts.push(bt_sector("hello iso 9660!"))   // 21
+    parts.push(bt_sector("inner file"))        // 22
+    parts.push(bt_ised(3))
+    parts.push(bt_sector(jroot))       // 26
+    parts.push(bt_sector(jsub))        // 27
+    parts.push(bt_ised(2))
+    write_file(f, bt_iso_join(parts))
+    let e = ar::archive_list(f)
+    assert_true(bt_find(e, "hello.txt") >= 0)       // Joliet, not HELLO.TXT
+    assert_true(bt_find(e, "sub") >= 0)
+    assert_true(bt_find(e, "sub/inner.txt") >= 0)
+    assert_eq(e[bt_find(e, "hello.txt")].size, 15)
+    assert_streq(ar::archive_read(f, "hello.txt"), "hello iso 9660!")
+    assert_streq(ar::archive_read(f, "sub/inner.txt"), "inner file")
+}
+
+// ---- a Rock Ridge ISO: NM (chained), PX, SL --------------------------------
+fn bt_nm(flags: Int, name: Str) -> Str {
+    return "NM" + chr(5 + name.len()) + chr(1) + chr(flags) + name
+}
+fn bt_px(mode: Int) -> Str {
+    var e = "PX" + chr(44) + chr(1)
+    var i = 0
+    while i < 4 { e = e + chr((mode >> (8 * i)) & 255)  i = i + 1 }
+    e = e + chr(0) + chr(0) + chr(0) + chr(0)          // mode high half
+    e = e + chr(1) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0)
+    var k = 0
+    while k < 24 { e = e + chr(0)  k = k + 1 }
+    return e
+}
+// RRIP 4.1.3.1: "SL", length, version, the entry's flags, then one component record: its flags, length, content
+fn bt_sl(flags: Int, target: Str) -> Str {
+    return "SL" + chr(7 + target.len()) + chr(1) + chr(flags) + chr(0) + chr(target.len()) + target
+}
+fn test_handbuilt_rockridge_iso() {
+    let f = bt_p("hand_rr.iso")
+    let long = "this_is_a_very_long_name_that_must_be_split_across_two_nm_entries_for_sure"
+    let h1 = long.slice(0, 40)
+    let h2 = long.slice(40, long.len())
+    let root = bt_irec(19, 2048, 2, bt_one(0), "") + bt_irec(19, 2048, 2, bt_one(1), "") +
+               bt_irec(21, 15, 0, "HELLO.TXT;1", bt_px(33188) + bt_nm(0, "hello.txt")) +
+               bt_irec(22, long.len(), 0, "THIS_IS_A;1", bt_px(33188) + bt_nm(1, h1) + bt_nm(0, h2)) +
+               bt_irec(23, 0, 0, "LINKHEL.;1", bt_sl(0, "HELLO.TXT"))
+    var parts: Vec<Str> = vec()
+    parts.push(bt_ised(16))
+    parts.push(bt_vd(1, "ROCKRIDGE", false, 19, 2048))
+    parts.push(bt_vd(255, "", false, 19, 2048))
+    parts.push(bt_sector(""))
+    parts.push(bt_sector(root))        // 19
+    parts.push(bt_sector(""))          // 20
+    parts.push(bt_sector("hello iso 9660!"))   // 21
+    parts.push(bt_sector(long))        // 22
+    parts.push(bt_ised(6))
+    write_file(f, bt_iso_join(parts))
+    let e = ar::archive_list(f)
+    assert_true(bt_find(e, "hello.txt") >= 0)
+    assert_true(bt_find(e, long) >= 0)                 // two NM entries joined
+    assert_true(bt_find(e, "HELLO.TXT") < 0)           // RRIP name replaces it
+    var i = 0
+    var sl = false
+    while i < e.len() {
+        if e[i].kind == 2 && e[i].link == "HELLO.TXT" { sl = true }
+        i = i + 1
+    }
+    assert_true(sl)
+    assert_streq(ar::archive_read(f, "hello.txt"), "hello iso 9660!")
+    assert_streq(ar::archive_read(f, long), long)
+}
+
+// ---- a multi-extent ISO ----------------------------------------------------
+fn test_handbuilt_multi_extent_iso() {
+    let f = bt_p("hand_multi.iso")
+    let root = bt_irec(19, 2048, 2, bt_one(0), "") + bt_irec(19, 2048, 2, bt_one(1), "") +
+               bt_irec(21, 2048, 0x80, "BIG.TXT;1", "") +
+               bt_irec(22, 200, 0, "BIG.TXT;1", "")
+    var parts: Vec<Str> = vec()
+    parts.push(bt_ised(16))
+    parts.push(bt_vd(1, "MULTI", false, 19, 2048))
+    parts.push(bt_vd(255, "", false, 19, 2048))
+    parts.push(bt_sector(""))
+    parts.push(bt_sector(root))        // 19
+    parts.push(bt_sector(""))
+    var c1 = ""
+    var i = 0
+    while i < 2048 { c1 = c1 + chr(65)  i = i + 1 }
+    parts.push(c1)                      // 21
+    var c2 = ""
+    i = 0
+    while i < 200 { c2 = c2 + chr(66)  i = i + 1 }
+    parts.push(bt_sector(c2))           // 22
+    parts.push(bt_ised(6))
+    write_file(f, bt_iso_join(parts))
+    let e = ar::archive_list(f)
+    let j = bt_find(e, "BIG.TXT")
+    assert_true(j >= 0)
+    assert_eq(e[j].size, 2248)
+    let d = ar::archive_read(f, "BIG.TXT")
+    assert_eq(d.len(), 2248)
+    assert_eq(ord(d.at(0)), 65)
+    assert_eq(ord(d.at(2048)), 66)
+}
+
+// ---- speed on a big archive -----------------------------------------------
+// (a many-entry zip exercises the central-directory listing at reasonable scale)
+fn test_many_zip() {
+    let e = ar::archive_list(bt_p("many.zip"))
+    assert_eq(e.len(), 300)
+}

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Noted
+Exec=note-app
+NoDisplay=true
+TryExec=definitely-missing-bin-xyzq

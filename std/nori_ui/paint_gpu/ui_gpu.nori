@@ -1,0 +1,605 @@
+//! std/nori_ui/paint_gpu: a wgpu (GPU) renderer for std/nori_ui overlays.
+//!
+//!   import "std/nori_ui" as ui
+//!   var gc = ui::paint_gpu::gpu_new_window(disp, win, w, h, myFont)   // Xlib/Win32 wgpu surface
+//!   ui::paint_gpu::render_overlay(gc, overlay, ui::core::color_rgb(22, 26, 38))
+//!
+//! Consumes the same ComputedOverlay / PaintPrimitive data as std/nori_ui/paint_cpu, but draws on the GPU:
+//! rounded-rect fills + borders via an SDF fragment shader, and text as textured quads sampling an
+//! R8 glyph atlas (std/font). Three targets: `gpu_new_window` presents to an Xlib/Win32 wgpu surface,
+//! `gpu_new_window_wl` to a Wayland one, and `gpu_new_offscreen` renders to a texture read back with
+//! `gpu_readback` (headless/testable).
+//! The heavy lifting lives in ui_gpu_glue.c (wgpu-native v29); Nori just walks primitives.
+//!
+//! A program built with `noric --build --native` links `__native_ui_gpu.nori` in the glue's place: the
+//! same pipelines in Nori, calling wgpu-native through `CFn` pointers into `libwgpu_native.so`, which it
+//! opens when a canvas is made (found on `LD_LIBRARY_PATH`; no `--cfile`/`--clink`). Without the
+//! library `gpu_ok` is false, as on a machine with no GPU. Offscreen canvases render and read back
+//! exactly as in a default build; a windowed canvas reports no GPU, because std/window's native backends
+//! hold no Xlib or libwayland objects for wgpu to make a surface from.
+use core::*
+use layout::*
+import "std/font" as font
+
+extern fn malloc(Int) -> Int
+extern fn free(Int)
+extern fn ui_gpu_new_offscreen(Int, Int) -> Int
+extern fn ui_gpu_new_window(Int, Int, Int, Int) -> Int
+extern fn ui_gpu_new_window_wl(Int, Int, Int, Int) -> Int
+extern fn ui_gpu_ok(Int) -> Int
+extern fn ui_gpu_resize(Int, Int, Int)
+extern fn ui_gpu_begin(Int, Float, Float, Float)
+extern fn ui_gpu_rect(Int, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
+extern fn ui_gpu_glyph(Int, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
+extern fn ui_gpu_atlas(Int, Int, Int, Int, Int)
+extern fn ui_gpu_atlas_gen(Int) -> Int
+extern fn ui_gpu_atlas_color(Int, Int, Int, Int)
+extern fn ui_gpu_image(Int, Int, Int, Int, Float, Float, Float, Float, Float)
+extern fn ui_gpu_device(Int) -> Int
+extern fn ui_gpu_queue(Int) -> Int
+extern fn ui_gpu_target_format(Int) -> Int
+extern fn ui_gpu_adapter(Int) -> Int
+extern fn ui_gpu_instance(Int) -> Int
+extern fn ui_gpu_image_view(Int, Int, Float, Float, Float, Float, Float, Int, Int)
+extern fn ui_gpu_clip(Int, Float, Float, Float, Float)
+extern fn ui_gpu_clip_none(Int)
+extern fn ui_gpu_end(Int)
+extern fn ui_gpu_readback(Int, Int) -> Int
+extern fn ui_gpu_readback_pipelined(Int, Int) -> Int
+extern fn ui_gpu_free(Int)
+
+/// a GPU render context + the font/atlas used for text. `ctx` is the opaque wgpu backend handle.
+pub struct GpuCanvas { ctx: Int, w: Int, h: Int, f: view font::Font, atlas: font::Atlas, has_font: Bool }
+
+/// an offscreen GPU canvas: renders to a texture; read it back with `gpu_readback`. For headless
+/// tests and image snapshots (no window needed).
+pub fn gpu_new_offscreen(w: Int, h: Int, inout f: font::Font) -> GpuCanvas {
+    var ctx = 0
+    unsafe { ctx = ui_gpu_new_offscreen(w, h) }
+    return GpuCanvas { ctx: ctx, w: w, h: h, f: f, atlas: font::atlas_new(1024, 1024), has_font: true }
+}
+/// a windowed GPU canvas presenting to an X11 surface (disp = Display*, win = Window XID from
+/// std/window native_display/native_handle). Frames are shown by `gpu_end` / `render_overlay`.
+pub fn gpu_new_window(disp: Int, win: Int, w: Int, h: Int, inout f: font::Font) -> GpuCanvas {
+    var ctx = 0
+    unsafe { ctx = ui_gpu_new_window(disp, win, w, h) }
+    return GpuCanvas { ctx: ctx, w: w, h: h, f: f, atlas: font::atlas_new(1024, 1024), has_font: true }
+}
+/// a windowed GPU canvas presenting to a native Wayland surface (disp = wl_display*, surf = wl_surface*
+/// from std/window_wayland). Native Wayland resizes cleanly and scales correctly on HiDPI outputs.
+pub fn gpu_new_window_wl(disp: Int, surf: Int, w: Int, h: Int, inout f: font::Font) -> GpuCanvas {
+    var ctx = 0
+    unsafe { ctx = ui_gpu_new_window_wl(disp, surf, w, h) }
+    return GpuCanvas { ctx: ctx, w: w, h: h, f: f, atlas: font::atlas_new(1024, 1024), has_font: true }
+}
+/// did the GPU backend initialize (adapter + device + pipelines)? false means no GPU/driver.
+pub fn gpu_ok(c: GpuCanvas) -> Bool { var r = 0  unsafe { r = ui_gpu_ok(c.ctx) }  return r == 1 }
+/// release all GPU resources.
+pub fn gpu_free(c: GpuCanvas) { unsafe { ui_gpu_free(c.ctx) } }
+/// resize the render target / surface to (w,h). Track w,h yourself for readback sizing.
+pub fn gpu_resize(c: GpuCanvas, w: Int, h: Int) { unsafe { ui_gpu_resize(c.ctx, w, h) } }
+
+/// Install a font's per-character advances into nori_ui for text measurement, so layout matches the
+/// glyphs drawn.
+///
+/// Call once after loading the font and before laying out (doc_layout / layout_overlay). Measurement
+/// is layout's job, not the renderer's, but it needs a real font to answer, so each renderer that
+/// has one installs it.
+pub fn use_font_metrics(inout f: font::Font) {
+    var upem = font::font_units_per_em(f)
+    var adv: Vec<Int> = vec()
+    var ch = 0
+    while ch < 256 {
+        var gid = font::font_glyph_index(f, ch)
+        adv.push(to_int(font::font_h_advance(f, gid) / upem * 65536.0))
+        ch = ch + 1
+    }
+    set_char_advances(adv)
+    text_engine_set_font(f)
+}
+
+fn ffloor_i(x: Float) -> Int { var t = to_int(x)  if x < 0.0 && to_float(t) != x { return t - 1 }  return t }
+fn fceil_i(x: Float) -> Int { var t = to_int(x)  if x > 0.0 && to_float(t) != x { return t + 1 }  return t }
+fn split_lines(s: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var start = 0
+    var i = 0
+    var n = s.len()
+    while i < n {
+        if ord(s.at(i)) == 10 { out.push(s.slice(start, i))  start = i + 1 }
+        i = i + 1
+    }
+    out.push(s.slice(start, n))
+    return out
+}
+
+// push one rounded-rect (radius) or border (border_w>0) instance; color channels are 0..255.
+fn gfloor(x: Float) -> Float { var t = to_int(x)  if to_float(t) > x { t = t - 1 }  return to_float(t) }
+fn gceil(x: Float) -> Float { var t = to_int(x)  if to_float(t) < x { t = t + 1 }  return to_float(t) }
+fn emit_rect(c: GpuCanvas, r: Rect, col: Color, radius: Float, border: Float) {
+    emit_rect_g(c, r, col, radius, border, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0)
+}
+// one rect instance, each also carrying the gradient parameters (see ui_gpu_glue.c's rect_vs/rect_fs)
+// in the style emit_line_g carries them for glyphs: gon = 0 turns the ramp off and the
+// shader uses `col` alone, so a plain fill emits the same instance as before. No extra draw call.
+fn emit_rect_g(c: GpuCanvas, r: Rect, col: Color, radius: Float, border: Float, gtr: Float, gtg: Float, gtb: Float, gta: Float, gax: Float, gaxd: Float, ghoriz: Float, gon: Float) {
+    var x = r.min.x
+    var y = r.min.y
+    var w = r.max.x - r.min.x
+    var h = r.max.y - r.min.y
+    // flat rect (no rounding/border): snap to integer pixel bounds so the SDF edge lands on pixel
+    // boundaries -> a hard fill over floor(min)..ceil(max), pixel-identical to the CPU renderer.
+    if radius == 0.0 && border == 0.0 {
+        x = gfloor(r.min.x)  y = gfloor(r.min.y)
+        w = gceil(r.max.x) - x  h = gceil(r.max.y) - y
+    }
+    if w <= 0.0 || h <= 0.0 { return }
+    var dd = gaxd
+    if dd < 1.0 { dd = 1.0 }
+    unsafe {
+        ui_gpu_rect(c.ctx, x, y, w, h,
+            to_float(col.r) / 255.0, to_float(col.g) / 255.0, to_float(col.b) / 255.0, to_float(col.a) / 255.0,
+            radius, border,
+            gtr, gtg, gtb, gta, gax, dd, ghoriz, gon)
+    }
+}
+/// fill `r` with a two-colour linear ramp from `col` to `gto` over [gax, gax + gaxd), along x when
+/// `ghoriz`, else y. The GPU half of paint_cpu::fill_rect_grad_cl, with the same rule:
+/// the ramp is evaluated per fragment from the screen position, so the two painters agree.
+pub fn gpu_fill_grad(c: GpuCanvas, r: Rect, col: Color, radius: Float, gto: Color, gax: Float, gaxd: Float, ghoriz: Bool) {
+    var hf = 0.0
+    if ghoriz { hf = 1.0 }
+    emit_rect_g(c, r, col, radius, 0.0, to_float(gto.r) / 255.0, to_float(gto.g) / 255.0, to_float(gto.b) / 255.0, to_float(gto.a) / 255.0, gax, gaxd, hf, 1.0)
+}
+
+// emit one baseline of glyph quads at (bx, baseline), mirroring ui_cpu::draw_line but to the atlas.
+fn emit_line(inout c: GpuCanvas, bx: Float, baseline: Float, text: Str, size: Float, col: Color) {
+    emit_line_g(c, bx, baseline, text, size, col, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, font::BIDI_AUTO(), "", 0)
+}
+// one baseline of glyph quads, each instance also carrying the frame's gradient parameters
+// (see ui_gpu_glue.c's text_vs/text_fs). gon = 0 turns the gradient off and the shader uses `col`.
+// `dir`, `lang` and `stack` as in paint_cpu::draw_line_g: the line's direction, its language, and
+// the text engine's font stack (0 = this canvas's face; another = the engine pool's faces).
+fn emit_line_g(inout c: GpuCanvas, bx: Float, baseline: Float, text: Str, size: Float, col: Color, gtr: Float, gtg: Float, gtb: Float, gta: Float, gax: Float, gaxd: Float, ghoriz: Float, gon: Float, lsp: Float, wsp: Float, dir: Int, lang: Str, stack: Int) {
+    var cr = to_float(col.r) / 255.0
+    var cg = to_float(col.g) / 255.0
+    var cb = to_float(col.b) / 255.0
+    var ca = to_float(col.a) / 255.0
+    // With layout's text engine on, every stack (the default one too) is drawn from the engine's
+    // faces: they are what layout measured with, and the default stack is this canvas's face (which
+    // use_font_metrics installed) followed by its fallbacks, so an emoji or a script the face lacks
+    // is drawn from the face that has it. Without the engine, the canvas's one face.
+    let pooled = text_engine_on()
+    var line = font::ShapedLine { glyphs: vec(), width: 0.0 }
+    if pooled { line = text_engine_shape(text, size, stack, dir, lang) }
+    else { line = font::shape_line_font(c.f, text, size, dir, lang, "") }
+    let run = line.glyphs
+    let fg = (col.r << 24) | (col.g << 16) | (col.b << 8) | 255
+    // letter_spacing / word_spacing: the same table paint_cpu's draw_line_g uses
+    // (layout::text_spacing_offsets_cps) over the same codepoints. layout_run is shaped, so a
+    // glyph is not always one codepoint (a ligature, a mark, a conjunct): each glyph takes the
+    // offset of the character its cluster starts at (`char_index`), which for plain text is still
+    // glyph i <-> codepoint i, and the two backends agree pixel for pixel.
+    var xsp = text_spacing_offsets_cps(font::utf8_codepoints(text), lsp, wsp)
+    var i = 0
+    while i < run.len() {
+        var pg = run[i]
+        // a colour glyph (an emoji) is packed from its colour form (COLR's foreground layers in the
+        // text colour) and drawn from the atlas's RGBA plane: `gon` 2 tells the shader so
+        var e = font::AtlasEntry { ux: 0, uy: 0, w: 0, h: 0, left: 0, top: 0, advance: 0.0 }
+        if pooled {
+            if font::font_has_color(text_engine_face(pg.font)) { e = font::atlas_glyph_color(c.atlas, text_engine_face(pg.font), pg.gid, size, fg) }
+            else { e = font::atlas_glyph(c.atlas, text_engine_face(pg.font), pg.gid, size) }
+        } else {
+            if font::font_has_color(c.f) { e = font::atlas_glyph_color(c.atlas, c.f, pg.gid, size, fg) }
+            else { e = font::atlas_glyph(c.atlas, c.f, pg.gid, size) }
+        }
+        var g_on = gon
+        if e.color { g_on = 2.0 }
+        if e.w > 0 {
+            var sx = to_float(ffloor_i(bx + pg.x + pg.x_off + xsp[pg.char_index]) + e.left)
+            var sy = baseline - pg.y_off - to_float(e.top)
+            unsafe {
+                ui_gpu_glyph(c.ctx, sx, sy, to_float(e.w), to_float(e.h),
+                    to_float(e.ux), to_float(e.uy), to_float(e.w), to_float(e.h),
+                    cr, cg, cb, ca,
+                    gtr, gtg, gtb, gta, gax, gaxd, ghoriz, g_on)
+            }
+        }
+        i = i + 1
+    }
+}
+/// px from a text box's top edge down to its first baseline at `size`: the font's real vertical
+/// metrics (hhea, scaled to px by std/font's font_v_metrics_px), centred in the line box the layout
+/// reserved, by layout::text_baseline_in_box. It is not a `size * k` guess, and not the raw ascent
+/// either: see that function for why a taller face would otherwise move every glyph in the window.
+/// The GPU half of paint_cpu::cpu_text_baseline_offset, with the identical rule so the two
+/// backends put a kind-2 primitive's glyphs on the same rows. Fontless canvas: a 0.82 em
+/// ascent, put through the same centring, so a canvas with a font and one without still agree.
+pub fn gpu_text_baseline_offset(c: GpuCanvas, size: Float) -> Float {
+    if !c.has_font { return text_baseline_in_box(size, size * 0.82, size * (0.0 - 0.18), 0.0) }
+    let v = font::font_v_metrics_px(c.f, size)
+    return text_baseline_in_box(size, v.ascent, v.descent, v.line_gap)
+}
+fn emit_text(inout c: GpuCanvas, pos: Vec2, text: Str, size: Float, col: Color) {
+    let nox: Vec<Float> = vec()
+    emit_text_g(c, pos, text, size, col, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, "", nox, 1.0, "", 0)
+}
+// `line_dir` / `line_x` / `lang` / `stack`: the text primitive's (layout::PaintPrimitive), line_x
+// scaled by `xs`
+fn emit_text_g(inout c: GpuCanvas, pos: Vec2, text: Str, size: Float, col: Color, gtr: Float, gtg: Float, gtb: Float, gta: Float, gax: Float, gaxd: Float, ghoriz: Float, gon: Float, lsp: Float, wsp: Float, line_dir: Str, line_x: Vec<Float>, xs: Float, lang: Str, stack: Int) {
+    if !c.has_font { return }
+    var lines = split_lines(text)
+    // The box's rhythm, not the face's. A paragraph arrives as one primitive with newlines in it, and
+    // the box the layout measured for it is `lines * text_line_height(size)`. Stepping by the face's
+    // own recommended advance instead would put the last line of a tall face outside the box that was
+    // reserved for it, and make the same paragraph a different height in two fonts.
+    var line_h = text_line_height(size)
+    var li = 0
+    while li < lines.len() {
+        var baseline = to_float(ffloor_i(pos.y + to_float(li) * line_h))
+        var dir = font::BIDI_AUTO()
+        if li < line_dir.len() { if ord(line_dir.at(li)) == 82 { dir = font::BIDI_RTL() } else { dir = font::BIDI_LTR() } }
+        var x = pos.x
+        if li < line_x.len() { x = x + line_x[li] * xs }
+        emit_line_g(c, x, baseline, lines[li], size, col, gtr, gtg, gtb, gta, gax, gaxd, ghoriz, gon, lsp, wsp, dir, lang, stack)
+        li = li + 1
+    }
+}
+
+// the eight outline directions of the text outline dilation: the same
+// table paint_cpu uses, so both painters stamp the outline in the same eight places.
+fn gofx_dx(w: Float, k: Int) -> Float {
+    if k == 0 { return w }
+    if k == 1 { return 0.0 - w }
+    if k == 2 { return 0.0 }
+    if k == 3 { return 0.0 }
+    if k == 4 { return w * 0.70710677 }
+    if k == 5 { return 0.0 - w * 0.70710677 }
+    if k == 6 { return w * 0.70710677 }
+    return 0.0 - w * 0.70710677
+}
+fn gofx_dy(w: Float, k: Int) -> Float {
+    if k == 0 { return 0.0 }
+    if k == 1 { return 0.0 }
+    if k == 2 { return w }
+    if k == 3 { return 0.0 - w }
+    if k == 4 { return w * 0.70710677 }
+    if k == 5 { return w * 0.70710677 }
+    if k == 6 { return 0.0 - w * 0.70710677 }
+    return 0.0 - w * 0.70710677
+}
+
+/// draw text with the PaintPrimitive text effects. The GPU half of paint_cpu::draw_text_fx_cl, with
+/// the same construction: eight offset copies under the glyphs for the outline (not an
+/// atlas dilate, which the CPU painter cannot reproduce), and the gradient as per-instance data the
+/// fragment shader evaluates. Both stay inside the single glyph draw call.
+pub fn gpu_text_fx(inout c: GpuCanvas, pos: Vec2, text: Str, size: Float, col: Color, ocol: Color, ow: Float, gon: Bool, gto: Color, gax: Float, gaxd: Float, ghoriz: Bool) { gpu_text_fx_sp(c, pos, text, size, col, ocol, ow, gon, gto, gax, gaxd, ghoriz, 0.0, 0.0) }
+/// gpu_text_fx carrying the primitive's letter_spacing / word_spacing (px, already scaled). The
+/// GPU half of paint_cpu::draw_text_fx_sp_cl.
+pub fn gpu_text_fx_sp(inout c: GpuCanvas, pos: Vec2, text: Str, size: Float, col: Color, ocol: Color, ow: Float, gon: Bool, gto: Color, gax: Float, gaxd: Float, ghoriz: Bool, lsp: Float, wsp: Float) {
+    let nox: Vec<Float> = vec()
+    gpu_text_fx_lines(c, pos, text, size, col, ocol, ow, gon, gto, gax, gaxd, ghoriz, lsp, wsp, "", nox, 1.0, "", 0)
+}
+// gpu_text_fx_sp with the primitive's per-line directions and offsets, language and font stack
+fn gpu_text_fx_lines(inout c: GpuCanvas, pos: Vec2, text: Str, size: Float, col: Color, ocol: Color, ow: Float, gon: Bool, gto: Color, gax: Float, gaxd: Float, ghoriz: Bool, lsp: Float, wsp: Float, line_dir: Str, line_x: Vec<Float>, xs: Float, lang: Str, stack: Int) {
+    // `pos` is the kind-2 text box top-left (layout::pp_text's contract); drop by one real font
+    // ascent to reach the baseline emit_text_g wants, once, before the eight outline copies.
+    var top = vec2(pos.x, pos.y + gpu_text_baseline_offset(c, size))
+    if ow > 0.0 && ocol.a > 0 {
+        var k = 0
+        while k < 8 {
+            emit_text_g(c, vec2(top.x + gofx_dx(ow, k), top.y + gofx_dy(ow, k)), text, size, ocol, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, lsp, wsp, line_dir, line_x, xs, lang, stack)
+            k = k + 1
+        }
+    }
+    var gf = 0.0
+    if gon { gf = 1.0 }
+    var hf = 0.0
+    if ghoriz { hf = 1.0 }
+    var dd = gaxd
+    if dd < 1.0 { dd = 1.0 }
+    emit_text_g(c, top, text, size, col, to_float(gto.r) / 255.0, to_float(gto.g) / 255.0, to_float(gto.b) / 255.0, to_float(gto.a) / 255.0, gax, dd, hf, gf, lsp, wsp, line_dir, line_x, xs, lang, stack)
+}
+
+// pack the atlas coverage buffer (Vec<Int>, 0..255) into a byte buffer and upload it, but only when
+// new glyphs have been added since the last upload (tracked by glyph count in the C backend).
+fn upload_atlas(c: GpuCanvas) {
+    var gen = 0
+    unsafe { gen = ui_gpu_atlas_gen(c.ctx) }
+    if font::atlas_count(c.atlas) == gen { return }
+    var aw = c.atlas.w
+    var ah = c.atlas.h
+    var n = aw * ah
+    var buf = 0
+    unsafe { buf = malloc(n) }
+    var i = 0
+    while i < n {
+        unsafe { poke8(buf + i, c.atlas.pix[i]) }
+        i = i + 1
+    }
+    unsafe {
+        ui_gpu_atlas(c.ctx, buf, aw, ah, font::atlas_count(c.atlas))
+        free(buf)
+    }
+    // the colour plane (premultiplied RGBA packed 0xRRGGBBAA), only once a colour glyph is in it
+    if c.atlas.has_color && c.atlas.rgba.len() >= n {
+        var cbuf = 0
+        unsafe { cbuf = malloc(n * 4) }
+        i = 0
+        while i < n {
+            let p = c.atlas.rgba[i]
+            unsafe {
+                poke8(cbuf + i * 4, (p >> 24) & 255)
+                poke8(cbuf + i * 4 + 1, (p >> 16) & 255)
+                poke8(cbuf + i * 4 + 2, (p >> 8) & 255)
+                poke8(cbuf + i * 4 + 3, p & 255)
+            }
+            i = i + 1
+        }
+        unsafe {
+            ui_gpu_atlas_color(c.ctx, cbuf, aw, ah)
+            free(cbuf)
+        }
+    }
+}
+
+/// draw a ComputedOverlay's paint primitives on the GPU over a `bg`-cleared frame. On a windowed
+/// canvas this presents the frame; on an offscreen canvas, follow with `gpu_readback`.
+pub fn gpu_render_overlay(inout c: GpuCanvas, ov: ComputedOverlay, bg: Color) {
+    gpu_render_overlay_opts(c, ov, false, bg)
+}
+
+/// like render_overlay, with `shadows` = a soft-ish drop shadow behind rounded, opaque filled rects.
+pub fn gpu_render_overlay_opts(inout c: GpuCanvas, ov: ComputedOverlay, shadows: Bool, bg: Color) {
+    gpu_render_overlay_scaled(c, ov, shadows, bg, 1.0)
+}
+
+fn gscale_rect(r: Rect, s: Float) -> Rect {
+    return rect_min_max(vec2(r.min.x * s, r.min.y * s), vec2(r.max.x * s, r.max.y * s))
+}
+
+/// render an overlay laid out in logical coordinates at `s`x physical resolution (all geometry + font
+/// sizes multiplied by `s`; glyphs are rasterized at physical size for crispness). For HiDPI/fractional
+/// scaling: configure the surface at logical*scale, lay out in logical, and let the compositor viewport
+/// map the physical buffer back to logical size. `s = 1.0` is the ordinary path.
+pub fn gpu_render_overlay_scaled(inout c: GpuCanvas, ov: ComputedOverlay, shadows: Bool, bg: Color, s: Float) {
+    gpu_begin(c, bg)
+    gpu_render_overlay_into(c, ov, shadows, s)
+    gpu_end(c)
+}
+
+// ---- composable frame API (begin -> draw many -> end) so a host can mix dock/overlay/windows/content ----
+/// clip every following primitive to `r` (physical/canvas coords) until `gpu_clear_clip`. The box is
+/// snapped outward to whole pixels, floor(min) and ceil(max), which is ui_cpu's `clip_of_rect`,
+/// so the two painters keep or drop the same pixels. It is frame state: `gpu_begin` resets it.
+pub fn gpu_set_clip(c: GpuCanvas, r: Rect) {
+    unsafe { ui_gpu_clip(c.ctx, to_float(ffloor_i(r.min.x)), to_float(ffloor_i(r.min.y)), to_float(fceil_i(r.max.x)), to_float(fceil_i(r.max.y))) }
+}
+/// stop clipping: following primitives are drawn unclipped.
+pub fn gpu_clear_clip(c: GpuCanvas) { unsafe { ui_gpu_clip_none(c.ctx) } }
+
+/// begin a GPU frame cleared to `bg`. Follow with gpu_render_dock/gpu_render_windows/gpu_render_overlay_into/
+/// gpu_fill/gpu_text, then `gpu_end` to draw + present.
+pub fn gpu_begin(c: GpuCanvas, bg: Color) {
+    unsafe { ui_gpu_begin(c.ctx, to_float(bg.r) / 255.0, to_float(bg.g) / 255.0, to_float(bg.b) / 255.0) }
+}
+/// finish the frame: upload the glyph atlas, draw, and present.
+pub fn gpu_end(c: GpuCanvas) {
+    upload_atlas(c)
+    unsafe { ui_gpu_end(c.ctx) }
+}
+// PaintPrimitive kind 3 = image: `text` carries the path ui_layout_media already
+// resolved, `rect` is the panel to fit inside. Same decode cache and same letterbox-contain rule as
+// the CPU painter; both live in layout/dsl_media.nori so the two backends cannot drift apart.
+// A blitter could keep a GPU texture per image; here the cache holds the
+// decoded RGBA bytes and ui_gpu_image uploads per draw, because the C glue exposes no texture
+// handle to hold on to. The decode, the expensive half, is still done once.
+// An image that does not decode draws nothing, silently.
+fn gpu_image_prim(inout c: GpuCanvas, r: Rect, path: Str, alpha: Int) {
+    if alpha <= 0 { return }
+    let im = ui_media_image_load(path)
+    if !im.ok { return }
+    let fit = ui_media_letterbox(r, im.w, im.h)
+    if fit.max.x - fit.min.x < 1.0 || fit.max.y - fit.min.y < 1.0 { return }
+    // the primitive's colour alpha is the image's overall alpha: an image faded by a subtree's
+    // opacity (layout/fx.nori). 255, the value of every unfaded image, is 1.0.
+    let w = fit.max.x - fit.min.x
+    let h = fit.max.y - fit.min.y
+    if im.px == 0 { return }
+    unsafe { ui_gpu_image(c.ctx, im.px, im.w, im.h, fit.min.x, fit.min.y, w, h, to_float(alpha) / 255.0) }
+}
+
+/// draw an overlay's primitives into an already-begun frame (no begin/present), geometry scaled by `s`.
+pub fn gpu_render_overlay_into(inout c: GpuCanvas, ov: ComputedOverlay, shadows: Bool, s: Float) {
+    var i = 0
+    while i < ov.prims.len() {
+        var prim = ov.prims[i]
+        // scroll viewports set has_clip/clip on every primitive they merged (layout's
+        // merge_clipped_overlay). Honour it as ui_cpu::render_overlay_scaled does: the clip
+        // rect is in the same logical space as prim.rect, so it takes the same `s` scaling.
+        if prim.has_clip { gpu_set_clip(c, gscale_rect(prim.clip, s)) } else { gpu_clear_clip(c) }
+        var r = gscale_rect(prim.rect, s)
+        if prim.kind == 0 {
+            if shadows && prim.radius > 0.5 && prim.color.a >= 250 { emit_rect(c, gscale_rect(shadow_rect(prim.rect), s), color_rgba(0, 0, 0, 70), (prim.radius + 3.0) * s, 0.0) }
+            if prim.has_grad { gpu_fill_grad(c, r, prim.color, prim.radius * s, prim.grad_to, prim.grad_a * s, prim.grad_b * s, prim.grad_horizontal) }
+            else { emit_rect(c, r, prim.color, prim.radius * s, 0.0) }
+        } else if prim.kind == 1 {
+            // And its radius. The shader draws a rounded border (`rect_fs` derives the
+            // band from the same signed distance the fill uses), so pass the radius or every
+            // outline would come out square whatever box it was tracing.
+            emit_rect(c, r, prim.color, prim.radius * s, prim.border_w * s)
+        }
+        else if prim.kind == 2 { gpu_text_fx_lines(c, vec2(prim.pos.x * s, prim.pos.y * s), prim.text, prim.size_px * s, prim.color, prim.outline_color, prim.outline_w * s, prim.has_grad, prim.grad_to, prim.grad_a * s, prim.grad_b * s, prim.grad_horizontal, prim.letter_spacing * s, prim.word_spacing * s, prim.line_dir, prim.line_x, s, prim.lang, prim.font) }
+        else if prim.kind == 3 { gpu_image_prim(c, r, prim.text, prim.color.a) }
+        else if prim.kind == 4 { gpu_box_shadow(c, r, prim.radius * s, prim.outline_w * s, prim.letter_spacing * s, prim.word_spacing * s, prim.color) }
+        i = i + 1
+    }
+    gpu_clear_clip(c)   // don't leak the last primitive's clip onto host content drawn after us
+}
+fn gpu_label(inout c: GpuCanvas, lb: TextLabel, s: Float) {
+    var col = color_rgb(228, 231, 240)
+    if lb.color.present { col = lb.color.color }
+    var sz = 14.0
+    if lb.has_font_size { sz = lb.font_size }
+    // TextLabel.top is a text box top, the same quantity as a kind-2 pos, so it takes the same
+    // top -> baseline conversion, using the font's real ascent.
+    emit_text(c, vec2(lb.left * s, (lb.top + gpu_text_baseline_offset(c, sz)) * s), lb.text, sz * s, col)
+}
+/// draw a dock's chrome (from layout_dock_ui) into an already-begun frame, scaled by `s`.
+pub fn gpu_render_dock(inout c: GpuCanvas, res: DockLayoutResult, s: Float) {
+    var i = 0
+    while i < res.rects.len() { emit_rect(c, gscale_rect(res.rects[i].rect, s), res.rects[i].color, 0.0, 0.0)  i = i + 1 }
+    var j = 0
+    while j < res.labels.len() { gpu_label(c, res.labels[j], s)  j = j + 1 }
+}
+/// draw floating-window chrome (from layout_windows) into an already-begun frame, scaled by `s`.
+pub fn gpu_render_windows(inout c: GpuCanvas, wr: WindowLayoutResult, s: Float) {
+    var i = 0
+    while i < wr.rects.len() { emit_rect(c, gscale_rect(wr.rects[i].rect, s), wr.rects[i].color, 0.0, 0.0)  i = i + 1 }
+    var j = 0
+    while j < wr.labels.len() { gpu_label(c, wr.labels[j], s)  j = j + 1 }
+}
+/// fill a rect (in physical/canvas coords) for host content, between begin/end.
+pub fn gpu_fill(c: GpuCanvas, r: Rect, col: Color) { emit_rect(c, r, col, 0.0, 0.0) }
+/// fill with rounded corners: the same instance, with a radius the shader turns into an SDF edge.
+pub fn gpu_fill_round(c: GpuCanvas, r: Rect, col: Color, radius: Float) { emit_rect(c, r, col, radius, 0.0) }
+/// draw text (physical coords, pos.y = baseline) for host content, between begin/end.
+pub fn gpu_text(inout c: GpuCanvas, pos: Vec2, str: Str, size: Float, col: Color) { emit_text(c, pos, str, size, col) }
+/// blit a straight RGBA8 image (`src` = iw*ih*4 bytes, byte0=R..byte3=A) into `r` (physical coords),
+/// scaled to fit, alpha-blended. Mirrors paint_cpu::blit_rgba. See std/image + nori_ui_render.
+pub fn gpu_blit_rgba(c: GpuCanvas, r: Rect, src: Int, iw: Int, ih: Int) {
+    let w = r.max.x - r.min.x
+    let h = r.max.y - r.min.y
+    if w <= 0.0 || h <= 0.0 || src == 0 { return }
+    unsafe { ui_gpu_image(c.ctx, src, iw, ih, r.min.x, r.min.y, w, h, 1.0) }
+}
+// ---- the host fills a `surface` hole with somebody else's GPU render ----------------
+//
+// `layout/surface.nori` hands a host a `Vec<SurfaceBlit>` of `{ id, rect, texture }`, where `rect`
+// is already in screen space and already clipped by any enclosing scroll viewport, and where a
+// texture-bound hole emitted no PaintPrimitive at all, so nothing under the blit was drawn and
+// nothing double-draws. `texture` is an opaque Int the host bound itself. For this backend it is a
+// **WGPUTextureView**, not a texture.
+//
+// The renderer that produced it owns it, records its own encoder and submits it before this call,
+// so ui_gpu still has exactly one encoder, one pass and one submit per frame. See ui_gpu_glue.c's
+// ui_gpu_image_view.
+
+/// the WGPUDevice this canvas owns, as an Int handle. Borrowed: do not release it, and do not use
+/// it after `gpu_free`. 0 when the backend did not come up. Pass it, with `gpu_queue`, to a second
+/// renderer that must draw into textures this canvas can sample.
+pub fn gpu_device(c: GpuCanvas) -> Int { var h = 0  unsafe { h = ui_gpu_device(c.ctx) }  return h }
+/// the WGPUQueue, on the same terms.
+pub fn gpu_queue(c: GpuCanvas) -> Int { var h = 0  unsafe { h = ui_gpu_queue(c.ctx) }  return h }
+/// the colour format this canvas renders into, as a WGPUTextureFormat enum value.
+pub fn gpu_target_format(c: GpuCanvas) -> Int { var v = 0  unsafe { v = ui_gpu_target_format(c.ctx) }  return v }
+/// the WGPUAdapter, borrowed, for capability queries without standing up a second instance.
+pub fn gpu_adapter(c: GpuCanvas) -> Int { var h = 0  unsafe { h = ui_gpu_adapter(c.ctx) }  return h }
+/// the WGPUInstance, borrowed.
+pub fn gpu_instance(c: GpuCanvas) -> Int { var h = 0  unsafe { h = ui_gpu_instance(c.ctx) }  return h }
+
+/// draw an already-resident texture view into `r` (physical coords), alpha-modulated by `alpha`.
+/// `tview` is a WGPUTextureView handle that must be TextureBinding-usable, sampled-float, 2D, and
+/// alive until the frame is presented; it is never released here. `linear` filters (a scene blit),
+/// `flip_v` samples with v inverted. The texture's own alpha is ignored: the blit is opaque.
+pub fn gpu_blit_view(c: GpuCanvas, r: Rect, tview: Int, alpha: Float, linear: Bool, flip_v: Bool) {
+    // Snapped to whole pixels, unlike gpu_blit_rgba. A scene rendered at the hole's integer size is
+    // meant to land one texel per pixel; a quad on a fractional boundary covers a row or column the
+    // layout rect does not contain (its pixel centres still fall inside the float rect) and the
+    // sampler then filters every texel. Round to nearest, so the snapped rect never grows by more
+    // than half a pixel on a side and a clipped surface stays inside its clip.
+    let x0 = to_float(ffloor_i(r.min.x + 0.5))
+    let y0 = to_float(ffloor_i(r.min.y + 0.5))
+    let w = to_float(ffloor_i(r.max.x + 0.5)) - x0
+    let h = to_float(ffloor_i(r.max.y + 0.5)) - y0
+    if w <= 0.0 || h <= 0.0 || tview == 0 { return }
+    var li = 0
+    if linear { li = 1 }
+    var fv = 0
+    if flip_v { fv = 1 }
+    unsafe { ui_gpu_image_view(c.ctx, tview, x0, y0, w, h, alpha, li, fv) }
+}
+
+/// draw every `SurfaceBlit` a document's holes produced, each into its own already-clipped rect,
+/// with `texture` read as a WGPUTextureView handle. `s` scales the rects the way every other draw
+/// call in this file scales them (HiDPI); pass 1.0 for the ordinary path.
+///
+/// Call this after `gpu_render_overlay_into` for the same overlay: the panel's own background is a
+/// prim and must be under the scene, and the hole itself emitted no prim to cover.
+pub fn gpu_blit_surfaces(c: GpuCanvas, blits: Vec<SurfaceBlit>, s: Float, flip_v: Bool) {
+    var i = 0
+    while i < blits.len() {
+        gpu_blit_view(c, gscale_rect(blits[i].rect, s), blits[i].texture, 1.0, true, flip_v)
+        i = i + 1
+    }
+}
+
+/// a null GpuCanvas (ctx = 0), a placeholder when the GPU backend is not the active one.
+pub fn gpu_null(inout f: font::Font) -> GpuCanvas { return GpuCanvas { ctx: 0, w: 0, h: 0, f: f, atlas: font::atlas_new(1, 1), has_font: false } }
+
+// a box shadow (kind 4) as rounded rects stacked from `blur` inside the moved box to `blur` outside it, each
+// a share of the colour: the CPU painter's falloff in steps (and, unlike it, under the element too, whose
+// own fill covers that)
+fn gpu_box_shadow(c: GpuCanvas, r: Rect, radius: Float, blur: Float, dx: Float, dy: Float, col: Color) {
+    let n = 6
+    var k = 0
+    while k < n {
+        let g = blur * (1.0 - 2.0 * (to_float(k) + 0.5) / to_float(n))
+        let sr = rect_min_max(vec2(r.min.x + dx - g, r.min.y + dy - g), vec2(r.max.x + dx + g, r.max.y + dy + g))
+        var rad = radius + g
+        if rad < 0.0 { rad = 0.0 }
+        if sr.max.x > sr.min.x && sr.max.y > sr.min.y { emit_rect(c, sr, color_rgba(col.r, col.g, col.b, col.a / n), rad, 0.0) }
+        k = k + 1
+    }
+}
+
+// a shadow rect: the source rect nudged down 3px and expanded 2px on each side.
+fn shadow_rect(r: Rect) -> Rect {
+    return rect_min_max(
+        vec2(r.min.x - 2.0, r.min.y + 1.0),
+        vec2(r.max.x + 2.0, r.max.y + 5.0))
+}
+
+/// present the current frame (windowed canvas). render_overlay already presents; use this only for
+/// custom draw sequences via ui_gpu_begin/rect/glyph.
+pub fn gpu_present(c: GpuCanvas) { unsafe { ui_gpu_end(c.ctx) } }
+
+/// read the offscreen frame into a freshly malloc'd `w*h` 0x00RRGGBB buffer (caller frees). Returns
+/// 0 on failure (e.g. a windowed canvas). Matches std/nori_ui/paint_cpu's canvas pixel layout.
+pub fn gpu_readback(c: GpuCanvas) -> Int {
+    var buf = 0
+    unsafe { buf = malloc(c.w * c.h * 4) }
+    var ok = 0
+    unsafe { ok = ui_gpu_readback(c.ctx, buf) }
+    if ok != 1 { unsafe { free(buf) }  return 0 }
+    return buf
+}
+
+/// read the offscreen frame without waiting for the GPU, for a frame path rather than a test.
+///
+/// Hands back the previous frame's pixels and starts this frame's copy, so the CPU never blocks on
+/// a copy it just submitted. `gpu_readback` does block, which is right for a screenshot and costs
+/// milliseconds a frame for anything continuous.
+///
+/// Two differences from `gpu_readback`:
+///   * it writes into a buffer the caller owns and keeps, because allocating and freeing `w*h*4`
+///     every frame is the other half of the cost this exists to remove. Size it `w*h*4` bytes.
+///   * the pixels are raw RGBA8 rows, not `0x00RRGGBB` words: the repack is a per-pixel loop, and
+///     an encoder or a texture upload wants the bytes as they are.
+///
+/// False when there is nothing to hand back yet, which is the first call: skip that frame.
+pub fn gpu_readback_pipelined(c: GpuCanvas, buf: Int) -> Bool {
+    if buf == 0 { return false }
+    var ok = 0
+    unsafe { ok = ui_gpu_readback_pipelined(c.ctx, buf) }
+    return ok == 1
+}
+
+/// the 0x00RRGGBB pixel at (x,y) in a readback buffer of width `w` (0 if out of bounds).
+pub fn readback_pixel(buf: Int, w: Int, h: Int, x: Int, y: Int) -> Int {
+    if x < 0 || y < 0 || x >= w || y >= h { return 0 }
+    var px = 0
+    unsafe { px = peek32(buf + (y * w + x) * 4) }
+    return px
+}

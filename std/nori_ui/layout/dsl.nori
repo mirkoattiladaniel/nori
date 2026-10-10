@@ -1,0 +1,841 @@
+use core::*
+import "std/math" as math
+import "std/result" as result
+import "std/parse" as parse           // the cursor + char classes come from the shared scanner
+
+// ===========================================================================
+// the full `.ui` / `.style` DSL parser (core subset).
+//
+// Strict, error-reporting successor to the minimal parse_ui: line/col-tracked
+// diagnostics ("L:C: message"), `//` line comments,
+// `/* ... */` block comments, `#` line comments (a `#` followed by a hex digit
+// is a color literal), invisible-junk skipping (BOM/NBSP/ZWSP, which
+// editors insert in real assets), quoted strings with escapes,
+// negative/decimal/exponent numbers, `[r,g,b,a]` and `#RGB/#RRGGBB/#RRGGBBAA`
+// colors (quoted or bare), a `stylesheet { tag NAME {...} class NAME {...} }`
+// block (a duplicate rule name replaces the earlier rule, like HashMap
+// insert), the `document { style: .. tree kind { .. } }` wrapper and
+// top-level `style:` / `tree` forms, and `span { ... }` rich-text children.
+// The node families are parsed in the sibling dsl_*_nodes / dsl_widgets /
+// dsl_input / dsl_media files; imports and components are in components.nori.
+// ===========================================================================
+
+/// parser state: a std/parse Scanner cursor + a sticky error (Nori has no exceptions). Line/column for
+/// error messages are computed on demand from the scanner offset (parse::line_col).
+///
+/// `file` names the source in errors and is what its imports are relative to ("" for a string with
+/// no file: then it cannot import). `cx` is what a parse carries from file to file: the components
+/// it knows, the files it has read; it is moved into the parser of an imported file or a
+/// component's body and back, never copied. `params`/`args`: inside a component body, its
+/// parameters and the values this use of it gave them; `slot`: the children the use gave it.
+pub struct DslP { src: view Str, s: parse::Scanner, failed: Vec<Int>, err: Vec<Str>, eline: Vec<Int>, ecol: Vec<Int>, emsg: Vec<Str>,
+                  efile: Vec<Str>, file: Str, cx: DslCtx, params: Vec<Str>, args: Vec<DslValue>, slot: Vec<UiNode>, in_comp: Bool, depth: Int, slot_used: Bool }
+fn dsl_new(src: Str) -> DslP {
+    var f: Vec<Int> = vec()
+    f.push(0)
+    var e: Vec<Str> = vec()
+    e.push("")
+    var el: Vec<Int> = vec()
+    el.push(0)
+    var ec: Vec<Int> = vec()
+    ec.push(0)
+    var em: Vec<Str> = vec()
+    em.push("")
+    var ef: Vec<Str> = vec()
+    ef.push("")
+    return DslP { src: src, s: parse::scanner(src), failed: f, err: e, eline: el, ecol: ec, emsg: em,
+                  efile: ef, file: "", cx: dsl_ctx_new(), params: vec(), args: vec(), slot: vec(), in_comp: false, depth: 0, slot_used: false }
+}
+fn dsl_fail(inout p: DslP, msg: Str) {
+    if p.failed[0] == 1 { return }
+    p.failed[0] = 1
+    let lc = parse::line_col(p.src, p.s.at())
+    // "{line}:{column}: {message}"
+    p.err[0] = (to_str(lc.line) + (":" + (to_str(lc.col) + (": " + msg))))
+    if p.file.len() > 0 { p.err[0] = p.file + (":" + p.err[0]) }
+    p.eline[0] = lc.line
+    p.ecol[0] = lc.col
+    p.emsg[0] = copy msg
+    p.efile[0] = copy p.file
+}
+/// take over the error another parser (an imported file's, a component body's) stopped on: its
+/// file, line and column, not this one's.
+fn dsl_fail_from(inout p: DslP, sub: DslP) {
+    if p.failed[0] == 1 { return }
+    p.failed[0] = 1
+    p.err[0] = copy sub.err[0]
+    p.eline[0] = sub.eline[0]
+    p.ecol[0] = sub.ecol[0]
+    p.emsg[0] = copy sub.emsg[0]
+    p.efile[0] = copy sub.efile[0]
+}
+fn dsl_peek(p: DslP) -> Int { return p.s.peek() }
+fn dsl_peek_at(p: DslP, k: Int) -> Int { return p.s.peek_at(k) }
+fn dsl_peek2(p: DslP) -> Int { return p.s.peek_at(1) }
+fn dsl_bump(inout p: DslP) { let _unused = p.s.advance() }
+fn dsl_is_hexdig(c: Int) -> Bool { return parse::is_hex(c) }
+fn dsl_is_digit(c: Int) -> Bool { return parse::is_digit(c) }
+fn dsl_is_alpha(c: Int) -> Bool { return parse::is_alpha(c) }
+/// an identifier starts with alpha or `_` (no leading digits).
+fn dsl_is_ident_start(c: Int) -> Bool { return parse::is_ident_start(c) }
+/// an identifier continues with alnum, `_`, or `/` (slash idents: `on_click: p/go`).
+fn dsl_is_ident_cont(c: Int) -> Bool { return parse::is_ident_cont(c) || c == 47 }
+/// whitespace + comments + invisible junk. Comments: `//` line, `/* */` block, and `#` line
+/// (only when not followed by a hex digit; `#fff` is a color literal).
+/// Junk: UTF-8 BOM, NBSP, and zero-width/bidi marks (editors insert these in real assets).
+/// Commas are not skipped: they are array-only separators.
+fn dsl_skip(inout p: DslP) {
+    while true {
+        var c = dsl_peek(p)
+        if c == 32 || c == 9 || c == 10 || c == 13 { dsl_bump(p) }
+        else if c == 239 && dsl_peek_at(p, 1) == 187 && dsl_peek_at(p, 2) == 191 { dsl_bump(p)  dsl_bump(p)  dsl_bump(p) }   // BOM
+        else if c == 194 && dsl_peek_at(p, 1) == 160 { dsl_bump(p)  dsl_bump(p) }                                            // NBSP
+        else if c == 226 && dsl_peek_at(p, 1) == 128 && dsl_peek_at(p, 2) >= 139 && dsl_peek_at(p, 2) <= 143 { dsl_bump(p)  dsl_bump(p)  dsl_bump(p) }   // ZWSP..RLM
+        else if c == 35 && !dsl_is_hexdig(dsl_peek2(p)) { while dsl_peek(p) != 10 && dsl_peek(p) >= 0 { dsl_bump(p) } }
+        else if c == 47 && dsl_peek2(p) == 47 { while dsl_peek(p) != 10 && dsl_peek(p) >= 0 { dsl_bump(p) } }
+        else if c == 47 && dsl_peek2(p) == 42 {
+            dsl_bump(p)
+            dsl_bump(p)
+            var open = true
+            while open {
+                if dsl_peek(p) < 0 { open = false }                            // unclosed: EOF ends it, no error
+                else if dsl_peek(p) == 42 && dsl_peek2(p) == 47 { dsl_bump(p)  dsl_bump(p)  open = false }
+                else { dsl_bump(p) }
+            }
+        }
+        else { return }
+    }
+}
+fn dsl_expect(inout p: DslP, c: Int, what: Str) {
+    dsl_skip(p)
+    if dsl_peek(p) == c { dsl_bump(p)  return }
+    dsl_fail(p, ("expected " + what))
+}
+/// read an identifier if one starts at the cursor; "" (no error) otherwise.
+fn dsl_probe_ident(inout p: DslP) -> Str {
+    dsl_skip(p)
+    if !dsl_is_ident_start(dsl_peek(p)) { return "" }
+    var start = p.s.at()
+    while dsl_is_ident_cont(dsl_peek(p)) { dsl_bump(p) }
+    return p.src.slice(start, p.s.at())
+}
+fn dsl_ident(inout p: DslP) -> Str {
+    var out = dsl_probe_ident(p)
+    if out.len() == 0 { dsl_fail(p, "expected identifier") }
+    return out
+}
+/// quoted string with escapes: \\ \" \n \r \t (others keep the char).
+fn dsl_string(inout p: DslP) -> Str {
+    dsl_expect(p, 34, "a string")
+    var out = ""
+    while true {
+        var c = dsl_peek(p)
+        if c < 0 { dsl_fail(p, "unterminated string")  return out }
+        if c == 34 { dsl_bump(p)  return out }
+        if c == 92 {
+            dsl_bump(p)
+            var e = dsl_peek(p)
+            if e < 0 { dsl_fail(p, "unterminated string")  return out }
+            if e == 110 { out = (out + chr(10)) }
+            else if e == 114 { out = (out + chr(13)) }
+            else if e == 116 { out = (out + chr(9)) }
+            else { out = (out + chr(e)) }
+            dsl_bump(p)
+        } else { out = (out + p.src.slice(p.s.at(), p.s.at() + 1))  dsl_bump(p) }
+    }
+    return out
+}
+/// a number: sign, digits, optional fraction, optional exponent (with backtrack when `e`
+/// is not followed by digits).
+fn dsl_number(inout p: DslP) -> Float {
+    dsl_skip(p)
+    var neg = false
+    if dsl_peek(p) == 45 { dsl_bump(p)  neg = true }
+    var v = 0.0
+    var digits = 0
+    while dsl_is_digit(dsl_peek(p)) { v = v * 10.0 + to_float(dsl_peek(p) - 48)  dsl_bump(p)  digits = digits + 1 }
+    if dsl_peek(p) == 46 {
+        dsl_bump(p)
+        var fs = 0.1
+        while dsl_is_digit(dsl_peek(p)) { v = v + to_float(dsl_peek(p) - 48) * fs  fs = fs * 0.1  dsl_bump(p)  digits = digits + 1 }
+    }
+    if digits == 0 { dsl_fail(p, "expected a number")  return 0.0 }
+    if dsl_peek(p) == 101 || dsl_peek(p) == 69 {
+        var si = p.s.at()
+        dsl_bump(p)
+        var eneg = false
+        if dsl_peek(p) == 45 { eneg = true  dsl_bump(p) }
+        else if dsl_peek(p) == 43 { dsl_bump(p) }
+        var ed = 0
+        var ev = 0
+        while dsl_is_digit(dsl_peek(p)) { ev = ev * 10 + (dsl_peek(p) - 48)  dsl_bump(p)  ed = ed + 1 }
+        if ed == 0 { p.s.seek(si) }                                            // not an exponent: backtrack
+        else {
+            var k = 0
+            while k < ev { if eneg { v = v / 10.0 } else { v = v * 10.0 }  k = k + 1 }
+        }
+    }
+    if neg { return 0.0 - v }
+    return v
+}
+
+// ---- values (DslValue: 0 str / 1 num / 2 bool / 3 ident / 4 array / 5 `--variable`; a `$param` is replaced by its value) ----
+pub struct DslValue { kind: Int, s: Str, f: Float, b: Bool, arr: Vec<DslValue> }
+fn dval(kind: Int) -> DslValue {
+    var a: Vec<DslValue> = vec()
+    return DslValue { kind: kind, s: "", f: 0.0, b: false, arr: a }
+}
+fn dsl_hash_literal(inout p: DslP) -> Str {
+    var out = "#"
+    dsl_bump(p)                                       // '#'
+    while dsl_is_hexdig(dsl_peek(p)) { out = (out + p.src.slice(p.s.at(), p.s.at() + 1))  dsl_bump(p) }
+    return out
+}
+fn dsl_value(inout p: DslP) -> DslValue {
+    dsl_skip(p)
+    var c = dsl_peek(p)
+    if c == 34 { var v = dval(0)  v.s = dsl_string(p)  return v }
+    if c == 91 {                                      // [ array ] : elements require `,` separators
+        dsl_bump(p)
+        var v = dval(4)
+        dsl_skip(p)
+        if dsl_peek(p) == 93 { dsl_bump(p)  return v }
+        while true {
+            v.arr.push(dsl_value(p))
+            if p.failed[0] == 1 { return v }
+            dsl_skip(p)
+            if dsl_peek(p) == 44 { dsl_bump(p) }
+            else if dsl_peek(p) == 93 { dsl_bump(p)  return v }
+            else if dsl_peek(p) < 0 { dsl_fail(p, "unterminated array")  return v }
+            else { dsl_fail(p, "expected `,` or `]` in array")  return v }
+        }
+        return v
+    }
+    if c == 35 { var v = dval(3)  v.s = dsl_hash_literal(p)  return v }
+    if c == 36 {
+        // `$name`: a component's parameter (layout/components.nori)
+        dsl_bump(p)
+        let st = p.s.at()
+        while parse::is_ident_cont(dsl_peek(p)) { dsl_bump(p) }
+        let pn = p.src.slice(st, p.s.at())
+        var pi = 0
+        while pi < p.params.len() { if p.params[pi] == pn { return dval_dup(p.args[pi]) }  pi = pi + 1 }
+        if p.in_comp { dsl_fail(p, ("unknown parameter `$" + (pn + "`"))) }
+        else { dsl_fail(p, ("`$" + (pn + "` is a component parameter; there is none outside a component body"))) }
+        return dval(0)
+    }
+    if c == 45 && dsl_peek2(p) == 45 {
+        // `--name`: a style variable (layout/sheet.nori). Only a stylesheet resolves one; anywhere
+        // else it is a value of the wrong kind, and the attribute's own check says so.
+        dsl_bump(p)
+        dsl_bump(p)
+        var v = dval(5)
+        let st = p.s.at()
+        while dsl_is_var_char(dsl_peek(p)) { dsl_bump(p) }
+        v.s = p.src.slice(st, p.s.at())
+        if v.s.len() == 0 { dsl_fail(p, "expected a variable name after `--`") }
+        return v
+    }
+    if c == 45 || dsl_is_digit(c) { var v = dval(1)  v.f = dsl_number(p)  return v }
+    var id = dsl_ident(p)
+    if (id == "true") { var v = dval(2)  v.b = true  return v }
+    if (id == "false") { var v = dval(2)  v.b = false  return v }
+    var v = dval(3)
+    v.s = id
+    return v
+}
+/// a variable name continues with alnum, `_` or `-` (`--accent-hover`).
+fn dsl_is_var_char(c: Int) -> Bool { return parse::is_ident_cont(c) || c == 45 }
+fn hexpair(hs: Str, i: Int, wide: Bool) -> Int {
+    var h1 = ord(hs.at(i))
+    var d1 = 0
+    if h1 >= 48 && h1 <= 57 { d1 = h1 - 48 } else if h1 >= 97 { d1 = h1 - 87 } else { d1 = h1 - 55 }
+    if !wide { return d1 * 16 + d1 }                  // #RGB shorthand: F -> FF
+    var h2 = ord(hs.at(i + 1))
+    var d2 = 0
+    if h2 >= 48 && h2 <= 57 { d2 = h2 - 48 } else if h2 >= 97 { d2 = h2 - 87 } else { d2 = h2 - 55 }
+    return d1 * 16 + d2
+}
+/// a color from `[r,g,b,a]` or a `#RGB` / `#RRGGBB` / `#RRGGBBAA` literal, bare or quoted
+/// (a String or Ident starting with '#' is accepted).
+fn dsl_color(inout p: DslP, v: DslValue) -> Color {
+    if (v.kind == 3 || v.kind == 0) && v.s.len() > 0 && ord(v.s.at(0)) == 35 {
+        var hex = v.s.slice(1, v.s.len())
+        var n = hex.len()
+        if n == 3 { return color_rgba(hexpair(hex, 0, false), hexpair(hex, 1, false), hexpair(hex, 2, false), 255) }
+        if n == 6 { return color_rgba(hexpair(hex, 0, true), hexpair(hex, 2, true), hexpair(hex, 4, true), 255) }
+        if n == 8 { return color_rgba(hexpair(hex, 0, true), hexpair(hex, 2, true), hexpair(hex, 4, true), hexpair(hex, 6, true)) }
+        dsl_fail(p, "hex color must be #RGB, #RRGGBB, or #RRGGBBAA")
+        return color_transparent()
+    }
+    if v.kind == 4 {
+        if v.arr.len() != 4 { dsl_fail(p, "color array must have 4 elements")  return color_transparent() }
+        var ch: Vec<Int> = vec()
+        var i = 0
+        while i < 4 {
+            var e = v.arr[i]
+            if e.kind != 1 { dsl_fail(p, "color channels must be numbers")  return color_transparent() }
+            var nv = to_int(e.f)
+            if nv < 0 || nv > 255 { dsl_fail(p, "color channel must be 0..=255")  return color_transparent() }
+            ch.push(nv)
+            i = i + 1
+        }
+        return color_rgba(ch[0], ch[1], ch[2], ch[3])
+    }
+    dsl_fail(p, "expected [r,g,b,a] or a #hex color")
+    return color_transparent()
+}
+fn dsl_num_of(inout p: DslP, v: DslValue, what: Str) -> Float {
+    if v.kind == 1 { return v.f }
+    dsl_fail(p, (what + " must be a number"))
+    return 0.0
+}
+/// Bool as-is, Number as `f != 0.0`, anything else errors.
+fn dsl_bool_of(inout p: DslP, v: DslValue, what: Str) -> Bool {
+    if v.kind == 2 { return v.b }
+    if v.kind == 1 { return v.f != 0.0 }
+    dsl_fail(p, (what + " must be true or false"))
+    return false
+}
+fn dsl_str_of(inout p: DslP, v: DslValue, what: Str) -> Str {
+    if v.kind == 0 || v.kind == 3 { return copy v.s }
+    dsl_fail(p, (what + " must be a string or ident"))
+    return ""
+}
+fn dsl_lower(c: Int) -> Int { return parse::to_lower(c) }
+/// a bare unit suffix directly after a number: `%` / `vh` / `vw` / `ui` (case-insensitive,
+/// not followed by alnum/`_`). UiLength units: 0 px, 1 %, 2 vw, 3 vh, 4 ui.
+fn dsl_length_suffix(inout p: DslP, n: Float) -> UiLength {
+    if dsl_peek(p) == 37 { dsl_bump(p)  return UiLength { unit: 1, value: n } }
+    var c1 = dsl_lower(dsl_peek(p))
+    var c2 = dsl_lower(dsl_peek2(p))
+    var unit = 0
+    if c1 == 118 && c2 == 104 { unit = 3 }            // vh
+    else if c1 == 118 && c2 == 119 { unit = 2 }       // vw
+    else if c1 == 117 && c2 == 105 { unit = 4 }       // ui
+    if unit != 0 {
+        var nxt = dsl_peek_at(p, 2)
+        if !(dsl_is_digit(nxt) || dsl_is_alpha(nxt) || nxt == 95) { dsl_bump(p)  dsl_bump(p)  return UiLength { unit: unit, value: n } }
+    }
+    return UiLength { unit: 0, value: n }
+}
+/// a length value: bare `50` / `50%` / `40vh` / `30vw` / `2ui` (suffix read at the cursor;
+/// dsl_value leaves it untouched right after a number) or a quoted/ident form via
+/// ui_length_parse; `fill` is rejected with a hint naming the `fill:` alias.
+fn dsl_length(inout p: DslP, v: DslValue, what: Str) -> UiLength {
+    if v.kind == 1 { return dsl_length_suffix(p, v.f) }
+    if v.kind == 0 || v.kind == 3 {
+        if (v.s == "fill") { dsl_fail(p, (what + ": use fill_w / fill_h instead of `fill`"))  return ui_px(0.0) }
+        var lp = ui_length_parse(v.s)
+        if lp.ok { return sink lp.len }
+        dsl_fail(p, ("invalid " + (what + (": " + v.s))))
+        return ui_px(0.0)
+    }
+    dsl_fail(p, (what + " must be a number or length"))
+    return ui_px(0.0)
+}
+
+// ---- strict word mappers (unknown words are errors; the lenient up_* stay for parse_ui) ----
+fn ds_cross(inout p: DslP, v: DslValue) -> Int {
+    if v.kind == 3 {
+        if (v.s == "stretch") { return cross_stretch() }
+        if (v.s == "start") { return cross_start() }
+        if (v.s == "center") { return cross_center() }
+        if (v.s == "end") { return cross_end() }
+    }
+    dsl_fail(p, "cross_align must be stretch, start, center, or end")
+    return cross_stretch()
+}
+fn ds_main(inout p: DslP, v: DslValue) -> Int {
+    if v.kind == 3 {
+        if (v.s == "start") { return main_start() }
+        if (v.s == "center") { return main_center() }
+        if (v.s == "end") { return main_end() }
+        if (v.s == "space_between") { return main_space_between() }
+    }
+    dsl_fail(p, "main_align must be start, center, end, or space_between")
+    return main_start()
+}
+fn ds_overflow(inout p: DslP, v: DslValue) -> Int {
+    var w = ""
+    if v.kind == 0 || v.kind == 3 { w = v.s }
+    if (w == "visible") { return 0 }
+    if (w == "hidden") { return 1 }
+    if (w == "auto") { return 2 }
+    if (w == "scroll") { return 3 }
+    dsl_fail(p, "overflow must be visible, hidden, auto, or scroll")
+    return 0
+}
+fn ds_position(inout p: DslP, v: DslValue) -> Int {
+    var w = ""
+    if v.kind == 0 || v.kind == 3 { w = v.s }
+    if (w == "relative") { return 0 }
+    if (w == "absolute") { return 1 }
+    if (w == "overlay") { return 2 }
+    dsl_fail(p, "position must be relative, absolute, or overlay")
+    return 0
+}
+fn ds_transform(inout p: DslP, v: DslValue) -> Int {
+    var w = ""
+    if v.kind == 0 || v.kind == 3 { w = v.s }
+    if (w == "none") { return 0 }
+    if (w == "uppercase") { return 1 }
+    if (w == "lowercase") { return 2 }
+    if (w == "capitalize") { return 3 }
+    dsl_fail(p, "unknown text_transform (use none, uppercase, lowercase, capitalize)")
+    return 0
+}
+fn ds_decoration(inout p: DslP, v: DslValue) -> Int {
+    var w = ""
+    if v.kind == 0 || v.kind == 3 { w = v.s }
+    if (w == "none") { return 0 }
+    if (w == "underline") { return 1 }
+    if (w == "strikethrough") || (w == "line_through") { return 2 }
+    if (w == "overline") { return 3 }
+    dsl_fail(p, "unknown text_decoration (use none, underline, strikethrough, overline)")
+    return 0
+}
+fn ds_toverflow(inout p: DslP, v: DslValue) -> Int {
+    var w = ""
+    if v.kind == 0 || v.kind == 3 { w = v.s }
+    if (w == "clip") { return 0 }
+    if (w == "ellipsis") { return 1 }
+    dsl_fail(p, "unknown text_overflow (use clip or ellipsis)")
+    return 0
+}
+/// `flex_wrap` on a row: a Bool, or the ident/string `wrap` / `true`.
+fn ds_flex_wrap(inout p: DslP, v: DslValue) -> Bool {
+    if v.kind == 2 { return v.b }
+    if v.kind == 0 || v.kind == 3 { return (v.s == "wrap") || (v.s == "true") }
+    dsl_fail(p, "flex_wrap must be true, false, or wrap")
+    return false
+}
+/// a horizontal text-alignment word -> anchor x.
+fn ds_anchor_x(inout p: DslP, v: DslValue) -> Float {
+    if v.kind == 0 || v.kind == 3 {
+        if (v.s == "start") || (v.s == "left") { return 0.0 }
+        if (v.s == "center") || (v.s == "middle") { return 0.5 }
+        if (v.s == "end") || (v.s == "right") { return 1.0 }
+    }
+    dsl_fail(p, "text alignment must be start, left, center, end, or right")
+    return 0.0
+}
+/// which kind of alignment a text-alignment word is: start/end follow the line's direction (ta_start /
+/// ta_end), left/center/right do not (ta_physical). The word was already checked by ds_anchor_x.
+fn ds_text_align(v: DslValue) -> Int {
+    if v.s == "start" { return ta_start() }
+    if v.s == "end" { return ta_end() }
+    return ta_physical()
+}
+/// a family list: one string or name ("Noto Sans" / sans-serif), or a list of them (`[a, b]`, or in a
+/// `.style` source `a, b, c`), made one comma-separated string. A list may hold lists (a token naming
+/// a list), which are flattened.
+fn ds_family(inout p: DslP, v: DslValue) -> Str {
+    if v.kind == 0 || v.kind == 3 { return copy v.s }
+    if v.kind == 4 {
+        var out = ""
+        var i = 0
+        while i < v.arr.len() {
+            let f = ds_family(p, v.arr[i])
+            if f.len() > 0 { if out.len() > 0 { out = out + "," }  out = out + f }
+            i = i + 1
+        }
+        return out
+    }
+    dsl_fail(p, "font_family must be a family name or a list of them")
+    return ""
+}
+/// a weight: 100-900, or normal (400) / bold (700) / light (300) / medium (500) / semibold (600).
+fn ds_weight(inout p: DslP, v: DslValue) -> Int {
+    if v.kind == 1 {
+        let w = to_int(v.f)
+        if w >= 1 && w <= 1000 { return w }
+    }
+    if v.kind == 0 || v.kind == 3 {
+        if v.s == "normal" || v.s == "regular" { return 400 }
+        if v.s == "bold" { return 700 }
+        if v.s == "light" { return 300 }
+        if v.s == "medium" { return 500 }
+        if v.s == "semibold" { return 600 }
+        if v.s == "thin" { return 100 }
+        if v.s == "black" { return 900 }
+    }
+    dsl_fail(p, "font_weight must be 1-1000, normal, bold, light, medium, semibold, thin or black")
+    return 400
+}
+/// a slant: normal (1) / italic or oblique (2).
+fn ds_slant(inout p: DslP, v: DslValue) -> Int {
+    if v.kind == 0 || v.kind == 3 {
+        if v.s == "normal" { return 1 }
+        if v.s == "italic" || v.s == "oblique" { return 2 }
+    }
+    dsl_fail(p, "font_style must be normal, italic or oblique")
+    return 1
+}
+/// a direction word -> dir_ltr / dir_rtl / dir_auto (`dir` / `direction`).
+fn ds_dir(inout p: DslP, v: DslValue) -> Int {
+    if v.kind == 0 || v.kind == 3 {
+        if v.s == "ltr" { return dir_ltr() }
+        if v.s == "rtl" { return dir_rtl() }
+        if v.s == "auto" { return dir_auto() }
+    }
+    dsl_fail(p, "direction must be ltr, rtl, or auto")
+    return dir_auto()
+}
+/// a vertical text-alignment word -> anchor y.
+fn ds_anchor_y(inout p: DslP, v: DslValue) -> Float {
+    if v.kind == 0 || v.kind == 3 {
+        if (v.s == "start") || (v.s == "top") { return 0.0 }
+        if (v.s == "center") || (v.s == "middle") { return 0.5 }
+        if (v.s == "end") || (v.s == "bottom") { return 1.0 }
+    }
+    dsl_fail(p, "vertical alignment must be start, top, center, middle, end, or bottom")
+    return 0.0
+}
+/// a strict Bool (no Number coercion): button's label_bold/label_italic and text's bold/italic/wrap_text.
+fn ds_strict_bool(inout p: DslP, v: DslValue, what: Str) -> Bool {
+    if v.kind == 2 { return v.b }
+    dsl_fail(p, (what + " must be true or false"))
+    return false
+}
+/// a strict Number (no Ident coercion): every numeric attribute on button/rect/surface/text.
+fn ds_strict_num(inout p: DslP, v: DslValue, what: Str) -> Float {
+    if v.kind == 1 { return v.f }
+    dsl_fail(p, (what + " must be a number"))
+    return 0.0
+}
+/// this kind takes no `align_self` / `flex_wrap` / `min_width`: the four flex containers.
+fn ds_is_container(k: Int) -> Bool { return k == nk_column() || k == nk_row() || k == nk_scroll_column() || k == nk_scroll_row() }
+
+// ---- the `.style` stylesheet block ----
+/// apply one style property (aliases included) onto `ns`; unknown names are errors.
+/// NodeStyle is a copy struct: the updated value is returned, never mutated in place.
+fn dsl_style_prop(inout p: DslP, ns0: NodeStyle, name: Str, v: DslValue) -> NodeStyle {
+    var ns = copy ns0
+    if (name == "bg") { ns.has_bg = true  ns.bg = rgba_pack(dsl_color(p, v)) }
+    else if (name == "bg_to") { ns.has_bg_to = true  ns.bg_to = rgba_pack(dsl_color(p, v)) }
+    else if (name == "bg_vertical") { ns.has_bg_vertical = true  ns.bg_vertical = dsl_bool_of(p, v, name) }
+    else if (name == "text_color") { ns.has_text_color = true  ns.text_color = rgba_pack(dsl_color(p, v)) }
+    else if (name == "color") { ns.has_color = true  ns.color = rgba_pack(dsl_color(p, v)) }
+    else if (name == "border_color") { ns.has_border_color = true  ns.border_color = rgba_pack(dsl_color(p, v)) }
+    else if (name == "size_px") || (name == "font_size") || (name == "text_size") || (name == "label_size_px") { ns.has_size_px = true  ns.size_px = dsl_num_of(p, v, "size_px") }
+    else if (name == "radius") { ns.has_radius = true  ns.radius = dsl_num_of(p, v, "radius") }
+    else if (name == "padding") || (name == "pad") { ns.has_padding = true  ns.padding = dsl_num_of(p, v, "padding") }
+    else if (name == "border_w") || (name == "border_width") { ns.has_border_w = true  ns.border_w = dsl_num_of(p, v, "border_w") }
+    else if (name == "line_height") || (name == "line_height_mult") { ns.has_line_height_mult = true  ns.line_height_mult = dsl_num_of(p, v, "line_height") }
+    else if (name == "letter_spacing") { ns.has_letter_spacing = true  ns.letter_spacing = dsl_num_of(p, v, "letter_spacing") }
+    else if (name == "direction") || (name == "dir") { ns.has_text_dir = true  ns.text_dir = ds_dir(p, v) }
+    else if (name == "lang") { ns.has_lang = true  ns.lang = dsl_str_of(p, v, "lang") }
+    else if (name == "font_family") || (name == "family") { ns.has_font_family = true  ns.font_family = ds_family(p, v) }
+    else if (name == "font_weight") { ns.has_font_weight = true  ns.font_weight = ds_weight(p, v) }
+    else if (name == "font_style") { ns.has_font_slant = true  ns.font_slant = ds_slant(p, v) }
+    else if (name == "text_align") { ns.has_text_align = true  ns.align_x = ds_anchor_x(p, v)  ns.text_align = ds_text_align(v) }
+    else if (name == "word_spacing") { ns.has_word_spacing = true  ns.word_spacing = dsl_num_of(p, v, "word_spacing") }
+    else if (name == "max_width") || (name == "max_w") { ns.has_max_width = true  ns.max_width = dsl_num_of(p, v, "max_width") }
+    else if (name == "min_height") || (name == "min_h") { ns.has_min_height = true  ns.min_height = dsl_num_of(p, v, "min_height") }
+    else if (name == "bold") || (name == "font_bold") { ns.has_font_bold = true  ns.font_bold = dsl_bool_of(p, v, name) }
+    else if (name == "italic") || (name == "font_italic") { ns.has_font_italic = true  ns.font_italic = dsl_bool_of(p, v, name) }
+    else if (name == "wrap") || (name == "wrap_text") { ns.has_wrap = true  ns.wrap = dsl_bool_of(p, v, name) }
+    else if (name == "wrap_hard_break") { ns.has_wrap_hard_break = true  ns.wrap_hard_break = dsl_bool_of(p, v, name) }
+    else if (name == "line_clamp") {
+        ns.has_line_clamp = true
+        var lc = to_int(dsl_num_of(p, v, "line_clamp"))
+        if lc < 1 { lc = 1 }                          // floored at 1
+        ns.line_clamp = lc
+    }
+    else if (name == "text_overflow") || (name == "overflow") { ns.has_text_overflow = true  ns.text_overflow = ds_toverflow(p, v) }
+    else if (name == "text_transform") || (name == "transform") { ns.has_text_transform = true  ns.text_transform = ds_transform(p, v) }
+    else if (name == "text_decoration") || (name == "decoration") { ns.has_text_decoration = true  ns.text_decoration = ds_decoration(p, v) }
+    else if (name == "overflow_y") { ns.has_overflow_y = true  ns.overflow_y = ds_overflow(p, v) }
+    else if (name == "overflow_x") { ns.has_overflow_x = true  ns.overflow_x = ds_overflow(p, v) }
+    else if (name == "position") { ns.has_position = true  ns.position = ds_position(p, v) }
+    else if (name == "z_index") { ns.has_z_index = true  ns.z_index = to_int(dsl_num_of(p, v, "z_index")) }
+    else if (name == "top") { ns.has_top = true  ns.top = dsl_num_of(p, v, "top") }
+    else if (name == "right") { ns.has_right = true  ns.right = dsl_num_of(p, v, "right") }
+    else if (name == "bottom") { ns.has_bottom = true  ns.bottom = dsl_num_of(p, v, "bottom") }
+    else if (name == "left") { ns.has_left = true  ns.left = dsl_num_of(p, v, "left") }
+    else if (name == "hover_bg") { ns.has_hover_bg = true  ns.hover_bg = rgba_pack(dsl_color(p, v)) }
+    else if (name == "hover_border_color") { ns.has_hover_border_color = true  ns.hover_border_color = rgba_pack(dsl_color(p, v)) }
+    else if (name == "hover_text_color") { ns.has_hover_text_color = true  ns.hover_text_color = rgba_pack(dsl_color(p, v)) }
+    else if (name == "active_bg") { ns.has_active_bg = true  ns.active_bg = rgba_pack(dsl_color(p, v)) }
+    else if (name == "opacity") { ns.has_opacity = true  ns.opacity = dsl_num_of(p, v, "opacity") }
+    else if (name == "translate_x") { ns.has_translate_x = true  ns.translate_x = dsl_num_of(p, v, "translate_x") }
+    else if (name == "translate_y") { ns.has_translate_y = true  ns.translate_y = dsl_num_of(p, v, "translate_y") }
+    else if (name == "translate") { ds_pair(p, v, "translate")  ns.has_translate_x = true  ns.has_translate_y = true  ns.translate_x = ds_pair_a(v)  ns.translate_y = ds_pair_b(v) }
+    else if (name == "scale_x") { ns.has_scale_x = true  ns.scale_x = dsl_num_of(p, v, "scale_x") }
+    else if (name == "scale_y") { ns.has_scale_y = true  ns.scale_y = dsl_num_of(p, v, "scale_y") }
+    else if (name == "scale") {
+        // one number scales both axes; `[x, y]` each
+        ns.has_scale_x = true  ns.has_scale_y = true
+        if v.kind == 1 { ns.scale_x = v.f  ns.scale_y = v.f }
+        else { ds_pair(p, v, "scale")  ns.scale_x = ds_pair_a(v)  ns.scale_y = ds_pair_b(v) }
+    }
+    else if (name == "w") || (name == "width") { let l = ds_style_length(p, v, "w")  ns.has_w = true  ns.w_unit = l.unit  ns.w_val = l.value }
+    else if (name == "h") || (name == "height") { let l = ds_style_length(p, v, "h")  ns.has_h = true  ns.h_unit = l.unit  ns.h_val = l.value }
+    else if (name == "gap") { ns.has_gap = true  ns.gap = dsl_num_of(p, v, "gap") }
+    // a shadow (a box's outside it, a text's behind its glyphs): its colour, how soft, how much bigger, where
+    else if (name == "shadow_color") { ns.has_shadow_color = true  ns.shadow_color = rgba_pack(dsl_color(p, v)) }
+    else if (name == "shadow_blur") { ns.has_shadow_blur = true  ns.shadow_blur = dsl_num_of(p, v, "shadow_blur") }
+    else if (name == "shadow_spread") { ns.has_shadow_spread = true  ns.shadow_spread = dsl_num_of(p, v, "shadow_spread") }
+    else if (name == "shadow_offset_x") { ns.has_shadow_x = true  ns.shadow_x = dsl_num_of(p, v, "shadow_offset_x") }
+    else if (name == "shadow_offset_y") { ns.has_shadow_y = true  ns.shadow_y = dsl_num_of(p, v, "shadow_offset_y") }
+    else if (name == "shadow_offset") { ds_pair(p, v, "shadow_offset")  ns.has_shadow_x = true  ns.has_shadow_y = true  ns.shadow_x = ds_pair_a(v)  ns.shadow_y = ds_pair_b(v) }
+    else { dsl_fail(p, ("unknown style property `" + (name + "`"))) }
+    return ns
+}
+/// `[a, b]` of two numbers (translate / scale pairs).
+fn ds_pair(inout p: DslP, v: DslValue, what: Str) {
+    if v.kind != 4 || v.arr.len() != 2 || v.arr[0].kind != 1 || v.arr[1].kind != 1 { dsl_fail(p, (what + " must be [x, y]")) }
+}
+fn ds_pair_a(v: DslValue) -> Float { if v.kind == 4 && v.arr.len() == 2 { return v.arr[0].f }  return 0.0 }
+fn ds_pair_b(v: DslValue) -> Float { if v.kind == 4 && v.arr.len() == 2 { return v.arr[1].f }  return 0.0 }
+/// a length in a style rule: a number (px), or a string carrying its unit ("50%", "10vh"). The
+/// style parser turns `50%` into the string form before it gets here, since a rule's values are
+/// kept (and may come from a variable) rather than read off the cursor.
+fn ds_style_length(inout p: DslP, v: DslValue, what: Str) -> UiLength {
+    if v.kind == 1 { return ui_px(v.f) }
+    if v.kind == 0 || v.kind == 3 {
+        let lp = ui_length_parse(v.s)
+        if lp.ok { return UiLength { unit: lp.len.unit, value: lp.len.value } }
+        dsl_fail(p, ("invalid " + (what + (": " + v.s))))
+        return ui_px(0.0)
+    }
+    dsl_fail(p, (what + " must be a number or length"))
+    return ui_px(0.0)
+}
+/// put a rule into parallel key/style vecs, replacing an existing rule wholesale
+/// (whole-value replacement, not the field-merge of sheet_merge_tag/class).
+fn dsl_sheet_put(inout keys: Vec<Str>, inout styles: Vec<NodeStyle>, name: Str, ns: NodeStyle) {
+    var i = 0
+    while i < keys.len() {
+        if (keys[i] == name) { styles[i] = node_style_dup(ns)  return }
+        i = i + 1
+    }
+    keys.push(copy name)
+    styles.push(node_style_dup(ns))
+}
+// ---- node parsing ----
+// Each element name has its own attribute table, in the sibling root file that owns its family:
+// dsl_core_nodes.nori (column/row/scroll_*/spacer/text/button/rect/surface), dsl_widgets.nori,
+// dsl_input.nori and dsl_media.nori. There is no shared attribute table: each kind has its
+// own accepted set, value strictness and error text.
+
+/// `span { ... }`: one styled run inside a `text` node. It has its own attribute table, its own
+/// value strictness, and its own error messages, ``expected `:` in span node`` and
+/// `unknown span field "X"` (the name is quoted with its quotes as part of the text).
+///
+/// The `text` attribute table is `text`, `classes`, `class`, `size_px`/`font_size`, `color`/`text_color`, `bold`,
+/// `italic`, `letter_spacing`, `font_family`, `text_outline_color`/`outline_color`/`stroke_color`
+/// and `text_outline_width_px`/`outline_width`/`stroke_width`. Two of those are not accepted on a span,
+/// because TextSpanRun has no field for them and nothing downstream could read one:
+///   * `font_family`: there is no font-family field on PaintPrimitive and neither painter can select a
+///     face. Rejected on `text` for the same reason.
+///   * `letter_spacing`: the rich-text flow measures with text_measure_style(size), which carries
+///     no tracking, so a stored value would never reach a glyph advance.
+/// An attribute nothing reads is worse than an error.
+/// `text_transform:` / `transform:` is the one addition in the other direction: it is an
+/// extension (transforms otherwise apply only at the node level) and TextSpanRun really does carry it.
+fn dsl_span(inout p: DslP) -> TextSpanRun {
+    var sp = span("")
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 { dsl_bump(p)  return sp }
+        if dsl_peek(p) < 0 || p.failed[0] == 1 { dsl_fail(p, "unterminated span")  return sp }
+        var name = dsl_ident(p)
+        dsl_expect(p, 58, "`:` in span node")
+        var v = dsl_value(p)
+        if p.failed[0] == 1 { return sp }
+        if (name == "text") { sp.text = dsl_str_of(p, v, "text") }
+        else if (name == "classes") { sp.classes = dw_classes(p, v) }
+        else if (name == "class") { var one: Vec<Str> = vec()  one.push(dw_str_of(p, v, "class"))  sp.classes = one }
+        else if (name == "size_px") || (name == "font_size") { sp.has_size = true  sp.size_px = dsl_num_of(p, v, "size_px") }
+        else if (name == "color") || (name == "text_color") { sp.has_color = true  sp.color = dw_color(p, v) }
+        else if (name == "bold") { sp.bold = dsl_bool_of(p, v, "bold") }
+        else if (name == "italic") { sp.italic = dsl_bool_of(p, v, "italic") }
+        else if (name == "text_transform") || (name == "transform") { sp.transform = ds_transform(p, v) }
+        else if (name == "text_outline_color") || (name == "outline_color") || (name == "stroke_color") { sp.has_outline = true  sp.outline_color = dw_color(p, v) }
+        else if (name == "text_outline_width_px") || (name == "outline_width") || (name == "stroke_width") { sp.outline_width_px = dsl_num_of(p, v, "text_outline_width_px") }
+        else { dsl_fail(p, ("unknown span field " + dw_dq(name))) }
+    }
+    return sp
+}
+/// one node body: name and opening brace already consumed. Every element name routes to the parser that owns its family, each
+/// with its own attribute table, value strictness and error text.
+fn dsl_node_body(inout p: DslP, kindname: Str) -> UiNode {
+    var kind = up_kind(kindname)
+    if kind < 0 {
+        // a component (layout/components.nori), or the place a component's use puts its children
+        if kindname == "slot" { return dsl_slot(p) }
+        let ci = dsl_comp_find(p.cx, kindname)
+        if ci >= 0 { return dsl_instantiate(p, ci) }
+        dsl_fail(p, ("unknown node type " + dw_dq(kindname)))
+        return ui_node_blank(nk_column())
+    }
+    // The widget / input / media families each own their parser, in a sibling root file of this
+    // directory module. Each family has its own attribute table, its own per-kind error text
+    // ("unknown slider field" vs "unknown checkbox field") and its own value strictness:
+    // `slider { padding: 4 }` is rejected, which one shared table would wave through.
+    // The opening `{` has already been consumed by the caller.
+    if (kindname == "divider") { return dsl_widgets_node(p, kindname, kind) }
+    if kind == nk_checkbox() || kind == nk_slider() || kind == nk_scrollbar() || kind == nk_dropdown() { return dsl_widgets_node(p, kindname, kind) }
+    if kind == nk_number() || kind == nk_text_input() || kind == nk_text_area() || kind == nk_picker() || kind == nk_code_editor() { return dsl_input_node(p, kindname, kind) }
+    if kind == nk_image() { return dsl_media_node(p, kindname, kind) }
+    return dsl_core_node(p, kindname, kind)
+}
+
+// ---- entries ----
+/// the strict parse result: on failure, `err` is "L:C: message",
+/// with the parts in eline/ecol/emsg; src_empty marks a blank source.
+/// `efile`: the file the error is in ("" for the source itself when it has no name; an import's
+/// or a component's error names the file it is in); `deps`: every file the parse read (its
+/// imports, transitively), which is what hot reload watches.
+pub struct DslParseResult { ok: Bool, err: Str, src_empty: Bool, eline: Int, ecol: Int, emsg: Str, doc: UiDocument, efile: Str = "", deps: Vec<Str> }
+fn dsl_doc_fail(p: DslP, sink doc: UiDocument) -> DslParseResult {
+    return DslParseResult { ok: false, err: copy p.err[0], src_empty: false, eline: p.eline[0], ecol: p.ecol[0], emsg: copy p.emsg[0], doc: doc, efile: copy p.efile[0], deps: path_copy_str(p.cx.deps) }
+}
+/// the "a second root node" message. The two top-level spellings are intentional: a bare
+/// `KIND {` says `only one root node allowed` and `tree KIND` says
+/// `only one root allowed`. Inside a `document { }` wrapper both cases say
+/// `only one root in document`, because there the wrapper is
+/// the thing that has one root. Which spelling you get therefore depends on the form you wrote.
+fn dsl_dup_root_msg(braced: Bool, tree_form: Bool) -> Str {
+    if braced { return "only one root in document" }
+    if tree_form { return "only one root allowed" }
+    return "only one root node allowed"
+}
+/// the five `document { }` messages that are spelled differently from the unbraced top level. There are
+/// two separate loops, the top level and the `document { }` body, and
+/// they do not share their wording: inside the wrapper the thing being described is the document,
+/// outside it the top level. This is the same split dsl_dup_root_msg
+/// makes for the duplicate-root text. The four name-carrying ones
+/// double-quote the name (dw_dq), not backticked.
+fn dsl_doc_unknown_field_msg(braced: Bool) -> Str { if braced { return "unknown document field " }  return "unknown top-level field " }
+fn dsl_doc_bad_item_msg(braced: Bool) -> Str { if braced { return "bad document item " }  return "unexpected after " }
+fn dsl_doc_no_root_msg(braced: Bool) -> Str { if braced { return "document needs tree column/panel { ... } or root block" }  return "document needs a root column/panel/row/text/button/rect/surface block" }
+fn dsl_doc_trailing_msg(braced: Bool) -> Str { if braced { return "trailing content after document" }  return "trailing content after root" }
+/// `tree KIND { ... }` as a root. This is checked before the `{` branch inside a `document { }`
+/// wrapper and after it at the top level, so the two loops reach it from
+/// different places and it is a function rather than a copy.
+fn dsl_document_tree_root(inout p: DslP, inout doc: UiDocument, braced: Bool, inout hr: Vec<Int>) {
+    if hr[0] == 1 { dsl_fail(p, dsl_dup_root_msg(braced, true))  return }
+    var root_kind = dsl_ident(p)
+    if p.failed[0] == 1 { return }
+    dsl_expect(p, 123, "`{` after the element name")
+    doc.tree = dsl_node_body(p, root_kind)
+    hr[0] = 1
+}
+/// the shared top-level field loop:
+/// `style: "name"`, `stylesheet { }` (duplicate errors), `tree KIND { }`, or `KIND { }` as
+/// the single root. `braced` = inside a `document { }` wrapper (terminates on `}`).
+fn dsl_document_fields(inout p: DslP, inout doc: UiDocument, braced: Bool, inout hr: Vec<Int>) {
+    while true {
+        dsl_skip(p)
+        if braced && dsl_peek(p) == 125 { dsl_bump(p)  return }
+        if dsl_peek(p) < 0 {
+            if braced { dsl_fail(p, "unterminated document block") }
+            return
+        }
+        if p.failed[0] == 1 { return }
+        var name = dsl_ident(p)
+        if p.failed[0] == 1 { return }
+        dsl_skip(p)
+        if (name == "import") && dsl_peek(p) == 34 {
+            dsl_import(p, doc, dsl_string(p))
+            if p.failed[0] == 1 { return }
+            continue
+        }
+        if (name == "component") && dsl_is_ident_start(dsl_peek(p)) {
+            dsl_component_def(p)
+            if p.failed[0] == 1 { return }
+            continue
+        }
+        if dsl_peek(p) == 58 {
+            dsl_bump(p)
+            var v = dsl_value(p)
+            if p.failed[0] == 1 { return }
+            if (name == "style") { doc.style = dsl_str_of(p, v, "style") }
+            else if braced && (name == "tree") { dsl_fail(p, "use `tree column {` form: tree keyword expects a block")  return }
+            else { dsl_fail(p, (dsl_doc_unknown_field_msg(braced) + dw_dq(name)))  return }
+        } else if braced && (name == "tree") {
+            dsl_document_tree_root(p, doc, braced, hr)
+        } else if dsl_peek(p) == 123 {
+            dsl_bump(p)
+            if (name == "stylesheet") {
+                if doc.has_sheet { dsl_fail(p, "duplicate stylesheet block")  return }
+                doc.has_sheet = true
+                // the whole customization language (layout/sheet.nori) into `doc.rich`, and the
+                // tag/class sheet the immediate path draws with derived from it
+                let si = style_set_add_source(doc.rich, p.file, "")
+                sh_items(p, doc.rich, si, true)
+                // keep the source only as far as the block reaches: its errors' positions need no more
+                doc.rich.srcs[si] = p.src.slice(0, p.s.at())
+                if p.failed[0] == 0 { doc.sheet = style_set_legacy(doc.rich) }
+            } else {
+                if hr[0] == 1 { dsl_fail(p, dsl_dup_root_msg(braced, false))  return }
+                doc.tree = dsl_node_body(p, name)
+                hr[0] = 1
+            }
+        } else if (name == "tree") {
+            dsl_document_tree_root(p, doc, braced, hr)
+        } else { dsl_fail(p, (dsl_doc_bad_item_msg(braced) + dw_dq(name)))  return }
+        if p.failed[0] == 1 { return }
+    }
+}
+/// parse a `.ui` document: an optional `document { ... }` wrapper, else top-level
+/// `style:` / `stylesheet { }` / root-node fields in any order (exactly one root).
+/// Strict: unknown elements/attributes/properties and malformed values are errors with line:col;
+/// a blank source is the distinct `src_empty` error.
+pub fn dsl_parse_document(src: Str) -> DslParseResult { return dsl_parse_document_file(src, "") }
+/// dsl_parse_document for a source that is the file `file`: errors name it, and its `import`s are
+/// read relative to its directory.
+pub fn dsl_parse_document_file(src: Str, file: Str) -> DslParseResult {
+    var p = dsl_new(src)
+    p.file = copy file
+    var doc = UiDocument { has_sheet: false, sheet: stylesheet_new(), tree: ui_node_blank(nk_column()), style: "", rich: style_set_new() }
+    dsl_skip(p)
+    if dsl_peek(p) < 0 {
+        return DslParseResult { ok: false, err: "empty overlay document", src_empty: true, eline: 0, ecol: 0, emsg: "", doc: doc, efile: copy file, deps: vec() }
+    }
+    var hr: Vec<Int> = vec()
+    hr.push(0)
+    // probe for the `document { ... }` wrapper (rewind if it isn't one)
+    var si = p.s.at()
+    var first = dsl_probe_ident(p)
+    dsl_skip(p)
+    var braced = (first == "document") && dsl_peek(p) == 123
+    if braced {
+        dsl_bump(p)
+        dsl_document_fields(p, doc, true, hr)
+    } else {
+        p.s.seek(si)
+        dsl_document_fields(p, doc, false, hr)
+    }
+    if p.failed[0] == 0 && hr[0] == 0 { dsl_fail(p, dsl_doc_no_root_msg(braced)) }
+    dsl_skip(p)
+    if p.failed[0] == 0 && dsl_peek(p) >= 0 { dsl_fail(p, dsl_doc_trailing_msg(braced)) }
+    if p.failed[0] == 1 { return dsl_doc_fail(p, sink doc) }
+    // styles an import brought in reach the immediate path's sheet too
+    if doc.rich.rules.len() > 0 { doc.sheet = style_set_legacy(doc.rich)  doc.has_sheet = true }
+    return DslParseResult { ok: true, err: "", src_empty: false, eline: 0, ecol: 0, emsg: "", doc: doc, efile: "", deps: path_copy_str(p.cx.deps) }
+}
+/// the strict stylesheet-only entry for a standalone `.style` source: the legacy tag/class sheet
+/// (`sheet`, what the immediate path draws with) and everything the source says (`set`, which a
+/// retained document compiles; see layout/sheet.nori).
+pub struct DslSheetResult { ok: Bool, err: Str, src_empty: Bool, eline: Int, ecol: Int, emsg: Str, sheet: OverlayStyleSheet, styles: StyleSet }
+fn dsl_sheet_fail(p: DslP, sink sheet: OverlayStyleSheet, sink ss: StyleSet) -> DslSheetResult {
+    return DslSheetResult { ok: false, err: copy p.err[0], src_empty: false, eline: p.eline[0], ecol: p.ecol[0], emsg: copy p.emsg[0], sheet: sheet, styles: ss }
+}
+pub fn dsl_parse_stylesheet(src: Str) -> DslSheetResult {
+    var p = dsl_new(src)
+    var sheet = stylesheet_new()
+    var ss = style_set_new()
+    dsl_skip(p)
+    if dsl_peek(p) < 0 {
+        return DslSheetResult { ok: false, err: "empty overlay stylesheet", src_empty: true, eline: 0, ecol: 0, emsg: "", sheet: sheet, styles: ss }
+    }
+    let si = style_set_add_source(ss, "", src)
+    sh_items(p, ss, si, false)
+    if p.failed[0] == 1 { return dsl_sheet_fail(p, sink sheet, sink ss) }
+    sheet = style_set_legacy(ss)
+    return DslSheetResult { ok: true, err: "", src_empty: false, eline: 0, ecol: 0, emsg: "", sheet: sheet, styles: ss }
+}

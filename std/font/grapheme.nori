@@ -1,0 +1,75 @@
+// std/font: grapheme clusters: UAX #29's extended grapheme cluster boundaries (Unicode 16).
+//
+//   let b = font::grapheme_breaks(cps)        // b[i] true-ish (1) when a cluster starts at cps[i]
+//   let o = font::grapheme_offsets("éx")  // [0, 3, 4]: byte offsets of every cluster start, and the end
+//
+// A grapheme cluster is what a user calls a character: a base and its marks, a Hangul syllable
+// spelled in jamo, a Devanagari conjunct (GB9c), an emoji ZWJ sequence, a flag. A caret never stops
+// inside one, and Backspace removes one. The rules are GB3-GB13 and GB999 as written in UAX #29,
+// over the Grapheme_Cluster_Break and Indic_Conjunct_Break properties in data/ucd.bin.
+// GraphemeBreakTest.txt is run whole by grapheme_test.nori.
+
+/// a cluster boundary before every code point of `cps` (and after the last): `n + 1` entries, 1 where
+/// a cluster starts (entry 0 and entry `n` are always 1 for a non-empty run), 0 inside a cluster.
+pub fn grapheme_breaks(cps: Vec<Int>) -> Vec<Int> {
+    let n = cps.len()
+    var out: Vec<Int> = vec()
+    if n == 0 { out.push(1)  return out }
+    var cls: Vec<Int> = vec()
+    var ib: Vec<Int> = vec()
+    var i = 0
+    while i < n { cls.push(ucd_gcb(cps[i]))  ib.push(ucd_incb(cps[i]))  i = i + 1 }
+    out.push(1)
+    var ri = 0                                          // regional indicators just before position i
+    i = 1
+    while i < n {
+        let p = cls[i - 1]
+        let c = cls[i]
+        if p == GCB_Regional_Indicator() { ri = ri + 1 } else { ri = 0 }
+        var brk = true
+        if p == GCB_CR() && c == GCB_LF() { brk = false }                                       // GB3
+        else if p == GCB_CR() || p == GCB_LF() || p == GCB_Control() { brk = true }              // GB4
+        else if c == GCB_CR() || c == GCB_LF() || c == GCB_Control() { brk = true }              // GB5
+        else if p == GCB_L() && (c == GCB_L() || c == GCB_V() || c == GCB_LV() || c == GCB_LVT()) { brk = false }   // GB6
+        else if (p == GCB_LV() || p == GCB_V()) && (c == GCB_V() || c == GCB_T()) { brk = false }                  // GB7
+        else if (p == GCB_LVT() || p == GCB_T()) && c == GCB_T() { brk = false }                                   // GB8
+        else if c == GCB_Extend() || c == GCB_ZWJ() { brk = false }                              // GB9
+        else if c == GCB_SpacingMark() { brk = false }                                          // GB9a
+        else if p == GCB_Prepend() { brk = false }                                              // GB9b
+        if brk && ib[i] == INCB_Consonant() {
+            // GB9c: Consonant [Extend Linker]* Linker [Extend Linker]* x Consonant
+            var j = i - 1
+            var linked = false
+            while j >= 0 && (ib[j] == INCB_Linker() || ib[j] == INCB_Extend()) {
+                if ib[j] == INCB_Linker() { linked = true }
+                j = j - 1
+            }
+            if linked && j >= 0 && ib[j] == INCB_Consonant() { brk = false }
+        }
+        if brk && p == GCB_ZWJ() && ucd_is_extended_pictographic(cps[i]) {
+            // GB11: ExtPict Extend* ZWJ x ExtPict
+            var k = i - 2
+            while k >= 0 && cls[k] == GCB_Extend() { k = k - 1 }
+            if k >= 0 && ucd_is_extended_pictographic(cps[k]) { brk = false }
+        }
+        if brk && p == GCB_Regional_Indicator() && c == GCB_Regional_Indicator() && (ri & 1) == 1 { brk = false }   // GB12/13
+        if brk { out.push(1) } else { out.push(0) }
+        i = i + 1
+    }
+    out.push(1)
+    return out
+}
+
+/// the byte offsets in `text` where grapheme clusters start, followed by `text.len()`: a caret may
+/// stand at exactly these offsets. Malformed UTF-8 is one cluster per bad byte.
+pub fn grapheme_offsets(text: Str) -> Vec<Int> {
+    var cps: Vec<Int> = vec()
+    var offs: Vec<Int> = vec()
+    utf8_decode_offsets(text, cps, offs)
+    let b = grapheme_breaks(cps)
+    var out: Vec<Int> = vec()
+    var i = 0
+    while i < cps.len() { if b[i] == 1 { out.push(offs[i]) }  i = i + 1 }
+    out.push(text.len())
+    return out
+}

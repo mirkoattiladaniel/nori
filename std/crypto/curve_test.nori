@@ -1,0 +1,57 @@
+// .nori tests for X25519, run with
+//   noric --test std/crypto/curve_test.nori compiler/runtime.nori --import-root .
+//
+// Answers come from a different implementation (OpenSSL, via python cryptography), so this
+// proves agreement rather than self-consistency. That distinction matters: using 56129 for the
+// curve constant a24 instead of 121665 still produces a well-formed 32-byte result for every
+// input, on the wrong curve, and every structural check passes. Only a known answer finds it.
+//
+// The project's test suite also cross-checks fresh random keys each run.
+import "std/crypto" as crypto
+
+fn hexv(c: Byte) -> Int {
+    let o = ord(c)
+    if o >= 97 { return (o - 87) }
+    if o >= 65 { return (o - 55) }
+    return (o - 48)
+}
+fn unhex(h: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < h.len() { out = (out + chr(((hexv(h.at(i)) << 4) | hexv(h.at(i + 1)))))  i = i + 2 }
+    return out
+}
+fn tohex(s: Str) -> Str {
+    let d = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < s.len() { let b = ord(s.at(i))  out = ((out + d.at((b >> 4))) + d.at((b & 15)))  i = i + 1 }
+    return out
+}
+
+fn test_x25519_public_keys() {
+    assert_streq(tohex(crypto::x25519_base(unhex("0046c2eba29304ed0bb6dc59e2efb7034fb0e4430745556d32477e903a1a0160"))), "82473508634c7a8c4fcb11089fea5ecbf23500842cabc41a53c30dfa1cf0397a")
+    assert_streq(tohex(crypto::x25519_base(unhex("5880cfed76dd6e004289f6f445444a99369343532b44137239f7d5fa50c9397a"))), "a630e57dd4df66d91def06f27d7db5a52b259099bc5da34e0fd85d47d59a0a5c")
+    assert_streq(tohex(crypto::x25519_base(unhex("f869159aa3940fc0091c4c6b6cc4729dd385734620bba6c36cb7531ae951766f"))), "df17e330dc9376ce581017bb87b695898675ce84d08607e5e6efe763820fa327")
+    // an all-ones scalar: nothing survives this unless clamping is right
+    assert_streq(tohex(crypto::x25519_base(unhex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"))), "847c0d2c375234f365e660955187a3735a0f7613d1609d3a6a4d8c53aeaa5a22")
+}
+
+fn test_x25519_agreement() {
+    // both sides reach the same secret from opposite halves
+    assert_streq(tohex(crypto::x25519(unhex("682a1de00158ff7e5ef4e7b16fb60816a6ccb1f4b9364ad35aa0b7b166ed8f74"), unhex("e2a75ea6bd321dafd79f8c6ff9797cb8cf09586cf83099648292e05a1d759a02"))), "0b4ec1b244a52198081c95e5d797fe5033ce00513cd0cd8141ea176d198a1a53")
+    assert_streq(tohex(crypto::x25519(unhex("282445f656ce33f85f9d7239a80dfe65ffcfbb01c8baddc2f352bd04d2504e7e"), unhex("4e704439152c61f27ef083fa4142a881398da5ddcaa4ba38644b03c9d9cbd132"))), "0b4ec1b244a52198081c95e5d797fe5033ce00513cd0cd8141ea176d198a1a53")
+    // both sides reach the same secret from opposite halves
+    assert_streq(tohex(crypto::x25519(unhex("58f7fa6bde2b972916ed5aee622d1dea6590460a091c61aaa71ca31b0c9e694c"), unhex("7f50e68bb5a0673c089c5b98b30dfdf71bb24e25c28671c2245b6f3e7f64be41"))), "8f41555c52e5ff0a1393cee923cb70f556a092c917e816c94eb5fb5e883b1f4b")
+    assert_streq(tohex(crypto::x25519(unhex("f8323e1bee2f9a72b0423d540bd64ce59844cc6ffe2554bb4beb6ba9e3dfca46"), unhex("7f6f1b07c733311ac75be8dd44c354ff743f9315d81bdc79d42885ba2738cc10"))), "8f41555c52e5ff0a1393cee923cb70f556a092c917e816c94eb5fb5e883b1f4b")
+    // both sides reach the same secret from opposite halves
+    assert_streq(tohex(crypto::x25519(unhex("90445ea0f723702ed09fe5e9a67796b4c541508794dff90b52b02da3e95ab17d"), unhex("a43a0ae461ed66f41a6329ee0337476a408aebe5d2689156910cafdb7e583227"))), "c3c84835ffcad4edf2413453288e861be3361fc32268b9625d06dd536e899c70")
+    assert_streq(tohex(crypto::x25519(unhex("d846d1ff59f783052ee922f5f10a852141e0528cafde3d29ad79a1194ea10d6a"), unhex("3242f55d04353a8fe54157445f3041e23a493b646b959c04e2a467689e5f3635"))), "c3c84835ffcad4edf2413453288e861be3361fc32268b9625d06dd536e899c70")
+}
+
+fn test_x25519_refuses() {
+    // a small-order point: every party would agree the same worthless value, so refuse it
+    assert_streq(crypto::x25519_shared(unhex("58e01fac89a0c23dc756175a5c603543535d198eb19ad5bb1533906d89338c6a"), unhex("0000000000000000000000000000000000000000000000000000000000000000")), "")
+    assert_streq(crypto::x25519(unhex("aabb"), unhex("1111111111111111111111111111111111111111111111111111111111111111")), "")
+    assert_streq(crypto::x25519(unhex("2222222222222222222222222222222222222222222222222222222222222222"), unhex("bb")), "")
+}

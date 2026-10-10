@@ -1,0 +1,33 @@
+# The C glue a program built with `noric --build --native` cannot compile, and the Nori module that
+# answers it. When a program's generated code mentions PREFIX, MODULE is compiled with
+# `--runtime --cfg native`, like the native build's libc layer, and linked beside it. The files after
+# MODULE are the ones it imports; the compiled module is cached under a key over all of them. Paths
+# are relative to NORI_HOME.
+#
+# A module belongs here only where the native build has to do something the LLVM build does not. Glue
+# that a Nori source can express for both (`extern fn … from "lib"`, `CFn` calls, `cfn_addr`) is written
+# that way in the module itself instead (std/dl, the plugin host callback).
+#
+# PREFIX  MODULE  [IMPORTED FILES...]
+
+# std/window: the LLVM build links C shims over libwayland-client, libxkbcommon and libX11, chosen per
+# platform by the program's --cfile list. The native build speaks the Wayland and X11 wire protocols over
+# their sockets instead, and stays a static executable needing none of those libraries.
+@nori_win_ std/window/__native_linux.nori std/window/__native_wayland.nori std/window/__native_wayland_shell.nori std/window/__native_xkb.nori std/window/__native_keysyms.nori std/window/__native_x11.nori
+
+# std/audio: alsa.nori's C dlopens libasound. The native build plays through the PulseAudio native protocol
+# and the kernel PCM ioctls instead, so it stays static and plays on a machine with no libasound.
+@nori_c_naud_ std/audio/__native_audio.nori std/audio/__native_audio_pulse.nori std/audio/__native_audio_alsa.nori
+
+# std/nori_ui/paint_gpu: the LLVM build links ui_gpu_glue.c with wgpu-native, or ui_gpu_absent.c for no GPU,
+# as the program's --cfile list chooses. The native build has no such list: this module dlopens
+# libwgpu_native.so when a canvas is made and answers as the absent glue does when it is not there.
+@ui_gpu_ std/nori_ui/paint_gpu/__native_ui_gpu.nori
+
+# What a project's manifest may still name under [native] and be built by the native back end: the C
+# glue answered above, and the libraries and flags only that glue needed. `roll` reads these three
+# lists: a [native] section made of nothing else does not send the project to the LLVM pipeline, and
+# the entries are left off the native build's command line. One `*` in an entry stands for anything.
+=cfile std/window/window_dispatch.c std/window/window_wayland.c std/window/window_x11.c std/window/window_absent.c std/window/*-protocol.c std/nori_ui/paint_gpu/ui_gpu_glue.c std/nori_ui/paint_gpu/ui_gpu_absent.c
+=clink wayland-client xkbcommon X11 wgpu_native asound
+=ccflag -DNORI_HAVE_X11

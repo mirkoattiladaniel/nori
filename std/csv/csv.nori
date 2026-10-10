@@ -1,0 +1,115 @@
+//! std/csv: RFC 4180 CSV parse + write. `parse` turns CSV text into rows of string fields
+//! (handling quoted fields with embedded commas/newlines and `""` escapes); `write` serializes rows back,
+//! quoting any field that needs it. Round-trips.
+//!   import "std/csv" as csv
+//!   let rows = csv::parse("a,b\n1,\"x,y\"\n")   // [["a","b"], ["1","x,y"]]
+//!   csv::write(rows)
+
+/// parse CSV `text` into rows of fields. CR, LF, and CRLF all end a row; `"`-quoted fields may contain
+/// commas/newlines and `""` for a literal quote.
+pub fn parse(text: Str) -> Vec<Vec<Str>> {
+    var rows: Vec<Vec<Str>> = vec()
+    var row: Vec<Str> = vec()
+    var field = ""
+    var inq = false
+    var i = 0
+    let n = text.len()
+    while i < n {
+        let c = ord(text.at(i))
+        if inq {
+            if c == 34 {
+                if i + 1 < n && ord(text.at(i + 1)) == 34 {
+                    field = (field + chr(34))
+                    i = i + 1
+                }
+                // "" -> "
+                else {
+                    inq = false
+                }
+            } else { field = (field + chr(c)) }
+        } else {
+            if c == 34 {
+                inq = true
+            }
+            else if c == 44 {
+                row.push(field)
+                field = ""
+            }
+            // ,
+            else if c == 10 || c == 13 {
+                // end of row
+                if c == 13 && i + 1 < n && ord(text.at(i + 1)) == 10 {
+                    i = i + 1
+                }
+                // CRLF
+                row.push(field) field = ""
+                rows.push(row) row = vec()
+            } else { field = (field + chr(c)) }
+        }
+        i = i + 1
+    }
+    if row.len() > 0 || field.len() > 0 {
+        row.push(field)
+        rows.push(row)
+    }
+    // flush a final unterminated row
+    return rows
+}
+
+/// does `f` need quoting (contains a comma, quote, or newline)?
+fn needs_quote(f: Str) -> Bool {
+    var i = 0
+    while i < f.len() {
+        let c = ord(f.at(i))
+        if c == 44 || c == 34 || c == 10 || c == 13 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// `f` quoted per RFC 4180 if it needs it (wrap in `"`, double inner quotes); otherwise returned as-is.
+pub fn quote_field(f: Str) -> Str {
+    if !needs_quote(f) {
+        return copy f
+    }
+    var out = ""
+    out = (out + chr(34)) // open quote
+    var i = 0
+    while i < f.len() {
+        let c = ord(f.at(i))
+        out = (out + chr(c))
+        if c == 34 {
+            out = (out + chr(34))
+        }
+        // double an inner quote
+        i = i + 1
+    }
+    return(out + chr(34)) // close quote
+}
+
+/// serialize one row of fields to a CSV line (no trailing newline).
+pub fn write_row(fields: Vec<Str>) -> Str {
+    var out = ""
+    var i = 0
+    while i < fields.len() {
+        if i > 0 {
+            out = (out + ",")
+        }
+        out = (out + quote_field(fields[i]))
+        i = i + 1
+    }
+    return out
+}
+
+/// serialize rows to CSV text, each row terminated by `\n`.
+pub fn write(rows: Vec<Vec<Str>>) -> Str {
+    var out = ""
+    var i = 0
+    while i < rows.len() {
+        out = (out + (write_row(rows[i]) + chr(10)))
+        i = i + 1
+    }
+    return out
+}

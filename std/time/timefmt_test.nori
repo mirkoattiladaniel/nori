@@ -1,0 +1,69 @@
+import "std/time" as t
+
+fn test_pad2() {
+    assert_streq(t::time_pad2(0), "00")
+    assert_streq(t::time_pad2(5), "05")
+    assert_streq(t::time_pad2(42), "42")
+}
+
+fn test_days_from_civil() {
+    assert_eq(t::days_from_civil(1970, 1, 1), 0)
+    assert_eq(t::days_from_civil(1970, 1, 2), 1)
+    assert_eq(t::days_from_civil(1969, 12, 31), -1)
+    assert_eq(t::days_from_civil(2000, 1, 1), 10957)
+}
+
+fn test_roundtrip() {
+    assert_eq(t::time_to_unix(t::breakdown(0)), 0)
+    assert_eq(t::time_to_unix(t::breakdown(1700000000)), 1700000000)
+    assert_eq(t::time_to_unix(t::breakdown(86400)), 86400)
+    assert_eq(t::time_to_unix(t::breakdown(1234567890)), 1234567890)
+    assert_eq(t::time_to_unix(t::breakdown(951782400)), 951782400)
+}
+
+fn test_iso8601() {
+    let dt0 = t::breakdown(0)
+    assert_streq(t::iso8601(dt0), "1970-01-01T00:00:00Z")
+    let dt = t::breakdown(1700000000)
+    assert_streq(t::iso8601(dt), "2023-11-14T22:13:20Z")
+}
+
+fn test_parse() {
+    assert_eq(t::parse_iso8601("1970-01-01T00:00:00Z"), 0)
+    assert_eq(t::parse_iso8601("2023-11-14T22:13:20Z"), 1700000000)
+    assert_eq(t::parse_iso8601("2023-11-14T22:13:20"), 1700000000)
+    assert_eq(t::parse_iso8601("2023-11-14 22:13:20"), 1700000000)
+    assert_eq(t::parse_iso8601("not-a-date"), -1)
+    assert_eq(t::parse_iso8601("2023/11/14T22:13:20Z"), -1)
+    assert_eq(t::parse_iso8601("20x3-11-14T22:13:20Z"), -1)
+}
+
+fn test_names() {
+    let dt = t::breakdown(1700000000)        // 2023-11-14 is a Tuesday
+    assert_eq(dt.weekday, 2)
+    assert_streq(t::weekday_name(0), "Sunday")
+    assert_streq(t::weekday_name(2), "Tuesday")
+    assert_streq(t::weekday_name(6), "Saturday")
+    assert_streq(t::weekday_name(9), "")
+    assert_streq(t::month_name(1), "January")
+    assert_streq(t::month_name(11), "November")
+    assert_streq(t::month_name(12), "December")
+    assert_streq(t::month_name(0), "")
+}
+
+fn test_format_dt() {
+    let dt = t::breakdown(1700000000)        // 2023-11-14T22:13:20, Tuesday
+    assert_streq(t::format_dt(dt, "%Y-%m-%d"), "2023-11-14")
+    assert_streq(t::format_dt(dt, "%H:%M:%S"), "22:13:20")
+    assert_streq(t::format_dt(dt, "%A %B"), "Tuesday November")
+    assert_streq(t::format_dt(dt, "%a %b"), "Tue Nov")
+    assert_streq(t::format_dt(dt, "%y"), "23")
+    assert_streq(t::format_dt(dt, "%%"), "%")
+    assert_streq(t::format_dt(dt, "x%Yx"), "x2023x")
+}
+
+fn test_date_time_string() {
+    let dt = t::breakdown(1700000000)
+    assert_streq(t::date_string(dt), "2023-11-14")
+    assert_streq(t::time_string(dt), "22:13:20")
+}

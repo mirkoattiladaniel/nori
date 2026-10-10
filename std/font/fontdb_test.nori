@@ -1,0 +1,108 @@
+// Native tests for std/font's font discovery, fallback and itemization: run with
+//   noric --test std/font/fontdb_test.nori compiler/runtime.nori --import-root .
+import "std/font" as font
+
+fn assets() -> Vec<font::FontFaceInfo> {
+    var dirs: Vec<Str> = vec()
+    dirs.push("std/font/assets")
+    return font::scan_font_dirs(dirs)
+}
+
+fn test_scan_assets() {
+    let faces = assets()
+    // 7 single fonts of our own + DejaVu's 4 .ttf and 1 .woff2, the CJK pair, and the 2-face .ttc
+    assert_true(faces.len() >= 14)
+    let i = font::match_face(faces, "dejavu sans", 400, false)
+    assert_true(i >= 0)
+    assert_streq(faces[i].family, "DejaVu Sans")
+    let b = font::match_face(faces, "DejaVu Sans", 700, false)
+    assert_true(b >= 0)
+    assert_eq(faces[b].weight, 700)
+    let o = font::match_face(faces, "DejaVu Sans", 400, true)
+    assert_true(faces[o].italic)
+    let m = font::match_face(faces, "DejaVu Sans Mono", 400, false)
+    assert_true(faces[m].monospace)
+    assert_eq(font::match_face(faces, "No Such Family", 400, false), 0 - 1)
+    // the collection's two faces are both found, with their own index
+    var ttc = 0
+    var k = 0
+    while k < faces.len() { if faces[k].index == 1 { ttc = ttc + 1 }  k = k + 1 }
+    assert_true(ttc >= 1)
+    // the emoji face is recognised as a color face
+    var color = false
+    k = 0
+    while k < faces.len() { if faces[k].color { color = true }  k = k + 1 }
+    assert_true(color)
+}
+
+fn test_face_coverage() {
+    let faces = assets()
+    let ar = font::match_face(faces, "Noto Sans Arabic", 400, false)
+    assert_true(ar >= 0)
+    assert_true(font::face_covers(faces[ar], 1604))        // lam
+    assert_true(!font::face_covers(faces[ar], 19968))      // not a CJK ideograph
+}
+
+fn test_fontset_for_text() {
+    let faces = assets()
+    let p = font::match_face(faces, "Noto Sans", 400, false)
+    assert_true(p >= 0)
+    let fs = font::fontset_for_text(faces, p, "Hello مرحبا नमस्ते 永 😀")
+    // primary + Arabic + Devanagari + CJK + emoji
+    assert_true(font::fontset_len(fs) >= 5)
+    let runs = font::itemize(fs, "Hello مرحبا नमस्ते 永 😀", font::BIDI_LTR())
+    // every run's font has its characters
+    var i = 0
+    var seen_rtl = false
+    while i < runs.len() {
+        if (runs[i].level & 1) == 1 { seen_rtl = true }
+        i = i + 1
+    }
+    assert_true(seen_rtl)
+    assert_true(runs.len() >= 5)
+    let line = font::shape_line(fs, "Hello مرحبا नमस्ते 永 😀", 16.0, font::BIDI_LTR(), "", "")
+    // no notdef anywhere: every cluster found a face
+    var notdef = 0
+    i = 0
+    while i < line.glyphs.len() { if line.glyphs[i].gid == 0 { notdef = notdef + 1 }  i = i + 1 }
+    assert_eq(notdef, 0)
+    assert_true(line.width > 100.0)
+}
+
+fn test_itemize_bidi_and_script() {
+    var fs = font::fontset_new()
+    font::fontset_add(fs, font::font_load(read_file("std/font/assets/NotoSans-subset.ttf")).font)
+    font::fontset_add(fs, font::font_load(read_file("std/font/assets/NotoSansArabic-subset.ttf")).font)
+    let t = "abc السلام 123 def"
+    let runs = font::itemize(fs, t, font::BIDI_LTR())
+    // "abc " | "السلام " (RTL, Arabic font) | "123" (level 2: W2 makes it AN) | " " | "def"
+    assert_eq(runs.len(), 5)
+    var arabic_run = 0 - 1
+    var i = 0
+    while i < runs.len() { if runs[i].start == 4 { arabic_run = i }  i = i + 1 }
+    assert_eq(runs[2].level, 2)
+    assert_eq(runs[4].level, 0)
+    assert_eq(runs[4].font, 0)
+    assert_true(arabic_run >= 0)
+    assert_eq(runs[arabic_run].level, 1)
+    assert_streq(font::script_code(runs[arabic_run].script), "Arab")
+    // visual order puts the logical runs left to right, the RTL run reversed within itself
+    let line = font::shape_line(fs, t, 20.0, font::BIDI_LTR(), "", "")
+    var x = 0.0 - 1.0
+    i = 0
+    while i < line.glyphs.len() { assert_true(line.glyphs[i].x >= x)  x = line.glyphs[i].x  i = i + 1 }
+    // the first glyph is 'a' (cluster 0), the last is 'f'
+    assert_eq(line.glyphs[0].cluster, 0)
+    assert_eq(line.glyphs[line.glyphs.len() - 1].cluster, t.len() - 1)
+}
+
+fn test_name_table_unicode() {
+    // a hand-made name table: one Windows record, id 1, "Ä€" (U+00C4 U+20AC)
+    var nm = ""
+    nm = nm + chr(0) + chr(0) + chr(0) + chr(1) + chr(0) + chr(18)               // format, count, stringOffset
+    nm = nm + chr(0) + chr(3) + chr(0) + chr(1) + chr(4) + chr(9) + chr(0) + chr(1) + chr(0) + chr(4) + chr(0) + chr(0)
+    nm = nm + chr(0) + chr(196) + chr(32) + chr(172)
+    assert_streq(font::name_table_string(nm, 1), "Ä€")
+    assert_streq(font::name_table_string(nm, 2), "")
+    assert_streq(font::name_table_string("", 1), "")
+}

@@ -1,0 +1,35 @@
+import "std/io" as io
+fn test_builder() {
+    var b = io::builder()
+    io::add(b, "x=")
+    io::add_line(b, "1")
+    io::add(b, "done")
+    assert_streq(io::build(b), "x=1\ndone")
+}
+fn test_lines() {
+    let ls = io::lines("a\nb\r\nc\n")
+    assert_eq(ls.len(), 3)
+    assert_streq(ls[0], "a")
+    assert_streq(ls[1], "b")
+    assert_streq(ls[2], "c")
+    assert_eq((io::lines("")).len(), 0)
+    assert_eq((io::lines("solo")).len(), 1)
+}
+fn test_copy_file() {
+    write_file("/tmp/nori_iotest_src.txt", "streamed copy content\n")
+    assert_true(io::copy_file("/tmp/nori_iotest_src.txt", "/tmp/nori_iotest_dst.txt"))
+    assert_streq(read_file("/tmp/nori_iotest_dst.txt"), "streamed copy content\n")
+    // a file larger than the 64K chunk must copy byte-for-byte
+    var big = ""  var i = 0  while i < 5000 { big = big + "0123456789ABCDEF"  i = i + 1 }   // 80000 bytes
+    write_file("/tmp/nori_iotest_big.txt", big)
+    assert_true(io::copy_file("/tmp/nori_iotest_big.txt", "/tmp/nori_iotest_bigdst.txt"))
+    assert_eq(read_file("/tmp/nori_iotest_bigdst.txt").len(), 80000)
+    // missing source -> false
+    assert_false(io::copy_file("/tmp/nori_iotest_nope_xyz", "/tmp/nori_iotest_x.txt"))
+}
+fn test_append_file() {
+    remove_path("/tmp/nori_iotest_app.txt")
+    assert_true(io::append_file("/tmp/nori_iotest_app.txt", "a\n"))   // creates it
+    assert_true(io::append_file("/tmp/nori_iotest_app.txt", "b\n"))   // appends
+    assert_streq(read_file("/tmp/nori_iotest_app.txt"), "a\nb\n")
+}

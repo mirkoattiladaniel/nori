@@ -1,0 +1,246 @@
+// roll: `roll bench`, time the app, and `--try-schedules` to search parallel/vectorize schedules for the
+// loops a program names.
+//
+// One directory module of roll (see src/main.nori for the layout). It reaches the others through
+// their aliases below, and only what another module uses is `pub`. The modules import each other
+// freely (`cmds` and `deps` call in both directions); cycles between directory modules are fine.
+
+import "std/os" as os
+import "std/time" as time
+import "../caps" as caps
+import "../cmds" as cmds
+import "../deps" as deps
+import "../law" as law
+import "../manifest" as manifest
+import "../ui" as ui
+import "../util" as util
+
+use caps::*
+use cmds::*
+use deps::*
+use law::*
+use manifest::*
+use ui::*
+use util::*
+
+// ---- `roll bench --try-schedules`: schedule autotuning ----
+// the identifier immediately following `kw` in `s` (skips one run of spaces), or "" if none.
+fn ident_after(s: Str, kw: Str) -> Str {
+    let p = find_substr(s, kw)
+    if p < 0 {
+        return ""
+    }
+    var i = p + kw.len()
+    var sk = true
+    while sk && i < s.len() {
+        if ord(s.at(i)) == 32 {
+            i = i + 1
+        } else {
+            sk = false
+        }
+    }
+    // skip spaces after kw
+    let start = i
+    var going = true
+    while going && i < s.len() {
+        let c = ord(s.at(i))
+        let ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95
+        if ok {
+            i = i + 1
+        } else {
+            going = false
+        }
+    }
+    if i <= start {
+        return ""
+    }
+    return s.slice(start, i)
+}
+// scan the project sources for `foreach … named LABEL` loops, recording each one's enclosing `fn NAME`
+// (a line-oriented heuristic, good enough for canonically formatted Nori). Fills parallel arrays.
+fn bench_scan(files: Vec<Str>, inout occfn: Vec<Str>, inout occlabel: Vec<Str>, inout schedfns: Vec<Str>) {
+    var fi = 0
+    while fi < files.len() {
+        let f = files[fi]
+        if !ends_with(f, ".nori") {
+            fi = fi + 1
+            continue
+        }
+        let lines = law_split_lines(read_file(f))
+        var curfn = ""
+        var i = 0
+        while i < lines.len() {
+            let t = trim(lines[i])
+            if starts_with(t, "fn ") {
+                curfn = ident_after(t, "fn ")
+            }
+            if starts_with(t, "schedule ") {
+                schedfns.push(ident_after(t, "schedule "))
+            }
+            // already-scheduled fns: leave them alone
+            if find_substr(t, " named ") >= 0 {
+                let lbl = ident_after(t, " named ")
+                if !(lbl == "") && !(curfn == "") {
+                    occfn.push(copy curfn)
+                    occlabel.push(lbl)
+                }
+            }
+            i = i + 1
+        }
+        fi = fi + 1
+    }
+}
+// build `entry` with an extra `schedule` block appended, into `out`; return true on success (a racy /
+// unsafe schedule is a build error, so unsafe candidates simply fail here and are
+// dropped from the ranking; the autotuner only ever proposes schedules that compile).
+fn bench_build(mf: Str, rootsrc: Str, sched: Str, out: Str, quiet: Bool) -> Bool {
+    let broot = "build/_bench_root.nori" // beside build/_root.nori so its `import "../src/…"` paths resolve
+    os::make_dir_p("build/bench")
+    write_file(broot, (rootsrc + (chr(10) + (sched + chr(10)))))
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--build") cmd.push(broot) cmd.push(copy out) cmd.push("--quiet") cmd.push("--opt") cmd.push("2")
+    cmd.push("--no-auto-par") // bench evaluates manual schedules: measure against a serial baseline, otherwise auto-par would parallelize the baseline and mask every schedule's effect
+    add_import_flags(cmd, mf)
+    if quiet {
+        return os::run_silent(cmd) == 0
+    }
+    // candidate probes: hide the compile errors of racy/unsafe schedules
+    return os::run(cmd) == 0
+}
+// run `bin` `runs` times (output discarded), returning the minimum wall-clock in ms (min filters noise).
+fn bench_time(bin: Str, runs: Int) -> Int {
+    var best = 0 - 1
+    var r = 0
+    while r < runs {
+        var c: Vec<Str> = vec() c.push(copy bin)
+        let t0 = time::now_ms()
+        let _ = os::run_silent(c)
+        let dt = time::now_ms() - t0
+        if best < 0 {
+            best = dt
+        } else {
+            if dt < best {
+                best = dt
+            }
+        }
+        r = r + 1
+    }
+    return best
+}
+pub fn bench_cmd() -> Int {
+    let mf = load_manifest()
+    let bk = section_get(mf, "", "kind")
+    if(bk == "lib") || (bk == "plugin") {
+        printl("roll: `bench` needs an app with a `main` to run")
+        return 1
+    }
+    let entry = section_get(mf, "", "entry")
+    if caps_enforce(mf) != 0 {
+        return 1
+    }
+    let runs = to_int_or(flag_val("--runs", "3"), 3)
+    let root = gen_root(entry)
+    let rootsrc = read_file(root)
+    os::make_dir_p("build/bench")
+    let base = "build/bench/base"
+    eprintl((verb("Baseline", "1;36") + (" " + dim("building + timing the project as written"))))
+    if !bench_build(mf, rootsrc, "", base, false) {
+        eprintl((verb("Failed", "1;31") + " the baseline build did not complete"))
+        return 1
+    }
+    let basems = bench_time(base, runs)
+    printl(("baseline: " + (basems + "ms")))
+    if !has_flag("--try-schedules") {
+        printl(dim("  (pass --try-schedules to search parallel/vectorize schedules for `named` loops)"))
+        return 0
+    }
+    // discover named loops
+    var occfn: Vec<Str> = vec() var occlabel: Vec<Str> = vec() var schedfns: Vec<Str> = vec()
+    var files: Vec<Str> = vec()
+    let all = os::list_tree(dirname(entry))
+    var ai = 0
+    while ai < all.len() {
+        files.push(copy all[ai])
+        ai = ai + 1
+    }
+    bench_scan(files, occfn, occlabel, schedfns)
+    if occfn.len() == 0 {
+        printl(dim("  no `foreach … named L` loops found — add a `named` label to tune a loop"))
+        return 0
+    }
+    // distinct tunable fns (in first-seen order), skipping any that already carry a `schedule`
+    var fns: Vec<Str> = vec()
+    var i = 0
+    while i < occfn.len() {
+        let fname = occfn[i]
+        if shadow_idx(fns, fname) < 0 && shadow_idx(schedfns, fname) < 0 {
+            fns.push(copy fname)
+        }
+        i = i + 1
+    }
+    printl("")
+    var recommended = ""
+    var fj = 0
+    while fj < fns.len() {
+        let fname = fns[fj]
+        // labels for this fn, in source order (outer first)
+        var labels: Vec<Str> = vec()
+        i = 0
+        while i < occfn.len() {
+            if(occfn[i] == fname) {
+                if shadow_idx(labels, occlabel[i]) < 0 {
+                    labels.push(copy occlabel[i])
+                }
+            }
+            i = i + 1
+        }
+        let outer = labels[0]
+        var inner = outer
+        if labels.len() > 1 {
+            inner = labels[labels.len() - 1]
+        }
+        // candidate schedule bodies (verbs); baseline is the empty schedule (already measured)
+        var cand: Vec<Str> = vec()
+        cand.push(("parallel(" + (outer + ")")))
+        cand.push(("vectorize(" + (inner + ")")))
+        cand.push(("parallel(" + (outer + (")  vectorize(" + (inner + ")")))))
+        printl((fname + (" — searching schedules (baseline " + (basems + "ms))"))))
+        var bestms = basems
+        var bestsched = ""
+        var ci = 0
+        while ci < cand.len() {
+            let verbs = cand[ci]
+            let block = ("schedule " + (fname + (" { " + (verbs + " }"))))
+            let out = ("build/bench/cand")
+            if !bench_build(mf, rootsrc, block, out, true) {
+                printl(dim(("    " + (verbs + "  — rejected (does not compile: likely a data race)"))))
+            } else {
+                let ms = bench_time(out, runs)
+                var tag = ""
+                if ms < bestms {
+                    bestms = ms
+                    bestsched = verbs
+                    tag = "  <- new best"
+                }
+                printl(("    " + (verbs + (": " + (ms + ("ms" + tag))))))
+            }
+            ci = ci + 1
+        }
+        if !(bestsched == "") {
+            printl(("  winner for " + (fname + (": " + (bestsched + dim(("   (" + (basems + ("ms -> " + (bestms + "ms)"))))))))))
+            recommended = (recommended + ("schedule " + (fname + (" { " + (bestsched + (" }" + chr(10)))))))
+        } else {
+            printl(dim(("  no schedule beat the baseline for " + fname)))
+        }
+        printl("")
+        fj = fj + 1
+    }
+    if(recommended == "") {
+        printl("no schedule improved on the baseline — nothing to add")
+        return 0
+    }
+    printl("recommended — paste into your source (tuning is versioned like code):")
+    printl("")
+    printl(recommended)
+    return 0
+}

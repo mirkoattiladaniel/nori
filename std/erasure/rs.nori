@@ -1,0 +1,270 @@
+//! Reed–Solomon erasure coding over GF(2^8).
+//!
+//! k data shards in, m parity shards out. Any k of the k+m reconstruct the whole set, so m losses
+//! of any kind are survivable. Against keeping whole copies that is a large difference in what
+//! storage buys: two replicas cost 2x and survive one loss, while RS(8,4) costs 1.5x and survives
+//! four.
+//!
+//! Systematic, which matters more than it sounds. The k data shards come out unchanged (the code
+//! is appended, not applied), so a reader that has the data reads it as before and never
+//! touches parity or does any arithmetic at all. Only a degraded read, where something is missing,
+//! pays anything.
+//!
+//! Cauchy, not Vandermonde. The generator is the identity stacked on a Cauchy matrix
+//! C[i][j] = 1/(x_i + y_j) over disjoint x and y. Every square submatrix of a Cauchy matrix is
+//! invertible, which is the property recovery depends on: any k surviving rows must give a
+//! solvable system. A Vandermonde matrix does not guarantee that, and the failure is not a wrong
+//! answer but a set of k shards that cannot be inverted at all, discovered only when something
+//! has already been lost and it is too late to choose differently.
+//!
+//! The field is GF(2^8) modulo 0x11d with generator 2. Multiplication goes through a full 64KB
+//! product table built once: the inner loop is one lookup and one XOR per byte, which is what
+//! makes coding megabyte shards in this language reasonable.
+
+fn gf_poly() -> Int { return 0x11d }
+
+/// exp/log tables for the field: exp[i] = 2^i, and log is its inverse.
+fn gf_tables() -> Vec<Int> {
+    var t: Vec<Int> = vec()
+    var i = 0
+    while i < 512 { t.push(0)  i = i + 1 }          // 0..255 exp, 256..511 log
+    var x = 1
+    var e = 0
+    while e < 255 {
+        t[e] = x
+        t[256 + x] = e
+        var nx = (x << 1)
+        if (nx & 256) != 0 { nx = (nx ^ gf_poly()) }
+        x = nx
+        e = e + 1
+    }
+    t[255] = t[0]
+    return t
+}
+
+/// The 256x256 product table. Built once and passed around: without it every byte of every shard
+/// costs two log lookups, an add and an exp lookup, and the inner loop is where all the time goes.
+pub fn gf_mul_table() -> Vec<Int> {
+    let t = gf_tables()
+    var m: Vec<Int> = vec()
+    var i = 0
+    while i < 65536 { m.push(0)  i = i + 1 }
+    var a = 1
+    while a < 256 {
+        var b = 1
+        let la = t[256 + a]
+        while b < 256 {
+            let lb = t[256 + b]
+            var s = (la + lb)
+            if s >= 255 { s = (s - 255) }
+            m[((a << 8) | b)] = t[s]
+            b = b + 1
+        }
+        a = a + 1
+    }
+    return m
+}
+
+fn gf_mul(mt: Vec<Int>, a: Int, b: Int) -> Int { return mt[((a << 8) | b)] }
+
+fn gf_inv(mt: Vec<Int>, a: Int) -> Int {
+    var b = 1
+    while b < 256 {
+        if gf_mul(mt, a, b) == 1 { return b }
+        b = b + 1
+    }
+    return 0
+}
+
+/// The m x k Cauchy matrix, row-major. x_i = k+i and y_j = j are disjoint by construction, which
+/// is what makes every square submatrix invertible.
+pub fn rs_matrix(k: Int, m: Int, mt: Vec<Int>) -> Vec<Int> {
+    var c: Vec<Int> = vec()
+    var i = 0
+    while i < m {
+        var j = 0
+        while j < k {
+            c.push(gf_inv(mt, ((k + i) ^ j)))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+/// k data shards -> m parity shards, each the same length. All shards must be equal length; a
+/// caller that pads to a size class already has that.
+pub fn rs_encode(data: Vec<Str>, m: Int) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let k = data.len()
+    if k == 0 || m <= 0 || (k + m) > 256 { return out }
+    let n = data[0].len()
+    var v = 0
+    while v < k { if data[v].len() != n { return out }  v = v + 1 }
+    let mt = gf_mul_table()
+    let c = rs_matrix(k, m, mt)
+    var i = 0
+    while i < m {
+        var acc: Vec<Int> = vec()
+        var z = 0
+        while z < n { acc.push(0)  z = z + 1 }
+        var j = 0
+        while j < k {
+            let coef = c[((i * k) + j)]
+            if coef != 0 {
+                let base = (coef << 8)
+                let d = data[j]
+                var p = 0
+                while p < n {
+                    acc[p] = (acc[p] ^ mt[(base | ord(d.at(p)))])
+                    p = p + 1
+                }
+            }
+            j = j + 1
+        }
+        var b = io_bytes(acc)
+        out.push(b)
+        i = i + 1
+    }
+    return out
+}
+
+fn io_bytes(v: Vec<Int>) -> Str {
+    var s = ""
+    var i = 0
+    while i < v.len() { s = (s + chr(v[i]))  i = i + 1 }
+    return s
+}
+
+/// Invert a k x k matrix in place by Gauss-Jordan over GF(2^8). Returns the inverse, or an empty
+/// Vec if the matrix is singular (which a Cauchy-derived one never is), so an empty result means
+/// the caller built the wrong rows.
+fn gf_invert(a: Vec<Int>, k: Int, mt: Vec<Int>) -> Vec<Int> {
+    var mrx: Vec<Int> = vec()
+    var inv: Vec<Int> = vec()
+    var i = 0
+    while i < (k * k) { mrx.push(a[i])  inv.push(0)  i = i + 1 }
+    var d = 0
+    while d < k { inv[((d * k) + d)] = 1  d = d + 1 }
+    var col = 0
+    while col < k {
+        // find a pivot
+        var piv = 0 - 1
+        var r = col
+        while r < k {
+            if piv < 0 && mrx[((r * k) + col)] != 0 { piv = r }
+            r = r + 1
+        }
+        if piv < 0 { var empty: Vec<Int> = vec()  return empty }
+        if piv != col {
+            var q = 0
+            while q < k {
+                let t1 = mrx[((col * k) + q)]  mrx[((col * k) + q)] = mrx[((piv * k) + q)]  mrx[((piv * k) + q)] = t1
+                let t2 = inv[((col * k) + q)]  inv[((col * k) + q)] = inv[((piv * k) + q)]  inv[((piv * k) + q)] = t2
+                q = q + 1
+            }
+        }
+        let pv = mrx[((col * k) + col)]
+        let ip = gf_inv(mt, pv)
+        var q2 = 0
+        while q2 < k {
+            mrx[((col * k) + q2)] = gf_mul(mt, mrx[((col * k) + q2)], ip)
+            inv[((col * k) + q2)] = gf_mul(mt, inv[((col * k) + q2)], ip)
+            q2 = q2 + 1
+        }
+        var r2 = 0
+        while r2 < k {
+            if r2 != col {
+                let f = mrx[((r2 * k) + col)]
+                if f != 0 {
+                    var q3 = 0
+                    while q3 < k {
+                        mrx[((r2 * k) + q3)] = (mrx[((r2 * k) + q3)] ^ gf_mul(mt, f, mrx[((col * k) + q3)]))
+                        inv[((r2 * k) + q3)] = (inv[((r2 * k) + q3)] ^ gf_mul(mt, f, inv[((col * k) + q3)]))
+                        q3 = q3 + 1
+                    }
+                }
+            }
+            r2 = r2 + 1
+        }
+        col = col + 1
+    }
+    return inv
+}
+
+/// Rebuild the k data shards from any k surviving shards.
+///
+/// `shards` is the full n = k+m set in order (data first, then parity), with "" wherever a shard
+/// is missing. Returns the k data shards, or an empty Vec when fewer than k survive; that is not
+/// a failure to handle so much as the point at which the data is gone.
+pub fn rs_recover(shards: Vec<Str>, k: Int) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let n = shards.len()
+    if k <= 0 || n <= k { return out }
+    let m = (n - k)
+    var have: Vec<Int> = vec()
+    var size = 0
+    var i = 0
+    while i < n {
+        if shards[i].len() > 0 {
+            if have.len() < k { have.push(i) }
+            if size == 0 { size = shards[i].len() }
+        }
+        i = i + 1
+    }
+    if have.len() < k { return out }
+    // nothing missing among the data shards: systematic coding means they are the data
+    var missing = false
+    var d0 = 0
+    while d0 < k { if shards[d0].len() == 0 { missing = true }  d0 = d0 + 1 }
+    if !missing {
+        var j0 = 0
+        while j0 < k { out.push(copy shards[j0])  j0 = j0 + 1 }
+        return out
+    }
+    let mt = gf_mul_table()
+    let c = rs_matrix(k, m, mt)
+    // the k x k system: one row per surviving shard, in terms of the k unknown data shards
+    var sys: Vec<Int> = vec()
+    var h = 0
+    while h < k {
+        let idx = have[h]
+        var j = 0
+        while j < k {
+            if idx < k {
+                var e = 0
+                if idx == j { e = 1 }
+                sys.push(e)
+            } else {
+                sys.push(c[(((idx - k) * k) + j)])
+            }
+            j = j + 1
+        }
+        h = h + 1
+    }
+    let inv = gf_invert(sys, k, mt)
+    if inv.len() == 0 { return out }
+    var r = 0
+    while r < k {
+        var acc: Vec<Int> = vec()
+        var z = 0
+        while z < size { acc.push(0)  z = z + 1 }
+        var h2 = 0
+        while h2 < k {
+            let coef = inv[((r * k) + h2)]
+            if coef != 0 {
+                let base = (coef << 8)
+                let sd = shards[have[h2]]
+                var p = 0
+                while p < size {
+                    acc[p] = (acc[p] ^ mt[(base | ord(sd.at(p)))])
+                    p = p + 1
+                }
+            }
+            h2 = h2 + 1
+        }
+        out.push(io_bytes(acc))
+        r = r + 1
+    }
+    return out
+}

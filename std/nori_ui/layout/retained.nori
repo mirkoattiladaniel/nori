@@ -1,0 +1,1928 @@
+use core::*
+import "std/math" as math
+import "std/os" as os
+import "std/path" as path
+
+// ===========================================================================
+// layout/retained: a `.ui` document that persists between frames.
+//
+// The immediate path (doc_layout / layout_overlay) re-lays out the whole tree
+// and re-records every primitive on every call. That is fine for an editor
+// that repaints anyway and fatal for a desktop shell, where a taskbar must
+// cost nothing while nothing changes and a clock ticking once a minute must
+// cost one small redraw. A retained document keeps:
+//
+//   * the parsed tree, one RNode per node: the node as authored (`src`), the
+//     node as drawn (`cur`: authored + cascade + runtime state + animation),
+//     and its children beside it;
+//   * per node, its measured size (two entries: a node is measured against
+//     its parent's context and against the padded box's), its layout rect, and
+//     its OWN output (`own`: the primitives, hits, surfaces and scroll regions
+//     the node itself emits, in layout space);
+//   * per node, that output carried to the screen (`fin`: through every
+//     ancestor's transform, opacity, scroll offset and clip);
+//   * the flat overlay the painters draw (`rdoc_overlay`).
+//
+// A change marks what it touches. `sty`: re-resolve this node's style; when
+// `cur` comes out different, `dirty`: relayout it. Layout walks only paths
+// that hold something dirty and reuses every subtree whose rect, context and
+// contents are unchanged (cached measures make the siblings of a changed node
+// free). Flatten re-transforms only nodes that were laid out again or whose
+// ancestors' transform changed. Damage is computed by comparing each re-built
+// node's old and new screen primitives, so it is exact whatever was relaid:
+// a text that changes to text of the same width damages that text's box.
+//
+// Layout is the immediate path's. Leaves are laid out by ui_layout_node_body
+// itself; containers (row / column / scroll_* / overflow / absolute children)
+// are decomposed here so their children can be cached, using the same flex
+// pass (container_flex_rects) and the same rules, and a differential test
+// (retained_test.nori) holds the two to the same primitives.
+//
+// Differences from the immediate path, on purpose:
+//   * a scroll offset is a translate applied to the children at flatten time,
+//     not a relayout; scrolling a list re-transforms it and lays out nothing;
+//   * an anonymous scroll region is named "_scroll_" + its child-index path
+//     (e.g. "_scroll_0.2"), stable across unrelated edits, where the immediate
+//     path numbers them by how many were emitted before it.
+// ===========================================================================
+
+// ---- small value helpers ----------------------------------------------------------------------
+
+fn ctx_same(a: LayoutLengthContext, b: LayoutLengthContext) -> Bool {
+    return a.viewport_w == b.viewport_w && a.viewport_h == b.viewport_h && a.ui_scale == b.ui_scale && a.parent_inner_w == b.parent_inner_w && a.parent_inner_h == b.parent_inner_h
+}
+fn ctx_dup(c: LayoutLengthContext) -> LayoutLengthContext {
+    return LayoutLengthContext { viewport_w: c.viewport_w, viewport_h: c.viewport_h, ui_scale: c.ui_scale, parent_inner_w: c.parent_inner_w, parent_inner_h: c.parent_inner_h }
+}
+fn ctx_zero() -> LayoutLengthContext { return LayoutLengthContext { viewport_w: 0.0, viewport_h: 0.0, ui_scale: 0.0, parent_inner_w: 0.0, parent_inner_h: 0.0 } }
+pub fn rect_same(a: Rect, b: Rect) -> Bool { return a.min.x == b.min.x && a.min.y == b.min.y && a.max.x == b.max.x && a.max.y == b.max.y }
+fn rect_zero() -> Rect { return rect_min_max(vec2_zero(), vec2_zero()) }
+fn rect_area(r: Rect) -> Float { return math::fmax(r.width(), 0.0) * math::fmax(r.height(), 0.0) }
+pub fn color_same(a: Color, b: Color) -> Bool { return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a }
+pub fn strs_same(a: Vec<Str>, b: Vec<Str>) -> Bool {
+    if a.len() != b.len() { return false }
+    var i = 0
+    while i < a.len() { if !(a[i] == b[i]) { return false }  i = i + 1 }
+    return true
+}
+fn span_same(a: TextSpanRun, b: TextSpanRun) -> Bool {
+    return a.text == b.text && strs_same(a.classes, b.classes) && a.has_size == b.has_size && a.size_px == b.size_px && a.has_color == b.has_color && color_same(a.color, b.color) && a.bold == b.bold && a.italic == b.italic && a.transform == b.transform && a.has_outline == b.has_outline && color_same(a.outline_color, b.outline_color) && a.outline_width_px == b.outline_width_px
+}
+pub fn spans_same(a: Vec<TextSpanRun>, b: Vec<TextSpanRun>) -> Bool {
+    if a.len() != b.len() { return false }
+    var i = 0
+    while i < a.len() { if !span_same(a[i], b[i]) { return false }  i = i + 1 }
+    return true
+}
+
+/// every field of `a` and `b` but their children is equal (generated from UiNode's field list:
+/// a field added to UiNode must be added here, or a change to it will not be seen).
+pub fn ui_node_shallow_eq(a: UiNode, b: UiNode) -> Bool {
+    if !(a.kind == b.kind && a.id == b.id && a.text == b.text && a.on_click == b.on_click && a.gap == b.gap && a.padding == b.padding) { return false }
+    if !(a.has_padding_x == b.has_padding_x && a.padding_x == b.padding_x && a.has_padding_y == b.has_padding_y && a.padding_y == b.padding_y && a.cross_align == b.cross_align && a.main_align == b.main_align) { return false }
+    if !(a.has_bg == b.has_bg && a.bg == b.bg && a.radius == b.radius && a.has_border == b.has_border && a.border_color == b.border_color && a.border_w == b.border_w) { return false }
+    if !(a.fill_w == b.fill_w && a.fill_h == b.fill_h && a.has_flex_weight == b.has_flex_weight && a.flex_weight == b.flex_weight && a.has_flex_shrink == b.has_flex_shrink && a.flex_shrink == b.flex_shrink) { return false }
+    if !((a.w.unit == b.w.unit && a.w.value == b.w.value) && (a.h.unit == b.h.unit && a.h.value == b.h.value) && a.has_color == b.has_color && a.color == b.color && a.size_px == b.size_px && a.min_height == b.min_height) { return false }
+    if !(a.tag == b.tag && strs_same(a.classes, b.classes) && a.wrap == b.wrap && a.wrap_hard_break == b.wrap_hard_break && a.line_clamp == b.line_clamp && a.text_overflow == b.text_overflow) { return false }
+    if !(a.text_transform == b.text_transform && a.has_max_width == b.has_max_width && a.max_width_px == b.max_width_px && a.line_height_mult == b.line_height_mult && a.overflow_x == b.overflow_x && a.overflow_y == b.overflow_y) { return false }
+    if !(a.hidden == b.hidden && a.disabled == b.disabled && a.bind_visible == b.bind_visible && a.bind_disabled == b.bind_disabled && a.position == b.position && a.z_index == b.z_index) { return false }
+    if !(a.has_tab_index == b.has_tab_index && a.tab_index == b.tab_index && spans_same(a.spans, b.spans) && a.has_hover_bg == b.has_hover_bg && a.hover_bg == b.hover_bg && a.has_hover_border_color == b.has_hover_border_color) { return false }
+    if !(a.hover_border_color == b.hover_border_color && a.has_hover_text_color == b.has_hover_text_color && a.hover_text_color == b.hover_text_color && a.has_active_bg == b.has_active_bg && a.active_bg == b.active_bg && a.has_top == b.has_top) { return false }
+    if !(a.top == b.top && a.has_right == b.has_right && a.right == b.right && a.has_bottom == b.has_bottom && a.bottom == b.bottom && a.has_left == b.has_left) { return false }
+    if !(a.left == b.left && a.has_align_self == b.has_align_self && a.align_self == b.align_self && a.flex_wrap == b.flex_wrap && a.has_min_width == b.has_min_width && a.min_width == b.min_width) { return false }
+    if !(a.bind == b.bind && a.src == b.src && a.checked == b.checked && a.value_f == b.value_f && a.value_s == b.value_s && a.vmin == b.vmin) { return false }
+    if !(a.vmax == b.vmax && a.has_step == b.has_step && a.step == b.step && a.has_precision == b.has_precision && a.precision == b.precision && a.suffix == b.suffix) { return false }
+    if !(strs_same(a.options, b.options) && a.selected == b.selected && a.open == b.open && a.has_item_height == b.has_item_height && a.item_height == b.item_height && a.has_track_h == b.has_track_h) { return false }
+    if !(a.track_h == b.track_h && a.has_knob_r == b.has_knob_r && a.knob_r == b.knob_r && a.has_track_color == b.has_track_color && a.track_color == b.track_color && a.has_fill_color == b.has_fill_color) { return false }
+    if !(a.fill_color == b.fill_color && a.has_knob_color == b.has_knob_color && a.knob_color == b.knob_color && a.read_only == b.read_only && a.line_numbers == b.line_numbers && a.gutter_marks == b.gutter_marks) { return false }
+    if !(a.line_notes == b.line_notes && a.diags == b.diags && a.focus_from == b.focus_from && a.focus_to == b.focus_to && a.highlight_line == b.highlight_line && a.hot_line == b.hot_line) { return false }
+    if !(a.tab_size == b.tab_size && a.hard_tabs == b.hard_tabs && a.word_wrap == b.word_wrap && a.language == b.language && a.min_rows == b.min_rows && a.max_rows == b.max_rows) { return false }
+    if !(a.caret == b.caret && a.has_caret == b.has_caret && a.sel_anchor == b.sel_anchor && a.scroll_y == b.scroll_y && a.scroll_x == b.scroll_x && a.anchor_x == b.anchor_x) { return false }
+    if !(a.anchor_y == b.anchor_y && a.has_anchor == b.has_anchor && a.font_bold == b.font_bold && a.font_italic == b.font_italic && a.has_letter_spacing == b.has_letter_spacing && a.letter_spacing == b.letter_spacing) { return false }
+    if !(a.has_word_spacing == b.has_word_spacing && a.word_spacing == b.word_spacing && a.has_text_outline == b.has_text_outline && a.text_outline_color == b.text_outline_color && a.text_outline_width_px == b.text_outline_width_px && a.has_text_gradient_from == b.has_text_gradient_from) { return false }
+    if !(a.text_gradient_from == b.text_gradient_from && a.has_text_gradient_to == b.has_text_gradient_to && a.text_gradient_to == b.text_gradient_to && a.text_gradient_horizontal == b.text_gradient_horizontal && a.has_text_shadow == b.has_text_shadow && a.text_shadow_color == b.text_shadow_color) { return false }
+    if !(a.shadow_blur == b.shadow_blur && a.shadow_spread == b.shadow_spread && a.shadow_offset_x == b.shadow_offset_x && a.shadow_offset_y == b.shadow_offset_y && a.text_decoration == b.text_decoration && a.has_text_decoration_color == b.has_text_decoration_color) { return false }
+    if !(a.text_decoration_color == b.text_decoration_color && a.text_decoration_width_px == b.text_decoration_width_px && a.opacity == b.opacity && a.translate_x == b.translate_x && a.translate_y == b.translate_y && a.scale_x == b.scale_x) { return false }
+    if !(a.scale_y == b.scale_y && a.text_dir == b.text_dir && a.lang == b.lang && a.text_align == b.text_align) { return false }
+    if !(a.font_family == b.font_family && a.font_weight == b.font_weight && a.font_slant == b.font_slant) { return false }
+    if !(a.has_bg_to == b.has_bg_to && a.bg_to == b.bg_to && a.bg_vertical == b.bg_vertical) { return false }
+    return true
+}
+
+// ---- overlays as values ------------------------------------------------------------------------
+
+/// an overlay with nothing in it and no input state.
+pub fn overlay_empty() -> ComputedOverlay {
+    return ComputedOverlay { prims: vec(), hits: vec(), surfaces: vec(), scrolls: vec(), pop_prims: vec(), pop_hits: vec(), scroll_in_ids: vec(), scroll_in_offs: vec(), in_has_mouse: false, in_mouse: vec2_zero(), in_mouse_down: false }
+}
+fn scroll_meta_dup(m: ScrollRegionMeta) -> ScrollRegionMeta { return ScrollRegionMeta { id: copy m.id, viewport: rect_dup(m.viewport), content_extent: m.content_extent, axis: m.axis } }
+fn surface_dup(s: SurfaceRegion) -> SurfaceRegion { return SurfaceRegion { id: copy s.id, rect: rect_dup(s.rect) } }
+/// a deep copy of an overlay's output layers (the input state is not carried).
+pub fn overlay_dup(ov: ComputedOverlay) -> ComputedOverlay {
+    var o = overlay_empty()
+    overlay_append_copy(o, ov)
+    return o
+}
+/// copy every output layer of `src` onto the end of `out`.
+pub fn overlay_append_copy(inout out: ComputedOverlay, src: ComputedOverlay) {
+    var i = 0
+    while i < src.prims.len() { out.prims.push(pp_dup(src.prims[i]))  i = i + 1 }
+    var h = 0
+    while h < src.hits.len() { out.hits.push(hit_region_dup(src.hits[h]))  h = h + 1 }
+    var s = 0
+    while s < src.surfaces.len() { out.surfaces.push(surface_dup(src.surfaces[s]))  s = s + 1 }
+    var c = 0
+    while c < src.scrolls.len() { out.scrolls.push(scroll_meta_dup(src.scrolls[c]))  c = c + 1 }
+    var pp = 0
+    while pp < src.pop_prims.len() { out.pop_prims.push(pp_dup(src.pop_prims[pp]))  pp = pp + 1 }
+    var ph = 0
+    while ph < src.pop_hits.len() { out.pop_hits.push(hit_region_dup(src.pop_hits[ph]))  ph = ph + 1 }
+}
+
+/// two primitives draw the same thing.
+pub fn pp_same(a: PaintPrimitive, b: PaintPrimitive) -> Bool {
+    if !(a.kind == b.kind && rect_same(a.rect, b.rect) && color_same(a.color, b.color) && a.radius == b.radius && a.border_w == b.border_w && a.text == b.text) { return false }
+    if !(a.pos.x == b.pos.x && a.pos.y == b.pos.y && a.size_px == b.size_px && a.has_clip == b.has_clip && a.font_bold == b.font_bold && a.font_italic == b.font_italic) { return false }
+    if a.has_clip && !rect_same(a.clip, b.clip) { return false }
+    if !(color_same(a.outline_color, b.outline_color) && a.outline_w == b.outline_w && a.has_grad == b.has_grad && a.letter_spacing == b.letter_spacing && a.word_spacing == b.word_spacing) { return false }
+    if a.has_grad && !(color_same(a.grad_to, b.grad_to) && a.grad_a == b.grad_a && a.grad_b == b.grad_b && a.grad_horizontal == b.grad_horizontal) { return false }
+    if !(a.font == b.font && a.lang == b.lang && a.line_dir == b.line_dir && a.line_x.len() == b.line_x.len()) { return false }
+    var k = 0
+    while k < a.line_x.len() { if a.line_x[k] != b.line_x[k] { return false }  k = k + 1 }
+    return true
+}
+
+/// The screen area a primitive can change, as either painter draws it: generous rather than tight,
+/// because a damage rect that is too small leaves a stale strip on the screen and one that is a
+/// few pixels too big costs a few pixels. Empty (zero area) when nothing of it is drawn.
+///   fill:   its rect, plus the drop shadow the painters put under a rounded, opaque fill when
+///           shadows are on (paint_cpu: offset 3, blur 7; paint_gpu: shadow_rect). The CPU shadow
+///           ignores the primitive's clip, so its box is not clipped either.
+///   border: its rect.
+///   text:   from its top-left over the widest line and every line's height, padded by the outline,
+///           a quarter em for glyph overhang (italics, accents above the box) and a pixel.
+///   image:  its rect (the letterboxed blit lands inside it).
+///   box shadow: its box and the blurred shape, moved by its offset and grown by its blur.
+pub fn pp_bounds(p: PaintPrimitive) -> Rect {
+    var r = rect_zero()
+    if p.kind == 2 {
+        if p.text.len() == 0 { return rect_zero() }
+        var st = text_measure_style_sp(p.size_px, p.letter_spacing, p.word_spacing)
+        st.stack = p.font
+        st.lang = copy p.lang
+        var w = 0.0
+        var lines = 1
+        var start = 0
+        var i = 0
+        while i <= p.text.len() {
+            if i == p.text.len() || ord(p.text.at(i)) == 10 {
+                var lw = text_measure_width(p.text.slice(start, i), st)
+                if lines - 1 < p.line_x.len() { lw = lw + p.line_x[lines - 1] }
+                if lw > w { w = lw }
+                if i < p.text.len() { lines = lines + 1 }
+                start = i + 1
+            }
+            i = i + 1
+        }
+        let lh = math::fmax(text_line_height(p.size_px), p.size_px)
+        let pad = p.outline_w + p.size_px * 0.25 + 1.0
+        r = rect_min_max(vec2(p.pos.x - pad, p.pos.y - pad), vec2(p.pos.x + w + pad, p.pos.y + to_float(lines) * lh + pad))
+    } else if p.kind == 4 {
+        // a box shadow: the box, and the blurred shape moved off it
+        let b = p.outline_w + 1.0
+        r = p.rect.union(rect_min_max(vec2(p.rect.min.x + p.letter_spacing - b, p.rect.min.y + p.word_spacing - b), vec2(p.rect.max.x + p.letter_spacing + b, p.rect.max.y + p.word_spacing + b)))
+    } else {
+        r = rect_dup(p.rect)
+    }
+    if p.has_clip {
+        if let Option::Some(c) = r.intersect(p.clip) { r = sink c } else { r = rect_zero() }
+    }
+    if p.kind == 0 && p.radius > 0.5 && p.color.a >= 250 {
+        // the drop shadow: not clipped (paint_cpu draws it on the whole canvas)
+        let sh = rect_min_max(vec2(p.rect.min.x - 8.0, p.rect.min.y - 6.0), vec2(p.rect.max.x + 8.0, p.rect.max.y + 11.0))
+        if rect_area(r) > 0.0 { r = r.union(sh) } else { r = copy sh }
+    }
+    return r
+}
+
+/// clip an overlay's layers to `viewport`, in place: merge_clipped_overlay's rules (a clip already
+/// on a primitive is narrowed, never widened; text is kept on a bounding-box test and carries the
+/// clip; rects/borders/images are cut; hits that miss the viewport go; surfaces are cut). The
+/// popup layer and scroll regions are not clipped, there or here.
+fn overlay_clip_inplace(inout ov: ComputedOverlay, viewport: Rect) {
+    var kept: Vec<PaintPrimitive> = vec()
+    var i = 0
+    while i < ov.prims.len() {
+        var prim = sink ov.prims[i]
+        var keep = true
+        var cl = rect_dup(viewport)
+        if prim.has_clip {
+            if let Option::Some(both) = prim.clip.intersect(viewport) { cl = sink both } else { keep = false }
+        }
+        if keep {
+            if prim.kind == 2 {
+                let ty0 = prim.pos.y - prim.size_px
+                let ty1 = prim.pos.y + prim.size_px + prim.size_px
+                if prim.pos.x <= cl.max.x && ty1 >= cl.min.y && ty0 <= cl.max.y {
+                    prim.has_clip = true
+                    prim.clip = sink cl
+                    kept.push(sink prim)
+                }
+            } else if prim.kind == 4 {
+                // a box shadow keeps its shape (cutting the box would move its edges): clipped instead
+                if pp_bounds(prim).overlaps(cl) {
+                    prim.has_clip = true
+                    prim.clip = sink cl
+                    kept.push(sink prim)
+                }
+            } else {
+                if let Option::Some(clipped) = prim.rect.intersect(cl) {
+                    prim.rect = clipped
+                    prim.has_clip = true
+                    prim.clip = sink cl
+                    kept.push(sink prim)
+                }
+            }
+        }
+        i = i + 1
+    }
+    ov.prims = sink kept
+    var hk: Vec<HitRegion> = vec()
+    var h = 0
+    while h < ov.hits.len() { if ov.hits[h].rect.overlaps(viewport) { hk.push(sink ov.hits[h]) }  h = h + 1 }
+    ov.hits = sink hk
+    var sk: Vec<SurfaceRegion> = vec()
+    var sf = 0
+    while sf < ov.surfaces.len() {
+        if let Option::Some(sr) = ov.surfaces[sf].rect.intersect(viewport) { sk.push(SurfaceRegion { id: sink ov.surfaces[sf].id, rect: sr }) }
+        sf = sf + 1
+    }
+    ov.surfaces = sink sk
+}
+
+// ---- damage --------------------------------------------------------------------------------------
+
+/// add `r` to a damage list (nothing when it is empty).
+pub fn damage_add(inout dmg: Vec<Rect>, r: Rect) {
+    if r.width() <= 0.0 || r.height() <= 0.0 { return }
+    dmg.push(rect_dup(r))
+}
+/// merge a damage list into a few disjoint-ish rects: overlapping (or touching) rects are unioned
+/// until nothing overlaps; past `max_n` rects everything collapses into their bounding box. Each
+/// rect is clipped to `bounds` and snapped outward to whole logical pixels.
+pub fn damage_merge(dmg: Vec<Rect>, bounds: Rect, max_n: Int) -> Vec<Rect> {
+    var rs: Vec<Rect> = vec()
+    var i = 0
+    while i < dmg.len() {
+        if let Option::Some(c) = dmg[i].intersect(bounds) {
+            rs.push(rect_min_max(vec2(math::floor(c.min.x), math::floor(c.min.y)), vec2(math::ceil(c.max.x), math::ceil(c.max.y))))
+        }
+        i = i + 1
+    }
+    var merged = true
+    while merged {
+        merged = false
+        var out: Vec<Rect> = vec()
+        var used: Vec<Bool> = vec()
+        var k = 0
+        while k < rs.len() { used.push(false)  k = k + 1 }
+        var a = 0
+        while a < rs.len() {
+            if !used[a] {
+                var acc = rect_dup(rs[a])
+                used[a] = true
+                var grew = true
+                while grew {
+                    grew = false
+                    var b = 0
+                    while b < rs.len() {
+                        if !used[b] {
+                            // touching counts: two abutting rects are one repaint, not two
+                            if acc.min.x <= rs[b].max.x && rs[b].min.x <= acc.max.x && acc.min.y <= rs[b].max.y && rs[b].min.y <= acc.max.y {
+                                acc = acc.union(rs[b])
+                                used[b] = true
+                                grew = true
+                                merged = true
+                            }
+                        }
+                        b = b + 1
+                    }
+                }
+                out.push(sink acc)
+            }
+            a = a + 1
+        }
+        rs = sink out
+    }
+    if rs.len() > max_n {
+        var bb = rect_dup(rs[0])
+        var j = 1
+        while j < rs.len() { bb = bb.union(rs[j])  j = j + 1 }
+        var one: Vec<Rect> = vec()
+        one.push(sink bb)
+        return one
+    }
+    return rs
+}
+
+// ---- the retained tree -----------------------------------------------------------------------------
+
+/// one node of a retained document. See the header.
+pub struct RNode {
+    key: Str,
+    src: Vec<UiNode>,           // the node as authored; empty until it is first styled, when `cur`
+                                // (which holds it until then) hands it over: one copy, not two
+    cur: UiNode,
+    kids: Vec<RNode>,
+    path: Str,
+    // what has to happen to it
+    sty: Bool,                  // re-resolve the style (rebuild `cur` from `src`)
+    sdesc: Bool,                // a descendant has `sty`
+    dirty: Bool,                // `cur` or the child list changed: lay it out again
+    desc: Bool,                 // a descendant is dirty
+    relaid: Bool,               // laid out since the last flatten
+    fdesc: Bool,                // a descendant was laid out since the last flatten
+    // pointer state (screen space)
+    ptr_in: Bool, hover: Bool, active: Bool,
+    // measure cache
+    m_n: Int, m0c: LayoutLengthContext, m0: Vec2, m1c: LayoutLengthContext, m1: Vec2,
+    // layout cache
+    laid: Bool, l_rect: Rect, l_ctx: LayoutLengthContext,
+    own: Vec<ComputedOverlay>,     // the layout output: one, or none (an empty overlay costs a record and nine vectors)
+    kid_vis: Vec<Bool>, kid_abs: Vec<Bool>, order: Vec<Int>,
+    clip_self: Bool, clip_kids: Bool, vp: Rect,
+    sc_axis: Int, sc_off: Float,
+    cull: Bool,                 // scroll: children wholly outside the viewport are not drawn
+    // flatten cache
+    f_ok: Bool, f_xf: Xf, f_op: Float,
+    f_has_clip: Bool, f_clip: Rect,             // intersection of the ancestors' clips (screen)
+    f_kxf: Xf, f_kop: Float, f_kclip_on: Bool, f_kclip: Rect,
+    fin: Vec<ComputedOverlay>,     // the screen output when it is not `own`: one, or none
+    ftouch: Bool,               // it or a descendant was carried to the screen again this frame
+    fin_own: Bool,              // the screen output IS `own` (no transform, opacity or clip on it): `fin` unused
+    // `own` is not held here but in the flat overlay, at the node's ranges (o_p, n_p, …): when the
+    // screen output is the layout output, keeping both a node's copy and the flat list's would hold
+    // every primitive twice. rn_take_own brings it back before anything reads or replaces it.
+    own_in_ov: Bool,
+    old_in_ov: Bool,            // its previous screen output is in the flat overlay's ranges (it was
+                                // own_in_ov when a new layout replaced it): what damage diffs against
+    // where its output sits in the flat overlay (and how much of it), for patching in place
+    o_p: Int, o_h: Int, o_s: Int, o_c: Int, o_pp: Int, o_ph: Int,
+    n_p: Int, n_h: Int, n_s: Int, n_c: Int, n_pp: Int, n_ph: Int,
+    // style: what the cascade asks for (`tgt`, only while something moves) and what moves
+    styled: Bool, tgt: Vec<UiNode>,
+    trans: Vec<TransSpec>,              // the node's `transition`
+    trs: Vec<RTrans>,                   // transitions running
+    has_an: Bool, an: AnimSpec, an_start: Float,
+    anim: Bool                          // something on it moves: style it again next frame
+}
+
+fn rn_new(sink src: UiNode, sink path: Str) -> RNode {
+    var kids: Vec<RNode> = vec()
+    var vis: Vec<Bool> = vec()
+    var abs: Vec<Bool> = vec()
+    var ord: Vec<Int> = vec()
+    let key = copy src.id
+    return RNode {
+        key: key, src: vec(), cur: src, kids: kids, path: path,
+        sty: true, sdesc: true, dirty: true, desc: true, relaid: false, fdesc: false,
+        ptr_in: false, hover: false, active: false,
+        m_n: 0, m0c: ctx_zero(), m0: vec2_zero(), m1c: ctx_zero(), m1: vec2_zero(),
+        laid: false, l_rect: rect_zero(), l_ctx: ctx_zero(),
+        own: vec(),
+        kid_vis: vis, kid_abs: abs, order: ord,
+        clip_self: false, clip_kids: false, vp: rect_zero(),
+        sc_axis: 0, sc_off: 0.0, cull: false,
+        f_ok: false, f_xf: xf_identity(), f_op: 1.0, f_has_clip: false, f_clip: rect_zero(),
+        f_kxf: xf_identity(), f_kop: 1.0, f_kclip_on: false, f_kclip: rect_zero(),
+        fin: vec(), ftouch: false, fin_own: false, own_in_ov: false, old_in_ov: false,
+        o_p: 0, o_h: 0, o_s: 0, o_c: 0, o_pp: 0, o_ph: 0, n_p: 0, n_h: 0, n_s: 0, n_c: 0, n_pp: 0, n_ph: 0,
+        styled: false, tgt: vec(), trans: vec(), trs: vec(),
+        has_an: false, an: anim_none(), an_start: 0.0, anim: false
+    }
+}
+/// build the retained subtree for a parsed node (the node's children move into it).
+fn rn_build(sink node: UiNode, path: Str) -> RNode {
+    var kids = sink node.children
+    var rn = rn_new(sink node, copy path)
+    var i = 0
+    while i < kids.len() {
+        rn.kids.push(rn_build(sink kids[i], path + ("." + to_str(i))))
+        i = i + 1
+    }
+    return rn
+}
+/// the node as authored.
+fn rn_src(rn: RNode) -> view UiNode {
+    if rn.src.len() > 0 { return rn.src[0] }
+    return rn.cur
+}
+/// true for the kinds a retained document decomposes (their children are cached on their own).
+fn rk_container(k: Int) -> Bool { return k == nk_column() || k == nk_row() || k == nk_scroll_column() || k == nk_scroll_row() }
+
+/// the per-id state a host sets on nodes, which survives every re-render of the document.
+pub struct RIdState { id: Str, add: Vec<Str>, del: Vec<Str>, has_text: Bool, text: Str }
+
+/// a retained document. Create with rdoc_new, feed it with rdoc_set_tree / rdoc_set_source and
+/// the input setters, and call rdoc_frame once per frame.
+pub struct RDoc {
+    tree: Vec<RNode>,                       // zero or one root
+    layers: Vec<RLayer>,                    // the style sources, in cascade order
+    sheet: CSheet,                          // …compiled
+    style_err: UiError, has_style_err: Bool,
+    // where the document came from, for hot reload
+    doc_file: Str, has_src: Bool, src: Str, src_file: Str, doc_deps: Vec<Str>,
+    watch: Vec<Str>, stamps: Vec<Str>,
+    err: UiError, has_err: Bool,
+    now: Float, animating: Bool,
+    vw: Float, vh: Float,
+    has_mouse: Bool, mouse: Vec2, mouse_down: Bool,
+    focus_id: Str,
+    caret_off: Bool = false,                // a blinking caret in its off phase (rdoc_set_caret_on)
+    ids: Vec<RIdState>,
+    bind_ids: Vec<Str>, bind_vals: Vec<Str>,
+    scroll_ids: Vec<Str>, scroll_offs: Vec<Float>,
+    // pending work
+    p_style_all: Bool,                      // every node's style must be re-resolved
+    p_layout: Bool,                         // the root must be laid out (viewport changed)
+    p_pointer: Bool,                        // the pointer moved or a button changed
+    p_down: Bool,                           // the button changed
+    p_full: Bool,                           // damage the whole viewport (first frame, resize)
+    p_any: Bool,                            // something at all is pending
+    // the result
+    ov: ComputedOverlay,
+    ov_dirty: Bool,                         // something on the screen changed this frame
+    ov_full: Bool,                          // the flat overlay must be rebuilt (else it was patched)
+    ov_pop_p: Int, ov_pop_h: Int,           // where the popup layer starts in it
+    dmg: Vec<Rect>,
+    // counters for tests and measurements
+    n_laid: Int, n_flat: Int, n_styled: Int
+}
+
+pub fn rdoc_new() -> RDoc {
+    var t: Vec<RNode> = vec()
+    var ids: Vec<RIdState> = vec()
+    var bi: Vec<Str> = vec()
+    var bv: Vec<Str> = vec()
+    var si: Vec<Str> = vec()
+    var so: Vec<Float> = vec()
+    var dm: Vec<Rect> = vec()
+    return RDoc {
+        tree: t, layers: vec(), sheet: csheet_empty(), style_err: ui_error_none(), has_style_err: false,
+        doc_file: "", has_src: false, src: "", src_file: "", doc_deps: vec(), watch: vec(), stamps: vec(),
+        err: ui_error_none(), has_err: false,
+        now: 0.0, animating: false,
+        vw: 0.0, vh: 0.0,
+        has_mouse: false, mouse: vec2_zero(), mouse_down: false,
+        focus_id: "",
+        ids: ids, bind_ids: bi, bind_vals: bv, scroll_ids: si, scroll_offs: so,
+        p_style_all: true, p_layout: true, p_pointer: false, p_down: false, p_full: true, p_any: true,
+        ov: overlay_empty(), ov_dirty: true, ov_full: true, ov_pop_p: 0, ov_pop_h: 0, dmg: dm,
+        n_laid: 0, n_flat: 0, n_styled: 0
+    }
+}
+
+// ---- inputs ----------------------------------------------------------------------------------------
+
+/// the viewport (logical px). A change relays out the root and damages everything.
+pub fn rdoc_set_viewport(inout d: RDoc, w: Float, h: Float) {
+    if w == d.vw && h == d.vh { return }
+    d.vw = w
+    d.vh = h
+    d.p_layout = true
+    d.p_full = true
+    d.p_any = true
+}
+/// the pointer, in the same logical space as the viewport.
+pub fn rdoc_pointer(inout d: RDoc, x: Float, y: Float, down: Bool) {
+    if d.has_mouse && d.mouse.x == x && d.mouse.y == y && d.mouse_down == down { return }
+    if down != d.mouse_down { d.p_down = true }
+    d.has_mouse = true
+    d.mouse = vec2(x, y)
+    d.mouse_down = down
+    d.p_pointer = true
+    d.p_any = true
+}
+/// the pointer left the surface.
+pub fn rdoc_pointer_leave(inout d: RDoc) {
+    if !d.has_mouse { return }
+    if d.mouse_down { d.p_down = true }
+    d.has_mouse = false
+    d.mouse_down = false
+    d.p_pointer = true
+    d.p_any = true
+}
+/// a scroll region's offset (by its id, as rdoc_overlay(d).scrolls reports it).
+pub fn rdoc_set_scroll(inout d: RDoc, id: Str, off: Float) {
+    var i = 0
+    while i < d.scroll_ids.len() {
+        if d.scroll_ids[i] == id {
+            if d.scroll_offs[i] == off { return }
+            d.scroll_offs[i] = off
+            rdoc_mark_scroll(d, id)
+            return
+        }
+        i = i + 1
+    }
+    d.scroll_ids.push(copy id)
+    d.scroll_offs.push(off)
+    rdoc_mark_scroll(d, id)
+}
+fn rdoc_scroll_of(d: RDoc, id: Str) -> Float {
+    var i = 0
+    while i < d.scroll_ids.len() { if d.scroll_ids[i] == id { return d.scroll_offs[i] }  i = i + 1 }
+    return 0.0
+}
+/// a bind variable (`bind_visible:` / `bind_disabled:`).
+pub fn rdoc_set_bind(inout d: RDoc, name: Str, value: Str) {
+    var i = 0
+    var found = false
+    while i < d.bind_ids.len() {
+        if d.bind_ids[i] == name {
+            if d.bind_vals[i] == value { return }
+            d.bind_vals[i] = copy value
+            found = true
+        }
+        i = i + 1
+    }
+    if !found { d.bind_ids.push(copy name)  d.bind_vals.push(copy value) }
+    rdoc_mark_bind(d, name)
+}
+fn rdoc_idstate(inout d: RDoc, id: Str) -> Int {
+    var i = 0
+    while i < d.ids.len() { if d.ids[i].id == id { return i }  i = i + 1 }
+    var a: Vec<Str> = vec()
+    var r: Vec<Str> = vec()
+    d.ids.push(RIdState { id: copy id, add: a, del: r, has_text: false, text: "" })
+    return d.ids.len() - 1
+}
+/// `v` without any `s` in it.
+fn strs_without(v: Vec<Str>, s: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var i = 0
+    while i < v.len() { if !(v[i] == s) { out.push(copy v[i]) }  i = i + 1 }
+    return out
+}
+pub fn strs_has(v: Vec<Str>, s: Str) -> Bool {
+    var i = 0
+    while i < v.len() { if v[i] == s { return true }  i = i + 1 }
+    return false
+}
+/// give the node `id` the class `cls` (a state the host sets: `.urgent`, `.playing`), on top of the
+/// classes its `.ui` gives it. Survives re-renders of the document.
+pub fn rdoc_add_class(inout d: RDoc, id: Str, cls: Str) {
+    let i = rdoc_idstate(d, id)
+    let had_del = strs_has(d.ids[i].del, cls)
+    if had_del { d.ids[i].del = strs_without(d.ids[i].del, cls) }
+    if strs_has(d.ids[i].add, cls) && !had_del { return }
+    if !strs_has(d.ids[i].add, cls) { d.ids[i].add.push(copy cls) }
+    rdoc_mark_id_style(d, id)
+}
+/// take the class `cls` off the node `id`, including one its `.ui` gave it.
+pub fn rdoc_remove_class(inout d: RDoc, id: Str, cls: Str) {
+    let i = rdoc_idstate(d, id)
+    let had_add = strs_has(d.ids[i].add, cls)
+    if had_add { d.ids[i].add = strs_without(d.ids[i].add, cls) }
+    if strs_has(d.ids[i].del, cls) && !had_add { return }
+    if !strs_has(d.ids[i].del, cls) { d.ids[i].del.push(copy cls) }
+    rdoc_mark_id_style(d, id)
+}
+/// replace the text of the node `id` (until the next rdoc_set_text for it, whatever the `.ui` says).
+pub fn rdoc_set_text(inout d: RDoc, id: Str, text: Str) {
+    let i = rdoc_idstate(d, id)
+    if d.ids[i].has_text && d.ids[i].text == text { return }
+    d.ids[i].has_text = true
+    d.ids[i].text = copy text
+    rdoc_mark_id_style(d, id)
+}
+/// which node has keyboard focus ("" for none): it gets the `focused` class and `:focus`.
+pub fn rdoc_set_focus(inout d: RDoc, id: Str) {
+    if d.focus_id == id { return }
+    let old = copy d.focus_id
+    d.focus_id = copy id
+    if old.len() > 0 { rdoc_mark_id_style(d, old) }
+    if id.len() > 0 { rdoc_mark_id_style(d, id) }
+}
+/// the blink phase of the carets in this document (caret_blink.nori): its focused fields are laid out again
+/// when it changes, so only they are repainted. A document that is never told keeps its carets on.
+pub fn rdoc_set_caret_on(inout d: RDoc, on: Bool) {
+    if d.caret_off == !on { return }
+    d.caret_off = !on
+    d.p_any = true
+    if d.tree.len() == 0 { return }
+    let _hit = rn_mark_carets(d.tree[0])
+}
+// every node that draws a caret, laid out again (only a focused one's output changes)
+fn rn_mark_carets(inout rn: RNode) -> Bool {
+    var hit = false
+    let k = rn.cur.kind
+    if k == nk_text_input() || k == nk_text_area() || k == nk_code_editor() || k == nk_picker() { rn.dirty = true  hit = true }
+    var i = 0
+    while i < rn.kids.len() { if rn_mark_carets(rn.kids[i]) { hit = true  rn.desc = true }  i = i + 1 }
+    return hit
+}
+/// one style source of a document: a theme, a plugin's `.style`, the document's own. `rank` orders
+/// them (lower cascades first, so a higher one overrides); `path` is the file it was loaded from
+/// ("" when it was handed over as a value), and `deps` every file that went into it.
+pub struct RLayer { name: Str, rank: Int, styles: StyleSet, path: Str, deps: Vec<Str> }
+fn rlayer_dup(l: RLayer) -> RLayer { return RLayer { name: copy l.name, rank: l.rank, styles: style_set_dup(l.styles), path: copy l.path, deps: path_copy_str(l.deps) } }
+
+/// set the style layer `name` at rank 0 (see rdoc_set_styles_ranked).
+pub fn rdoc_set_styles(inout d: RDoc, name: Str, styles: StyleSet) -> UiError { return rdoc_set_styles_ranked(d, name, 0, styles) }
+/// set the style layer `name` (a theme, a plugin's `.style`, a user's overrides). Layers cascade by
+/// `rank`, lower first: a theme at -1, the document's own styles at 0 (rdoc_load puts them
+/// there), a user's overrides at 1; within a rank, in the order they were first set.
+/// Replacing a layer keeps its place. They are compiled together, so a token one defines is used
+/// by every other and the last definition wins. Every node is restyled; one whose drawn form
+/// does not change costs nothing more.
+///
+/// A sheet that does not compile (an undefined token, a token loop) is refused: the error comes
+/// back (file, line, column) and the document keeps the sheet it had, so a broken theme never
+/// blanks the desktop.
+pub fn rdoc_set_styles_ranked(inout d: RDoc, name: Str, rank: Int, styles: StyleSet) -> UiError {
+    var none: Vec<Str> = vec()
+    return rdoc_set_layer(d, RLayer { name: copy name, rank: rank, styles: style_set_dup(styles), path: "", deps: none })
+}
+fn rdoc_set_layer(inout d: RDoc, sink layer: RLayer) -> UiError {
+    // the same styles again (a plugin re-sending its document) change nothing: no recompile, no restyle
+    var same = 0
+    while same < d.layers.len() {
+        if d.layers[same].name == layer.name && d.layers[same].rank == layer.rank && d.layers[same].path == layer.path && d.layers[same].styles.key == layer.styles.key && !d.has_style_err {
+            d.layers[same].deps = path_copy_str(layer.deps)
+            return ui_error_none()
+        }
+        same = same + 1
+    }
+    var ls: Vec<RLayer> = vec()
+    var placed = false
+    var i = 0
+    while i < d.layers.len() {
+        if d.layers[i].name == layer.name { ls.push(rlayer_dup(layer))  placed = true } else { ls.push(rlayer_dup(d.layers[i])) }
+        i = i + 1
+    }
+    if !placed {
+        // after every layer of the same rank or lower
+        var at = ls.len()
+        while at > 0 && ls[at - 1].rank > layer.rank { at = at - 1 }
+        ls.push(rlayer_dup(layer))
+        var k = ls.len() - 1
+        while k > at { var tmp = sink ls[k - 1]  ls[k - 1] = sink ls[k]  ls[k] = sink tmp  k = k - 1 }
+    } else {
+        // a changed rank moves it
+        var sorted: Vec<RLayer> = vec()
+        var j = 0
+        while j < ls.len() {
+            var at2 = sorted.len()
+            while at2 > 0 && sorted[at2 - 1].rank > ls[j].rank { at2 = at2 - 1 }
+            sorted.push(rlayer_dup(ls[j]))
+            var k2 = sorted.len() - 1
+            while k2 > at2 { var tmp2 = sink sorted[k2 - 1]  sorted[k2 - 1] = sink sorted[k2]  sorted[k2] = sink tmp2  k2 = k2 - 1 }
+            j = j + 1
+        }
+        ls = sink sorted
+    }
+    var all = style_set_new()
+    var q = 0
+    while q < ls.len() { style_set_append(all, ls[q].styles)  q = q + 1 }
+    var c = style_compile(all)
+    if !c.ok {
+        d.style_err = ui_error_dup(c.err)
+        d.has_style_err = true
+        return sink c.err
+    }
+    d.layers = sink ls
+    d.sheet = sink c.sheet
+    d.has_style_err = false
+    d.p_style_all = true
+    d.p_any = true
+    rdoc_restamp(d)
+    return ui_error_none()
+}
+/// the last style error rdoc_set_styles refused a sheet for (`msg` empty when the sheet in use is
+/// the one last set).
+pub fn rdoc_style_error(d: RDoc) -> UiError { if d.has_style_err { return ui_error_dup(d.style_err) }  return ui_error_none() }
+
+// ---- files: the document, its imports, style layers; hot reload; errors that keep the last good ----
+
+/// load a `.style` file (and the `.style` files it imports) as the layer `name` at `rank`. It is
+/// watched: rdoc_poll reloads it when it or anything it imports changes. On an error the layer
+/// keeps what it had.
+pub fn rdoc_load_styles(inout d: RDoc, name: Str, rank: Int, file: Str) -> UiError {
+    let st = os::stat_path(file)
+    if !st.ok { return rdoc_fail(d, UiError { file: copy file, line: 0, col: 0, msg: "no such file" }) }
+    let text = read_file(file)
+    var p = dsl_new(text)
+    p.file = copy file
+    p.cx.deps.push(copy file)
+    var ldoc = UiDocument { has_sheet: false, sheet: stylesheet_new(), tree: ui_node_blank(nk_column()), style: "", rich: style_set_new() }
+    dsl_import_style(p, ldoc, file, text)
+    if p.failed[0] == 1 { return rdoc_fail(d, UiError { file: copy p.efile[0], line: p.eline[0], col: p.ecol[0], msg: copy p.emsg[0] }) }
+    let e = rdoc_set_layer(d, RLayer { name: copy name, rank: rank, styles: sink ldoc.rich, path: copy file, deps: path_copy_str(p.cx.deps) })
+    if e.msg.len() > 0 { return rdoc_fail(d, e) }
+    d.has_err = false
+    rdoc_restamp(d)
+    return ui_error_none()
+}
+/// the document from `.ui` source text, which is what a plugin sends. `file` names it in errors and is what
+/// its imports are relative to ("" for a source that imports nothing). The document is diffed
+/// against the one there (rdoc_set_tree), and its own styles (its `stylesheet { }` block and the
+/// styles it imports) become the layer "document" at rank 0.
+///
+/// Nothing changes on an error: a source that does not parse, an import that is missing or broken,
+/// styles that do not compile, each comes back as file:line:col and the document on screen stays
+/// the last good one. rdoc_error says what is wrong until a good source replaces it.
+pub fn rdoc_set_source(inout d: RDoc, src: Str, file: Str) -> UiError {
+    d.has_src = true
+    d.src = copy src
+    d.src_file = copy file
+    var r = dsl_parse_document_file(src, file)
+    d.doc_deps = path_copy_str(r.deps)
+    if !r.ok {
+        var ef = copy r.efile
+        if ef.len() == 0 { ef = copy file }
+        let e = rdoc_fail(d, UiError { file: ef, line: r.eline, col: r.ecol, msg: copy r.emsg })
+        rdoc_restamp(d)
+        return e
+    }
+    var deps = path_copy_str(r.deps)
+    let se = rdoc_set_layer(d, RLayer { name: "document", rank: 0, styles: style_set_dup(r.doc.rich), path: "", deps: sink deps })
+    if se.msg.len() > 0 { let e2 = rdoc_fail(d, se)  rdoc_restamp(d)  return e2 }
+    rdoc_set_tree(d, sink r.doc.tree)
+    d.has_err = false
+    rdoc_restamp(d)
+    return ui_error_none()
+}
+/// the document from a `.ui` file, watched for changes (rdoc_poll) with everything it imports.
+pub fn rdoc_load(inout d: RDoc, file: Str) -> UiError {
+    d.doc_file = copy file
+    let st = os::stat_path(file)
+    if !st.ok {
+        let e = rdoc_fail(d, UiError { file: copy file, line: 0, col: 0, msg: "no such file" })
+        rdoc_restamp(d)
+        return e
+    }
+    return rdoc_set_source(d, read_file(file), file)
+}
+/// Hot reload re-reads whatever changed on disk (the document's file, any file it imports, any
+/// style layer's file or its imports) and applies it. A file that now has an error leaves the last
+/// good version in place (rdoc_error says why). Two stats per watched file; returns true when
+/// something was reloaded.
+pub fn rdoc_poll(inout d: RDoc) -> Bool {
+    var changed = false
+    var i = 0
+    while i < d.watch.len() {
+        if !(rdoc_stamp(d.watch[i]) == d.stamps[i]) { changed = true }
+        i = i + 1
+    }
+    if !changed { return false }
+    rdoc_reload(d)
+    return true
+}
+/// every file the document and its style layers were read from, for a host that watches them
+/// itself (inotify), so that a quiet desktop polls nothing, and calls rdoc_reload when one changes.
+pub fn rdoc_watch_list(d: RDoc) -> Vec<Str> { return path_copy_str(d.watch) }
+/// the directories those files are in, once each, as os::watch_add takes (inotify watches
+/// directories): watch them, and call rdoc_reload when os::watch_take says something changed.
+pub fn rdoc_watch_dirs(d: RDoc) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var i = 0
+    while i < d.watch.len() {
+        let dir = path::dirname(d.watch[i])
+        if !strs_has(out, dir) { out.push(copy dir) }
+        i = i + 1
+    }
+    return out
+}
+/// re-read every file the document and its style layers came from, changed or not. rdoc_poll's
+/// stat stamp is size and mtime in whole seconds, so two saves of the same length within one
+/// second look the same to it; a host told by the file system that a file changed calls this.
+pub fn rdoc_reload(inout d: RDoc) {
+    var names: Vec<Str> = vec()
+    var ranks: Vec<Int> = vec()
+    var paths: Vec<Str> = vec()
+    var l = 0
+    while l < d.layers.len() {
+        if d.layers[l].path.len() > 0 { names.push(copy d.layers[l].name)  ranks.push(d.layers[l].rank)  paths.push(copy d.layers[l].path) }
+        l = l + 1
+    }
+    var k = 0
+    while k < names.len() { let _e = rdoc_load_styles(d, names[k], ranks[k], paths[k])  k = k + 1 }
+    if d.doc_file.len() > 0 { let _e2 = rdoc_load(d, copy d.doc_file) }
+    else if d.has_src { let _e3 = rdoc_set_source(d, copy d.src, copy d.src_file) }
+    rdoc_restamp(d)
+}
+/// what is wrong with the last source, style or file the document was given (`msg` empty when
+/// nothing is: the document on screen is the last one it was given).
+pub fn rdoc_error(d: RDoc) -> UiError { if d.has_err { return ui_error_dup(d.err) }  return ui_error_none() }
+fn rdoc_fail(inout d: RDoc, e: UiError) -> UiError {
+    d.err = ui_error_dup(e)
+    d.has_err = true
+    return ui_error_dup(e)
+}
+fn rdoc_stamp(file: Str) -> Str {
+    let st = os::stat_path(file)
+    if !st.ok { return "" }
+    return to_str(st.size) + ("@" + to_str(st.mtime))
+}
+/// watch every file the document and its layers came from, as they are now.
+fn rdoc_restamp(inout d: RDoc) {
+    var w: Vec<Str> = vec()
+    if d.doc_file.len() > 0 { w.push(copy d.doc_file) }
+    var i = 0
+    while i < d.doc_deps.len() { if !strs_has(w, d.doc_deps[i]) { w.push(copy d.doc_deps[i]) }  i = i + 1 }
+    var l = 0
+    while l < d.layers.len() {
+        if d.layers[l].path.len() > 0 && !strs_has(w, d.layers[l].path) { w.push(copy d.layers[l].path) }
+        var j = 0
+        while j < d.layers[l].deps.len() { if !strs_has(w, d.layers[l].deps[j]) { w.push(copy d.layers[l].deps[j]) }  j = j + 1 }
+        l = l + 1
+    }
+    var st: Vec<Str> = vec()
+    var k = 0
+    while k < w.len() { st.push(rdoc_stamp(w[k]))  k = k + 1 }
+    d.watch = sink w
+    d.stamps = sink st
+}
+
+// marking: each walks only to what it marks, setting sdesc on the way back up
+fn rn_mark_id(inout rn: RNode, id: Str, subtree: Bool) -> Bool {
+    var hit = false
+    if rn_src(rn).id == id {
+        // a class / focus change can restyle the node's descendants when a rule has a combinator
+        if subtree { rn_mark_all(rn) } else { rn.sty = true }
+        hit = true
+    }
+    var i = 0
+    while i < rn.kids.len() { if rn_mark_id(rn.kids[i], id, subtree) { hit = true  rn.sdesc = true }  i = i + 1 }
+    return hit
+}
+fn rdoc_mark_id_style(inout d: RDoc, id: Str) {
+    d.p_any = true
+    if d.tree.len() == 0 { return }
+    let _hit = rn_mark_id(d.tree[0], id, d.sheet.comb || d.sheet.state_anc)
+}
+fn rn_mark_bind(inout rn: RNode, name: Str) -> Bool {
+    var hit = false
+    if rn_src(rn).bind_visible == name || rn_src(rn).bind_disabled == name { rn.sty = true  hit = true }
+    var i = 0
+    while i < rn.kids.len() { if rn_mark_bind(rn.kids[i], name) { hit = true  rn.sdesc = true }  i = i + 1 }
+    return hit
+}
+fn rdoc_mark_bind(inout d: RDoc, name: Str) {
+    d.p_any = true
+    if d.tree.len() == 0 { return }
+    let _hit = rn_mark_bind(d.tree[0], name)
+}
+fn rn_scroll_rid(rn: RNode) -> Str {
+    if rn.cur.id.len() > 0 { return copy rn.cur.id }
+    return "_scroll_" + rn.path
+}
+fn rn_mark_scroll(inout rn: RNode, id: Str) -> Bool {
+    var hit = false
+    if rn.sc_axis != 0 && rn_scroll_rid(rn) == id { rn.dirty = true  hit = true }
+    var i = 0
+    while i < rn.kids.len() { if rn_mark_scroll(rn.kids[i], id) { hit = true  rn.desc = true }  i = i + 1 }
+    return hit
+}
+fn rdoc_mark_scroll(inout d: RDoc, id: Str) {
+    d.p_any = true
+    if d.tree.len() == 0 { return }
+    let _hit = rn_mark_scroll(d.tree[0], id)
+}
+fn rn_mark_all(inout rn: RNode) {
+    rn.sty = true
+    rn.sdesc = true
+    var i = 0
+    while i < rn.kids.len() { rn_mark_all(rn.kids[i])  i = i + 1 }
+}
+
+// ---- the source: a whole new tree, diffed against the one there ----------------------------------
+
+/// replace the document's tree with `tree`, keeping every node that is still there.
+///
+/// Nodes are matched to the existing ones by `id` where they have one and by position among their
+/// un-id'd siblings where they do not; a match of the same kind is diffed (its attributes compared,
+/// its children matched in turn) and keeps its caches, its pointer state and its running
+/// transitions, so a plugin that re-renders its whole document when one label changes costs the
+/// parse and the compare, and lays out and repaints that label.
+pub fn rdoc_set_tree(inout d: RDoc, sink tree: UiNode) {
+    d.p_any = true
+    if d.tree.len() == 0 {
+        d.tree.push(rn_build(sink tree, "0"))
+        d.p_full = true
+        return
+    }
+    var t = sink d.tree
+    if rn_src(t[0]).kind != tree.kind {
+        rf_clear(d, t[0])
+        var fresh: Vec<RNode> = vec()
+        fresh.push(rn_build(sink tree, "0"))
+        d.tree = sink fresh
+        return
+    }
+    rn_diff(d, t[0], sink tree, "0")
+    d.tree = sink t
+}
+
+/// diff `rn` against the parsed `nn` (same kind). Returns true when anything below needs work.
+fn rn_diff(inout d: RDoc, inout rn: RNode, sink nn: UiNode, path: Str) {
+    var nkids = sink nn.children
+    if !ui_node_shallow_eq(rn_src(rn), nn) {
+        rn.key = copy nn.id
+        if rn.src.len() > 0 { rn.src[0] = sink nn } else { rn.cur = sink nn }
+        rn.sty = true
+    }
+    if !(rn.path == path) { rn.path = copy path  rn.dirty = true }
+    var old = sink rn.kids
+    var used: Vec<Bool> = vec()
+    var oi = 0
+    while oi < old.len() { used.push(false)  oi = oi + 1 }
+    var out: Vec<RNode> = vec()
+    var changed = false
+    var last = 0 - 1
+    var pos_cursor = 0                       // the next un-id'd old child a positional match may take
+    var j = 0
+    while j < nkids.len() {
+        let key = copy nkids[j].id
+        var idx = 0 - 1
+        if key.len() > 0 {
+            var k = 0
+            while k < old.len() && idx < 0 {
+                if !used[k] && old[k].key == key && rn_src(old[k]).kind == nkids[j].kind { idx = k }
+                k = k + 1
+            }
+        } else {
+            while pos_cursor < old.len() && (used[pos_cursor] || old[pos_cursor].key.len() > 0) { pos_cursor = pos_cursor + 1 }
+            if pos_cursor < old.len() && rn_src(old[pos_cursor]).kind == nkids[j].kind { idx = pos_cursor }
+            if pos_cursor < old.len() { pos_cursor = pos_cursor + 1 }
+        }
+        let cpath = path + ("." + to_str(j))
+        if idx >= 0 {
+            used[idx] = true
+            if idx < last { changed = true }
+            last = idx
+            var kn = sink old[idx]
+            rn_diff(d, kn, sink nkids[j], cpath)
+            if kn.sty || kn.sdesc { rn.sdesc = true }
+            if kn.dirty || kn.desc { rn.desc = true }
+            out.push(sink kn)
+        } else {
+            out.push(rn_build(sink nkids[j], cpath))
+            rn.sdesc = true
+            rn.desc = true
+            changed = true
+        }
+        j = j + 1
+    }
+    var r = 0
+    while r < old.len() {
+        if !used[r] { rf_clear(d, old[r])  changed = true }
+        r = r + 1
+    }
+    if changed { rn.dirty = true }
+    rn.kids = sink out
+}
+
+// ---- style: `cur` from `src` --------------------------------------------------------------------
+
+/// what a selector sees of a drawn node.
+fn minfo_same(a: MInfo, b: MInfo) -> Bool {
+    if !(a.tag == b.tag && a.hover == b.hover && a.active == b.active && a.focus == b.focus && a.disabled == b.disabled) { return false }
+    return strs_same(a.classes, b.classes)
+}
+fn rn_minfo(d: RDoc, rn: RNode) -> MInfo {
+    var tag = copy rn.cur.tag
+    if tag.len() == 0 { tag = ui_kind_tag(rn.cur.kind) }
+    let foc = rn.cur.id.len() > 0 && rn.cur.id == d.focus_id
+    return MInfo { tag: tag, classes: path_copy_str(rn.cur.classes), hover: rn.hover, active: rn.active, focus: foc, disabled: rn.cur.disabled }
+}
+/// the cascade's answer for a node: the node as authored, with the host's per-id state (classes
+/// added and removed, replaced text), the bind variables and the focus, then every matching rule.
+struct RCompute { node: UiNode, trans: Vec<TransSpec>, has_an: Bool, an: AnimSpec }
+fn rst_compute(d: RDoc, rn: RNode, anc: Vec<MInfo>) -> RCompute {
+    var n = ui_node_dup_shallow(rn_src(rn))
+    if n.id.len() > 0 {
+        var i = 0
+        while i < d.ids.len() {
+            if d.ids[i].id == n.id {
+                var a = 0
+                while a < d.ids[i].add.len() { if !strs_has(n.classes, d.ids[i].add[a]) { n.classes.push(copy d.ids[i].add[a]) }  a = a + 1 }
+                var r = 0
+                while r < d.ids[i].del.len() { n.classes = strs_without(n.classes, d.ids[i].del[r])  r = r + 1 }
+                if d.ids[i].has_text { n.text = copy d.ids[i].text }
+            }
+            i = i + 1
+        }
+        if d.focus_id.len() > 0 && n.id == d.focus_id && !strs_has(n.classes, "focused") { n.classes.push("focused") }
+    }
+    if n.bind_visible.len() > 0 { n.hidden = !bind_truthy(bind_get(d.bind_ids, d.bind_vals, n.bind_visible)) }
+    if n.bind_disabled.len() > 0 { n.disabled = !bind_truthy(bind_get(d.bind_ids, d.bind_vals, n.bind_disabled)) }
+    var tag = copy n.tag
+    if tag.len() == 0 { tag = ui_kind_tag(n.kind) }
+    let me = MInfo { tag: tag, classes: path_copy_str(n.classes), hover: rn.hover, active: rn.active, focus: n.id.len() > 0 && n.id == d.focus_id, disabled: n.disabled }
+    var trans: Vec<TransSpec> = vec()
+    var has_an = false
+    var an = anim_none()
+    if d.sheet.rules.len() > 0 {
+        let cas = csheet_cascade(d.sheet, me, anc)
+        apply_style_to_node(n, cas.style)
+        if n.spans.len() > 0 {
+            var sanc: Vec<MInfo> = vec()
+            var q = 0
+            while q < anc.len() { sanc.push(minfo_dup(anc[q]))  q = q + 1 }
+            sanc.push(minfo_dup(me))
+            var si = 0
+            while si < n.spans.len() {
+                if n.spans[si].classes.len() > 0 {
+                    let sm = MInfo { tag: "span", classes: path_copy_str(n.spans[si].classes), hover: false, active: false, focus: false, disabled: false }
+                    apply_style_to_span(n.spans[si], csheet_cascade(d.sheet, sm, sanc).style)
+                }
+                si = si + 1
+            }
+        }
+        var j = 0
+        while j < cas.trans.len() { trans.push(trans_dup(cas.trans[j]))  j = j + 1 }
+        has_an = cas.has_anim
+        an = anim_dup(cas.anim)
+    }
+    // the sheet's UI font (`--ui-font`), for a node that names no family of its own
+    if n.font_family.len() == 0 && d.sheet.ui_font.len() > 0 { n.font_family = copy d.sheet.ui_font }
+    return RCompute { node: n, trans: trans, has_an: has_an, an: an }
+}
+
+/// re-cascade a node (`restyle`) or only advance what is moving on it, then work out what it
+/// looks like at `d.now`: the cascade's answer with every running transition and the animation
+/// applied. A node whose drawn form changed is dirty.
+///
+/// The cascade's answer is kept apart from what is drawn (`tgt`) only while something moves on
+/// the node; otherwise the two are the same node and `cur` is both, so a document that does not
+/// animate pays for one node per node, not two.
+fn rst_node(inout d: RDoc, inout rn: RNode, anc: Vec<MInfo>, restyle: Bool) {
+    let now = d.now
+    if restyle {
+        var co = rst_compute(d, rn, anc)
+        d.n_styled = d.n_styled + 1
+        let first = rn.src.len() == 0
+        if rn.styled && (co.trans.len() > 0 || rn.trs.len() > 0) {
+            // a property the cascade now asks something else of starts a transition from where
+            // it is drawn, so one that reverses half way turns round smoothly, or, with no
+            // transition for it, jumps (and stops any transition it was in)
+            var p = 0
+            while p < ap_count() {
+                var ov = aval(0.0)
+                if rn.tgt.len() > 0 { ov = av_get(rn.tgt[0], p) } else { ov = av_get(rn.cur, p) }
+                let nv = av_get(co.node, p)
+                if !aval_eq(ov, nv) {
+                    var kept: Vec<RTrans> = vec()
+                    var k = 0
+                    while k < rn.trs.len() { if rn.trs[k].prop != p { kept.push(sink rn.trs[k]) }  k = k + 1 }
+                    rn.trs = sink kept
+                    let ti = trans_find(co.trans, p)
+                    if ti >= 0 && co.trans[ti].dur > 0.0 {
+                        rn.trs.push(RTrans { prop: p, from: av_get(rn.cur, p), to: aval_dup(nv), start: now, dur: co.trans[ti].dur, delay: co.trans[ti].delay, ease: ease_dup(co.trans[ti].ease) })
+                    }
+                }
+                p = p + 1
+            }
+        }
+        if co.has_an {
+            if !rn.has_an || !(rn.an.name == co.an.name) { rn.an_start = now }
+            rn.has_an = true
+            rn.an = anim_dup(co.an)
+        } else { rn.has_an = false }
+        rn.trans = sink co.trans
+        rn.styled = true
+        if first {
+            // first styled: `cur` held the authored node until now; it becomes `src` (moved, not copied)
+            rn.src.push(sink rn.cur)
+            rn.dirty = true
+            if rn.trs.len() == 0 && !rn.has_an {
+                var none0: Vec<UiNode> = vec()
+                rn.tgt = sink none0
+                rn.anim = false
+                rn.cur = sink co.node
+                return
+            }
+            rn.cur = ui_node_dup_shallow(co.node)
+        }
+        if rn.trs.len() == 0 && !rn.has_an {
+            // nothing moves: what is drawn is what the cascade says
+            var none: Vec<UiNode> = vec()
+            rn.tgt = sink none
+            rn.anim = false
+            if !ui_node_shallow_eq(co.node, rn.cur) { rn.cur = sink co.node  rn.dirty = true }
+            return
+        }
+        var one: Vec<UiNode> = vec()
+        one.push(sink co.node)
+        rn.tgt = sink one
+    }
+    if rn.tgt.len() == 0 { rn.anim = false  return }
+    // what is drawn now
+    var disp = ui_node_dup_shallow(rn.tgt[0])
+    var live: Vec<RTrans> = vec()
+    var t = 0
+    while t < rn.trs.len() {
+        if !rtrans_done(rn.trs[t], now) {
+            av_set(disp, rn.trs[t].prop, rtrans_value(rn.trs[t], now))
+            live.push(sink rn.trs[t])
+        }
+        t = t + 1
+    }
+    rn.trs = sink live
+    var moving = rn.trs.len() > 0
+    if rn.has_an {
+        let kfi = csheet_kf(d.sheet, rn.an.name)
+        if kfi >= 0 {
+            let at = anim_at(rn.an, rn.an_start, now)
+            if at.on {
+                var p = 0
+                while p < ap_count() {
+                    let kv = kf_value(d.sheet.kfs[kfi], p, at.f, av_get(disp, p), rn.an.ease)
+                    if kv.has { av_set(disp, p, kv.v) }
+                    p = p + 1
+                }
+            }
+            if !at.done { moving = true }
+        }
+    }
+    rn.anim = moving
+    if moving { d.animating = true }
+    if !ui_node_shallow_eq(disp, rn.cur) { rn.cur = sink disp  rn.dirty = true }
+}
+
+/// the style pass: re-cascade every node marked `sty` (every node when `all`), advance every node
+/// with something moving on it. Returns true when the subtree holds a dirty node (so its measures
+/// are stale). `anc` holds the ancestors as selectors see them, root first.
+fn rst_pass(inout d: RDoc, inout rn: RNode, inout anc: Vec<MInfo>, all: Bool) -> Bool {
+    // What a descendant matches can depend on this node: `.front .uline`, `.bar > .tb`, `.wi:hover .ico`.
+    // When restyling changes what this node is to a selector (its classes, its states), every node
+    // under it is restyled too, or a child would keep the look its parent's old class gave it.
+    var sub_all = all
+    if all || rn.sty || rn.anim {
+        let restyle = all || rn.sty
+        let was = rn_minfo(d, rn)
+        rst_node(d, rn, anc, restyle)
+        rn.sty = false
+        if restyle && !minfo_same(was, rn_minfo(d, rn)) { sub_all = true }
+    }
+    if sub_all || rn.sdesc {
+        anc.push(rn_minfo(d, rn))
+        var keep = false
+        var i = 0
+        while i < rn.kids.len() {
+            if rst_pass(d, rn.kids[i], anc, sub_all) { rn.desc = true }
+            if rn.kids[i].anim || rn.kids[i].sdesc { keep = true }
+            i = i + 1
+        }
+        let _me = anc.pop()
+        // a descendant still moving keeps this path open for the next frame's pass
+        rn.sdesc = keep
+    }
+    if rn.dirty || rn.desc { rn.m_n = 0  return true }
+    return false
+}
+
+// ---- layout ------------------------------------------------------------------------------------------
+
+fn rn_measure(inout d: RDoc, inout rn: RNode, ctx: LayoutLengthContext) -> Vec2 {
+    if rn.m_n > 0 && ctx_same(rn.m0c, ctx) { return vec2(rn.m0.x, rn.m0.y) }
+    if rn.m_n > 1 && ctx_same(rn.m1c, ctx) { return vec2(rn.m1.x, rn.m1.y) }
+    let v = rn_measure_raw(d, rn, ctx)
+    if rn.m_n > 0 {
+        rn.m1c = sink rn.m0c
+        rn.m1 = sink rn.m0
+    }
+    rn.m0c = ctx_dup(ctx)
+    rn.m0 = vec2(v.x, v.y)
+    if rn.m_n < 2 { rn.m_n = rn.m_n + 1 }
+    return v
+}
+/// ui_measure, with a container's children measured through the cache.
+fn rn_measure_raw(inout d: RDoc, inout rn: RNode, ctx: LayoutLengthContext) -> Vec2 {
+    if rn.cur.hidden { return vec2_zero() }
+    let k = rn.cur.kind
+    if !rk_container(k) { return ui_measure(rn.cur, ctx) }
+    if k == nk_scroll_column() || k == nk_scroll_row() {
+        var vh = rn.cur.min_height
+        if k == nk_scroll_row() { vh = rn.cur.min_width }
+        if vh <= 0.0 { vh = 120.0 }
+        if k == nk_scroll_column() { vh = vh + node_pad_y(rn.cur) * 2.0 } else { vh = vh + node_pad_x(rn.cur) * 2.0 }
+        var cw = 0.0
+        var mi = 0
+        while mi < rn.kids.len() {
+            let ms = rn_measure(d, rn.kids[mi], ctx)
+            if k == nk_scroll_column() { cw = math::fmax(cw, ms.x) } else { cw = math::fmax(cw, ms.y) }
+            mi = mi + 1
+        }
+        if k == nk_scroll_column() { cw = cw + node_pad_x(rn.cur) * 2.0 } else { cw = cw + node_pad_y(rn.cur) * 2.0 }
+        if k == nk_scroll_column() { return vec2(cw, vh) }
+        return vec2(vh, cw)
+    }
+    let is_row = k == nk_row()
+    var inner_w = 0.0
+    var inner_h = 0.0
+    var count = 0
+    var i = 0
+    while i < rn.kids.len() {
+        let cs = rn_measure(d, rn.kids[i], ctx)
+        if is_row { inner_w = inner_w + cs.x  inner_h = math::fmax(inner_h, cs.y) }
+        else { inner_h = inner_h + cs.y  inner_w = math::fmax(inner_w, cs.x) }
+        count = count + 1
+        i = i + 1
+    }
+    var gaps = 0.0
+    if count > 1 { gaps = rn.cur.gap * to_float(count - 1) }
+    var total_w = inner_w + node_pad_x(rn.cur) * 2.0
+    var total_h = inner_h + node_pad_y(rn.cur) * 2.0
+    if is_row { total_w = total_w + gaps } else { total_h = total_h + gaps }
+    total_h = math::fmax(total_h, rn.cur.min_height)
+    return container_fixed_size(rn.cur, ctx, vec2(total_w, total_h))
+}
+
+/// an overlay for this node's own output. Hover is decided in screen space by the pointer pass
+/// (rp_pointer), so the layout code (which tests `rect.contains(mouse)` in layout space) is
+/// handed a pointer that lands inside the node's rect exactly when the node is under the pointer.
+fn rl_own_overlay(d: RDoc, rn: RNode, rect: Rect) -> ComputedOverlay {
+    var o = overlay_empty()
+    o.in_has_mouse = d.has_mouse
+    if rn.ptr_in { o.in_mouse = rect.center() } else { o.in_mouse = vec2(0.0 - 1000000000.0, 0.0 - 1000000000.0) }
+    o.in_mouse_down = d.mouse_down
+    return o
+}
+
+/// lay `rn` out at `rect` in `ctx`, reusing everything that is still valid. Returns true when it
+/// (or something under it) was laid out again.
+fn rl_layout(inout d: RDoc, inout rn: RNode, rect: Rect, ctx: LayoutLengthContext) -> Bool {
+    if rn.laid && !rn.dirty && !rn.desc && rect_same(rect, rn.l_rect) && ctx_same(ctx, rn.l_ctx) { return false }
+    let moved = !(rn.laid && rect_same(rect, rn.l_rect) && ctx_same(ctx, rn.l_ctx))
+    rn.laid = true
+    rn.l_rect = rect_dup(rect)
+    rn.l_ctx = ctx_dup(ctx)
+    var any = false
+    if rn.dirty || moved {
+        d.n_laid = d.n_laid + 1
+        rn.relaid = true
+        any = true
+    }
+    let nk = rn.kids.len()
+    var vis: Vec<Bool> = vec()
+    var abs: Vec<Bool> = vec()
+    var ord: Vec<Int> = vec()
+    var q = 0
+    while q < nk { vis.push(false)  abs.push(false)  q = q + 1 }
+    rn.clip_self = false
+    rn.clip_kids = false
+    rn.sc_axis = 0
+    rn.sc_off = 0.0
+    rn.cull = false
+    if rn.cur.hidden || !rk_container(rn.cur.kind) {
+        if rn.dirty || moved {
+            var o = rl_own_overlay(d, rn, rect)
+            if !rn.cur.hidden { ui_layout_node_body(rn.cur, rect, ctx, o) }
+            rn_set_own(rn, sink o)
+        }
+        rn.kid_vis = sink vis
+        rn.kid_abs = sink abs
+        rn.order = sink ord
+        rn.dirty = false
+        rn.desc = false
+        return any
+    }
+    // a container: its chrome is recomputed (cheap); its children are laid out through the cache
+    var own = rl_own_overlay(d, rn, rect)
+    var flow: Vec<Int> = vec()
+    var absk: Vec<Int> = vec()
+    var i = 0
+    while i < nk { if rn.kids[i].cur.position == 1 { absk.push(i) } else { flow.push(i) }  i = i + 1 }
+    if rl_flow(d, rn, rect, ctx, flow, own, vis) { any = true }
+    var f = 0
+    while f < flow.len() { ord.push(flow[f])  f = f + 1 }
+    if absk.len() > 0 {
+        // absolute children: out of the flow, placed against the padded box at their natural size,
+        // painted after it in ascending z_index (ties in document order), as the immediate path's
+        // has_absolute_child branch, over the same z_sort_absolute.
+        let inner = rect_min_max(vec2(rect.min.x + node_pad_x(rn.cur), rect.min.y + node_pad_y(rn.cur)), vec2(rect.max.x - node_pad_x(rn.cur), rect.max.y - node_pad_y(rn.cur)))
+        var zs: Vec<Int> = vec()
+        var zi = 0
+        while zi < absk.len() {
+            zs.push(absk[zi])
+            var jj = zs.len() - 1
+            while jj > 0 && rn.kids[zs[jj - 1]].cur.z_index > rn.kids[absk[zi]].cur.z_index {
+                zs[jj] = zs[jj - 1]
+                zs[jj - 1] = absk[zi]
+                jj = jj - 1
+            }
+            zi = zi + 1
+        }
+        var a = 0
+        while a < zs.len() {
+            let ki = zs[a]
+            let ms = rn_measure(d, rn.kids[ki], ctx)
+            let arect = resolve_absolute_rect(inner, ms, rn.kids[ki].cur)
+            if rl_layout(d, rn.kids[ki], arect, ctx) { any = true  rn.fdesc = true }
+            vis[ki] = !rn.kids[ki].cur.hidden
+            abs[ki] = true
+            ord.push(ki)
+            a = a + 1
+        }
+    }
+    if rn.dirty || moved || !own_same(d, rn, own) { rn.relaid = true  any = true  rn_set_own(rn, sink own) }
+    // a change of paint order (a z_index) cannot be patched into the flat overlay
+    if ord.len() != rn.order.len() { d.ov_full = true }
+    else { var oq = 0  while oq < ord.len() { if ord[oq] != rn.order[oq] { d.ov_full = true }  oq = oq + 1 } }
+    rn.kid_vis = sink vis
+    rn.kid_abs = sink abs
+    rn.order = sink ord
+    rn.dirty = false
+    rn.desc = false
+    return any
+}
+// an overlay held as zero or one (see RNode.own / fin)
+global g_no_ov: Vec<ComputedOverlay>
+fn ov_v(v: Vec<ComputedOverlay>) -> view ComputedOverlay {
+    if v.len() > 0 { return v[0] }
+    if g_no_ov.len() == 0 { g_no_ov.push(overlay_empty()) }
+    return g_no_ov[0]
+}
+fn ov_one(sink o: ComputedOverlay) -> Vec<ComputedOverlay> { var v: Vec<ComputedOverlay> = vec()  v.push(sink o)  return v }
+fn ov_take(inout v: Vec<ComputedOverlay>) -> ComputedOverlay {
+    if v.len() == 0 { return overlay_empty() }
+    return v.pop()
+}
+/// bring a node's layout output back from the flat overlay (a copy: the flat overlay is what is on
+/// the screen and stays whole) before it is read or replaced.
+fn rn_take_own(inout d: RDoc, inout rn: RNode) {
+    if !rn.own_in_ov { return }
+    var o = overlay_empty()
+    var i = 0
+    while i < rn.n_p { o.prims.push(pp_dup(d.ov.prims[rn.o_p + i]))  i = i + 1 }
+    i = 0
+    while i < rn.n_h { o.hits.push(hit_region_dup(d.ov.hits[rn.o_h + i]))  i = i + 1 }
+    i = 0
+    while i < rn.n_s { o.surfaces.push(surface_dup(d.ov.surfaces[rn.o_s + i]))  i = i + 1 }
+    i = 0
+    while i < rn.n_c { o.scrolls.push(scroll_meta_dup(d.ov.scrolls[rn.o_c + i]))  i = i + 1 }
+    i = 0
+    while i < rn.n_pp { o.pop_prims.push(pp_dup(d.ov.prims[d.ov_pop_p + rn.o_pp + i]))  i = i + 1 }
+    i = 0
+    while i < rn.n_ph { o.pop_hits.push(hit_region_dup(d.ov.hits[d.ov_pop_h + rn.o_ph + i]))  i = i + 1 }
+    rn.own = ov_one(sink o)
+    rn.own_in_ov = false
+}
+/// replace a node's own output. When its screen output WAS that output (fin_own), the old one is
+/// kept as `fin` until flatten has diffed the new one against it.
+fn rn_set_own(inout rn: RNode, sink o: ComputedOverlay) {
+    if rn.fin_own && rn.f_ok {
+        // the old screen output: in the flat overlay already (nothing to keep), or the node's
+        if rn.own_in_ov { rn.old_in_ov = true } else { rn.fin = sink rn.own }
+        rn.fin_own = false
+    }
+    rn.own = ov_one(sink o)
+    rn.own_in_ov = false
+}
+// a container's freshly computed chrome against what it had (wherever that is kept)
+fn own_same(d: RDoc, rn: RNode, o: ComputedOverlay) -> Bool {
+    if !rn.own_in_ov { return overlay_prims_same(ov_v(rn.own), o) }
+    if o.prims.len() != rn.n_p || o.hits.len() != rn.n_h || o.scrolls.len() != rn.n_c { return false }
+    var i = 0
+    while i < o.prims.len() { if !pp_same(d.ov.prims[rn.o_p + i], o.prims[i]) { return false }  i = i + 1 }
+    var h = 0
+    while h < o.hits.len() {
+        let a = d.ov.hits[rn.o_h + h]
+        if !(a.id == o.hits[h].id && a.on_click == o.hits[h].on_click && rect_same(a.rect, o.hits[h].rect)) { return false }
+        h = h + 1
+    }
+    var c = 0
+    while c < o.scrolls.len() {
+        let a = d.ov.scrolls[rn.o_c + c]
+        if !(a.id == o.scrolls[c].id && rect_same(a.viewport, o.scrolls[c].viewport) && a.content_extent == o.scrolls[c].content_extent && a.axis == o.scrolls[c].axis) { return false }
+        c = c + 1
+    }
+    return o.surfaces.len() == rn.n_s && o.pop_prims.len() == rn.n_pp && o.pop_hits.len() == rn.n_ph
+}
+/// rf_damage with the OLD screen output read from the node's ranges in the flat overlay
+fn rf_damage_slots(inout d: RDoc, rn: RNode, nw: ComputedOverlay) {
+    let ok = rn.f_ok
+    if ok && rn.n_p == nw.prims.len() && rn.n_pp == nw.pop_prims.len() {
+        var i = 0
+        while i < nw.prims.len() {
+            if !pp_same(d.ov.prims[rn.o_p + i], nw.prims[i]) { damage_add(d.dmg, pp_bounds(d.ov.prims[rn.o_p + i]))  damage_add(d.dmg, pp_bounds(nw.prims[i])) }
+            i = i + 1
+        }
+        var j = 0
+        while j < nw.pop_prims.len() {
+            let q = d.ov_pop_p + rn.o_pp + j
+            if !pp_same(d.ov.prims[q], nw.pop_prims[j]) { damage_add(d.dmg, pp_bounds(d.ov.prims[q]))  damage_add(d.dmg, pp_bounds(nw.pop_prims[j])) }
+            j = j + 1
+        }
+        return
+    }
+    if ok { rf_damage_all_slots(d, rn) }
+    var c = 0
+    while c < nw.prims.len() { damage_add(d.dmg, pp_bounds(nw.prims[c]))  c = c + 1 }
+    var e = 0
+    while e < nw.pop_prims.len() { damage_add(d.dmg, pp_bounds(nw.pop_prims[e]))  e = e + 1 }
+}
+fn rf_damage_all_slots(inout d: RDoc, rn: RNode) {
+    var a = 0
+    while a < rn.n_p { damage_add(d.dmg, pp_bounds(d.ov.prims[rn.o_p + a]))  a = a + 1 }
+    var b = 0
+    while b < rn.n_pp { damage_add(d.dmg, pp_bounds(d.ov.prims[d.ov_pop_p + rn.o_pp + b]))  b = b + 1 }
+}
+fn overlay_prims_same(a: ComputedOverlay, b: ComputedOverlay) -> Bool {
+    if a.prims.len() != b.prims.len() || a.hits.len() != b.hits.len() || a.scrolls.len() != b.scrolls.len() { return false }
+    var i = 0
+    while i < a.prims.len() { if !pp_same(a.prims[i], b.prims[i]) { return false }  i = i + 1 }
+    var h = 0
+    while h < a.hits.len() { if !(a.hits[h].id == b.hits[h].id && a.hits[h].on_click == b.hits[h].on_click && rect_same(a.hits[h].rect, b.hits[h].rect)) { return false }  h = h + 1 }
+    var s = 0
+    while s < a.scrolls.len() { if !(a.scrolls[s].id == b.scrolls[s].id && rect_same(a.scrolls[s].viewport, b.scrolls[s].viewport) && a.scrolls[s].content_extent == b.scrolls[s].content_extent) { return false }  s = s + 1 }
+    return true
+}
+
+/// a container's own chrome and its flow children: ui_layout_node_body's container half, with the
+/// scroll offset left to flatten (a translate of the children) and the clips recorded for it.
+fn rl_flow(inout d: RDoc, inout rn: RNode, rect: Rect, ctx: LayoutLengthContext, flow: Vec<Int>, inout own: ComputedOverlay, inout vis: Vec<Bool>) -> Bool {
+    var any = false
+    let k = rn.cur.kind
+    ui_emit_chrome(rn.cur, rect, own)
+    if rn.cur.on_click.len() > 0 && !rn.cur.disabled { own.hits.push(HitRegion { id: copy rn.cur.id, on_click: copy rn.cur.on_click, rect: rect_dup(rect) }) }
+    var ovf = 0
+    if k == nk_column() { ovf = rn.cur.overflow_y }
+    if k == nk_row() { ovf = rn.cur.overflow_x }
+    let gap = rn.cur.gap
+    if k == nk_scroll_column() || k == nk_scroll_row() || ovf >= 2 {
+        let rid = rn_scroll_rid(rn)
+        let inner = rect_min_max(vec2(rect.min.x + node_pad_x(rn.cur), rect.min.y + node_pad_y(rn.cur)), vec2(rect.max.x - node_pad_x(rn.cur), rect.max.y - node_pad_y(rn.cur)))
+        rn.clip_kids = true
+        rn.vp = rect_dup(inner)
+        rn.sc_off = rdoc_scroll_of(d, rid)
+        // a child the viewport cannot show is not drawn: the immediate path does not even lay it
+        // out, unless something under it escapes the clip (a popup, a nested scroll region)
+        var clippable = true
+        var cq = 0
+        while cq < flow.len() { if !rn_clippable(rn.kids[flow[cq]]) { clippable = false }  cq = cq + 1 }
+        rn.cull = clippable
+        if k == nk_scroll_column() || k == nk_column() {
+            rn.sc_axis = 1
+            var svp = rect_dup(inner)
+            var fctx = length_context_with_parent(ctx, svp.width(), svp.height())
+            var raw_h = rl_flow_extent(d, rn, flow, fctx, gap, true)
+            if raw_h > inner.height() {
+                svp = rect_min_max(vec2(inner.min.x, inner.min.y), vec2(inner.max.x - scrollbar_track_width(), inner.max.y))
+                fctx = length_context_with_parent(ctx, svp.width(), svp.height())
+                raw_h = rl_flow_extent(d, rn, flow, fctx, gap, true)
+            }
+            own.scrolls.push(ScrollRegionMeta { id: copy rid, viewport: rect_dup(inner), content_extent: math::fmax(raw_h, inner.height()), axis: 1 })
+            var y = inner.min.y
+            var ci = 0
+            while ci < flow.len() {
+                let ki = flow[ci]
+                if !(rn.kids[ki].cur.kind == nk_spacer() || rn.kids[ki].cur.hidden) {
+                    let chh = rn_measure(d, rn.kids[ki], fctx).y
+                    if rl_layout(d, rn.kids[ki], rect_min_size(vec2(svp.min.x, y), vec2(svp.width(), chh)), fctx) { any = true  rn.fdesc = true }
+                    vis[ki] = true
+                    y = y + chh + gap
+                }
+                ci = ci + 1
+            }
+        } else {
+            rn.sc_axis = 2
+            let cctx = length_context_with_parent(ctx, inner.width(), inner.height())
+            let content_w = math::fmax(rl_flow_extent(d, rn, flow, cctx, gap, false), inner.width())
+            own.scrolls.push(ScrollRegionMeta { id: copy rid, viewport: rect_dup(inner), content_extent: content_w, axis: 0 })
+            var x = inner.min.x
+            var cj = 0
+            while cj < flow.len() {
+                let ki = flow[cj]
+                if !(rn.kids[ki].cur.kind == nk_spacer() || rn.kids[ki].cur.hidden) {
+                    let chw = rn_measure(d, rn.kids[ki], cctx).x
+                    if rl_layout(d, rn.kids[ki], rect_min_size(vec2(x, inner.min.y), vec2(chw, inner.height())), cctx) { any = true  rn.fdesc = true }
+                    vis[ki] = true
+                    x = x + chw + gap
+                }
+                cj = cj + 1
+            }
+        }
+        return any
+    }
+    if ovf == 1 {
+        // overflow: hidden clips the children to the padded box (not the box itself, as in CSS)
+        rn.clip_kids = true
+        rn.vp = rect_min_max(vec2(rect.min.x + node_pad_x(rn.cur), rect.min.y + node_pad_y(rn.cur)), vec2(rect.max.x - node_pad_x(rn.cur), rect.max.y - node_pad_y(rn.cur)))
+    }
+    let inner = container_inner(rn.cur, rect)
+    let cctx = length_context_with_parent(ctx, inner.width(), inner.height())
+    var items: Vec<Float> = vec()
+    var m = 0
+    while m < flow.len() { let cs = rn_measure(d, rn.kids[flow[m]], cctx)  flex_item_push(items, rn.kids[flow[m]].cur, cs.x, cs.y)  m = m + 1 }
+    let crects = container_flex_rects(rn.cur, inner, items)
+    var c = 0
+    while c < flow.len() {
+        let ki = flow[c]
+        if rl_layout(d, rn.kids[ki], flex_rect_at(crects, c), cctx) { any = true  rn.fdesc = true }
+        vis[ki] = !rn.kids[ki].cur.hidden
+        c = c + 1
+    }
+    return any
+}
+/// scroll_content_is_clippable, on the drawn tree.
+fn rn_clippable(rn: RNode) -> Bool {
+    let k = rn.cur.kind
+    if k == nk_scroll_column() || k == nk_scroll_row() { return false }
+    if k > nk_image() { return false }
+    if rn.cur.overflow_x >= 2 || rn.cur.overflow_y >= 2 { return false }
+    if rn.cur.position == 1 { return false }
+    var i = 0
+    while i < rn.kids.len() { if !rn_clippable(rn.kids[i]) { return false }  i = i + 1 }
+    return true
+}
+/// is the kid `ki` of a culling scroll container outside its viewport at the current offset?
+fn rn_culled(rn: RNode, ki: Int) -> Bool {
+    if !rn.cull || rn.kid_abs[ki] { return false }
+    let r = rn.kids[ki].l_rect
+    if rn.sc_axis == 1 { let y = r.min.y - rn.sc_off  return (y + r.height()) < rn.vp.min.y || y > rn.vp.max.y }
+    if rn.sc_axis == 2 { let x = r.min.x - rn.sc_off  return (x + r.width()) < rn.vp.min.x || x > rn.vp.max.x }
+    return false
+}
+/// measure_flow_column_h / measure_flow_row_w over the cache.
+fn rl_flow_extent(inout d: RDoc, inout rn: RNode, flow: Vec<Int>, ctx: LayoutLengthContext, gap: Float, vertical: Bool) -> Float {
+    var total = 0.0
+    var count = 0
+    var i = 0
+    while i < flow.len() {
+        let ki = flow[i]
+        if !(rn.kids[ki].cur.kind == nk_spacer() || rn.kids[ki].cur.hidden) {
+            let ms = rn_measure(d, rn.kids[ki], ctx)
+            if vertical { total = total + ms.y } else { total = total + ms.x }
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count > 1 { total = total + gap * to_float(count - 1) }
+    return total
+}
+
+// ---- flatten: each node's output on the screen ---------------------------------------------------------
+
+/// damage what changed between a node's old and new screen output.
+fn rf_damage(inout d: RDoc, old: ComputedOverlay, nw: ComputedOverlay, old_ok: Bool) {
+    if old_ok && old.prims.len() == nw.prims.len() && old.pop_prims.len() == nw.pop_prims.len() {
+        var i = 0
+        while i < nw.prims.len() {
+            if !pp_same(old.prims[i], nw.prims[i]) { damage_add(d.dmg, pp_bounds(old.prims[i]))  damage_add(d.dmg, pp_bounds(nw.prims[i])) }
+            i = i + 1
+        }
+        var j = 0
+        while j < nw.pop_prims.len() {
+            if !pp_same(old.pop_prims[j], nw.pop_prims[j]) { damage_add(d.dmg, pp_bounds(old.pop_prims[j]))  damage_add(d.dmg, pp_bounds(nw.pop_prims[j])) }
+            j = j + 1
+        }
+        return
+    }
+    if old_ok {
+        var a = 0
+        while a < old.prims.len() { damage_add(d.dmg, pp_bounds(old.prims[a]))  a = a + 1 }
+        var b = 0
+        while b < old.pop_prims.len() { damage_add(d.dmg, pp_bounds(old.pop_prims[b]))  b = b + 1 }
+    }
+    var c = 0
+    while c < nw.prims.len() { damage_add(d.dmg, pp_bounds(nw.prims[c]))  c = c + 1 }
+    var e = 0
+    while e < nw.pop_prims.len() { damage_add(d.dmg, pp_bounds(nw.pop_prims[e]))  e = e + 1 }
+}
+
+fn rf_damage_all(inout d: RDoc, ov: ComputedOverlay) {
+    var a = 0
+    while a < ov.prims.len() { damage_add(d.dmg, pp_bounds(ov.prims[a]))  a = a + 1 }
+    var b = 0
+    while b < ov.pop_prims.len() { damage_add(d.dmg, pp_bounds(ov.pop_prims[b]))  b = b + 1 }
+}
+/// write a node's new screen output over its old one in the flat overlay, when the flat overlay
+/// is current and the node's layers hold as many items as when it was collected. Anything else
+/// (an item more or less, a node newly drawn) leaves it for a rebuild.
+fn rf_patch(inout d: RDoc, rn: RNode, ns: ComputedOverlay) {
+    if d.ov_full { return }
+    if ns.prims.len() != rn.n_p || ns.hits.len() != rn.n_h || ns.surfaces.len() != rn.n_s || ns.scrolls.len() != rn.n_c || ns.pop_prims.len() != rn.n_pp || ns.pop_hits.len() != rn.n_ph { d.ov_full = true  return }
+    var i = 0
+    while i < ns.prims.len() { d.ov.prims[rn.o_p + i] = pp_dup(ns.prims[i])  i = i + 1 }
+    var h = 0
+    while h < ns.hits.len() { d.ov.hits[rn.o_h + h] = hit_region_dup(ns.hits[h])  h = h + 1 }
+    var f = 0
+    while f < ns.surfaces.len() { d.ov.surfaces[rn.o_s + f] = surface_dup(ns.surfaces[f])  f = f + 1 }
+    var c = 0
+    while c < ns.scrolls.len() { d.ov.scrolls[rn.o_c + c] = scroll_meta_dup(ns.scrolls[c])  c = c + 1 }
+    var pp = 0
+    while pp < ns.pop_prims.len() { d.ov.prims[d.ov_pop_p + rn.o_pp + pp] = pp_dup(ns.pop_prims[pp])  pp = pp + 1 }
+    var ph = 0
+    while ph < ns.pop_hits.len() { d.ov.hits[d.ov_pop_h + rn.o_ph + ph] = hit_region_dup(ns.pop_hits[ph])  ph = ph + 1 }
+}
+/// rf_patch for a node drawn exactly as laid out: its output moves into the flat overlay (the node
+/// then holds none: own_in_ov). Nothing moves when the flat overlay is to be rebuilt: rf_collect
+/// moves it then.
+fn rf_patch_own(inout d: RDoc, inout rn: RNode) {
+    if d.ov_full { return }
+    let ns = ov_v(rn.own)
+    if ns.prims.len() != rn.n_p || ns.hits.len() != rn.n_h || ns.surfaces.len() != rn.n_s || ns.scrolls.len() != rn.n_c || ns.pop_prims.len() != rn.n_pp || ns.pop_hits.len() != rn.n_ph { d.ov_full = true  return }
+    var o = ov_take(rn.own)
+    var i = 0
+    while i < o.prims.len() { d.ov.prims[rn.o_p + i] = sink o.prims[i]  i = i + 1 }
+    var h = 0
+    while h < o.hits.len() { d.ov.hits[rn.o_h + h] = sink o.hits[h]  h = h + 1 }
+    var f = 0
+    while f < o.surfaces.len() { d.ov.surfaces[rn.o_s + f] = sink o.surfaces[f]  f = f + 1 }
+    var c = 0
+    while c < o.scrolls.len() { d.ov.scrolls[rn.o_c + c] = sink o.scrolls[c]  c = c + 1 }
+    var pp = 0
+    while pp < o.pop_prims.len() { d.ov.prims[d.ov_pop_p + rn.o_pp + pp] = sink o.pop_prims[pp]  pp = pp + 1 }
+    var ph = 0
+    while ph < o.pop_hits.len() { d.ov.hits[d.ov_pop_h + rn.o_ph + ph] = sink o.pop_hits[ph]  ph = ph + 1 }
+    rn.own = vec()
+    rn.own_in_ov = true
+}
+/// a node (and everything under it) is no longer drawn: damage what it drew and forget it.
+fn rf_clear(inout d: RDoc, inout rn: RNode) {
+    if rn.f_ok {
+        if rn.old_in_ov || (rn.fin_own && rn.own_in_ov) { rf_damage_all_slots(d, rn) }
+        else if rn.fin_own { rf_damage_all(d, ov_v(rn.own)) }
+        else { rf_damage_all(d, ov_v(rn.fin)) }
+        rn.fin = vec()
+    }
+    rn.old_in_ov = false
+    rn_take_own(d, rn)                     // it may be drawn again without a new layout
+    if rn.f_ok {
+        rn.fin_own = false
+        rn.f_ok = false
+        d.ov_dirty = true
+        d.ov_full = true
+    }
+    rn.ptr_in = false
+    rn.hover = false
+    rn.active = false
+    var i = 0
+    while i < rn.kids.len() { rf_clear(d, rn.kids[i])  i = i + 1 }
+}
+
+/// carry `rn`'s output to the screen. `pxf`/`pop`: the transform and opacity of its parent's
+/// child space; `clips`: the screen-space clips of its ancestors, outermost first; `force`: they
+/// changed since last time.
+fn rf_flatten(inout d: RDoc, inout rn: RNode, pxf: Xf, pop: Float, clips: Vec<Rect>, force: Bool) {
+    if !force && !rn.relaid && !rn.fdesc && rn.f_ok { return }
+    rn.ftouch = true
+    var kforce = force
+    if force || rn.relaid || !rn.f_ok {
+        d.n_flat = d.n_flat + 1
+        let selfx = xf_then(node_fx_xf(rn.cur, rn.l_rect), pxf)
+        let op = pop * fx_opacity(rn.cur.opacity)
+        var vpr = xf_rect(selfx, rn.vp)
+        if !rn.f_ok { d.ov_full = true }
+        if xf_is_identity(selfx) && op >= 1.0 && clips.len() == 0 && !rn.clip_self {
+            // drawn exactly as laid out: the screen output IS the layout output, no copy (and when it
+            // already was, and the layout output was not replaced, nothing on the screen changed)
+            if !(rn.fin_own && rn.own_in_ov) {
+                // (in the flat overlay already and drawn as laid out: nothing on the screen changed)
+                if !rn.fin_own && !d.p_full {
+                    if rn.old_in_ov { rf_damage_slots(d, rn, ov_v(rn.own)) } else { rf_damage(d, ov_v(rn.fin), ov_v(rn.own), rn.f_ok) }
+                }
+                rn.old_in_ov = false
+                if rn.fin.len() > 0 { rn.fin = vec() }
+                rn.fin_own = true
+                rf_patch_own(d, rn)
+            }
+        } else {
+            rn_take_own(d, rn)                     // (a copy: the flat overlay still shows it)
+            var nf = overlay_dup(ov_v(rn.own))
+            overlay_apply_fx(nf, selfx, op)
+            if rn.clip_self { overlay_clip_inplace(nf, vpr) }
+            var ci = clips.len() - 1
+            while ci >= 0 { overlay_clip_inplace(nf, clips[ci])  ci = ci - 1 }
+            if !d.p_full {
+                if rn.old_in_ov { rf_damage_slots(d, rn, nf) }
+                else if rn.fin_own { rf_damage(d, ov_v(rn.own), nf, rn.f_ok) } else { rf_damage(d, ov_v(rn.fin), nf, rn.f_ok) }
+            }
+            rn.old_in_ov = false
+            rf_patch(d, rn, nf)
+            rn.fin = ov_one(sink nf)
+            rn.fin_own = false
+        }
+        d.ov_dirty = true
+        // the space the children are drawn in: this node's, then the scroll offset
+        var kx = xf_dup(selfx)
+        if rn.sc_axis == 1 { kx = xf_then(xf_translate(0.0, 0.0 - rn.sc_off), selfx) }
+        else if rn.sc_axis == 2 { kx = xf_then(xf_translate(0.0 - rn.sc_off, 0.0), selfx) }
+        if !rn.f_ok || !xf_eq(kx, rn.f_kxf) || op != rn.f_kop || rn.clip_kids != rn.f_kclip_on || (rn.clip_kids && !rect_same(vpr, rn.f_kclip)) { kforce = true }
+        if !rn.f_ok || !xf_eq(selfx, rn.f_xf) { kforce = true }       // absolute children ride `selfx`
+        rn.f_kxf = sink kx
+        rn.f_kop = op
+        rn.f_kclip_on = rn.clip_kids
+        rn.f_kclip = sink vpr
+        rn.f_xf = sink selfx
+        rn.f_op = op
+        rn.f_has_clip = clips.len() > 0
+        if clips.len() > 0 {
+            var cc = rect_dup(clips[0])
+            var q = 1
+            while q < clips.len() {
+                if let Option::Some(x) = cc.intersect(clips[q]) { cc = sink x } else { cc = rect_zero() }
+                q = q + 1
+            }
+            rn.f_clip = sink cc
+        }
+        rn.f_ok = true
+    }
+    // the children (the paint order is irrelevant here: each keeps its own output)
+    var kclips: Vec<Rect> = vec()
+    var c = 0
+    while c < clips.len() { kclips.push(rect_dup(clips[c]))  c = c + 1 }
+    if rn.f_kclip_on { kclips.push(rect_dup(rn.f_kclip)) }
+    var i = 0
+    while i < rn.kids.len() {
+        if i < rn.kid_vis.len() && rn.kid_vis[i] && !rn_culled(rn, i) {
+            if rn.kid_abs[i] { rf_flatten(d, rn.kids[i], rn.f_xf, rn.f_op, clips, kforce) }
+            else { rf_flatten(d, rn.kids[i], rn.f_kxf, rn.f_kop, kclips, kforce) }
+        } else {
+            rf_clear(d, rn.kids[i])
+        }
+        i = i + 1
+    }
+    rn.relaid = false
+    rn.fdesc = false
+}
+
+/// the flat overlay: every drawn node's screen output in paint order, the popup layer last.
+fn rf_collect(inout d: RDoc, inout rn: RNode, inout ov: ComputedOverlay) {
+    if !rn.f_ok { return }
+    // where it was in the flat overlay being replaced (d.ov), and where it goes in the new one
+    let op = rn.o_p  let oh = rn.o_h  let os = rn.o_s  let oc = rn.o_c  let opp = rn.o_pp  let oph = rn.o_ph
+    rn.o_p = ov.prims.len()  rn.o_h = ov.hits.len()  rn.o_s = ov.surfaces.len()  rn.o_c = ov.scrolls.len()  rn.o_pp = ov.pop_prims.len()  rn.o_ph = ov.pop_hits.len()
+    if rn.fin_own && rn.own_in_ov {
+        // its output is in the old flat overlay: move it across
+        var i = 0
+        while i < rn.n_p { ov.prims.push(sink d.ov.prims[op + i])  i = i + 1 }
+        i = 0
+        while i < rn.n_h { ov.hits.push(sink d.ov.hits[oh + i])  i = i + 1 }
+        i = 0
+        while i < rn.n_s { ov.surfaces.push(sink d.ov.surfaces[os + i])  i = i + 1 }
+        i = 0
+        while i < rn.n_c { ov.scrolls.push(sink d.ov.scrolls[oc + i])  i = i + 1 }
+        i = 0
+        while i < rn.n_pp { ov.pop_prims.push(sink d.ov.prims[d.ov_pop_p + opp + i])  i = i + 1 }
+        i = 0
+        while i < rn.n_ph { ov.pop_hits.push(sink d.ov.hits[d.ov_pop_h + oph + i])  i = i + 1 }
+    } else if rn.fin_own {
+        // its output is the node's: move it in, and the node holds none from now on
+        var o = ov_take(rn.own)
+        var i = 0
+        while i < o.prims.len() { ov.prims.push(sink o.prims[i])  i = i + 1 }
+        i = 0
+        while i < o.hits.len() { ov.hits.push(sink o.hits[i])  i = i + 1 }
+        i = 0
+        while i < o.surfaces.len() { ov.surfaces.push(sink o.surfaces[i])  i = i + 1 }
+        i = 0
+        while i < o.scrolls.len() { ov.scrolls.push(sink o.scrolls[i])  i = i + 1 }
+        i = 0
+        while i < o.pop_prims.len() { ov.pop_prims.push(sink o.pop_prims[i])  i = i + 1 }
+        i = 0
+        while i < o.pop_hits.len() { ov.pop_hits.push(sink o.pop_hits[i])  i = i + 1 }
+        rn.own = vec()
+        rn.own_in_ov = true
+    } else { overlay_append_copy(ov, ov_v(rn.fin)) }
+    rn.n_p = ov.prims.len() - rn.o_p  rn.n_h = ov.hits.len() - rn.o_h  rn.n_s = ov.surfaces.len() - rn.o_s  rn.n_c = ov.scrolls.len() - rn.o_c  rn.n_pp = ov.pop_prims.len() - rn.o_pp  rn.n_ph = ov.pop_hits.len() - rn.o_ph
+    var i = 0
+    while i < rn.order.len() { rf_collect(d, rn.kids[rn.order[i]], ov)  i = i + 1 }
+}
+
+// ---- the pointer -------------------------------------------------------------------------------------
+
+/// recompute every drawn node's pointer state from its screen rect. A node styled by the pointer
+/// (hover_bg / hover_border_color / hover_text_color / active_bg) whose state changed is dirty.
+/// Returns true when anything was marked.
+fn rp_pointer(inout d: RDoc, inout rn: RNode, down_changed: Bool, all: Bool) -> Bool {
+    var marked = false
+    // when the pointer did not move, only what moved under it can have changed state
+    if !all && !rn.ftouch { return false }
+    rn.ftouch = false
+    if rn.f_ok {
+        let sr = xf_rect(rn.f_xf, rn.l_rect)
+        let pin = d.has_mouse && sr.contains(d.mouse)
+        var hov = pin
+        if hov && rn.f_has_clip { hov = rn.f_clip.contains(d.mouse) }
+        let act = hov && d.mouse_down
+        let legacy = rn.cur.has_hover_bg || rn.cur.has_hover_border_color || rn.cur.has_hover_text_color || rn.cur.has_active_bg
+        if legacy && (pin != rn.ptr_in || (pin && down_changed)) { rn.dirty = true  marked = true }
+        if d.sheet.state && (hov != rn.hover || act != rn.active) {
+            // :hover / :active: restyle the node, and its subtree when a state is tested on an ancestor
+            if d.sheet.state_anc { rn_mark_all(rn) } else { rn.sty = true }
+            marked = true
+        }
+        rn.ptr_in = pin
+        rn.hover = hov
+        rn.active = act
+    }
+    var i = 0
+    while i < rn.kids.len() {
+        if rp_pointer(d, rn.kids[i], down_changed, all) { rn.desc = true  rn.sdesc = true  marked = true }
+        i = i + 1
+    }
+    return marked
+}
+
+// ---- the frame ------------------------------------------------------------------------------------------
+
+/// what a frame did. `changed` false: nothing to draw, and the caller can sleep (or keep the last
+/// frame on screen): a document left alone answers this frame after frame at no cost.
+/// `damage`: the logical-px rects that differ from the previous frame (merged, inside the
+/// viewport); `full`: the whole viewport (the first frame, a resize).
+/// `animating`: something is moving (a transition, an animation): ask for another frame at the
+/// next vblank; false once everything has settled, and the document is idle again.
+/// `hits_changed`: the hit regions differ from the last frame's, which can happen with nothing to draw (an
+/// `on_click` given to a node that paints nothing): a host routing input re-reads rdoc_overlay then.
+pub struct RFrame { changed: Bool, full: Bool, damage: Vec<Rect>, laid: Int, flattened: Int, styled: Int, animating: Bool, hits_changed: Bool }
+
+/// bring the document up to date with its inputs and report what changed on the screen.
+pub fn rdoc_frame(inout d: RDoc, now: Float) -> RFrame {
+    var none: Vec<Rect> = vec()
+    if !d.p_any { return RFrame { changed: false, full: false, damage: none, laid: 0, flattened: 0, styled: 0, animating: false, hits_changed: false } }
+    d.now = now
+    set_caret_on(!d.caret_off)                      // its carets' phase while it is laid out, and on again after
+    var old_hits: Vec<HitRegion> = vec()
+    foreach oh in d.ov.hits { old_hits.push(hit_region_dup(oh)) }
+    d.animating = false
+    d.n_laid = 0
+    d.n_flat = 0
+    d.n_styled = 0
+    var t = sink d.tree
+    if t.len() > 0 {
+        var pass = 0
+        var again = true
+        var down_changed = d.p_down
+        d.p_down = false
+        while again && pass < 4 {
+            again = false
+            var anc: Vec<MInfo> = vec()
+            let _sd = rst_pass(d, t[0], anc, d.p_style_all)
+            d.p_style_all = false
+            let vp = rect_min_max(vec2_zero(), vec2(d.vw, d.vh))
+            let ctx = length_context_root(d.vw, d.vh)
+            if d.p_layout { t[0].dirty = true  d.p_layout = false }
+            if d.p_full { d.ov_full = true }               // everything is damaged anyway: rebuild, don't patch
+            let _rl = rl_layout(d, t[0], vp, ctx)
+            var noclips: Vec<Rect> = vec()
+            rf_flatten(d, t[0], xf_identity(), 1.0, noclips, false)
+            // pointer state is decided against what is now on the screen; a change re-runs the passes
+            // (no pointer, and none just gone: nothing is under it, nothing to do)
+            if d.p_pointer || (d.ov_dirty && d.has_mouse) {
+                if rp_pointer(d, t[0], down_changed, d.p_pointer) { again = true }
+                d.p_pointer = false
+                down_changed = false
+            }
+            pass = pass + 1
+        }
+    }
+    let full = d.p_full
+    if d.ov_full {
+        var ov = overlay_empty()
+        if t.len() > 0 { rf_collect(d, t[0], ov) }
+        d.ov_pop_p = ov.prims.len()
+        d.ov_pop_h = ov.hits.len()
+        overlay_flush_popups(ov)
+        d.ov = sink ov
+        d.ov_full = false
+    }
+    d.ov_dirty = false
+    set_caret_on(true)
+    d.tree = sink t
+    let bounds = rect_min_max(vec2_zero(), vec2(d.vw, d.vh))
+    var dmg: Vec<Rect> = vec()
+    if full { dmg.push(rect_dup(bounds)) } else { dmg = damage_merge(d.dmg, bounds, 8) }
+    var empty: Vec<Rect> = vec()
+    d.dmg = sink empty
+    d.p_full = false
+    d.p_any = d.animating
+    var hits_changed = old_hits.len() != d.ov.hits.len()
+    var hi = 0
+    while !hits_changed && hi < old_hits.len() {
+        let a = old_hits[hi]
+        if !(a.id == d.ov.hits[hi].id && a.on_click == d.ov.hits[hi].on_click && rect_same(a.rect, d.ov.hits[hi].rect)) { hits_changed = true }
+        hi = hi + 1
+    }
+    return RFrame { changed: dmg.len() > 0, full: full, damage: dmg, laid: d.n_laid, flattened: d.n_flat, styled: d.n_styled, animating: d.animating,
+                    hits_changed: hits_changed }
+}
+
+/// the document's current paint list, hit regions, surfaces and scroll regions, the same shape
+/// layout_overlay returns, so every painter and hit test works on it unchanged.
+pub fn rdoc_overlay(d: RDoc) -> view ComputedOverlay { return d.ov }
+/// the front-most hit region under `p`.
+pub fn rdoc_hit(d: RDoc, p: Vec2) -> HitRegion { return overlay_hit_test(d.ov, p) }
+/// true when a frame would do something (an input changed since the last rdoc_frame).
+pub fn rdoc_pending(d: RDoc) -> Bool { return d.p_any }
+/// the number of nodes in the document.
+pub fn rdoc_node_count(d: RDoc) -> Int { if d.tree.len() == 0 { return 0 }  return rn_count(d.tree[0]) }
+fn rn_count(rn: RNode) -> Int {
+    var n = 1
+    var i = 0
+    while i < rn.kids.len() { n = n + rn_count(rn.kids[i])  i = i + 1 }
+    return n
+}

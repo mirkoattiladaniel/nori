@@ -1,0 +1,164 @@
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// backend-agnostic draw-command model
+//
+// Each enum variant carries a single payload struct, and an optional sub-object
+// is modeled as `has_*: Bool` + a value field, so consumers read it directly.
+// ===========================================================================
+
+/// render layer: Main (base UI) draws first, Overlay (floating UI) on top.
+pub enum PaintLayer { LayerMain LayerOverlay }
+
+/// the integer tag of a PaintLayer (0 = Main, 1 = Overlay).
+pub fn paint_layer_tag(l: PaintLayer) -> Int {
+    match l { PaintLayer::LayerMain => { return 0 } PaintLayer::LayerOverlay => { return 1 } }
+}
+
+/// an axis-aligned clip rect with optional rounded corners.
+pub struct ClipRegion { rect: Rect, radius: Float }
+
+/// a contiguous text substring with its own color (concatenate runs for a full line).
+pub struct StyledTextRun { text: Str, color: Color }
+
+/// a horizontal or vertical color ramp applied across a label's layout bounds.
+pub struct TextGradientFill { from: Color, to: Color, horizontal: Bool, bounds: Rect }
+
+/// a drop shadow for a filled rect (blur + spread + offset around `body_rect`).
+pub struct RectDropShadow {
+    color: Color, blur: Float, spread: Float,
+    offset_x: Float, offset_y: Float, body_rect: Rect
+}
+
+/// a bilinear (four-corner) rectangle gradient.
+pub struct GradientRectCommand {
+    rect: Rect,
+    color_tl: Color, color_tr: Color, color_bl: Color, color_br: Color,
+    corner_radius: Float
+}
+
+/// a CSS-like dash pattern for stroked rects (dasharray + dashoffset).
+pub struct BorderDash { dash: Float, gap: Float, offset: Float }
+
+/// a text draw command. Optional features are gated by `has_*` flags; `styled_runs`
+/// is empty when a single solid color is used.
+pub struct TextCommand {
+    pos: Vec2,
+    text: Str,
+    color: Color,
+    size: Float,
+    has_font_family: Bool,
+    font_family: Str,
+    font_bold: Bool,
+    font_italic: Bool,
+    has_clip_bounds: Bool,
+    clip_bounds: Rect,
+    outline_color: OptColor,
+    outline_width_px: Float,
+    has_text_gradient: Bool,
+    text_gradient: TextGradientFill,
+    styled_runs: Vec<StyledTextRun>
+}
+
+/// a plain text command (single color, no outline/gradient/clip/custom font).
+pub fn text_cmd(copy pos: Vec2, text: Str, copy color: Color, size: Float) -> TextCommand {
+    var runs: Vec<StyledTextRun> = vec()
+    return TextCommand {
+        pos: pos, text: copy text, color: color, size: size,
+        has_font_family: false, font_family: "",
+        font_bold: false, font_italic: false,
+        has_clip_bounds: false, clip_bounds: rect_min_max(vec2_zero(), vec2_zero()),
+        outline_color: no_color(), outline_width_px: 0.0,
+        has_text_gradient: false,
+        text_gradient: TextGradientFill { from: color_black(), to: color_black(), horizontal: true, bounds: rect_min_max(vec2_zero(), vec2_zero()) },
+        styled_runs: runs
+    }
+}
+
+/// payload for DrawCommand::DcRectFilled.
+pub struct RectFilledCmd {
+    rect: Rect, body_rect: Rect, color: Color, corner_radius: Float,
+    has_drop_shadow: Bool, drop_shadow: RectDropShadow,
+    has_clip_region: Bool, clip_region: ClipRegion
+}
+
+/// payload for DrawCommand::DcRectStroke.
+pub struct RectStrokeCmd { rect: Rect, stroke: Stroke, corner_radius: Float, has_dash: Bool, dash: BorderDash }
+
+/// payload for DrawCommand::DcLine.
+pub struct LineCmd { from: Vec2, to: Vec2, stroke: Stroke }
+
+/// payload for DrawCommand::DcCircleFilled.
+pub struct CircleFilledCmd { center: Vec2, radius: Float, color: Color }
+
+/// payload for DrawCommand::DcCircleStroke.
+pub struct CircleStrokeCmd { center: Vec2, radius: Float, stroke: Stroke }
+
+/// payload for DrawCommand::DcImage (RGBA PNG path, host-resolved).
+pub struct ImageCmd { rect: Rect, path: Str }
+
+/// a backend-agnostic drawing command (one variant per primitive kind).
+pub enum DrawCommand {
+    DcRectFilled(RectFilledCmd)
+    DcRectStroke(RectStrokeCmd)
+    DcGradientRect(GradientRectCommand)
+    DcLine(LineCmd)
+    DcCircleFilled(CircleFilledCmd)
+    DcCircleStroke(CircleStrokeCmd)
+    DcText(TextCommand)
+    DcImage(ImageCmd)
+}
+
+/// the integer kind tag of a DrawCommand (stable order matching the enum).
+pub fn draw_command_tag(c: DrawCommand) -> Int {
+    match c {
+        DrawCommand::DcRectFilled(x) => { return 0 }
+        DrawCommand::DcRectStroke(x) => { return 1 }
+        DrawCommand::DcGradientRect(x) => { return 2 }
+        DrawCommand::DcLine(x) => { return 3 }
+        DrawCommand::DcCircleFilled(x) => { return 4 }
+        DrawCommand::DcCircleStroke(x) => { return 5 }
+        DrawCommand::DcText(x) => { return 6 }
+        DrawCommand::DcImage(x) => { return 7 }
+    }
+}
+
+/// a simple filled-rect command (no shadow, no clip, square corners by default).
+pub fn dc_rect_filled(rect: Rect, copy color: Color, corner_radius: Float) -> DrawCommand {
+    return DrawCommand::DcRectFilled(RectFilledCmd {
+        rect: rect_min_max(rect.min, rect.max), body_rect: rect_min_max(rect.min, rect.max),
+        color: color, corner_radius: corner_radius,
+        has_drop_shadow: false,
+        drop_shadow: RectDropShadow { color: color_transparent(), blur: 0.0, spread: 0.0, offset_x: 0.0, offset_y: 0.0, body_rect: rect_min_max(rect.min, rect.max) },
+        has_clip_region: false,
+        clip_region: ClipRegion { rect: rect_min_max(rect.min, rect.max), radius: 0.0 }
+    })
+}
+
+/// a stroked-rect command (solid, no dash).
+pub fn dc_rect_stroke(rect: Rect, strk: Stroke, corner_radius: Float) -> DrawCommand {
+    return DrawCommand::DcRectStroke(RectStrokeCmd {
+        rect: rect_copy(rect), stroke: stroke_copy(strk), corner_radius: corner_radius,
+        has_dash: false, dash: BorderDash { dash: 0.0, gap: 0.0, offset: 0.0 }
+    })
+}
+
+/// a line command.
+pub fn dc_line(copy from: Vec2, copy to: Vec2, strk: Stroke) -> DrawCommand {
+    return DrawCommand::DcLine(LineCmd { from: from, to: to, stroke: stroke_copy(strk) })
+}
+
+/// a filled-circle command.
+pub fn dc_circle_filled(copy center: Vec2, radius: Float, copy color: Color) -> DrawCommand {
+    return DrawCommand::DcCircleFilled(CircleFilledCmd { center: center, radius: radius, color: color })
+}
+
+/// a text draw command wrapping a plain TextCommand.
+pub fn dc_text(sink t: TextCommand) -> DrawCommand { return DrawCommand::DcText(t) }
+
+/// a 4-corner gradient-rect command.
+pub fn dc_gradient_rect(rect: Rect, copy tl: Color, copy tr: Color, copy bl: Color, copy br: Color, corner_radius: Float) -> DrawCommand {
+    return DrawCommand::DcGradientRect(GradientRectCommand { rect: rect_copy(rect), color_tl: tl, color_tr: tr, color_bl: bl, color_br: br, corner_radius: corner_radius })
+}
+

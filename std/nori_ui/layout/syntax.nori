@@ -1,0 +1,169 @@
+use core::*
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// the portable core of syntax highlighting.
+//
+// The host-independent pieces: the token color table + palette (with
+// stylesheet overrides), source line splitting, the visible-line window, and
+// bracket matching. Registry and highlighter plumbing is host integration and
+// lives outside this file.
+// ===========================================================================
+
+/// highlight span within a source line: [start_col, end_col) with a token `class`.
+pub struct HighlightSpan { start_col: Int, end_col: Int, cls: Str }
+/// build a highlight span.
+pub fn highlight_span(start_col: Int, end_col: Int, cls: Str) -> HighlightSpan { return HighlightSpan { start_col: start_col, end_col: end_col, cls: copy cls } }
+/// highlight spans for one source line.
+pub struct HighlightLine { line_index: Int, spans: Vec<HighlightSpan> }
+
+/// the built-in color for a token `class`, or no_color() for an unknown class.
+pub fn default_token_color(cls: Str) -> OptColor {
+    if (cls == "keyword") { return some_color(color_rgba(86, 156, 214, 255)) }
+    if (cls == "string") { return some_color(color_rgba(206, 145, 120, 255)) }
+    if (cls == "comment") { return some_color(color_rgba(106, 153, 85, 255)) }
+    if (cls == "function") { return some_color(color_rgba(220, 220, 170, 255)) }
+    if (cls == "type") { return some_color(color_rgba(78, 201, 176, 255)) }
+    if (cls == "number") { return some_color(color_rgba(181, 206, 168, 255)) }
+    if (cls == "operator") { return some_color(color_rgba(180, 180, 180, 255)) }
+    if (cls == "bracket_match") { return some_color(color_rgba(255, 215, 0, 180)) }
+    // A diagnostic has a severity, and severity is a colour before it is a word: the eye finds the
+    // red one in a page of output without reading any of it. Named rather than spelled in the one
+    // place that draws them, so a stylesheet can restate them alongside every other token class.
+    if (cls == "error") { return some_color(color_rgba(224, 108, 108, 255)) }
+    if (cls == "warning") { return some_color(color_rgba(229, 192, 123, 255)) }
+    if (cls == "hint") { return some_color(color_rgba(134, 187, 137, 255)) }
+    if (cls == "path") { return some_color(color_rgba(130, 170, 200, 255)) }
+    // A link is underlined where it is painted (see ce_paint_line); this is only its colour.
+    if (cls == "link") { return some_color(color_rgba(122, 176, 255, 255)) }
+    // the same link with the pointer on it: brighter, so the hover is visible before the click.
+    if (cls == "link_hot") { return some_color(color_rgba(180, 214, 255, 255)) }
+    return no_color()
+}
+
+/// the classes seeded into a palette.
+pub fn token_classes() -> Vec<Str> {
+    var v: Vec<Str> = vec()
+    v.push("keyword")  v.push("string")  v.push("comment")  v.push("function")  v.push("type")  v.push("number")  v.push("operator")
+    v.push("error")  v.push("warning")  v.push("hint")  v.push("path")  v.push("link")  v.push("link_hot")
+    return v
+}
+
+/// resolved token colors: stylesheet class `text_color`/`color` overrides, else the built-in default,
+/// else the palette default. Stored as parallel Vecs (Map<Color> is unsupported).
+pub struct SyntaxTokenPalette { def: Color, keys: Vec<Str>, cols: Vec<Color> }
+
+/// build a palette: for each token class, prefer `sheet`'s class rule text_color/color, then the
+/// built-in default, then `def`. Pass an empty stylesheet for defaults-only.
+pub fn palette_new(copy def: Color, sheet: OverlayStyleSheet) -> SyntaxTokenPalette {
+    var keys: Vec<Str> = vec()
+    var cols: Vec<Color> = vec()
+    var classes = token_classes()
+    var i = 0
+    while i < classes.len() {
+        var cls = classes[i]
+        var col = copy def
+        var got = false
+        if sheet_has_class(sheet, cls) {
+            var ns = sheet_class(sheet, cls)
+            if ns.has_text_color { col = rgba_color(ns.text_color)  got = true }
+            else if ns.has_color { col = rgba_color(ns.color)  got = true }
+        }
+        if !got {
+            var d = default_token_color(cls)
+            if d.present { col = color_dup(d.color) }
+        }
+        keys.push(copy cls)
+        cols.push(sink col)
+        i = i + 1
+    }
+    return SyntaxTokenPalette { def: def, keys: keys, cols: cols }
+}
+/// a defaults-only palette (no stylesheet overrides).
+pub fn palette_defaults(def: Color) -> SyntaxTokenPalette { return palette_new(def, stylesheet_new()) }
+
+/// the color for token `class`: the palette entry, else the built-in default, else the palette default.
+pub fn palette_color(pal: SyntaxTokenPalette, cls: Str) -> Color {
+    var i = 0
+    while i < pal.keys.len() { if (pal.keys[i] == cls) { return color_dup(pal.cols[i]) }  i = i + 1 }
+    var d = default_token_color(cls)
+    if d.present { return sink d.color }
+    return color_dup(pal.def)
+}
+
+/// split `source` into lines on '\n'; an empty source yields a single empty line.
+pub fn source_lines(source: Str) -> Vec<Str> { return wt_split_nl(source) }
+
+/// the visible line window for a virtualized editor.
+pub struct VisibleRange { start: Int, end: Int }
+pub fn visible_line_range(view_height: Float, scroll_y: Float, line_height: Float, total_lines: Int, overscan: Int) -> VisibleRange {
+    var line_h = math::fmax(line_height, 1.0)
+    var first = to_int(math::floor(scroll_y / line_h))
+    var visible = to_int(math::ceil(view_height / line_h)) + 1
+    var start = first - overscan
+    if start < 0 { start = 0 }
+    var cap = total_lines
+    if cap < 1 { cap = 1 }
+    // The start cannot sit past the last line. Clamping it against 0 alone would let a
+    // scroll offset beyond the end of a short document, which nothing stops a caller from having,
+    // produce a start past the end; `end` was clamped down to `cap`, and then the `end < start + 1`
+    // repair below pushed `end` back out again to keep the range non-empty. That guard exists to
+    // protect `end > start`; it must not do so by breaking `end <= total_lines`, because the caller
+    // indexes a Vec with both. One line of a one-line file, scrolled 300px: start 12, end 13,
+    // `rows[12]`, out of range.
+    if start > cap - 1 { start = cap - 1 }
+    var end = first + visible + overscan
+    if end > cap { end = cap }
+    if end < start + 1 { end = start + 1 }
+    return VisibleRange { start: start, end: end }
+}
+
+// ---- bracket matching ----
+
+/// the matching-bracket position for the bracket at/nearest `caret`.
+pub struct BracketMatch { present: Bool, index: Int }
+pub fn bracket_no_match() -> BracketMatch { return BracketMatch { present: false, index: 0 } }
+
+/// scan for the partner of the bracket at `frm` (open/close byte values), forward or backward.
+pub fn scan_bracket(text: Str, frm: Int, open: Int, close: Int, forward: Bool) -> BracketMatch {
+    var n = text.len()
+    if forward {
+        var depth = 1
+        var i = frm + 1
+        while i < n {
+            var c = ord(text.at(i))
+            if c == open { depth = depth + 1 }
+            else if c == close { depth = depth - 1  if depth == 0 { return BracketMatch { present: true, index: i } } }
+            i = i + 1
+        }
+    } else {
+        var depth = 1
+        var i = frm
+        while i > 0 {
+            i = i - 1
+            var c = ord(text.at(i))
+            if c == close { depth = depth + 1 }
+            else if c == open { depth = depth - 1  if depth == 0 { return BracketMatch { present: true, index: i } } }
+        }
+    }
+    return bracket_no_match()
+}
+
+/// the matching bracket for the bracket at `caret` (clamped into range); no match if `caret` isn't on
+/// one of ()[]{}.
+pub fn bracket_partner_index(text: Str, caret: Int) -> BracketMatch {
+    var n = text.len()
+    if n == 0 { return bracket_no_match() }
+    var idx = caret
+    if idx > n - 1 { idx = n - 1 }
+    if idx < 0 { idx = 0 }
+    var ch = ord(text.at(idx))
+    if ch == 40 { return scan_bracket(text, idx, 40, 41, true) }
+    if ch == 41 { return scan_bracket(text, idx, 40, 41, false) }
+    if ch == 91 { return scan_bracket(text, idx, 91, 93, true) }
+    if ch == 93 { return scan_bracket(text, idx, 91, 93, false) }
+    if ch == 123 { return scan_bracket(text, idx, 123, 125, true) }
+    if ch == 125 { return scan_bracket(text, idx, 123, 125, false) }
+    return bracket_no_match()
+}

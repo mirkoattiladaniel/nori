@@ -1,0 +1,356 @@
+use core::*
+import "std/font" as font
+import "std/math" as math
+
+// ===========================================================================
+// layout/text_layout: paragraphs (where lines break, how wide they are, which way each runs).
+//
+// Breaking. A line may end only at a UAX #14 opportunity (std/font's line_breaks): after a space,
+// after a hyphen, between two ideographs, never inside a word of Arabic or between a Devanagari
+// consonant and its vowel sign. Whitespace is first collapsed (runs of
+// space/tab/CR become one space, nothing at either end of a line), then the line is filled greedily:
+// the last opportunity whose text fits. Widths come from one caret table for the whole paragraph
+// (text_measure_cumulative_x: shaped once when the engine is on), and the line chosen is then
+// measured again on its own, the way it will be drawn, and backed off an opportunity if shaping it
+// alone made it wider than the estimate. A segment wider than the line on its own overflows, or,
+// with hard_break, is split between grapheme clusters, never inside one.
+//
+// Direction. Each hard line is a paragraph (UAX #9: a newline is a paragraph separator). Its
+// direction is the node's `dir`, or with `dir: auto` (the default) its first strong character's.
+// A soft-wrapped line keeps its paragraph's direction, and is reordered on its own when drawn
+// (UAX #9 L1-L4, per line, after breaking): the painters shape each line with that direction.
+// ===========================================================================
+
+fn tl_is_ws(c: Int) -> Bool { return c == 32 || c == 9 || c == 13 || c == 10 }
+fn tl_has_nl(s: Str) -> Bool {
+    var i = 0
+    while i < s.len() { if ord(s.at(i)) == 10 { return true }  i = i + 1 }
+    return false
+}
+
+/// `s` with every run of space/tab/CR/LF made one space and none at either end: what wrapping
+/// does to a line before filling it.
+pub fn text_collapse_ws(s: Str) -> Str {
+    var out = ""
+    var start = 0 - 1
+    var i = 0
+    let n = s.len()
+    while i < n {
+        let c = ord(s.at(i))
+        if tl_is_ws(c) {
+            if start >= 0 { if out.len() > 0 { out = out + " " }  out = out + s.slice(start, i)  start = 0 - 1 }
+        } else { if start < 0 { start = i } }
+        i = i + 1
+    }
+    if start >= 0 { if out.len() > 0 { out = out + " " }  out = out + s.slice(start, n) }
+    return out
+}
+
+// a character that disappears at the end of a line: a space, or a mandatory-break character
+fn tl_trims(cp: Int) -> Bool {
+    if cp == 32 || cp == 9 { return true }
+    let lb = font::ucd_line_break(cp)
+    return lb == font::LB_BK() || lb == font::LB_CR() || lb == font::LB_LF() || lb == font::LB_NL()
+}
+
+// ---- a line's break analysis, cached ----------------------------------------------------------
+// Filling a line at a width needs, for every place it may break, how far along the line that place
+// is, and nothing else. That does not depend on the width, so it is worked out once per line of
+// text (UAX #14 opportunities, one shaped caret table) and kept: a relayout at a new width, or the
+// same paragraph laid out again every frame, is then a walk over a few numbers per word. Entries
+// are flat Ints in globals (the std/font cache pattern); the whole cache is dropped past its budget.
+//
+// One entry per candidate end of a line: every break opportunity and the line's end:
+//   [byte offset of the candidate, byte offset after trimming the spaces before it,
+//    x at the candidate, x at the trimmed end (px * 2^20), 1 if the break is mandatory]
+// and a first entry for the line's start.
+global g_tl_idx: Map<Str, Int>
+global g_tl_on: Int = 0
+global g_tl_off: Vec<Int>
+global g_tl_n: Vec<Int>
+global g_tl_data: Vec<Int>
+fn TL_BUDGET() -> Int { return 1000000 }
+fn TL_FIX() -> Float { return 1048576.0 }
+fn tl_reset() {
+    var m: Map<Str, Int> = map()
+    g_tl_idx = sink m
+    g_tl_off = vec()
+    g_tl_n = vec()
+    g_tl_data = vec()
+    g_tl_on = 1
+}
+// the slot of `ln`'s analysis for `style`, worked out on a miss
+fn tl_analysis(ln: Str, style: TextMeasureStyle) -> Int {
+    if g_tl_on == 0 { tl_reset() }
+    let key = to_str(text_engine_generation()) + "/" + to_str(style.stack) + "/" + to_str(style.dir) + "/" + style.lang + "/" + to_str(style.size_px) + "/" + to_str(style.letter_spacing) + "/" + to_str(style.word_spacing) + "|" + ln
+    if g_tl_idx.has(key) { return g_tl_idx.get(key) }
+    var cps: Vec<Int> = vec()
+    var offs: Vec<Int> = vec()
+    font::utf8_decode_offsets(ln, cps, offs)
+    let n = cps.len()
+    offs.push(ln.len())
+    let brk = font::line_breaks(cps)
+    let cum = text_measure_cumulative_x(ln, style)
+    if g_tl_data.len() > TL_BUDGET() { tl_reset() }
+    let slot = g_tl_off.len()
+    g_tl_off.push(g_tl_data.len())
+    var cnt = 0
+    var k = 0
+    while k <= n {
+        if k == 0 || k == n || brk[k] != font::LBK_NONE() {
+            var e = k
+            while e > 0 && tl_trims(cps[e - 1]) { e = e - 1 }
+            g_tl_data.push(offs[k])
+            g_tl_data.push(offs[e])
+            g_tl_data.push(to_int(cum[offs[k]] * TL_FIX()))
+            g_tl_data.push(to_int(cum[offs[e]] * TL_FIX()))
+            var mand = 0
+            if k > 0 && k < n && brk[k] == font::LBK_MANDATORY() { mand = 1 }
+            g_tl_data.push(mand)
+            cnt = cnt + 1
+        }
+        k = k + 1
+    }
+    g_tl_n.push(cnt)
+    g_tl_idx.put(key, slot)
+    return slot
+}
+
+/// the lines one collapsed line `ln` breaks into at `max_w` (see the header). Pushes onto `out`.
+fn tl_fill(ln: Str, max_w: Float, style: TextMeasureStyle, hard_break: Bool, inout out: Vec<Str>) {
+    if ln.len() == 0 { out.push("")  return }
+    let slot = tl_analysis(ln, style)
+    let o = g_tl_off[slot]
+    let cnt = g_tl_n[slot]
+    let eps = 0.001
+    var s = 0                                           // the candidate the line starts at
+    while s < cnt - 1 {
+        let bs = g_tl_data[o + s * 5]
+        let xs = to_float(g_tl_data[o + s * 5 + 2]) / TL_FIX()
+        // the candidates after `s` the text up to fits (by the estimate)
+        var fits: Vec<Int> = vec()
+        var j = s + 1
+        var stop = false
+        while j < cnt && !stop {
+            var be = g_tl_data[o + j * 5 + 1]
+            var xe = to_float(g_tl_data[o + j * 5 + 3]) / TL_FIX()
+            if be < bs { be = bs  xe = xs }
+            if xe - xs <= max_w + eps {
+                fits.push(j)
+                if g_tl_data[o + j * 5 + 4] == 1 { stop = true }
+            } else { stop = true }
+            j = j + 1
+        }
+        var end = 0 - 1
+        // the last candidate that fits, measured the way the line will be drawn
+        var fi = fits.len() - 1
+        while fi >= 0 && end < 0 {
+            var be = g_tl_data[o + fits[fi] * 5 + 1]
+            if be < bs { be = bs }
+            if fi == 0 || text_measure_width(ln.slice(bs, be), style) <= max_w + eps { end = fits[fi] }
+            fi = fi - 1
+        }
+        if end < 0 {
+            let fb = g_tl_data[o + (s + 1) * 5]          // the first segment alone is wider than the line
+            if hard_break {
+                // as many grapheme clusters as fit, at least one
+                let seg = ln.slice(bs, fb)
+                let gs = font::grapheme_offsets(seg)
+                let cumseg = text_measure_cumulative_x(seg, style)
+                var best = gs[1]
+                var g = 2
+                while g < gs.len() && cumseg[gs[g]] <= max_w + eps { best = gs[g]  g = g + 1 }
+                if best >= seg.len() { end = s + 1 }
+                else {
+                    out.push(seg.slice(0, best))
+                    // the rest of the segment starts a line of its own: carry on from inside it
+                    tl_fill_from(ln, bs + best, max_w, style, hard_break, out)
+                    return
+                }
+            } else { end = s + 1 }
+        }
+        var be = g_tl_data[o + end * 5 + 1]
+        if be < bs { be = bs }
+        out.push(ln.slice(bs, be))
+        s = end
+    }
+}
+// tl_fill for the part of `ln` from byte `from` on (after a hard break split a segment): that part
+// is a line of text of its own, analysed and filled the same way
+fn tl_fill_from(ln: Str, from: Int, max_w: Float, style: TextMeasureStyle, hard_break: Bool, inout out: Vec<Str>) {
+    tl_fill(ln.slice(from, ln.len()), max_w, style, hard_break, out)
+}
+
+/// the wrapped lines of `text` at `max_w` for `style`: each hard line collapsed and filled at UAX #14
+/// opportunities. `max_w <= 1` leaves the text as it is (one piece per hard line).
+pub fn text_wrap_lines(text: Str, max_w: Float, style: TextMeasureStyle, hard_break: Bool) -> Vec<Str> {
+    var ix: Vec<Int> = vec()
+    return text_wrap_lines_ix(text, max_w, style, hard_break, ix)
+}
+/// text_wrap_lines, also saying which hard line (paragraph) of `text` each line came from.
+pub fn text_wrap_lines_ix(text: Str, max_w: Float, style: TextMeasureStyle, hard_break: Bool, inout hard_ix: Vec<Int>) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var start = 0
+    var i = 0
+    var h = 0
+    let n = text.len()
+    while i <= n {
+        if i == n || ord(text.at(i)) == 10 {
+            let piece = text.slice(start, i)
+            if max_w <= 1.0 { out.push(piece) } else { tl_fill(text_collapse_ws(piece), max_w, style, hard_break, out) }
+            while hard_ix.len() < out.len() { hard_ix.push(h) }
+            h = h + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// the direction of each hard line (paragraph) of `text`: `dir`, or for dir_auto its first strong
+/// character's, one character per hard line, 'L' or 'R'.
+pub fn text_para_dirs(text: Str, dir: Int) -> Str {
+    var out = ""
+    var start = 0
+    var i = 0
+    let n = text.len()
+    while i <= n {
+        if i == n || ord(text.at(i)) == 10 {
+            if text_para_dir(text.slice(start, i), dir) == 1 { out = out + "R" } else { out = out + "L" }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// `text` cut to fit `max_w` with "..." after it, at a grapheme cluster boundary (never inside a
+/// cluster). Unchanged when it already fits.
+pub fn text_truncate_ellipsis(text: Str, max_w: Float, style: TextMeasureStyle) -> Str {
+    if text_measure_width(text, style) <= max_w { return copy text }
+    let ell = "..."
+    var budget = max_w - text_measure_width(ell, style)
+    let floor = style.size_px * 0.52
+    if budget < floor { budget = floor }
+    let cum = text_measure_cumulative_x(text, style)
+    let gs = font::grapheme_offsets(text)
+    var keep = 0
+    var i = 1
+    var done = false
+    while i < gs.len() && !done {
+        if cum[gs[i]] > budget { done = true } else { keep = gs[i]  i = i + 1 }
+    }
+    // the estimate chose `keep`; the drawn prefix must fit too (shaping it alone can differ)
+    while keep > 0 && text_measure_width(text.slice(0, keep), style) > budget {
+        var j = 0
+        var prev = 0
+        while j < gs.len() && gs[j] < keep { prev = gs[j]  j = j + 1 }
+        keep = prev
+    }
+    return text.slice(0, keep) + ell
+}
+
+/// where each line of a laid-out text box starts, relative to the box's left edge: line `i` of width
+/// `widths[i]` in a box `box_w` wide, aligned by `ta_*`: start/end follow the line's
+/// direction ('L'/'R' in `dirs`), left/right/center do not. Empty when every line starts at 0 (the
+/// common case costs no allocation in the primitive).
+pub fn text_line_offsets(widths: Vec<Float>, dirs: Str, box_w: Float, align: Int, anchor_x: Float) -> Vec<Float> {
+    var out: Vec<Float> = vec()
+    var any = false
+    var i = 0
+    while i < widths.len() {
+        var rtl = i < dirs.len() && ord(dirs.at(i)) == 82
+        var a = anchor_x
+        if align == ta_start() || align == ta_auto() { if rtl { a = 1.0 } else { a = 0.0 } }
+        else if align == ta_end() { if rtl { a = 0.0 } else { a = 1.0 } }
+        let x = math::fmax(box_w - widths[i], 0.0) * a
+        if x != 0.0 { any = true }
+        out.push(x)
+        i = i + 1
+    }
+    if !any { var none: Vec<Float> = vec()  return none }
+    return out
+}
+/// text alignment: physical (left/center/right, or an `anchor` x, what `anchor_x` says) or
+/// direction-relative (start/end: the line's own start or end, which is the right for a line of
+/// Arabic). ta_auto is start, and is what a text node without `text_align` gets.
+pub fn ta_auto() -> Int { return 0 }
+pub fn ta_start() -> Int { return 1 }
+pub fn ta_end() -> Int { return 2 }
+pub fn ta_physical() -> Int { return 3 }
+
+/// the measure style of a line that runs in direction `rtl` (the painters shape it that way).
+pub fn text_style_dir(style: TextMeasureStyle, rtl: Bool) -> TextMeasureStyle {
+    var d = 0
+    if rtl { d = 1 }
+    return TextMeasureStyle { size_px: style.size_px, font_bold: style.font_bold, font_italic: style.font_italic, has_font_family: style.has_font_family, font_family: copy style.font_family, letter_spacing: style.letter_spacing, word_spacing: style.word_spacing, stack: style.stack, dir: d, lang: copy style.lang }
+}
+
+/// lay a text out: transform it, wrap it (when `wrap` or `line_clamp > 0`), clamp it or cut it with an
+/// `available_w`. Uses the shaper's widths, UAX #14
+/// breaks and each line's direction (TextLayout.line_dir) and width (TextLayout.line_w).
+pub fn text_render_st(text: Str, available_w: Float, max_width: Float, wrap: Bool, hard_break: Bool, line_clamp: Int, ellipsis: Bool, transform: Int, line_height_mult: Float, min_height: Float, style: TextMeasureStyle) -> TextLayout {
+    var avail = available_w
+    if avail < 1.0 { avail = 1.0 }
+    var max_w = avail
+    if max_width > 0.0 { max_w = math::fmin(max_width, avail) }
+    let rendered = apply_text_transform(text, transform)
+    // One line, nothing to fit: what almost every label is, and what a layout measures again and
+    // again: one direction, one cached width, no splitting
+    if !wrap && line_clamp <= 0 && !ellipsis && !tl_has_nl(rendered) {
+        let rtl = text_para_dir(rendered, style.dir) == 1
+        let lw = text_measure_width(rendered, text_style_dir(style, rtl))
+        var w1 = lw
+        if w1 > max_w { w1 = max_w }
+        if w1 < 1.0 { w1 = 1.0 }
+        var h1 = text_line_height_px(style.size_px, line_height_mult)
+        if h1 < min_height { h1 = min_height }
+        if h1 < 1.0 { h1 = 1.0 }
+        var ws1: Vec<Float> = vec()
+        ws1.push(lw)
+        var d1 = "L"
+        if rtl { d1 = "R" }
+        return TextLayout { content: rendered, width: w1, height: h1, lines: 1, line_w: ws1, line_dir: d1 }
+    }
+    var hix: Vec<Int> = vec()
+    var lines: Vec<Str> = vec()
+    if wrap || line_clamp > 0 { lines = text_wrap_lines_ix(rendered, max_w, style, hard_break, hix) }
+    else { lines = text_wrap_lines_ix(rendered, 0.0, style, false, hix) }
+    let pd = text_para_dirs(rendered, style.dir)
+    if line_clamp > 0 && lines.len() > line_clamp {
+        var kept: Vec<Str> = vec()
+        var i = 0
+        while i < line_clamp {
+            if i == line_clamp - 1 && ellipsis { kept.push(text_truncate_ellipsis(lines[i], max_w, text_style_dir(style, ord(pd.at(hix[i])) == 82))) }
+            else { kept.push(copy lines[i]) }
+            i = i + 1
+        }
+        lines = sink kept
+    } else if ellipsis && !wrap && line_clamp <= 0 {
+        var i = 0
+        while i < lines.len() { lines[i] = text_truncate_ellipsis(lines[i], max_w, text_style_dir(style, ord(pd.at(hix[i])) == 82))  i = i + 1 }
+    }
+    var content = ""
+    var dirs = ""
+    var ws: Vec<Float> = vec()
+    var w = 0.0
+    var i = 0
+    while i < lines.len() {
+        let rtl = ord(pd.at(hix[i])) == 82
+        if rtl { dirs = dirs + "R" } else { dirs = dirs + "L" }
+        let lw = text_measure_width(lines[i], text_style_dir(style, rtl))
+        ws.push(lw)
+        if lw > w { w = lw }
+        if i > 0 { content = content + "\n" }
+        content = content + lines[i]
+        i = i + 1
+    }
+    if w > max_w { w = max_w }
+    if w < 1.0 { w = 1.0 }
+    var lc = lines.len()
+    if lc < 1 { lc = 1 }
+    var h = to_float(lc) * text_line_height_px(style.size_px, line_height_mult)
+    if h < min_height { h = min_height }
+    if h < 1.0 { h = 1.0 }
+    return TextLayout { content: content, width: w, height: h, lines: lc, line_w: ws, line_dir: dirs }
+}

@@ -1,0 +1,494 @@
+//! The plugin host: one registry of panels, whatever they were written as.
+//!
+//! A panel arrives from one of two places, a **loaded** `.so` (see `loader.nori`) or a **built-in**
+//! compiled into the application, and after registration the host cannot tell them apart. Both are
+//! a `PanelDesc` plus a way to produce `.ui` source; the host lays that source out.
+//!
+//! Nothing here knows what a plugin was written in; if this file ever needs to name a tier, the
+//! design has gone wrong.
+
+use core::*
+import "std/json" as json
+
+/// a panel compiled into the application.
+pub fn SRC_BUILTIN() -> Int { return 0 }
+/// a panel from a loaded `.so`.
+pub fn SRC_LOADED() -> Int { return 1 }
+
+/// where the dock should place a panel by default.
+pub fn POS_LEFT() -> Int { return 0 }
+pub fn POS_RIGHT() -> Int { return 1 }
+pub fn POS_TOP() -> Int { return 2 }
+pub fn POS_BOTTOM() -> Int { return 3 }
+pub fn POS_CENTER() -> Int { return 4 }
+pub fn POS_FLOATING() -> Int { return 5 }
+
+/// a panel-scoped action on its way back to whoever owns the panel.
+pub struct PanelEvent { panel: Str, action: Str }
+
+/// build a `PanelDesc` with the usual defaults, the built-in equivalent of a manifest entry.
+pub fn panel(id: Str, name: Str, position: Int) -> PanelDesc {
+    return PanelDesc { id: copy id, name: copy name, icon: "", position: position,
+                       default_w: 280.0, default_h: 320.0, closable: true, shortcut: "" , duplicable: false}
+}
+
+/// everything registered: the panels and how to reach each one, the loaded libraries behind some of
+/// them, the pending events, and what has gone wrong. The service bus lives in `hostcall.nori`,
+/// one per process, and the host publishes into it.
+///
+/// The per-panel arrays are parallel and indexed together. A panel's renderer is its own closure, not
+/// a dispatcher shared by everything from the same source: two built-ins are as independent as two
+/// separate libraries.
+pub struct PluginHost {
+    panels: Vec<PanelDesc>,
+    p_src: Vec<Int>,
+    p_lib: Vec<Int>,
+    p_render: Vec<Fn(Str, Float, Float) -> Str>,
+    p_event: Vec<Fn(Str, Str) -> Int>,
+    p_err: Vec<Str>,
+    libs: Vec<LoadedPlugin>,
+    events: Vec<PanelEvent>,
+    errors: Vec<Str>
+}
+
+/// an empty host.
+pub fn host_new() -> PluginHost {
+    var ps: Vec<PanelDesc> = vec()
+    var sr: Vec<Int> = vec()
+    var lb: Vec<Int> = vec()
+    var rf: Vec<Fn(Str, Float, Float) -> Str> = vec()
+    var ef: Vec<Fn(Str, Str) -> Int> = vec()
+    var pe: Vec<Str> = vec()
+    var lv: Vec<LoadedPlugin> = vec()
+    var ev: Vec<PanelEvent> = vec()
+    var er: Vec<Str> = vec()
+    var h = PluginHost { panels: ps, p_src: sr, p_lib: lb, p_render: rf, p_event: ef, p_err: pe,
+                         libs: lv, events: ev, errors: er }
+    // A new host owns the host-callback bus from the moment it exists: a loaded plugin handed the
+    // callback at init can call in before anything else has run. Opening the bus here rather than at
+    // first load guarantees that, and opening it empty keeps a previous host's services from
+    // answering for this one.
+    hostcall_reset()
+    return h
+}
+
+/// open the host callback's bus again after `hostcall_unbind`. `host_new` already opens it; the
+/// bus is the process's, so what this host published and what the callback answers are one list.
+/// One process, one bound host: the callback is a C-ABI function pointer and has no context
+/// parameter to carry a host in.
+pub fn host_bind_hostcall(h: PluginHost) { hostcall_bind() }
+
+/// the address a plugin's `nori_plugin_init` is handed. `ui::plugin::init(p)` passes it for you.
+pub fn host_call_addr() -> Int { return hostcall_addr() }
+
+// ---- the registry -------------------------------------------------------------------------------
+
+/// append a panel row. Re-registering an id replaces it in place, which is what makes reload work.
+fn put_panel(inout h: PluginHost, sink d: PanelDesc, src: Int, lib: Int, sink rf: Fn(Str, Float, Float) -> Str, sink ef: Fn(Str, Str) -> Int) {
+    var i = 0
+    while i < h.panels.len() {
+        if h.panels[i].id == d.id {
+            h.panels[i] = d  h.p_src[i] = src  h.p_lib[i] = lib
+            h.p_render[i] = rf  h.p_event[i] = ef  h.p_err[i] = ""
+            return
+        }
+        i = i + 1
+    }
+    h.panels.push(d)  h.p_src.push(src)  h.p_lib.push(lib)
+    h.p_render.push(rf)  h.p_event.push(ef)  h.p_err.push("")
+}
+
+/// register a panel implemented in this application. `rf` returns `.ui` source for the panel; `ef`
+/// receives an action id and returns 0 when it handled it.
+pub fn host_register_builtin(inout h: PluginHost, sink d: PanelDesc, sink rf: Fn(Str, Float, Float) -> Str, sink ef: Fn(Str, Str) -> Int) {
+    put_panel(h, d, SRC_BUILTIN(), -1, rf, ef)
+}
+
+/// take a plugin the loader opened and register every panel it declares. A plugin that failed to
+/// load contributes nothing but its error. Returns the library's index, or -1 when it was refused.
+pub fn host_add(inout h: PluginHost, p: LoadedPlugin) -> Int {
+    if !p.ok { host_note_error(h, (p.path + (": " + p.err)))  return -1 }
+    // Run the plugin's init first. A plugin loaded through the host needs its one-time setup and
+    // the host callback, or a panel that reads the host's state would keep showing its own local data.
+    //
+    // Discovery stays side-effect free: `scan`/`load` only read the manifest, and `inspect`-style
+    // filtering happens before this. `host_add` is past that: it is registration into a live host,
+    // and a registered plugin that has not been initialised is not usable.
+    if !init(p) { host_note_error(h, (p.path + ": nori_plugin_init reported failure"))  return -1 }
+    let li = h.libs.len()
+    var i = 0
+    while i < p.panels.len() {
+        // A loaded panel is reached through its library, so the closure slots hold inert stand-ins;
+        // `host_render` dispatches on the source before it would ever call them.
+        put_panel(h, copy p.panels[i], SRC_LOADED(), li, |_a: Str, _b: Float, _c: Float| "", |_d: Str, _e: Str| 0)
+        i = i + 1
+    }
+    // Publish the keys this plugin declared, each as an ordinary bus entry that routes into
+    // the library. From here a builtin panel, another `.so`, or the host itself calls those keys with
+    // no idea a `.so` is behind them, so the shell carries no domain knowledge of its own: a plugin
+    // brings its services with it.
+    // Only a plugin that can actually answer. `load` already refuses a plugin whose manifest
+    // declares services it has no `nori_plugin_service` for, so this guard is a second check:
+    // a hand-built `LoadedPlugin` cannot put keys on the bus that answer nothing.
+    publish_services(p)
+    h.libs.push(copy p)
+    return li
+}
+
+/// put every service `p` declares on the bus, each answered by the library itself. The entry keeps
+/// its own copy of the library record (the handle and the entry points, a few strings), so a reload,
+/// which opens a new handle, publishes again and replaces these.
+fn publish_services(p: LoadedPlugin) {
+    if p.f_service == 0 { return }
+    var k = 0
+    while k < p.services.len() {
+        let key = copy p.services[k]
+        let lib = copy p
+        hostcall_register(key, |a: Str| service(lib, key, a))
+        k = k + 1
+    }
+}
+
+/// which loaded library fills the hole named `id`, or -1 when nothing claims it.
+///
+/// First claim wins, and a second claimant is an error the host reports rather than a silent
+/// override: two plugins fighting over one hole is a misconfiguration, and the frame that shows it
+/// should say so.
+pub fn host_surface_owner(inout h: PluginHost, id: Str) -> Int {
+    var found = -1
+    var i = 0
+    while i < h.libs.len() {
+        if fills_surface(h.libs[i], id) {
+            if found < 0 { found = i }
+            else { host_note_error(h, (("two plugins claim surface \"" + id) + ("\": " + (h.libs[found].name + (" and " + h.libs[i].name))))) }
+        }
+        i = i + 1
+    }
+    return found
+}
+
+/// every hole any loaded plugin offers to fill, in load order and without duplicates. A host uses
+/// this to know what it could fill; what it actually fills is whatever this frame's documents asked
+/// for. Discovery, not policy.
+pub fn host_surface_ids(h: PluginHost) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var i = 0
+    while i < h.libs.len() {
+        var j = 0
+        while j < h.libs[i].surfaces.len() {
+            let id = h.libs[i].surfaces[j]
+            var seen = false
+            var q = 0
+            while q < out.len() { if out[q] == id { seen = true }  q = q + 1 }
+            if !seen { out.push(copy id) }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+
+
+/// load every plugin in `dir` and register them. Returns how many loaded; the rest are in the error
+/// list, with the path that refused.
+pub fn host_load_dir(inout h: PluginHost, dir: Str) -> Int {
+    var found = scan(dir)
+    var n = 0
+    var i = 0
+    while i < found.len() {
+        if host_add(h, found[i]) >= 0 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+/// how many panels are registered.
+pub fn host_panel_count(h: PluginHost) -> Int { return h.panels.len() }
+/// the panel at `i`, in registration order.
+pub fn host_panel_at(h: PluginHost, i: Int) -> view PanelDesc { return h.panels[i] }
+/// where a panel came from: `SRC_BUILTIN` or `SRC_LOADED`.
+pub fn host_panel_source(h: PluginHost, i: Int) -> Int { return h.p_src[i] }
+
+/// index of the panel with this id, or -1.
+pub fn host_panel_index(h: PluginHost, id: Str) -> Int {
+    var i = 0
+    while i < h.panels.len() {
+        if h.panels[i].id == id { return i }
+        i = i + 1
+    }
+    // An instance resolves to its panel. `term.panel#2` is a second view of `term.panel`, created by
+    // duplicating its tab; the plugin that owns the panel owns every instance of it, so the lookup
+    // falls back to the base while the full id is what gets handed to the plugin, which is how a
+    // duplicate can be a different terminal rather than a second picture of the same one.
+    let base = panel_base_id(id)
+    if base.len() < id.len() {
+        i = 0
+        while i < h.panels.len() {
+            if h.panels[i].id == base { return i }
+            i = i + 1
+        }
+    }
+    return -1
+}
+
+/// `term.panel#2` -> `term.panel`; anything without an instance marker is returned unchanged.
+///
+/// `#` because it cannot appear in a panel id a manifest declares (those are dotted names), so an
+/// instance can never be mistaken for a panel somebody meant to declare.
+pub fn panel_base_id(id: Str) -> Str {
+    var i = 0
+    while i < id.len() { if ord(id.at(i)) == 35 { return id.slice(0, i) }  i = i + 1 }
+    return copy id
+}
+
+/// the instance number in `term.panel#2`, or 1 for a plain panel id.
+pub fn panel_instance(id: Str) -> Int {
+    var i = 0
+    while i < id.len() {
+        if ord(id.at(i)) == 35 {
+            var v = 0
+            var k = i + 1
+            while k < id.len() {
+                let d = ord(id.at(k)) - 48
+                if d < 0 || d > 9 { return v }
+                v = v * 10 + d
+                k = k + 1
+            }
+            if v < 1 { return 1 }
+            return v
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+/// ask one panel's plugin, rather than whoever holds the key on the bus.
+///
+/// The bus is a flat map from key to function and a later registration replaces an earlier one, so
+/// a key two plugins both offer belongs to whichever loaded last. That is right for a key with one
+/// answer (`shell.theme`, `project.root`) and wrong for a key that is inherently per panel.
+///
+/// `panel.cursor_at` is the case: the shell asks the panel under the pointer what cursor to show,
+/// every panel with links wants to answer, and only one of them could. The others were not shadowed
+/// loudly; they simply never ran.
+///
+/// A panel whose plugin does not offer the key gets the same shape an unknown key gets, so the
+/// caller cannot tell "no such panel" from "that panel says nothing", which is the same thing to
+/// everyone above this line.
+pub fn host_panel_service(h: PluginHost, id: Str, key: Str, arg: Str) -> Str {
+    let pi = host_panel_index(h, id)
+    if pi < 0 { return hostcall_no_service(key) }
+    if !(h.p_src[pi] == SRC_LOADED()) { return hostcall_no_service(key) }
+    return service(h.libs[h.p_lib[pi]], key, arg)
+}
+
+/// does the plugin that owns this panel declare this service key?
+///
+/// `host_has_service` is a question about the bus (is anyone, anywhere, answering this), and a
+/// shell that asks it and then calls `host_panel_service` on whichever panel is under the pointer
+/// sends the key into a plugin that never claimed it. Every plugin answers an unknown key
+/// correctly, so nothing breaks visibly; what it costs is a service dispatch per panel per frame,
+/// and some plugins do real work on the way in (a debugger pumping its session, a terminal
+/// draining its pty). Neither should happen because a pointer crossed a button.
+///
+/// Reads the plugin's own `services` array from its manifest, which is where a plugin says what it
+/// answers, so a panel that has not claimed the key is never asked.
+pub fn host_panel_serves(h: PluginHost, id: Str, key: Str) -> Bool {
+    let pi = host_panel_index(h, id)
+    if pi < 0 { return false }
+    if !(h.p_src[pi] == SRC_LOADED()) { return false }
+    let p = h.libs[h.p_lib[pi]]
+    var k = 0
+    while k < p.services.len() { if p.services[k] == key { return true }  k = k + 1 }
+    return false
+}
+
+/// true when a panel with this id is registered.
+pub fn host_has_panel(h: PluginHost, id: Str) -> Bool { return host_panel_index(h, id) >= 0 }
+
+/// every registered panel id, in registration order; what seeds the dock's tabs.
+pub fn host_panel_ids(h: PluginHost) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var i = 0
+    while i < h.panels.len() { out.push(copy h.panels[i].id)  i = i + 1 }
+    return out
+}
+
+/// the ids a given position bucket should hold, for seeding a dock layout.
+pub fn host_panel_ids_at(h: PluginHost, position: Int) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var i = 0
+    while i < h.panels.len() {
+        if h.panels[i].position == position { out.push(copy h.panels[i].id) }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- rendering + events -------------------------------------------------------------------------
+
+/// `.ui` source for a panel this frame, from whichever side owns it.
+///
+/// A panel that yields nothing has its error recorded against itself and returns ""; every other
+/// panel still draws. The caller decides what to show in the hole; `error_document` builds one.
+pub fn host_render(inout h: PluginHost, id: Str, w: Float, hgt: Float) -> Str {
+    let pi = host_panel_index(h, id)
+    if pi < 0 { return "" }
+    var out = ""
+    if h.p_src[pi] == SRC_LOADED() { out = render(h.libs[h.p_lib[pi]], id, w, hgt) }
+    else { var f = h.p_render[pi]  out = f(id, w, hgt) }
+    if out.len() == 0 { h.p_err[pi] = "the panel produced no document" }
+    else { h.p_err[pi] = "" }
+    return out
+}
+
+/// record that a panel's document could not be used, such as a parse failure the caller found. It is kept here so
+/// the failure travels with the panel rather than with whoever happened to notice.
+pub fn host_set_panel_error(inout h: PluginHost, id: Str, msg: Str) {
+    let pi = host_panel_index(h, id)
+    if pi >= 0 { h.p_err[pi] = copy msg }
+}
+
+/// the last thing that went wrong with this panel, or "".
+pub fn host_panel_error(h: PluginHost, id: Str) -> Str {
+    let pi = host_panel_index(h, id)
+    if pi < 0 { return "" }
+    return copy h.p_err[pi]
+}
+
+/// `.ui` source for a card describing a failure: what to draw where a panel could not.
+pub fn error_document(title: Str, msg: Str) -> Str {
+    return ("column { padding: 12 gap: 6 text { text: \"" + (ui_escape(title) +
+           ("\" size_px: 14 bold: true } text { text: \"" + (ui_escape(msg) +
+           "\" size_px: 12 wrap: true } }"))))
+}
+
+/// quote a string for a `.ui` attribute: backslash and double-quote are the two that matter.
+/// Byte-wise, so a multi-byte character passes through as its own bytes.
+pub fn ui_escape(s: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        let c = ord(s.at(i))
+        if c == 92 { out = (out + "\\\\") }
+        else if c == 34 { out = (out + "\\\"") }
+        else { out = (out + s.slice(i, i + 1)) }
+        i = i + 1
+    }
+    return out
+}
+
+/// queue an action for the panel that owns it; called from a `HitRegion`'s `on_click`.
+pub fn host_queue_event(inout h: PluginHost, panel: Str, action: Str) {
+    h.events.push(PanelEvent { panel: copy panel, action: copy action })
+}
+
+/// deliver every queued action to its panel, then clear the queue. Returns how many were delivered.
+pub fn host_drain_events(inout h: PluginHost) -> Int {
+    var n = 0
+    var i = 0
+    while i < h.events.len() {
+        let e = h.events[i]
+        let pi = host_panel_index(h, e.panel)
+        if pi >= 0 {
+            if h.p_src[pi] == SRC_LOADED() { let _r = event(h.libs[h.p_lib[pi]], e.panel, e.action) }
+            else { var f = h.p_event[pi]  let _r2 = f(e.panel, e.action) }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    // Only when there was something to clear. This is called once per frame whether or not anything
+    // is queued, and overwriting a `Vec` whose elements are not scalars does not release the one it
+    // replaces. A frame loop that runs at a thousand frames a second would leak about a gigabyte a
+    // second that way, so an idle drain allocates nothing at all.
+    if n > 0 {
+        var fresh: Vec<PanelEvent> = vec()
+        h.events = fresh
+    }
+    return n
+}
+
+// ---- services -----------------------------------------------------------------------------------
+// A JSON document in, a JSON document out: `Str -> Str` is too narrow the moment a service needs
+// more than one argument, so every payload is JSON.
+//
+// The bus is the one in hostcall.nori: a built-in panel reaches it through these functions, and a
+// loaded plugin reaches the same bus through the callback address `init` hands it, so a service is
+// answered the same way whoever asks.
+
+/// publish a service. Re-registering a key replaces it.
+pub fn host_register_service(inout h: PluginHost, key: Str, sink f: Fn(Str) -> Str) { hostcall_register(key, f) }
+
+/// true when the key is published.
+pub fn host_has_service(h: PluginHost, key: Str) -> Bool { return hostcall_has(key) }
+
+/// call a service with a JSON argument, returning its JSON reply.
+///
+/// An unknown key returns a JSON error rather than trapping: asking for a service this build does
+/// not have is normal, and the caller gets something it can parse either way.
+pub fn host_invoke_service(h: PluginHost, key: Str, arg: Str) -> Str { return hostcall_route(key, arg) }
+
+/// how many keys are published. A shell prints this to say how much of its bus came from plugins,
+/// which, for a shell that publishes nothing of its own, is all of it.
+pub fn host_service_count(h: PluginHost) -> Int { return hostcall_count() }
+
+/// the keys a panel may discover, as a JSON array.
+pub fn host_service_list(h: PluginHost) -> Str {
+    var out = "["
+    var i = 0
+    while i < hostcall_count() {
+        if i > 0 { out = (out + ",") }
+        out = (out + ("\"" + (json::js_escape(hostcall_key_at(i)) + "\"")))
+        i = i + 1
+    }
+    return (out + "]")
+}
+
+// ---- libraries + reload -------------------------------------------------------------------------
+
+/// how many `.so` plugins are loaded.
+pub fn host_lib_count(h: PluginHost) -> Int { return h.libs.len() }
+/// the loaded plugin at `i`.
+pub fn host_lib_at(h: PluginHost, i: Int) -> view LoadedPlugin { return h.libs[i] }
+
+/// reload every loaded plugin whose file changed, re-registering its panels. Returns how many moved.
+///
+/// A panel the new build no longer declares stays in the registry pointing at its library; ask
+/// `host_render` for it and it yields "" with the error recorded, like any other empty panel.
+pub fn host_reload_changed(inout h: PluginHost) -> Int {
+    var n = 0
+    var i = 0
+    while i < h.libs.len() {
+        if changed(h.libs[i]) {
+            let np = reload(h.libs[i])
+            if np.ok {
+                var k = 0
+                while k < np.panels.len() {
+                    put_panel(h, copy np.panels[k], SRC_LOADED(), i, |_a: Str, _b: Float, _c: Float| "", |_d: Str, _e: Str| 0)
+                    k = k + 1
+                }
+                publish_services(np)
+            } else { host_note_error(h, (np.path + (": reload failed: " + np.err))) }
+            h.libs[i] = np
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+/// close every loaded library. The host must not be rendered afterwards.
+pub fn host_unload_all(inout h: PluginHost) {
+    var i = 0
+    while i < h.libs.len() { let _r = unload(h.libs[i])  i = i + 1 }
+}
+
+// ---- diagnostics --------------------------------------------------------------------------------
+
+/// record a host-level failure, one that belongs to no single panel.
+pub fn host_note_error(inout h: PluginHost, msg: Str) { h.errors.push(copy msg) }
+/// how many host-level failures have been recorded.
+pub fn host_error_count(h: PluginHost) -> Int { return h.errors.len() }
+/// the host-level failure at `i`.
+pub fn host_error_at(h: PluginHost, i: Int) -> view Str { return h.errors[i] }

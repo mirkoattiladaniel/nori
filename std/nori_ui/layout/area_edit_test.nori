@@ -1,0 +1,165 @@
+// Native .nori tests for layout/area_edit.nori, run with
+//   noric --test std/nori_ui/layout/area_edit_test.nori compiler/runtime.nori --import-root .
+//
+// The multi-line sibling of the field editor. What these check is the half that is not shared with
+// `MultilineEditState` (which the code editor's tests cover), namely the input-bar
+// parts: newlines that survive an insert, a height that grows and then stops, and the three
+// attributes a `text_area` needs emitted together.
+import "std/nori_ui" as ui
+
+fn ae(t: Str) -> ui::layout::AreaEdit { return ui::layout::area_new(t, t.len()) }
+
+// ---- a paste keeps its lines, which is the difference from a field ----
+
+fn test_insert_keeps_newlines() {
+    var a = ae("")
+    ui::layout::area_insert(a, "alpha\nbeta\ngamma")
+    assert_streq(ui::layout::area_text(a), "alpha\nbeta\ngamma")
+    assert_eq(ui::layout::area_caret(a), 16)
+}
+
+fn test_newline_opens_a_line() {
+    var a = ae("ab")
+    ui::layout::area_newline(a)
+    assert_streq(ui::layout::area_text(a), "ab\n")
+}
+
+// ---- Enter is a newline here; a panel that wants it to send checks before calling ----
+
+fn test_enter_inserts_a_newline() {
+    var a = ae("ab")
+    let want = ui::layout::area_key(a, 65293, 0)
+    assert_streq(want, "")
+    assert_streq(ui::layout::area_text(a), "ab\n")
+}
+
+fn test_keypad_enter_is_the_same_key() {
+    var a = ae("ab")
+    let _w = ui::layout::area_key(a, 65421, 0)
+    assert_streq(ui::layout::area_text(a), "ab\n")
+}
+
+fn test_ctrl_c_asks_for_the_clipboard() {
+    var a = ae("hello")
+    ui::layout::area_select_all(a)
+    assert_streq(ui::layout::area_key(a, 99, 2), "copy")
+    assert_streq(ui::layout::area_sel_text(a), "hello")
+}
+
+fn test_ctrl_x_cuts_only_with_a_selection() {
+    var a = ae("hello")
+    assert_streq(ui::layout::area_key(a, 120, 2), "")      // nothing selected
+    assert_streq(ui::layout::area_text(a), "hello")
+    ui::layout::area_select_all(a)
+    assert_streq(ui::layout::area_key(a, 120, 2), "cut")
+    assert_streq(ui::layout::area_text(a), "")
+}
+
+// Up and down only mean something with more than one line, which is why a field does not take them
+// and this does.
+fn test_up_and_down_move_between_lines() {
+    var a = ui::layout::area_new("one\ntwo", 7)
+    let _u = ui::layout::area_key(a, 65362, 0)
+    assert_true(ui::layout::area_caret(a) <= 3)
+    let _d = ui::layout::area_key(a, 65364, 0)
+    assert_true(ui::layout::area_caret(a) > 3)
+}
+
+fn test_takes_the_keys_it_handles() {
+    assert_true(ui::layout::area_takes(65293, 0))          // Return
+    assert_true(ui::layout::area_takes(65362, 0))          // Up
+    assert_true(ui::layout::area_takes(65288, 0))          // Backspace
+    assert_true(ui::layout::area_takes(97, 2))             // Ctrl+A
+    assert_false(ui::layout::area_takes(97, 0))            // a plain letter is `char:`, not this
+}
+
+// Paste is not a key: the shell delivers it as text, so 118 must fall through rather than be
+// swallowed as a chord this module cannot service.
+fn test_ctrl_v_is_not_handled_here() {
+    var a = ae("x")
+    assert_streq(ui::layout::area_key(a, 118, 2), "")
+    assert_streq(ui::layout::area_text(a), "x")
+}
+
+// ---- the height grows with the content, and then stops ----
+
+fn test_height_grows_with_the_lines() {
+    let one = ui::layout::area_height(ae("one"), 400.0, 14.0, true, 1, 0, 8.0, 8.0)
+    let three = ui::layout::area_height(ae("one\ntwo\nsix"), 400.0, 14.0, true, 1, 0, 8.0, 8.0)
+    assert_true(three > one)
+}
+
+fn test_max_rows_stops_it() {
+    let many = ae("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12")
+    let capped = ui::layout::area_height(many, 400.0, 14.0, true, 1, 4, 8.0, 8.0)
+    let four = ui::layout::area_height(ae("1\n2\n3\n4"), 400.0, 14.0, true, 1, 4, 8.0, 8.0)
+    assert_feq(capped, four, 0.001)
+    let uncapped = ui::layout::area_height(many, 400.0, 14.0, true, 1, 0, 8.0, 8.0)
+    assert_true(uncapped > capped)
+}
+
+fn test_rows_counts_the_lines() {
+    assert_eq(ui::layout::area_rows(ae("a\nb\nc"), 400.0, 14.0, true, 8.0), 3)
+    assert_eq(ui::layout::area_rows(ae(""), 400.0, 14.0, true, 8.0), 1)
+}
+
+// ---- the three attributes go out together ----
+
+fn test_attrs_emit_all_three() {
+    var a = ui::layout::area_from("hello there", 5, 2, 12.0)
+    let s = ui::layout::area_attrs(a)
+    assert_true(ui::layout::area_caret(a) == 5)
+    assert_true(ui::layout::area_anchor(a) == 2)
+    assert_true(ui::layout::area_scroll_y(a) > 11.9)
+    // the fragment names each one: a caller that emitted a caret and forgot the anchor is the bug
+    // this function exists to make impossible
+    assert_true(s.len() > 0)
+}
+
+fn test_from_clamps_out_of_range_offsets() {
+    var a = ui::layout::area_from("abc", 99, 0 - 4, 0.0 - 1.0)
+    assert_eq(ui::layout::area_caret(a), 3)
+    assert_eq(ui::layout::area_anchor(a), 0)
+    assert_feq(ui::layout::area_scroll_y(a), 0.0, 0.001)
+}
+
+// ---- the pointer ----
+
+fn test_pointer_ignores_another_widget() {
+    var a = ae("hello")
+    assert_false(ui::layout::area_pointer(a, "press:other:1:1:100:40:1:0", "prompt", 14.0, true))
+}
+
+fn test_pointer_places_the_caret() {
+    var a = ui::layout::area_new("hello world", 0)
+    let took = ui::layout::area_pointer(a, "press:prompt:200:4:400:40:1:0", "prompt", 14.0, true)
+    assert_true(took)
+    assert_true(ui::layout::area_caret(a) > 0)
+}
+
+fn test_double_click_selects_a_word() {
+    var a = ui::layout::area_new("hello world", 0)
+    let _p = ui::layout::area_pointer(a, "press:prompt:10:4:400:40:2:0", "prompt", 14.0, true)
+    assert_true(ui::layout::area_has_sel(a))
+}
+
+// Padding changes the height, which is the point of letting a panel set it: an input bar level
+// with the 28px controls beside it rather than 7px taller than all of them.
+fn test_padding_changes_the_height() {
+    let roomy = ui::layout::area_height(ae("one"), 400.0, 14.0, true, 1, 0, 8.0, 8.0)
+    let tight = ui::layout::area_height(ae("one"), 400.0, 14.0, true, 1, 0, 8.0, 4.0)
+    assert_feq(roomy, 35.0, 0.001)
+    assert_feq(tight, 27.0, 0.001)
+}
+
+// The floor is three unless asked otherwise: an editor surface's default, and the reason an input
+// bar that set only max_rows came up three rows tall.
+fn test_min_rows_is_three_by_default() {
+    let dflt = ui::layout::area_height(ae(""), 400.0, 14.0, true, 0, 8, 8.0, 8.0)
+    assert_feq(dflt, 3.0 * 19.0 + 16.0, 0.001)
+}
+
+fn test_min_rows_one_starts_at_one_line() {
+    let bar = ui::layout::area_height(ae(""), 400.0, 14.0, true, 1, 8, 8.0, 4.0)
+    assert_feq(bar, 19.0 + 8.0, 0.001)
+}

@@ -1,0 +1,108 @@
+// .nori tests for HKDF, run with
+//   noric --test std/crypto/kdf_test.nori compiler/runtime.nori --import-root .
+//
+// Every answer here is an RFC 5869 Appendix A vector, so this proves agreement with the
+// specification rather than self-consistency. That matters more than usual for a KDF: a wrong
+// implementation still returns well-formed pseudorandom bytes of exactly the right length, and
+// every structural check you can write about it passes. Only a known answer finds the bug.
+import "std/crypto" as crypto
+
+fn hexv(c: Byte) -> Int {
+    let o = ord(c)
+    if o >= 97 { return (o - 87) }
+    if o >= 65 { return (o - 55) }
+    return (o - 48)
+}
+fn unhex(h: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < h.len() { out = (out + chr(((hexv(h.at(i)) << 4) | hexv(h.at(i + 1)))))  i = i + 2 }
+    return out
+}
+fn tohex(s: Str) -> Str {
+    let d = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < s.len() { let b = ord(s.at(i))  out = ((out + d.at((b >> 4))) + d.at((b & 15)))  i = i + 1 }
+    return out
+}
+// the ascending byte run `lo..hi` inclusive, which is how RFC 5869 spells its 80-octet test inputs.
+fn run(lo: Int, hi: Int) -> Str {
+    var out = ""
+    var i = lo
+    while i <= hi { out = (out + chr(i))  i = i + 1 }
+    return out
+}
+
+// A.1: basic case with SHA-256.
+fn test_rfc5869_case1() {
+    let ikm = unhex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")
+    let salt = unhex("000102030405060708090a0b0c")
+    let info = unhex("f0f1f2f3f4f5f6f7f8f9")
+    let prk = crypto::hkdf_extract(salt, ikm)
+    assert_streq(tohex(prk), "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")
+    let okm = crypto::hkdf_expand(prk, info, 42)
+    assert_streq(tohex(okm), "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+    // the one-shot spelling must agree with extract-then-expand
+    assert_streq(tohex(crypto::hkdf(salt, ikm, info, 42)), tohex(okm))
+}
+
+// A.2: longer inputs and output; exercises the multi-block expand loop (82 bytes = 3 blocks).
+fn test_rfc5869_case2() {
+    let ikm = run(0, 79)
+    let salt = run(96, 175)
+    let info = run(176, 255)
+    let prk = crypto::hkdf_extract(salt, ikm)
+    assert_streq(tohex(prk), "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244")
+    let okm = crypto::hkdf_expand(prk, info, 82)
+    assert_streq(tohex(okm), "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87")
+}
+
+// A.3: zero-length salt and info. The empty salt is the case most likely to be got wrong:
+// the RFC defines it as a block of zeros, not as an empty HMAC key.
+fn test_rfc5869_case3_empty_salt_and_info() {
+    let ikm = unhex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")
+    let prk = crypto::hkdf_extract("", ikm)
+    assert_streq(tohex(prk), "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04")
+    let okm = crypto::hkdf_expand(prk, "", 42)
+    assert_streq(tohex(okm), "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8")
+}
+
+// an empty salt is specified to mean 32 zero bytes, so the two spellings must not diverge.
+fn test_empty_salt_is_zeros_not_empty_key() {
+    let ikm = unhex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")
+    var zeros = ""
+    var i = 0
+    while i < 32 { zeros = (zeros + chr(0))  i = i + 1 }
+    assert_streq(tohex(crypto::hkdf_extract("", ikm)), tohex(crypto::hkdf_extract(zeros, ikm)))
+}
+
+// the whole point of `info`: two keys from one secret that reveal nothing about each other.
+fn test_info_separates_outputs() {
+    let prk = crypto::hkdf_extract("salt", "shared secret")
+    let send = crypto::hkdf_expand(prk, "send", 32)
+    let recv = crypto::hkdf_expand(prk, "recv", 32)
+    assert_eq(send.len(), 32)
+    assert_eq(recv.len(), 32)
+    assert_true(!(tohex(send) == tohex(recv)))
+    // and a label is not a prefix game: "send" and "send\x00" are different labels
+    assert_true(!(tohex(crypto::hkdf_expand(prk, ("send" + chr(0)), 32)) == tohex(send)))
+}
+
+// a shorter request is the prefix of a longer one; HKDF is a stream, not a per-length function.
+fn test_output_is_a_prefix_stream() {
+    let prk = crypto::hkdf_extract("salt", "ikm")
+    let long = crypto::hkdf_expand(prk, "info", 96)
+    assert_eq(long.len(), 96)
+    assert_streq(tohex(crypto::hkdf_expand(prk, "info", 16)), tohex(long.slice(0, 16)))
+    assert_streq(tohex(crypto::hkdf_expand(prk, "info", 64)), tohex(long.slice(0, 64)))
+}
+
+// the construction tops out at 255 hash blocks; past that it must refuse, not wrap the counter.
+fn test_length_bounds() {
+    let prk = crypto::hkdf_extract("salt", "ikm")
+    assert_eq(crypto::hkdf_expand(prk, "info", 0).len(), 0)
+    assert_eq(crypto::hkdf_expand(prk, "info", 255 * 32).len(), 255 * 32)
+    assert_eq(crypto::hkdf_expand(prk, "info", 255 * 32 + 1).len(), 0)
+    assert_eq(crypto::hkdf_expand(prk, "info", 0 - 1).len(), 0)
+}

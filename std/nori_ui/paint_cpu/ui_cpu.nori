@@ -1,0 +1,1932 @@
+//! std/nori_ui/paint_cpu: a CPU (software) renderer for std/nori_ui overlays.
+//!
+//!   import "std/nori_ui" as ui
+//!   import "std/font" as font
+//!   var cv = ui::paint_cpu::canvas_new(w, h, myFont)         // 32bpp framebuffer + a text font
+//!   ui::paint_cpu::clear(cv, color_rgb(22, 26, 38))
+//!   ui::paint_cpu::render_overlay(cv, overlay)               // walk ComputedOverlay -> pixels
+//!   // cv.buf is a 0x00RRGGBB framebuffer: XPutImage it, or dump it with `to_ppm`.
+//!
+//! It turns nori_ui's PaintPrimitive data (filled rects, borders, text) into pixels in a CPU
+//! framebuffer, using std/font for glyphs. The wgpu renderer consumes the same ComputedOverlay
+//! through the same primitive set; only the per-primitive draw differs. Deterministic and
+//! headless-testable (dump to an image, diff), with no GPU.
+
+use core::*
+use layout::*
+import "std/font" as font
+import "std/math" as m
+
+extern fn malloc(Int) -> Int
+extern fn free(Int)
+
+/// a CPU framebuffer + the font used for text. `buf` is `w*h` 32-bit pixels (0x00RRGGBB), so the
+/// std/window X11 present shim (XPutImage) can blit it directly.
+// `s` = device pixels per CSS pixel. Everything above this module lays out in CSS pixels, because
+// that is the unit a stylesheet is written in and the one a phone's viewport is measured in; the
+// panel underneath has two or three times as many. A canvas with s > 1 owns a buffer that many times
+// larger and multiplies the coordinates and font sizes handed to its primitives, so glyphs are
+// rasterised at the device size rather than drawn small and stretched by the compositor afterwards.
+// s = 1.0 is the desktop case, where the scale changes nothing.
+pub struct CpuCanvas { buf: Int, w: Int, h: Int, f: view font::Font, has_font: Bool, fb: view font::Font, has_fb: Bool, s: Float,
+    // An alpha channel, when the canvas is shown as a translucent surface (a dock with rounded
+    // corners over the wallpaper). Off, a pixel is 0x00RRGGBB and its top byte means nothing. On,
+    // a pixel is premultiplied 0xAARRGGBB, which is what the colour arithmetic below already
+    // computes (c' = src·a + dst·(1-a) is premultiplied "over" when dst is premultiplied), so only
+    // the alpha byte has to be carried along with it: a' = a + dst_a·(1-a). `canvas_alpha` turns
+    // it on.
+    al: Bool = false }
+
+/// a new canvas with a text font (glyphs drawn via std/font).
+pub fn canvas_new(w: Int, h: Int, inout f: font::Font) -> CpuCanvas {
+    var b = 0
+    unsafe { b = malloc(w * h * 4) }
+    return CpuCanvas { buf: b, w: w, h: h, f: f, has_font: true, fb: f, has_fb: false, s: 1.0 }
+}
+/// a canvas whose buffer is `s` times larger in each axis than the CSS-pixel area it stands for.
+///
+/// Draw in CSS pixels exactly as at scale 1: the primitives multiply positions, sizes and radii by
+/// `s`, so glyphs are rasterised at the device size rather than drawn small and stretched by the
+/// display afterwards, which is the difference between a page that looks native and one that looks
+/// like a screenshot blown up. `canvas_w`/`canvas_h` report the buffer size, which is what `present`,
+/// `blit_slice` and `to_ppm` need.
+pub fn canvas_new_scaled(wCss: Int, hCss: Int, inout f: font::Font, s: Float) -> CpuCanvas {
+    var sc = s
+    if sc <= 0.0 { sc = 1.0 }
+    // the buffer's size as wp_fractional_scale_v1 says: the logical size times the scale, rounded halfway away from
+    // zero (a compositor shows a buffer of exactly that size pixel for pixel; one a pixel short it must scale)
+    let dw = to_int(to_float(wCss) * sc + 0.5)
+    let dh = to_int(to_float(hCss) * sc + 0.5)
+    var b = 0
+    unsafe { b = malloc(dw * dh * 4) }
+    return CpuCanvas { buf: b, w: dw, h: dh, f: f, has_font: true, fb: f, has_fb: false, s: sc }
+}
+/// device pixels per CSS pixel: 1.0 unless the canvas came from `canvas_new_scaled`.
+pub fn canvas_scale(c: CpuCanvas) -> Float { return c.s }
+
+/// a view of the same framebuffer with a fallback face for codepoints the primary face lacks (.notdef).
+/// The fallback joins layout's text engine too, so a line measured is a line drawn.
+pub fn canvas_with_fallback(c: CpuCanvas, inout fb: font::Font) -> CpuCanvas {
+    if c.has_font { text_engine_add_fallback(fb) }
+    return CpuCanvas { buf: c.buf, w: c.w, h: c.h, f: c.f, has_font: c.has_font, fb: fb, has_fb: true, s: c.s, al: c.al }
+}
+/// a view of the same framebuffer with a different text face (shares `buf`), which lets a renderer draw
+/// mixed bold/italic/mono runs onto one canvas. Pair with `use_font_metrics(f)` before drawing.
+pub fn canvas_with_font(c: CpuCanvas, inout f: font::Font) -> CpuCanvas {
+    return CpuCanvas { buf: c.buf, w: c.w, h: c.h, f: f, has_font: true, fb: c.fb, has_fb: c.has_fb, s: c.s, al: c.al }
+}
+/// the same framebuffer with its alpha channel on (premultiplied 0xAARRGGBB: a translucent surface's
+/// pixels) or off (0x00RRGGBB, the top byte unused; every canvas's default). Clear it after turning
+/// it on: the pixels already there are not converted.
+pub fn canvas_alpha(c: CpuCanvas, on: Bool) -> CpuCanvas {
+    return CpuCanvas { buf: c.buf, w: c.w, h: c.h, f: c.f, has_font: c.has_font, fb: c.fb, has_fb: c.has_fb, s: c.s, al: on }
+}
+/// is the canvas's alpha channel on?
+pub fn canvas_has_alpha(c: CpuCanvas) -> Bool { return c.al }
+/// a new canvas with no font (text primitives are skipped), for pure rect/border rendering.
+pub fn canvas_new_nofont(w: Int, h: Int) -> CpuCanvas {
+    var b = 0
+    unsafe { b = malloc(w * h * 4) }
+    return CpuCanvas { buf: b, w: w, h: h, f: font::font_empty(), has_font: false, fb: font::font_empty(), has_fb: false, s: 1.0 }
+}
+/// free the framebuffer.
+pub fn canvas_free(c: CpuCanvas) { unsafe { free(c.buf) } }
+
+/// the pixel buffer, as `w * h` little-endian `0x00RRGGBB` words.
+///
+/// This is the layout `image::save_png_readback` documents for a GPU readback, so a software render
+/// can be written out the same way.
+pub fn canvas_buf(c: CpuCanvas) -> Int { return c.buf }
+/// a new w×h canvas holding a copy of `c`'s pixels starting at (x0,y0), a backdrop snapshot for
+/// group-opacity/transform compositing. Out-of-bounds source pixels copy as 0.
+pub fn canvas_copy_region(c: CpuCanvas, x0: Int, y0: Int, w: Int, h: Int, inout f: font::Font) -> CpuCanvas {
+    var b = 0
+    unsafe { b = malloc(w * h * 4) }
+    var j = 0
+    while j < h {
+        var i = 0
+        while i < w {
+            var px = 0
+            let sx = x0 + i  let sy = y0 + j
+            if sx >= 0 && sy >= 0 && sx < c.w && sy < c.h { unsafe { px = peek32(c.buf + (sy * c.w + sx) * 4) } }
+            unsafe { poke32(b + (j * w + i) * 4, px) }
+            i = i + 1
+        }
+        j = j + 1
+    }
+    return CpuCanvas { buf: b, w: w, h: h, f: f, has_font: true, fb: f, has_fb: false, s: 1.0 }
+}
+/// affine-blit `off` (element rendered over a sentinel background) onto `c`, transforming around canvas-
+/// space center (cx,cy) by scale (sx,sy) then rotation (cosR,sinR). `ox0,oy0` = off's canvas origin. Dest
+/// pixels inverse-map to `off`; sentinel (drawn-nothing) samples are skipped. `alpha` (0..255) scales blend.
+pub fn blit_transformed(c: CpuCanvas, off: CpuCanvas, ox0: Int, oy0: Int, cx: Float, cy: Float, sx: Float, sy: Float, cosR: Float, sinR: Float, alpha: Int, sentinel: Int) {
+    blit_transformed_clip(c, off, ox0, oy0, cx, cy, sx, sy, cosR, sinR, alpha, sentinel, 0.0, 0.0, to_float(c.w), to_float(c.h))
+}
+/// …restricted to a clip box (device px). A transformed element is composited on its own, outside
+/// the op stream an `overflow: hidden` ancestor's clip lives in, so the clip has to be handed to the
+/// blit or the element paints straight through the box that should have cut it off.
+pub fn blit_transformed_clip(c: CpuCanvas, off: CpuCanvas, ox0: Int, oy0: Int, cx: Float, cy: Float, sx: Float, sy: Float, cosR: Float, sinR: Float, alpha: Int, sentinel: Int, kx0: Float, ky0: Float, kx1: Float, ky1: Float) {
+    // dest bbox = transformed corners of off's rect (in canvas coords)
+    var dx0 = 1000000.0  var dy0 = 1000000.0  var dx1 = 0.0 - 1000000.0  var dy1 = 0.0 - 1000000.0
+    var ci = 0
+    while ci < 4 {
+        var px = to_float(ox0)  var py = to_float(oy0)
+        if ci == 1 || ci == 3 { px = to_float(ox0 + off.w) }
+        if ci == 2 || ci == 3 { py = to_float(oy0 + off.h) }
+        let vx = (px - cx) * sx  let vy = (py - cy) * sy
+        let tx = cx + vx * cosR - vy * sinR  let ty = cy + vx * sinR + vy * cosR
+        if tx < dx0 { dx0 = tx }  if ty < dy0 { dy0 = ty }  if tx > dx1 { dx1 = tx }  if ty > dy1 { dy1 = ty }
+        ci = ci + 1
+    }
+    var a = alpha  if a < 0 { a = 0 }  if a > 255 { a = 255 }
+    let isx = 1.0 / sx  let isy = 1.0 / sy
+    var y = imax(imax(0, ffloor_i(ky0)), ffloor_i(dy0))
+    let ylim = imin(imin(c.h, fceil_i(ky1)), fceil_i(dy1))
+    let xlo = imax(imax(0, ffloor_i(kx0)), ffloor_i(dx0))
+    let xhi = imin(imin(c.w, fceil_i(kx1)), fceil_i(dx1))
+    while y < ylim {
+        var x = xlo
+        let xlim = xhi
+        while x < xlim {
+            // inverse: canvas dest -> off source
+            let rx = to_float(x) + 0.5 - cx  let ry = to_float(y) + 0.5 - cy
+            let ux = (rx * cosR + ry * sinR) * isx  let uy = (0.0 - rx * sinR + ry * cosR) * isy   // rotate(-R) then /scale
+            let sxp = to_int(cx + ux - to_float(ox0))  let syp = to_int(cy + uy - to_float(oy0))
+            if sxp >= 0 && syp >= 0 && sxp < off.w && syp < off.h {
+                var s = 0
+                unsafe { s = peek32(off.buf + (syp * off.w + sxp) * 4) }
+                if s != sentinel {
+                    blend_px(c, x, y, ((s >> 16) & 255), ((s >> 8) & 255), (s & 255), 255, a, 0, 0, c.w, c.h)
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+/// blend `off` onto `c` at (x0,y0): c = c·(1-a) + off·a (a = alpha/255). Since `off` started as a copy of
+/// c's backdrop, untouched pixels blend to themselves, giving correct group opacity without an alpha channel.
+pub fn blend_region(c: CpuCanvas, off: CpuCanvas, x0: Int, y0: Int, alpha: Int) {
+    var a = alpha  if a < 0 { a = 0 }  if a > 255 { a = 255 }
+    // Fully opaque is a copy, and copying does not need the blend arithmetic or the per-pixel
+    // bounds test, once the overlapping rows and columns are worked out once. Restoring a cached
+    // backdrop every animation frame goes through here, and the general path would read the
+    // destination and blend it against itself several hundred thousand times a frame.
+    if a == 255 {
+        var jy = 0
+        if y0 < 0 { jy = 0 - y0 }
+        var jyEnd = off.h
+        if y0 + jyEnd > c.h { jyEnd = c.h - y0 }
+        var ix = 0
+        if x0 < 0 { ix = 0 - x0 }
+        var ixEnd = off.w
+        if x0 + ixEnd > c.w { ixEnd = c.w - x0 }
+        while jy < jyEnd {
+            var sp = off.buf + (jy * off.w + ix) * 4
+            var dp = c.buf + ((y0 + jy) * c.w + (x0 + ix)) * 4
+            var n = ixEnd - ix
+            while n > 0 { unsafe { poke32(dp, peek32(sp)) }  sp = sp + 4  dp = dp + 4  n = n - 1 }
+            jy = jy + 1
+        }
+        return
+    }
+    var j = 0
+    while j < off.h {
+        var i = 0
+        while i < off.w {
+            let dx = x0 + i  let dy = y0 + j
+            if dx >= 0 && dy >= 0 && dx < c.w && dy < c.h {
+                var s = 0  var d = 0
+                unsafe { s = peek32(off.buf + (j * off.w + i) * 4)  d = peek32(c.buf + (dy * c.w + dx) * 4) }
+                let sr = ((s >> 16) & 255)  let sg = ((s >> 8) & 255)  let sb = (s & 255)
+                let dr = ((d >> 16) & 255)  let dg = ((d >> 8) & 255)  let db = (d & 255)
+                unsafe { poke32(c.buf + (dy * c.w + dx) * 4, pack(dr + rdiv255((sr - dr) * a), dg + rdiv255((sg - dg) * a), db + rdiv255((sb - db) * a))) }
+            }
+            i = i + 1
+        }
+        j = j + 1
+    }
+}
+/// Opaque copy of the `w`x`h` sub-rect of `src` at (sx,sy) onto `dst` at (dx,dy). Rows and columns
+/// falling outside either canvas are skipped.
+///
+/// The sub-rect matters: a tile painted to be copied back has anti-aliased edges against its own
+/// boundary, which are not the pixels the same content has in the middle of a full page. Painting a
+/// margin and copying only the inside leaves those edge pixels behind in the margin, where they
+/// belong. Copying the whole tile would leave a hairline of slightly wrong colour down its edge.
+pub fn blit_region(dst: CpuCanvas, src: CpuCanvas, sx: Int, sy: Int, w: Int, h: Int, dx: Int, dy: Int) {
+    var j = 0
+    while j < h {
+        let syy = sy + j
+        let dyy = dy + j
+        if syy >= 0 && syy < src.h && dyy >= 0 && dyy < dst.h {
+            var i = 0
+            while i < w {
+                let sxx = sx + i
+                let dxx = dx + i
+                if sxx >= 0 && sxx < src.w && dxx >= 0 && dxx < dst.w {
+                    unsafe { poke32(dst.buf + (dyy * dst.w + dxx) * 4, peek32(src.buf + (syy * src.w + sxx) * 4)) }
+                }
+                i = i + 1
+            }
+        }
+        j = j + 1
+    }
+}
+/// opaque copy of an `h`-row slice of `src` starting at source row `srcY`, onto `dst` at (dstX,dstY).
+/// Rows/cols outside either canvas are skipped. Used for scroll compositing: paint the whole page once
+/// to an offscreen canvas, then each scroll frame is a memcpy of the visible slice instead of a repaint.
+pub fn blit_slice(dst: CpuCanvas, src: CpuCanvas, srcY: Int, dstX: Int, dstY: Int, h: Int) {
+    // This runs once per scroll frame over the whole window, so the row bounds are worked out once
+    // and the struct fields are read into locals before the loops. A field read inside the inner
+    // loop is not folded away (`dst.buf`, `dst.w`, `src.buf`, `src.w` cost real instructions per
+    // pixel there), and clamping the column range up front removes the per-pixel `dx >= 0` test as
+    // well, leaving a copy that is only loads and stores.
+    let dbuf = dst.buf  let dw = dst.w  let dh = dst.h
+    let sbuf = src.buf  let sw = src.w  let sh = src.h
+    // columns: i in [i0, i1) keeps both dstX + i and i inside their buffers
+    var i0 = 0
+    if dstX < 0 { i0 = 0 - dstX }
+    var i1 = sw
+    if dw - dstX < i1 { i1 = dw - dstX }
+    if i1 <= i0 { return }
+    // rows: j in [j0, j1) keeps both srcY + j and dstY + j inside their buffers
+    var j0 = 0
+    if 0 - srcY > j0 { j0 = 0 - srcY }
+    if 0 - dstY > j0 { j0 = 0 - dstY }
+    var j1 = h
+    if sh - srcY < j1 { j1 = sh - srcY }
+    if dh - dstY < j1 { j1 = dh - dstY }
+    let n = i1 - i0
+    var j = j0
+    while j < j1 {
+        let sp = sbuf + ((srcY + j) * sw + i0) * 4
+        let dp = dbuf + ((dstY + j) * dw + dstX + i0) * 4
+        var i = 0
+        while i < n { unsafe { poke32(dp + i * 4, peek32(sp + i * 4)) }  i = i + 1 }
+        j = j + 1
+    }
+}
+/// the raw framebuffer pointer (0x00RRGGBB pixels), to hand to an XPutImage present shim.
+pub fn canvas_ptr(c: CpuCanvas) -> Int { return c.buf }
+/// canvas width / height in pixels.
+/// The two halves of the rounded fill, exposed so a test can draw the same rectangle the slow way
+/// and compare. fill_rect_cl skips the interior, which is only valid if the pixels are the
+/// same ones, so that is worth being able to check.
+pub fn corner_cov_at(px: Float, py: Float, x0: Float, y0: Float, x1: Float, y1: Float, radius: Float) -> Int {
+    return corner_cov(px, py, x0, y0, x1, y1, radius)
+}
+pub fn blend_px_at(c: CpuCanvas, x: Int, y: Int, col: Color, cov: Int) {
+    blend_px(c, x, y, col.r, col.g, col.b, col.a, cov, 0, 0, c.w, c.h)
+}
+
+pub fn canvas_w(c: CpuCanvas) -> Int { return c.w }
+pub fn canvas_h(c: CpuCanvas) -> Int { return c.h }
+pub fn canvas_font(c: CpuCanvas) -> view font::Font { return c.f }
+
+fn pack(r: Int, g: Int, b: Int) -> Int { return (((r << 16) | (g << 8)) | b) }
+// a pixel of `col` as this canvas stores it: 0x00RRGGBB (the colour, its alpha ignored, as `clear`
+// treats it) or, with the alpha channel on, premultiplied 0xAARRGGBB (a translucent clear colour
+// is a translucent surface).
+fn pack_px(c: CpuCanvas, col: Color) -> Int {
+    if !c.al { return pack(col.r, col.g, col.b) }
+    let a = col.a
+    if a >= 255 { return pack(col.r, col.g, col.b) | 4278190080 }
+    if a <= 0 { return 0 }
+    return (a << 24) | pack(rdiv255(col.r * a), rdiv255(col.g * a), rdiv255(col.b * a))
+}
+// the opaque pixel (r, g, b) as this canvas stores it
+fn pack_op(c: CpuCanvas, r: Int, g: Int, b: Int) -> Int {
+    if c.al { return pack(r, g, b) | 4278190080 }
+    return pack(r, g, b)
+}
+// the alpha byte of `old` after `a` (0..255) is laid over it: a + old·(1-a), or 0 when there is no channel
+fn over_a(c: CpuCanvas, old: Int, a: Int) -> Int {
+    if !c.al { return 0 }
+    let oa = (old >> 24) & 255
+    return (oa + rdiv255((255 - oa) * a)) << 24
+}
+
+/// install real per-character metrics from `f` into nori_ui, so layout (button sizing, wrapping,
+/// ellipsis) matches the advances std/font actually draws, instead of nori_ui's flat heuristic.
+/// Call once after loading the font and before laying out (doc_layout / layout_overlay).
+pub fn use_font_metrics(inout f: font::Font) {
+    var upem = font::font_units_per_em(f)
+    var adv: Vec<Int> = vec()          // 16.16 fixed point: advance_per_em * 65536
+    var ch = 0
+    while ch < 256 {
+        var gid = font::font_glyph_index(f, ch)
+        adv.push(to_int(font::font_h_advance(f, gid) / upem * 65536.0))
+        ch = ch + 1
+    }
+    set_char_advances(adv)
+    // ...and the face itself, for the text engine: layout then measures, breaks and aligns with the
+    // shaped widths this painter draws (layout/text_engine.nori)
+    text_engine_set_font(f)
+}
+
+/// fill the whole canvas with an opaque color.
+pub fn clear(c: CpuCanvas, col: Color) {
+    // `c.buf` read once, not once per pixel: a whole-window clear runs every frame.
+    //
+    // Two pixels per store. A large window can be four million pixels and this runs before every
+    // frame, so the loop's own overhead is the cost. The pixels are adjacent and identical, so a
+    // pair of them is one 64-bit word: half the iterations and half the stores, for a buffer that
+    // malloc already returned eight-byte aligned. The odd pixel at the end, if the canvas has an
+    // odd number of them, is written on its own.
+    let p = pack_px(c, col)
+    let pair = (p << 32) | p
+    let buf = c.buf
+    let n = c.w * c.h
+    let npair = n / 2
+    var i = 0
+    while i < npair { unsafe { poke(buf + i * 8, pair) }  i = i + 1 }
+    if (n & 1) == 1 { unsafe { poke32(buf + (n - 1) * 4, p) } }
+}
+
+// a pixel clip box in integer coordinates (half-open [x0,x1) x [y0,y1)), already intersected with
+// the canvas bounds.
+struct Clip { x0: Int, y0: Int, x1: Int, y1: Int }
+// CSS pixels -> this canvas's device pixels. Every public primitive that takes a position, a size or
+// a radius goes through these; the `_dev` bodies below them are unchanged and work in device pixels.
+fn dsc(c: CpuCanvas, v: Float) -> Float { return v * c.s }
+fn dsc_r(c: CpuCanvas, r: Rect) -> Rect {
+    if c.s == 1.0 { return rect_copy(r) }
+    return rect_min_max(vec2(r.min.x * c.s, r.min.y * c.s), vec2(r.max.x * c.s, r.max.y * c.s))
+}
+fn dsc_i(c: CpuCanvas, v: Int) -> Int { if c.s == 1.0 { return v }  return to_int(to_float(v) * c.s) }
+pub fn clip_full(c: CpuCanvas) -> Clip { return Clip { x0: 0, y0: 0, x1: c.w, y1: c.h } }
+fn imax(a: Int, b: Int) -> Int { if a > b { return a }  return b }
+fn imin(a: Int, b: Int) -> Int { if a < b { return a }  return b }
+fn ffloor_i(x: Float) -> Int { var t = to_int(x)  if x < 0.0 && to_float(t) != x { return t - 1 }  return t }
+fn fceil_i(x: Float) -> Int { var t = to_int(x)  if x > 0.0 && to_float(t) != x { return t + 1 }  return t }
+// clip a nori_ui Rect (pixel space) intersected with the canvas.
+fn clip_of_rect(c: CpuCanvas, r: Rect) -> Clip {
+    return Clip {
+        x0: imax(0, ffloor_i(r.min.x)), y0: imax(0, ffloor_i(r.min.y)),
+        x1: imin(c.w, fceil_i(r.max.x)), y1: imin(c.h, fceil_i(r.max.y))
+    }
+}
+
+fn fclamp01(x: Float) -> Float { if x < 0.0 { return 0.0 }  if x > 1.0 { return 1.0 }  return x }
+
+// alpha-blend a scalar color (cr,cg,cb,ca) scaled by coverage over the pixel at (x,y), clipped to the
+// scalar box [bx0,bx1) x [by0,by1). Scalar args only: passing a struct here would heap-allocate a
+// copy per pixel (millions of allocations), which cripples perf and overflows the allocator.
+fn blend_px(c: CpuCanvas, x: Int, y: Int, cr: Int, cg: Int, cb: Int, ca: Int, cov: Int, bx0: Int, by0: Int, bx1: Int, by1: Int) {
+    if x < bx0 || x >= bx1 || y < by0 || y >= by1 { return }
+    var a = ca * cov / 255
+    if a <= 0 { return }
+    var addr = c.buf + (y * c.w + x) * 4
+    if a >= 255 { unsafe { poke32(addr, pack_op(c, cr, cg, cb)) }  return }
+    var old = 0
+    unsafe { old = peek32(addr) }
+    var orr = ((old >> 16) & 255)
+    var og = ((old >> 8) & 255)
+    var ob = (old & 255)
+    // round-to-nearest (not truncate) so AA-edge blends match the GPU backend exactly (which rounds).
+    unsafe { poke32(addr, pack(orr + rdiv255((cr - orr) * a), og + rdiv255((cg - og) * a), ob + rdiv255((cb - ob) * a)) | over_a(c, old, a)) }
+}
+// round(n / 255) for signed n.
+fn rdiv255(n: Int) -> Int { if n < 0 { return 0 - ((0 - n + 127) / 255) }  return (n + 127) / 255 }
+
+// coverage (0..255) of pixel-center (px,py) inside a rounded rect given by scalar bounds: 255 away
+// from the corners, an anti-aliased 1px band across each corner arc. Scalar args (no per-pixel copy).
+fn corner_cov(px: Float, py: Float, rminx: Float, rminy: Float, rmaxx: Float, rmaxy: Float, radius: Float) -> Int {
+    if radius <= 0.0 { return 255 }
+    var cx = 0.0
+    var cy = 0.0
+    var in_corner = false
+    if px < rminx + radius && py < rminy + radius { cx = rminx + radius  cy = rminy + radius  in_corner = true }
+    else if px > rmaxx - radius && py < rminy + radius { cx = rmaxx - radius  cy = rminy + radius  in_corner = true }
+    else if px < rminx + radius && py > rmaxy - radius { cx = rminx + radius  cy = rmaxy - radius  in_corner = true }
+    else if px > rmaxx - radius && py > rmaxy - radius { cx = rmaxx - radius  cy = rmaxy - radius  in_corner = true }
+    if !in_corner { return 255 }
+    var dx = px - cx
+    var dy = py - cy
+    var dist = sqrt(dx * dx + dy * dy)
+    return to_int(fclamp01(radius - dist + 0.5) * 255.0)
+}
+
+// fill `r` with `col` (anti-aliased rounded corners of `radius` px), clipped to `cl`. Struct fields
+// are hoisted to scalars once, so the per-pixel inner loop passes only scalars (no heap churn).
+/// A run of identical pixels on one row, already clipped. `x0` inclusive, `x1` exclusive.
+///
+/// This is the reason fill_rect_cl is not one loop. A rounded rectangle is mostly not a
+/// corner: a 679x76 row at a 2.625 display scale is 356,000 pixels of which about four thousand
+/// are anywhere near a corner, and the rest would pay for a float distance, a square root and a
+/// divide to be told what is already known.
+fn fill_span(c: CpuCanvas, x0: Int, x1: Int, y: Int, cr: Int, cg: Int, cb: Int, ca: Int) {
+    if x1 <= x0 || ca <= 0 { return }
+    let row = c.buf + (y * c.w) * 4
+    if ca >= 255 {
+        // Opaque: no read, no blend. Two pixels per 64-bit store where the address allows it,
+        // the same trick `clear` uses and for the same reason: the loop's own overhead is the
+        // cost once the work per pixel is a single store.
+        let p = pack_op(c, cr, cg, cb)
+        let pair = (p << 32) | p
+        var x = x0
+        // an odd start cannot begin a pair
+        if ((y * c.w + x) & 1) == 1 { unsafe { poke32(row + x * 4, p) }  x = x + 1 }
+        while x + 1 < x1 { unsafe { poke(row + x * 4, pair) }  x = x + 2 }
+        while x < x1 { unsafe { poke32(row + x * 4, p) }  x = x + 1 }
+        return
+    }
+    // Translucent: the blend is per pixel, but the coverage is not: it is 255 everywhere in a
+    // span, so the multiply and divide that made `a` come out of the loop.
+    var x2 = x0
+    while x2 < x1 {
+        let addr = row + x2 * 4
+        var old = 0
+        unsafe { old = peek32(addr) }
+        let orr = ((old >> 16) & 255)
+        let og = ((old >> 8) & 255)
+        let ob = (old & 255)
+        unsafe { poke32(addr, pack(orr + rdiv255((cr - orr) * ca), og + rdiv255((cg - og) * ca), ob + rdiv255((cb - ob) * ca)) | over_a(c, old, ca)) }
+        x2 = x2 + 1
+    }
+}
+
+/// A row of the rectangle where every pixel has to be asked about: the rows a corner is in.
+fn fill_row_tested(c: CpuCanvas, x0: Int, x1: Int, y: Int, r: Rect, radius: Float,
+                   cr: Int, cg: Int, cb: Int, ca: Int, bx0: Int, by0: Int, bx1: Int, by1: Int) {
+    var x = x0
+    while x < x1 {
+        let cov = corner_cov(to_float(x) + 0.5, to_float(y) + 0.5, r.min.x, r.min.y, r.max.x, r.max.y, radius)
+        if cov > 0 { blend_px(c, x, y, cr, cg, cb, ca, cov, bx0, by0, bx1, by1) }
+        x = x + 1
+    }
+}
+
+pub fn fill_rect_cl(c: CpuCanvas, r: Rect, col: Color, radius: Float, cl: Clip) {
+    var cr = col.r  var cg = col.g  var cb = col.b  var ca = col.a
+    var bx0 = cl.x0  var by0 = cl.y0  var bx1 = cl.x1  var by1 = cl.y1
+    let x0 = imax(bx0, ffloor_i(r.min.x))
+    let y0 = imax(by0, ffloor_i(r.min.y))
+    let x1 = imin(bx1, fceil_i(r.max.x))
+    let y1 = imin(by1, fceil_i(r.max.y))
+    if x1 <= x0 || y1 <= y0 || ca <= 0 { return }
+
+    if radius <= 0.0 {
+        // A square rectangle has no pixel worth asking about.
+        var yy = y0
+        while yy < y1 { fill_span(c, x0, x1, yy, cr, cg, cb, ca)  yy = yy + 1 }
+        return
+    }
+
+    // Where the corners reach, in whole pixels. corner_cov tests the pixel centre, so a column is
+    // in the left corner region exactly when x + 0.5 < min.x + radius; these are those bounds
+    // solved for x, so the split lands on the same pixels the per-pixel test would have chosen.
+    let xl = fceil_i((r.min.x + radius) - 0.5)
+    let xr = ffloor_i((r.max.x - radius) - 0.5) + 1
+    let yt = fceil_i((r.min.y + radius) - 0.5)
+    let yb = ffloor_i((r.max.y - radius) - 0.5) + 1
+
+    // A rectangle narrower or shorter than its own corners has no interior to save: the two corner
+    // regions meet or overlap, and every pixel really is a corner pixel. Rare, and cheap to be
+    // right about.
+    if xl >= xr || yt >= yb {
+        var y2 = y0
+        while y2 < y1 { fill_row_tested(c, x0, x1, y2, r, radius, cr, cg, cb, ca, bx0, by0, bx1, by1)  y2 = y2 + 1 }
+        return
+    }
+
+    let mid_top = imax(y0, yt)
+    let mid_bot = imin(y1, yb)
+    let in_l = imin(x1, imax(x0, xl))
+    let in_r = imax(x0, imin(x1, xr))
+
+    // the rows a top corner is in
+    var y3 = y0
+    while y3 < imin(y1, yt) {
+        fill_row_tested(c, x0, in_l, y3, r, radius, cr, cg, cb, ca, bx0, by0, bx1, by1)
+        fill_span(c, in_l, in_r, y3, cr, cg, cb, ca)
+        fill_row_tested(c, in_r, x1, y3, r, radius, cr, cg, cb, ca, bx0, by0, bx1, by1)
+        y3 = y3 + 1
+    }
+    // the middle: no corner anywhere in it
+    var y4 = mid_top
+    while y4 < mid_bot { fill_span(c, x0, x1, y4, cr, cg, cb, ca)  y4 = y4 + 1 }
+    // ...and the rows a bottom corner is in
+    var y5 = imax(y0, yb)
+    while y5 < y1 {
+        fill_row_tested(c, x0, in_l, y5, r, radius, cr, cg, cb, ca, bx0, by0, bx1, by1)
+        fill_span(c, in_l, in_r, y5, cr, cg, cb, ca)
+        fill_row_tested(c, in_r, x1, y5, r, radius, cr, cg, cb, ca, bx0, by0, bx1, by1)
+        y5 = y5 + 1
+    }
+}
+
+// one channel of a two-colour ramp at parameter t, rounded to nearest (not truncated). The GPU
+// mixes in float and the swapchain quantises to the nearest 1/255, so rounding here is what makes
+// the two painters land on the same byte; truncating would bias every ramp pixel one low.
+fn cpu_gmix(a: Int, b: Int, t: Float) -> Int {
+    var v = to_float(a) + to_float(b - a) * t
+    if v <= 0.0 { return 0 }
+    if v >= 255.0 { return 255 }
+    return to_int(v + 0.5)
+}
+
+// fill `r` with a two-colour linear ramp from `col` to (gtr,gtg,gtb,gta), the kind-0 half of
+// PaintPrimitive's has_grad/grad_*. The ramp runs over [gax, gax + gaxd) along x when `ghoriz` = 1
+// and along y otherwise, sampled at the pixel centre (x + 0.5), which is the value the GPU's
+// @builtin(position) carries, the same rule draw_line_g uses for text, so a rect and a label with
+// the same gradient parameters agree, and so do the two backends. Coverage (rounded corners, the
+// clip box) is fill_rect_cl's; only the colour varies. Scalar args only (see blend_px).
+pub fn fill_rect_grad_cl(c: CpuCanvas, r: Rect, col: Color, radius: Float, cl: Clip, gtr: Int, gtg: Int, gtb: Int, gta: Int, gax: Float, gaxd: Float, ghoriz: Int) {
+    var cr = col.r  var cg = col.g  var cb = col.b  var ca = col.a
+    var rminx = r.min.x  var rminy = r.min.y  var rmaxx = r.max.x  var rmaxy = r.max.y
+    var bx0 = cl.x0  var by0 = cl.y0  var bx1 = cl.x1  var by1 = cl.y1
+    // a zero (or negative) span is a degenerate gradient, not a division: clamp the divisor to 1px
+    // as the text path and the WGSL `max(gprm.y, 1.0)` do, so grad_a == grad_b paints the
+    // whole rect in the "from" colour on the left/top of the axis origin and the "to" colour after it.
+    var dd = gaxd
+    if dd < 1.0 { dd = 1.0 }
+    var x0 = imax(bx0, ffloor_i(rminx))
+    var y0 = imax(by0, ffloor_i(rminy))
+    var x1 = imin(bx1, fceil_i(rmaxx))
+    var y1 = imin(by1, fceil_i(rmaxy))
+    var y = y0
+    while y < y1 {
+        // vertical ramp: one mix per row, hoisted out of the inner loop.
+        var vt = fclamp01((to_float(y) + 0.5 - gax) / dd)
+        var vr = cr  var vg = cg  var vb = cb  var va = ca
+        if ghoriz == 0 { vr = cpu_gmix(cr, gtr, vt)  vg = cpu_gmix(cg, gtg, vt)  vb = cpu_gmix(cb, gtb, vt)  va = cpu_gmix(ca, gta, vt) }
+        var x = x0
+        while x < x1 {
+            var cov = corner_cov(to_float(x) + 0.5, to_float(y) + 0.5, rminx, rminy, rmaxx, rmaxy, radius)
+            if cov > 0 {
+                if ghoriz == 1 {
+                    var ht = fclamp01((to_float(x) + 0.5 - gax) / dd)
+                    blend_px(c, x, y, cpu_gmix(cr, gtr, ht), cpu_gmix(cg, gtg, ht), cpu_gmix(cb, gtb, ht), cpu_gmix(ca, gta, ht), cov, bx0, by0, bx1, by1)
+                } else { blend_px(c, x, y, vr, vg, vb, va, cov, bx0, by0, bx1, by1) }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// distance from pixel-center (px,py) to the axis-aligned rect [rminx,rmaxx]x[rminy,rmaxy] (0 inside).
+fn rect_dist(px: Float, py: Float, rminx: Float, rminy: Float, rmaxx: Float, rmaxy: Float) -> Float {
+    var dx = 0.0
+    if px < rminx { dx = rminx - px } else if px > rmaxx { dx = px - rmaxx }
+    var dy = 0.0
+    if py < rminy { dy = rminy - py } else if py > rmaxy { dy = py - rmaxy }
+    return sqrt(dx * dx + dy * dy)
+}
+
+// distance from (px,py) to a rounded rect of corner radius `rad`: the rect field, measured from a
+// box inset by `rad` and then pushed back out by it. With rad = 0 this is rect_dist.
+fn rrect_dist(px: Float, py: Float, rminx: Float, rminy: Float, rmaxx: Float, rmaxy: Float, rad: Float) -> Float {
+    var rr = rad
+    let hw = (rmaxx - rminx) * 0.5
+    let hh = (rmaxy - rminy) * 0.5
+    if rr > hw { rr = hw }
+    if rr > hh { rr = hh }
+    if rr <= 0.0 { return rect_dist(px, py, rminx, rminy, rmaxx, rmaxy) }
+    let d = rect_dist(px, py, rminx + rr, rminy + rr, rmaxx - rr, rmaxy - rr) - rr
+    if d < 0.0 { return 0.0 }
+    return d
+}
+
+/// draw a soft drop shadow for `r` (offset by dx,dy, softened over `blur` px) in `col` at peak
+/// `alpha` (0..255). A distance falloff outside the rect, cheap but reads as a real shadow.
+pub fn drop_shadow(c: CpuCanvas, r: Rect, dx: Float, dy: Float, blur: Float, col: Color, alpha: Int) {
+    drop_shadow_r(c, r, dx, dy, blur, col, alpha, 0.0)
+}
+/// same, for a box with rounded corners. The falloff has to follow the rounded shape: measured from
+/// the square box, a `border-radius:50%` circle glows in four corner lobes, a visible X around it.
+pub fn drop_shadow_r(c: CpuCanvas, r: Rect, dx: Float, dy: Float, blur: Float, col: Color, alpha: Int, radius: Float) {
+    drop_shadow_r_dev(c, dsc_r(c, r), dsc(c, dx), dsc(c, dy), dsc(c, blur), col, alpha, dsc(c, radius))
+}
+fn drop_shadow_r_dev(c: CpuCanvas, r: Rect, dx: Float, dy: Float, blur: Float, col: Color, alpha: Int, radius: Float) {
+    drop_shadow_r_dev_cl(c, r, dx, dy, blur, col, alpha, radius, clip_full(c))
+}
+// …clipped to `cl` (a damaged region being repainted: render_overlay_damage).
+fn drop_shadow_r_dev_cl(c: CpuCanvas, r: Rect, dx: Float, dy: Float, blur: Float, col: Color, alpha: Int, radius: Float, cl: Clip) {
+    var sr = rect_min_max(vec2(r.min.x + dx, r.min.y + dy), vec2(r.max.x + dx, r.max.y + dy))
+    var x0 = imax(cl.x0, ffloor_i(sr.min.x - blur))
+    var y0 = imax(cl.y0, ffloor_i(sr.min.y - blur))
+    var x1 = imin(cl.x1, fceil_i(sr.max.x + blur))
+    var y1 = imin(cl.y1, fceil_i(sr.max.y + blur))
+    var cr = col.r  var cg = col.g  var cb = col.b
+    var rminx = sr.min.x  var rminy = sr.min.y  var rmaxx = sr.max.x  var rmaxy = sr.max.y
+    var bx0 = cl.x0  var by0 = cl.y0  var bx1 = cl.x1  var by1 = cl.y1
+    var y = y0
+    while y < y1 {
+        var x = x0
+        while x < x1 {
+            var d = rrect_dist(to_float(x) + 0.5, to_float(y) + 0.5, rminx, rminy, rmaxx, rmaxy, radius)
+            // CSS blurs a shadow with a Gaussian of sigma = blur/2, so coverage is ~50% at the shape
+            // edge and near zero by `blur` out. Running from 100% at the edge would draw a hard
+            // bright rim around the box and make a wide glow far stronger than CSS's.
+            var u = fclamp01(1.0 - d / blur)
+            var f = 0.5 * (u * u * (3.0 - 2.0 * u))          // smoothstep: an erfc without the erfc
+            var a = to_int(f * to_float(alpha))
+            if a > 0 { blend_px(c, x, y, cr, cg, cb, 255, a, bx0, by0, bx1, by1) }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// the signed distance from (px, py) to a rounded box (negative inside it)
+fn rrect_sdist(px: Float, py: Float, minx: Float, miny: Float, maxx: Float, maxy: Float, rad: Float) -> Float {
+    let hw = (maxx - minx) * 0.5
+    let hh = (maxy - miny) * 0.5
+    var rr = rad
+    if rr > hw { rr = hw }
+    if rr > hh { rr = hh }
+    if rr < 0.0 { rr = 0.0 }
+    var qx = px - (minx + hw)
+    if qx < 0.0 { qx = 0.0 - qx }
+    qx = qx - (hw - rr)
+    var qy = py - (miny + hh)
+    if qy < 0.0 { qy = 0.0 - qy }
+    qy = qy - (hh - rr)
+    var ox = qx
+    if ox < 0.0 { ox = 0.0 }
+    var oy = qy
+    if oy < 0.0 { oy = 0.0 }
+    var inside = qx
+    if qy > inside { inside = qy }
+    if inside > 0.0 { inside = 0.0 }
+    return sqrt(ox * ox + oy * oy) + inside - rr
+}
+
+/// A box shadow (PaintPrimitive kind 4), in device pixels: the box `r` (grown by `spread` already, corners
+/// `radius`) moved by (dx, dy) and blurred over `blur`, drawn only outside the element (`r` shrunk by
+/// `spread`), as CSS draws box-shadow. The coverage is CSS's Gaussian of sigma blur/2, as a smoothstep:
+/// half at the shape's edge, all of it `blur` inside, none `blur` outside. The element's inside is
+/// skipped a row's straight run at a time, so a big box costs its rim, not its area.
+fn box_shadow_dev(c: CpuCanvas, r: Rect, radius: Float, spread: Float, blur: Float, dx: Float, dy: Float, col: Color, cl: Clip) {
+    if col.a <= 0 { return }
+    let sminx = r.min.x + dx  let sminy = r.min.y + dy  let smaxx = r.max.x + dx  let smaxy = r.max.y + dy
+    // the element: no shadow inside it
+    let eminx = r.min.x + spread  let eminy = r.min.y + spread  let emaxx = r.max.x - spread  let emaxy = r.max.y - spread
+    var er = radius - spread
+    if er < 0.0 { er = 0.0 }
+    let x0 = imax(cl.x0, ffloor_i(sminx - blur))
+    let y0 = imax(cl.y0, ffloor_i(sminy - blur))
+    let x1 = imin(cl.x1, fceil_i(smaxx + blur))
+    let y1 = imin(cl.y1, fceil_i(smaxy + blur))
+    let cr = col.r  let cg = col.g  let cb = col.b  let ca = col.a
+    let bx0 = cl.x0  let by0 = cl.y0  let bx1 = cl.x1  let by1 = cl.y1
+    var y = y0
+    while y < y1 {
+        let fy = to_float(y) + 0.5
+        // this row's run wholly inside the element (where its corners do not reach): skipped
+        var skip0 = x1
+        var skip1 = x1
+        if fy >= eminy + er && fy < emaxy - er { skip0 = fceil_i(eminx)  skip1 = ffloor_i(emaxx) }
+        var x = x0
+        while x < x1 {
+            if x >= skip0 && x < skip1 { x = skip1 }
+            else {
+                let fx = to_float(x) + 0.5
+                if rrect_sdist(fx, fy, eminx, eminy, emaxx, emaxy, er) > 0.0 {
+                    let d = rrect_sdist(fx, fy, sminx, sminy, smaxx, smaxy, radius)
+                    var f = 0.0
+                    if blur > 0.0 {
+                        let u = fclamp01((blur - d) / (2.0 * blur))
+                        f = u * u * (3.0 - 2.0 * u)
+                    } else if d <= 0.0 { f = 1.0 }
+                    let a = to_int(f * to_float(ca))
+                    if a > 0 { blend_px(c, x, y, cr, cg, cb, 255, a, bx0, by0, bx1, by1) }
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+}
+
+/// fill `r` with a vertical gradient from `top` to `bottom` (per-row lerp), clipped to the canvas.
+pub fn fill_gradient(c: CpuCanvas, r: Rect, top: Color, bottom: Color) {
+    fill_gradient_dev(c, dsc_r(c, r), top, bottom)
+}
+fn fill_gradient_dev(c: CpuCanvas, r: Rect, top: Color, bottom: Color) {
+    var x0 = imax(0, ffloor_i(r.min.x))
+    var y0 = imax(0, ffloor_i(r.min.y))
+    var x1 = imin(c.w, fceil_i(r.max.x))
+    var y1 = imin(c.h, fceil_i(r.max.y))
+    var h = r.max.y - r.min.y
+    if h <= 0.0 { return }
+    var rminy = r.min.y
+    var tr = top.r  var tg = top.g  var tb = top.b
+    var dr = bottom.r - top.r  var dg = bottom.g - top.g  var db = bottom.b - top.b
+    var y = y0
+    while y < y1 {
+        var t = fclamp01((to_float(y) + 0.5 - rminy) / h)
+        var rr = tr + to_int(to_float(dr) * t)
+        var gg = tg + to_int(to_float(dg) * t)
+        var bb = tb + to_int(to_float(db) * t)
+        var x = x0
+        while x < x1 { blend_px(c, x, y, rr, gg, bb, 255, 255, 0, 0, c.w, c.h)  x = x + 1 }
+        y = y + 1
+    }
+}
+
+fn glf_min4(a: Float, b: Float, cc: Float, d: Float) -> Float { var m = a  if b < m { m = b }  if cc < m { m = cc }  if d < m { m = d }  return m }
+fn glf_max4(a: Float, b: Float, cc: Float, d: Float) -> Float { var m = a  if b > m { m = b }  if cc > m { m = cc }  if d > m { m = d }  return m }
+// fill `r` with an N-stop linear gradient along the (dirx,diry) axis (screen coords, y down). `poss` are
+// non-decreasing fractions 0..1; `cols[i]` is the color at poss[i]. Pixels project onto the axis and
+// interpolate between the surrounding stops (t normalized over the box's projection span).
+pub fn fill_linear_gradient(c: CpuCanvas, r: Rect, dirx: Float, diry: Float, poss: Vec<Float>, cols: Vec<Color>) {
+    fill_linear_gradient_r(c, r, dirx, diry, poss, cols, 0.0)
+}
+/// linear gradient clipped to rounded corners of `radius` px (border-radius on gradient boxes).
+pub fn fill_linear_gradient_r(c: CpuCanvas, r: Rect, dirx: Float, diry: Float, poss: Vec<Float>, cols: Vec<Color>, radius: Float) {
+    fill_linear_gradient_r_dev(c, dsc_r(c, r), dirx, diry, poss, cols, dsc(c, radius))
+}
+fn fill_linear_gradient_r_dev(c: CpuCanvas, r: Rect, dirx: Float, diry: Float, poss: Vec<Float>, cols: Vec<Color>, radius: Float) {
+    let ns = poss.len()
+    if ns == 0 { return }
+    if ns == 1 { fill_rect_cl(c, r, cols[0], 0.0, clip_full(c))  return }
+    let x0 = imax(0, ffloor_i(r.min.x))
+    let y0 = imax(0, ffloor_i(r.min.y))
+    let x1 = imin(c.w, fceil_i(r.max.x))
+    let y1 = imin(c.h, fceil_i(r.max.y))
+    let w = r.max.x - r.min.x
+    let h = r.max.y - r.min.y
+    let pmin = glf_min4(0.0, w * dirx, h * diry, w * dirx + h * diry)     // box corner projections (rel r.min)
+    let pmax = glf_max4(0.0, w * dirx, h * diry, w * dirx + h * diry)
+    let span = pmax - pmin
+    if span <= 0.0 { fill_rect_cl(c, r, cols[0], 0.0, clip_full(c))  return }
+    var y = y0
+    while y < y1 {
+        let ry = to_float(y) + 0.5 - r.min.y
+        var x = x0
+        while x < x1 {
+            let rx = to_float(x) + 0.5 - r.min.x
+            let t = fclamp01((rx * dirx + ry * diry - pmin) / span)
+            var si = 0
+            while si < ns - 1 && t > poss[si + 1] { si = si + 1 }
+            var lo = si  var hi = si + 1
+            if hi >= ns { hi = ns - 1 }
+            let plo = poss[lo]  let phi = poss[hi]
+            var f = 0.0
+            if phi > plo { f = (t - plo) / (phi - plo) }
+            if f < 0.0 { f = 0.0 }
+            if f > 1.0 { f = 1.0 }
+            let a = cols[lo]  let b = cols[hi]
+            let rr = a.r + to_int(to_float(b.r - a.r) * f)
+            let gg = a.g + to_int(to_float(b.g - a.g) * f)
+            let bb = a.b + to_int(to_float(b.b - a.b) * f)
+            let aa = a.a + to_int(to_float(b.a - a.a) * f)
+            var rcv = 255
+            if radius > 0.0 { rcv = corner_cov(to_float(x) + 0.5, to_float(y) + 0.5, r.min.x, r.min.y, r.max.x, r.max.y, radius) }
+            if rcv > 0 { blend_px(c, x, y, rr, gg, bb, aa, rcv, 0, 0, c.w, c.h) }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn fclamp255(x: Float) -> Int { if x < 0.0 { return 0 }  if x > 255.0 { return 255 }  return to_int(x) }
+// box-blur `c` in place with the given radius, averaging only non-sentinel neighbors (so the element's
+// pixels blur without bleeding the transparent sentinel background). O(w·h·r²), for small offscreens.
+pub fn box_blur(c: CpuCanvas, radius: Int, sentinel: Int) {
+    if radius < 1 { return }
+    var r = radius  if r > 20 { r = 20 }
+    var tmp = 0
+    unsafe { tmp = malloc(c.w * c.h * 4) }
+    var y = 0
+    while y < c.h {
+        var x = 0
+        while x < c.w {
+            var self0 = 0
+            unsafe { self0 = peek32(c.buf + (y * c.w + x) * 4) }
+            if self0 == sentinel { unsafe { poke32(tmp + (y * c.w + x) * 4, sentinel) } }
+            else {
+                var sr = 0  var sg = 0  var sb = 0  var cnt = 0
+                var jy = y - r
+                while jy <= y + r {
+                    if jy >= 0 && jy < c.h {
+                        var jx = x - r
+                        while jx <= x + r {
+                            if jx >= 0 && jx < c.w { var p = 0  unsafe { p = peek32(c.buf + (jy * c.w + jx) * 4) }  if p != sentinel { sr = sr + ((p >> 16) & 255)  sg = sg + ((p >> 8) & 255)  sb = sb + (p & 255)  cnt = cnt + 1 } }
+                            jx = jx + 1
+                        }
+                    }
+                    jy = jy + 1
+                }
+                if cnt > 0 { unsafe { poke32(tmp + (y * c.w + x) * 4, pack(sr / cnt, sg / cnt, sb / cnt)) } } else { unsafe { poke32(tmp + (y * c.w + x) * 4, self0) } }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var i = 0
+    let nn = c.w * c.h
+    while i < nn { unsafe { poke32(c.buf + i * 4, peek32(tmp + i * 4)) }  i = i + 1 }
+    unsafe { free(tmp) }
+}
+// blend one channel: mode 1 multiply, 2 screen, 3 overlay, 4 darken, 5 lighten, 6 difference, 7 exclusion.
+fn blend_ch(bd: Int, sc: Int, mode: Int) -> Int {
+    if mode == 1 { return bd * sc / 255 }
+    if mode == 2 { return 255 - (255 - bd) * (255 - sc) / 255 }
+    if mode == 4 { if bd < sc { return bd }  return sc }
+    if mode == 5 { if bd > sc { return bd }  return sc }
+    if mode == 6 { if bd > sc { return bd - sc }  return sc - bd }
+    if mode == 7 { return bd + sc - 2 * bd * sc / 255 }
+    if mode == 3 { if bd < 128 { return 2 * bd * sc / 255 }  return 255 - 2 * (255 - bd) * (255 - sc) / 255 }   // overlay
+    return sc
+}
+// blit `off` (element over sentinel) onto `c` with a mix-blend-mode: each drawn pixel blends with the
+// backdrop already in `c` using `mode`, then the result replaces the backdrop (scaled by alpha).
+pub fn blend_mode_blit(c: CpuCanvas, off: CpuCanvas, ox0: Int, oy0: Int, mode: Int, alpha: Int, sentinel: Int) {
+    var y = 0
+    while y < off.h {
+        var x = 0
+        while x < off.w {
+            let dx = ox0 + x  let dy = oy0 + y
+            if dx >= 0 && dy >= 0 && dx < c.w && dy < c.h {
+                var s = 0
+                unsafe { s = peek32(off.buf + (y * off.w + x) * 4) }
+                if s != sentinel {
+                    var bp = 0
+                    unsafe { bp = peek32(c.buf + (dy * c.w + dx) * 4) }
+                    let sr = ((s >> 16) & 255)  let sg = ((s >> 8) & 255)  let sb = (s & 255)
+                    let br = ((bp >> 16) & 255)  let bg = ((bp >> 8) & 255)  let bb = (bp & 255)
+                    blend_px(c, dx, dy, blend_ch(br, sr, mode), blend_ch(bg, sg, mode), blend_ch(bb, sb, mode), 255, alpha, 0, 0, c.w, c.h)
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+// blit `off` onto `c` keeping only pixels inside a clip-path shape (box-local coords; box origin at
+// (boxOX,boxOY) in off, size boxW×boxH). kind 1 circle (a=radius frac of min side), 2 inset (a/b/c/d =
+// top/right/bottom/left fractions). sentinel pixels are skipped.
+pub fn clip_shape_blit(c: CpuCanvas, off: CpuCanvas, ox0: Int, oy0: Int, kind: Int, a: Float, b: Float, cc: Float, dd: Float, boxOX: Int, boxOY: Int, boxW: Float, boxH: Float, alpha: Int, sentinel: Int) {
+    var mn = boxW  if boxH < mn { mn = boxH }
+    let rad = a * mn                                                          // circle radius
+    let cx = boxW * 0.5  let cy = boxH * 0.5
+    var y = 0
+    while y < off.h {
+        var x = 0
+        while x < off.w {
+            let dx = ox0 + x  let dy = oy0 + y
+            if dx >= 0 && dy >= 0 && dx < c.w && dy < c.h {
+                let lx = to_float(x - boxOX)  let ly = to_float(y - boxOY)
+                var inside = false
+                if kind == 1 { let px = lx - cx  let py = ly - cy  inside = px * px + py * py <= rad * rad }
+                else if kind == 2 { inside = lx >= dd * boxW && lx < boxW - b * boxW && ly >= a * boxH && ly < boxH - cc * boxH }
+                if inside {
+                    var s = 0
+                    unsafe { s = peek32(off.buf + (y * off.w + x) * 4) }
+                    if s != sentinel { blend_px(c, dx, dy, ((s >> 16) & 255), ((s >> 8) & 255), (s & 255), 255, alpha, 0, 0, c.w, c.h) }
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+// blit `off` (element over a sentinel background) onto `c` applying a CSS color filter to each drawn pixel:
+// brightness, contrast, grayscale, sepia, saturate, invert (applied in that order). alpha scales the blend.
+pub fn apply_filter_blit(c: CpuCanvas, off: CpuCanvas, ox0: Int, oy0: Int, gray: Float, bright: Float, inv: Float, sep: Float, contrast: Float, sat: Float, alpha: Int, sentinel: Int) {
+    var y = 0
+    while y < off.h {
+        var x = 0
+        while x < off.w {
+            let dx = ox0 + x  let dy = oy0 + y
+            if dx >= 0 && dy >= 0 && dx < c.w && dy < c.h {
+                var s = 0
+                unsafe { s = peek32(off.buf + (y * off.w + x) * 4) }
+                if s != sentinel {
+                    var r = to_float(((s >> 16) & 255))  var g = to_float(((s >> 8) & 255))  var b = to_float((s & 255))
+                    r = r * bright  g = g * bright  b = b * bright                              // brightness
+                    r = (r - 128.0) * contrast + 128.0  g = (g - 128.0) * contrast + 128.0  b = (b - 128.0) * contrast + 128.0   // contrast
+                    if gray > 0.0 { let l = 0.299 * r + 0.587 * g + 0.114 * b  r = r + (l - r) * gray  g = g + (l - g) * gray  b = b + (l - b) * gray }
+                    if sep > 0.0 { let sr = 0.393 * r + 0.769 * g + 0.189 * b  let sg = 0.349 * r + 0.686 * g + 0.168 * b  let sb = 0.272 * r + 0.534 * g + 0.131 * b  r = r + (sr - r) * sep  g = g + (sg - g) * sep  b = b + (sb - b) * sep }
+                    if sat != 1.0 { let l = 0.299 * r + 0.587 * g + 0.114 * b  r = l + (r - l) * sat  g = l + (g - l) * sat  b = l + (b - l) * sat }
+                    if inv > 0.0 { r = r + (255.0 - r - r) * inv  g = g + (255.0 - g - g) * inv  b = b + (255.0 - b - b) * inv }
+                    blend_px(c, dx, dy, fclamp255(r), fclamp255(g), fclamp255(b), 255, alpha, 0, 0, c.w, c.h)
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+// fill `r` with an N-stop radial gradient centered in the box, radius = distance to the farthest corner.
+pub fn fill_radial_gradient(c: CpuCanvas, r: Rect, poss: Vec<Float>, cols: Vec<Color>) {
+    fill_radial_gradient_at(c, r, poss, cols, 0.5, 0.5, 0.0)
+}
+/// radial gradient centred at (fx, fy) fractions of `r`; radPx > 0 = explicit radius in px
+/// (CSS `transparent 42rem`), else the corner distance.
+pub fn fill_radial_gradient_at(c: CpuCanvas, r: Rect, poss: Vec<Float>, cols: Vec<Color>, fx: Float, fy: Float, radPx: Float) {
+    // fx/fy are fractions of the box, so they are already scale-free; radPx is a length.
+    fill_radial_gradient_at_dev(c, dsc_r(c, r), poss, cols, fx, fy, dsc(c, radPx))
+}
+fn fill_radial_gradient_at_dev(c: CpuCanvas, r: Rect, poss: Vec<Float>, cols: Vec<Color>, fx: Float, fy: Float, radPx: Float) {
+    let ns = poss.len()
+    if ns == 0 { return }
+    if ns == 1 { fill_rect_cl(c, r, cols[0], 0.0, clip_full(c))  return }
+    let x0 = imax(0, ffloor_i(r.min.x))
+    let y0 = imax(0, ffloor_i(r.min.y))
+    let x1 = imin(c.w, fceil_i(r.max.x))
+    let y1 = imin(c.h, fceil_i(r.max.y))
+    let cxp = r.min.x + (r.max.x - r.min.x) * fx
+    let cyp = r.min.y + (r.max.y - r.min.y) * fy
+    let hw = (r.max.x - r.min.x) * 0.5
+    let hh = (r.max.y - r.min.y) * 0.5
+    var radius = sqrt(hw * hw + hh * hh)
+    if radPx > 0.0 { radius = radPx }
+    if radius <= 0.0 { fill_rect_cl(c, r, cols[0], 0.0, clip_full(c))  return }
+    var y = y0
+    while y < y1 {
+        let dy = to_float(y) + 0.5 - cyp
+        var x = x0
+        while x < x1 {
+            let dx = to_float(x) + 0.5 - cxp
+            let t = fclamp01(sqrt(dx * dx + dy * dy) / radius)
+            var si = 0
+            while si < ns - 1 && t > poss[si + 1] { si = si + 1 }
+            var lo = si  var hi = si + 1
+            if hi >= ns { hi = ns - 1 }
+            let plo = poss[lo]  let phi = poss[hi]
+            var f = 0.0
+            if phi > plo { f = (t - plo) / (phi - plo) }
+            if f < 0.0 { f = 0.0 }
+            if f > 1.0 { f = 1.0 }
+            let a = cols[lo]  let b = cols[hi]
+            // A gradient that fades to `transparent` (every soft page backdrop does) has alpha ~ 0 over
+            // most of the box (a 32rem radial is 97% nothing). Compute the alpha first and
+            // skip the blend call (bounds checks included) where it cannot change the pixel, which
+            // is most of the cost of such a gradient tile.
+            let av = a.a + to_int(to_float(b.a - a.a) * f)
+            if av > 2 {
+                blend_px(c, x, y, a.r + to_int(to_float(b.r - a.r) * f), a.g + to_int(to_float(b.g - a.g) * f), a.b + to_int(to_float(b.b - a.b) * f), av, 255, 0, 0, c.w, c.h)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// fill `r` with an N-stop conic gradient about the box center; angle 0 at top, clockwise (t = angle/360).
+pub fn fill_conic_gradient(c: CpuCanvas, r: Rect, poss: Vec<Float>, cols: Vec<Color>) {
+    fill_conic_gradient_dev(c, dsc_r(c, r), poss, cols)
+}
+// ---- layers with an alpha channel ----------------------------------------------------------------
+// A canvas pixel is 0x00RRGGBB: opaque. A layer that must keep its transparency (one that is masked,
+// or blurred so its edges spread over what lies behind) is painted twice, over black and over white,
+// and the pair folded into one premultiplied layer: over black a pixel already is its premultiplied
+// colour, and how much of the white shows through is how transparent it is. The folded layer holds
+// alpha in the top byte. Nested soft edges survive this, where cutting a layer out against a
+// sentinel colour turns every half-covered pixel into a fringe of that colour.
+
+/// a canvas of `src`'s size holding a copy of its pixels, with no font attached.
+pub fn canvas_clone_nofont(src: CpuCanvas) -> CpuCanvas {
+    let dst = canvas_new_nofont(src.w, src.h)
+    let n = src.w * src.h
+    var i = 0
+    while i < n { unsafe { poke32(dst.buf + i * 4, peek32(src.buf + i * 4)) }  i = i + 1 }
+    return dst
+}
+/// fold `k` (the layer painted over black) and `w` (the same layer over white) into `k` as a
+/// premultiplied layer, alpha in the top byte.
+pub fn rgba_merge(k: CpuCanvas, w: CpuCanvas) {
+    let n = k.w * k.h
+    var i = 0
+    while i < n {
+        var p = 0  var q = 0
+        unsafe { p = peek32(k.buf + i * 4)  q = peek32(w.buf + i * 4) }
+        let kr = ((p >> 16) & 255)  let kg = ((p >> 8) & 255)  let kb = (p & 255)
+        let wr = ((q >> 16) & 255)  let wg = ((q >> 8) & 255)  let wb = (q & 255)
+        var a = 255 - ((wr - kr) + (wg - kg) + (wb - kb) + 1) / 3
+        if a < 0 { a = 0 }
+        if a > 255 { a = 255 }
+        var r = kr  var g = kg  var b = kb
+        if r > a { r = a }
+        if g > a { g = a }
+        if b > a { b = a }
+        unsafe { poke32(k.buf + i * 4, rgba_pack(a, r, g, b)) }
+        i = i + 1
+    }
+}
+fn rgba_pack(a: Int, r: Int, g: Int, b: Int) -> Int { return ((((a << 24) | (r << 16)) | (g << 8)) | b) }
+// a premultiplied pixel scaled by m/255 (all four channels).
+fn rgba_scale(p: Int, m: Int) -> Int {
+    return rgba_pack(((p >> 24) & 255) * m / 255, ((p >> 16) & 255) * m / 255, ((p >> 8) & 255) * m / 255, (p & 255) * m / 255)
+}
+/// cut a premultiplied layer down to the rounded rect (x0,y0)-(x1,y1), device pixels: an element's own
+/// `overflow` clip, applied to what its descendants painted before the element's filter runs.
+pub fn rgba_clip_rrect(c: CpuCanvas, x0: Float, y0: Float, x1: Float, y1: Float, radius: Float) {
+    var rad = radius
+    if rad * 2.0 > x1 - x0 { rad = (x1 - x0) * 0.5 }
+    if rad * 2.0 > y1 - y0 { rad = (y1 - y0) * 0.5 }
+    var y = 0
+    while y < c.h {
+        let py = to_float(y) + 0.5
+        var x = 0
+        while x < c.w {
+            let px = to_float(x) + 0.5
+            let addr = c.buf + (y * c.w + x) * 4
+            if px < x0 || px >= x1 || py < y0 || py >= y1 { unsafe { poke32(addr, 0) } }
+            else if rad > 0.0 {
+                let cov = corner_cov(px, py, x0, y0, x1, y1, rad)
+                if cov < 255 { var p = 0  unsafe { p = peek32(addr) }  unsafe { poke32(addr, rgba_scale(p, cov)) } }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+// the alpha (0..255) of a list of gradient stops at position t.
+fn stop_alpha(poss: Vec<Float>, al: Vec<Int>, t: Float) -> Int {
+    let ns = poss.len()
+    if t <= poss[0] { return al[0] }
+    if t >= poss[ns - 1] { return al[ns - 1] }
+    var i = 0
+    while i < ns - 1 && t > poss[i + 1] { i = i + 1 }
+    let p0 = poss[i]  let p1 = poss[i + 1]
+    if p1 <= p0 { return al[i + 1] }
+    let f = (t - p0) / (p1 - p0)
+    return al[i] + to_int(to_float(al[i + 1] - al[i]) * f)
+}
+/// composite one layer of a CSS mask into `mc`, which holds the mask so far in the low byte of each
+/// pixel. The layer is a gradient over the box (bx,by,bw,bh) in `mc`'s pixels: kind 0 linear along
+/// (dirx,diry), 1 radial centred at (gpx,gpy) of the box with radius `rad` (0 = to the farthest
+/// corner), 2 conic starting `fromT` turns clockwise from the top, and transparent outside the box
+/// (`mask-clip: border-box`). An empty stop list is a layer with no image. Layers go bottom-up: the
+/// `first` is written as is, and each one above it composites by `mode` (`mask-composite`): 0 add,
+/// 1 intersect, 2 subtract, 3 exclude.
+pub fn mask_layer(mc: CpuCanvas, first: Bool, mode: Int, kind: Int, bx: Float, by: Float, bw: Float, bh: Float, dirx: Float, diry: Float, fromT: Float, gpx: Float, gpy: Float, rad: Float, poss: Vec<Float>, alphas: Vec<Int>) {
+    let ns = poss.len()
+    let cx = bx + bw * 0.5  let cy = by + bh * 0.5
+    var lx = bw * dirx  if lx < 0.0 { lx = 0.0 - lx }
+    var ly = bh * diry  if ly < 0.0 { ly = 0.0 - ly }
+    var glen = lx + ly                                                    // the gradient line, corner to corner
+    if glen < 0.001 { glen = 0.001 }
+    let rcx = bx + bw * gpx  let rcy = by + bh * gpy
+    var rx = rad  var ry = rad
+    if rad <= 0.0 {
+        var fx = gpx  if 1.0 - gpx > fx { fx = 1.0 - gpx }
+        var fy = gpy  if 1.0 - gpy > fy { fy = 1.0 - gpy }
+        rx = fx * bw * 1.41421356  ry = fy * bh * 1.41421356
+    }
+    if rx < 0.001 { rx = 0.001 }
+    if ry < 0.001 { ry = 0.001 }
+    var y = 0
+    while y < mc.h {
+        let py = to_float(y) + 0.5
+        var x = 0
+        while x < mc.w {
+            let px = to_float(x) + 0.5
+            var a = 0
+            if ns > 0 && px >= bx && px < bx + bw && py >= by && py < by + bh {
+                var t = 0.0
+                if kind == 2 { t = m::atan2(px - cx, cy - py) / 6.283185307179586 - fromT  t = t - to_float(ffloor_i(t)) }
+                else if kind == 1 { let ux = (px - rcx) / rx  let uy = (py - rcy) / ry  t = sqrt(ux * ux + uy * uy) }
+                else { t = ((px - cx) * dirx + (py - cy) * diry) / glen + 0.5 }
+                a = stop_alpha(poss, alphas, t)
+            }
+            let addr = mc.buf + (y * mc.w + x) * 4
+            var mv = a
+            if !first {
+                var old = 0
+                unsafe { old = (peek32(addr) & 255) }
+                if mode == 1 { mv = a * old / 255 }
+                else if mode == 2 { mv = a * (255 - old) / 255 }
+                else if mode == 3 { mv = (a * (255 - old) + old * (255 - a)) / 255 }
+                else { mv = a + old * (255 - a) / 255 }
+            }
+            unsafe { poke32(addr, mv) }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+/// multiply a premultiplied layer by the mask `mc` built with `mask_layer` (same size).
+pub fn rgba_apply_mask(off: CpuCanvas, mc: CpuCanvas) {
+    let n = off.w * off.h
+    var i = 0
+    while i < n {
+        var mv = 0
+        unsafe { mv = (peek32(mc.buf + i * 4) & 255) }
+        if mv < 255 { var p = 0  unsafe { p = peek32(off.buf + i * 4) }  unsafe { poke32(off.buf + i * 4, rgba_scale(p, mv)) } }
+        i = i + 1
+    }
+}
+/// gaussian blur of a premultiplied layer, standard deviation about `radius` device pixels: three
+/// box passes each way, which is what a gaussian converges to. Transparency blurs with the colour,
+/// so a hard edge spreads into a soft one rather than stopping at the shape.
+pub fn rgba_blur(c: CpuCanvas, radius: Int) {
+    if radius < 1 { return }
+    var r = radius
+    if r > 80 { r = 80 }
+    var tmp = 0
+    unsafe { tmp = malloc(c.w * c.h * 4) }
+    var pass = 0
+    while pass < 3 {
+        rgba_box_pass(c.buf, tmp, c.w, c.h, r, 4, c.w * 4)                 // rows: step one pixel
+        rgba_box_pass(tmp, c.buf, c.h, c.w, r, c.w * 4, 4)                 // columns: step one row
+        pass = pass + 1
+    }
+    unsafe { free(tmp) }
+}
+// one sliding box of half-width r along `n` lines of `len` pixels each: `step` bytes between pixels
+// of a line, `lstride` bytes between lines. Outside the layer is transparent.
+fn rgba_box_pass(src: Int, dst: Int, len: Int, n: Int, r: Int, step: Int, lstride: Int) {
+    let win = 2 * r + 1
+    let half = win / 2
+    var li = 0
+    while li < n {
+        let base = li * lstride
+        var sa = 0  var sr = 0  var sg = 0  var sb = 0
+        var k = 0
+        while k <= r && k < len {
+            var p = 0
+            unsafe { p = peek32(src + base + k * step) }
+            sa = sa + ((p >> 24) & 255)  sr = sr + ((p >> 16) & 255)  sg = sg + ((p >> 8) & 255)  sb = sb + (p & 255)
+            k = k + 1
+        }
+        var x = 0
+        while x < len {
+            unsafe { poke32(dst + base + x * step, rgba_pack((sa + half) / win, (sr + half) / win, (sg + half) / win, (sb + half) / win)) }
+            let xo = x - r
+            if xo >= 0 {
+                var p = 0
+                unsafe { p = peek32(src + base + xo * step) }
+                sa = sa - ((p >> 24) & 255)  sr = sr - ((p >> 16) & 255)  sg = sg - ((p >> 8) & 255)  sb = sb - (p & 255)
+            }
+            let xi = x + r + 1
+            if xi < len {
+                var p = 0
+                unsafe { p = peek32(src + base + xi * step) }
+                sa = sa + ((p >> 24) & 255)  sr = sr + ((p >> 16) & 255)  sg = sg + ((p >> 8) & 255)  sb = sb + (p & 255)
+            }
+            x = x + 1
+        }
+        li = li + 1
+    }
+}
+// blend one premultiplied pixel onto `c`, `alpha` scaling it, optionally through a colour filter
+// (the order and formulas of `apply_filter_blit`).
+fn rgba_blend_px(c: CpuCanvas, x: Int, y: Int, p: Int, alpha: Int, hasFilt: Bool, gray: Float, bright: Float, inv: Float, sep: Float, contrast: Float, sat: Float) {
+    let a = ((p >> 24) & 255)
+    if a == 0 { return }
+    var ri = ((p >> 16) & 255) * 255 / a  var gi = ((p >> 8) & 255) * 255 / a  var bi = (p & 255) * 255 / a
+    if ri > 255 { ri = 255 }
+    if gi > 255 { gi = 255 }
+    if bi > 255 { bi = 255 }
+    if hasFilt {
+        var r = to_float(ri) * bright  var g = to_float(gi) * bright  var b = to_float(bi) * bright
+        r = (r - 128.0) * contrast + 128.0  g = (g - 128.0) * contrast + 128.0  b = (b - 128.0) * contrast + 128.0
+        if gray > 0.0 { let l = 0.299 * r + 0.587 * g + 0.114 * b  r = r + (l - r) * gray  g = g + (l - g) * gray  b = b + (l - b) * gray }
+        if sep > 0.0 { let sr = 0.393 * r + 0.769 * g + 0.189 * b  let sg = 0.349 * r + 0.686 * g + 0.168 * b  let sb = 0.272 * r + 0.534 * g + 0.131 * b  r = r + (sr - r) * sep  g = g + (sg - g) * sep  b = b + (sb - b) * sep }
+        if sat != 1.0 { let l = 0.299 * r + 0.587 * g + 0.114 * b  r = l + (r - l) * sat  g = l + (g - l) * sat  b = l + (b - l) * sat }
+        if inv > 0.0 { r = r + (255.0 - r - r) * inv  g = g + (255.0 - g - g) * inv  b = b + (255.0 - b - b) * inv }
+        ri = fclamp255(r)  gi = fclamp255(g)  bi = fclamp255(b)
+    }
+    blend_px(c, x, y, ri, gi, bi, a, alpha, 0, 0, c.w, c.h)
+}
+/// composite a premultiplied layer onto `c` at (ox0,oy0), `alpha` (0..255) scaling it, through the
+/// colour filter when `hasFilt`.
+pub fn rgba_blit(c: CpuCanvas, off: CpuCanvas, ox0: Int, oy0: Int, hasFilt: Bool, gray: Float, bright: Float, inv: Float, sep: Float, contrast: Float, sat: Float, alpha: Int) {
+    var y = 0
+    while y < off.h {
+        let dy = oy0 + y
+        if dy >= 0 && dy < c.h {
+            var x = 0
+            while x < off.w {
+                let dx = ox0 + x
+                if dx >= 0 && dx < c.w {
+                    var p = 0
+                    unsafe { p = peek32(off.buf + (y * off.w + x) * 4) }
+                    rgba_blend_px(c, dx, dy, p, alpha, hasFilt, gray, bright, inv, sep, contrast, sat)
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+}
+// a premultiplied pixel of `off`, or transparent outside it.
+fn rgba_tap(off: CpuCanvas, x: Int, y: Int) -> Int {
+    if x < 0 || y < 0 || x >= off.w || y >= off.h { return 0 }
+    var p = 0
+    unsafe { p = peek32(off.buf + (y * off.w + x) * 4) }
+    return p
+}
+/// composite a premultiplied layer placed at (ox0,oy0) onto `c`, scaled by (sx,sy) then rotated
+/// (cosR,sinR) about (cx,cy), sampled bilinearly (a layer stretched several times over must not turn
+/// to blocks) and clipped to (kx0,ky0)-(kx1,ky1).
+pub fn rgba_blit_transformed(c: CpuCanvas, off: CpuCanvas, ox0: Int, oy0: Int, cx: Float, cy: Float, sx: Float, sy: Float, cosR: Float, sinR: Float, alpha: Int, kx0: Float, ky0: Float, kx1: Float, ky1: Float) {
+    if sx == 0.0 || sy == 0.0 { return }
+    var dx0 = 1000000.0  var dy0 = 1000000.0  var dx1 = 0.0 - 1000000.0  var dy1 = 0.0 - 1000000.0
+    var ci = 0
+    while ci < 4 {
+        var px = to_float(ox0)  var py = to_float(oy0)
+        if ci == 1 || ci == 3 { px = to_float(ox0 + off.w) }
+        if ci == 2 || ci == 3 { py = to_float(oy0 + off.h) }
+        let vx = (px - cx) * sx  let vy = (py - cy) * sy
+        let tx = cx + vx * cosR - vy * sinR  let ty = cy + vx * sinR + vy * cosR
+        if tx < dx0 { dx0 = tx }
+        if ty < dy0 { dy0 = ty }
+        if tx > dx1 { dx1 = tx }
+        if ty > dy1 { dy1 = ty }
+        ci = ci + 1
+    }
+    let isx = 1.0 / sx  let isy = 1.0 / sy
+    var y = imax(imax(0, ffloor_i(ky0)), ffloor_i(dy0))
+    let ylim = imin(imin(c.h, fceil_i(ky1)), fceil_i(dy1))
+    let xlo = imax(imax(0, ffloor_i(kx0)), ffloor_i(dx0))
+    let xhi = imin(imin(c.w, fceil_i(kx1)), fceil_i(dx1))
+    while y < ylim {
+        var x = xlo
+        while x < xhi {
+            let rx = to_float(x) + 0.5 - cx  let ry = to_float(y) + 0.5 - cy
+            let ux = (rx * cosR + ry * sinR) * isx  let uy = (0.0 - rx * sinR + ry * cosR) * isy
+            let fx = cx + ux - to_float(ox0) - 0.5  let fy = cy + uy - to_float(oy0) - 0.5
+            let ix = ffloor_i(fx)  let iy = ffloor_i(fy)
+            if ix >= 0 - 1 && iy >= 0 - 1 && ix < off.w && iy < off.h {
+                let tx = fx - to_float(ix)  let ty = fy - to_float(iy)
+                let p00 = rgba_tap(off, ix, iy)  let p10 = rgba_tap(off, ix + 1, iy)
+                let p01 = rgba_tap(off, ix, iy + 1)  let p11 = rgba_tap(off, ix + 1, iy + 1)
+                let w00 = (1.0 - tx) * (1.0 - ty)  let w10 = tx * (1.0 - ty)  let w01 = (1.0 - tx) * ty  let w11 = tx * ty
+                let a = to_int(to_float((p00 >> 24) & 255) * w00 + to_float((p10 >> 24) & 255) * w10 + to_float((p01 >> 24) & 255) * w01 + to_float((p11 >> 24) & 255) * w11 + 0.5)
+                if a > 0 {
+                    let r = to_int(to_float((p00 >> 16) & 255) * w00 + to_float((p10 >> 16) & 255) * w10 + to_float((p01 >> 16) & 255) * w01 + to_float((p11 >> 16) & 255) * w11 + 0.5)
+                    let g = to_int(to_float((p00 >> 8) & 255) * w00 + to_float((p10 >> 8) & 255) * w10 + to_float((p01 >> 8) & 255) * w01 + to_float((p11 >> 8) & 255) * w11 + 0.5)
+                    let b = to_int(to_float(p00 & 255) * w00 + to_float(p10 & 255) * w10 + to_float(p01 & 255) * w01 + to_float(p11 & 255) * w11 + 0.5)
+                    rgba_blend_px(c, x, y, rgba_pack(a, r, g, b), alpha, false, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0)
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+fn fill_conic_gradient_dev(c: CpuCanvas, r: Rect, poss: Vec<Float>, cols: Vec<Color>) {
+    let ns = poss.len()
+    if ns == 0 { return }
+    if ns == 1 { fill_rect_cl(c, r, cols[0], 0.0, clip_full(c))  return }
+    let x0 = imax(0, ffloor_i(r.min.x))
+    let y0 = imax(0, ffloor_i(r.min.y))
+    let x1 = imin(c.w, fceil_i(r.max.x))
+    let y1 = imin(c.h, fceil_i(r.max.y))
+    let cxp = (r.min.x + r.max.x) * 0.5
+    let cyp = (r.min.y + r.max.y) * 0.5
+    var y = y0
+    while y < y1 {
+        let dy = to_float(y) + 0.5 - cyp
+        var x = x0
+        while x < x1 {
+            let dx = to_float(x) + 0.5 - cxp
+            var t = m::atan2(dx, 0.0 - dy) / 6.283185307179586             // from top, clockwise
+            if t < 0.0 { t = t + 1.0 }
+            var si = 0
+            while si < ns - 1 && t > poss[si + 1] { si = si + 1 }
+            var lo = si  var hi = si + 1
+            if hi >= ns { hi = ns - 1 }
+            let plo = poss[lo]  let phi = poss[hi]
+            var f = 0.0
+            if phi > plo { f = (t - plo) / (phi - plo) }
+            if f < 0.0 { f = 0.0 }
+            if f > 1.0 { f = 1.0 }
+            let a = cols[lo]  let b = cols[hi]
+            let av = a.a + to_int(to_float(b.a - a.a) * f)
+            if av > 2 {
+                blend_px(c, x, y, a.r + to_int(to_float(b.r - a.r) * f), a.g + to_int(to_float(b.g - a.g) * f), a.b + to_int(to_float(b.b - a.b) * f), av, 255, 0, 0, c.w, c.h)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// stroke the outline of `r` with `col`, `width` px thick (inset), clipped to `cl`.
+fn stroke_rect_cl(c: CpuCanvas, r: Rect, col: Color, width: Float, cl: Clip) {
+    var w = width
+    if w < 1.0 { w = 1.0 }
+    var x0 = ffloor_i(r.min.x)
+    var y0 = ffloor_i(r.min.y)
+    var x1 = fceil_i(r.max.x)
+    var y1 = fceil_i(r.max.y)
+    var t = to_int(w)
+    if t < 1 { t = 1 }
+    var cr = col.r  var cg = col.g  var cb = col.b  var ca = col.a
+    var bx0 = cl.x0  var by0 = cl.y0  var bx1 = cl.x1  var by1 = cl.y1
+    var y = imax(by0, y0)
+    var ymax = imin(by1, y1)
+    while y < ymax {
+        var x = imax(bx0, x0)
+        var xmax = imin(bx1, x1)
+        while x < xmax {
+            var edge = false
+            if x < x0 + t || x >= x1 - t { edge = true }
+            if y < y0 + t || y >= y1 - t { edge = true }
+            if edge { blend_px(c, x, y, cr, cg, cb, ca, 255, bx0, by0, bx1, by1) }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// split `s` on '\n' into lines (wrapped nori_ui text arrives as one primitive with newlines).
+fn split_lines(s: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var start = 0
+    var i = 0
+    var n = s.len()
+    while i < n {
+        if ord(s.at(i)) == 10 { out.push(s.slice(start, i))  start = i + 1 }
+        i = i + 1
+    }
+    out.push(s.slice(start, n))
+    return out
+}
+// draw one baseline of glyphs at (bx, baseline). Per-glyph font fallback: a codepoint the primary face
+// lacks (.notdef) is drawn from the canvas fallback face if it has it, so a page's Latin-subset web font
+// doesn't turn accented / non-Latin letters into tofu.
+// text-AA gamma: the correction that decides whether a glyph reads as its true weight or as a bolder
+// one, keyed on the text colour's luminance the way Skia's mask gamma is.
+//
+// Coverage blended straight into an sRGB buffer does not land where the eye expects: the same 50%
+// edge pixel reads too dark under black-on-white and too dim under white-on-black, so the same curve
+// cannot serve both, and the fitted exponents straddle 1.0: dark text needs its edges lightened,
+// light text needs them darkened. A single exponent for every colour would lift every partial
+// pixel and make the far more common dark-on-light body text read as semi-bold.
+//
+// The endpoints are measured against a reference Chromium render, not chosen: render the same string
+// in both polarities, then solve for the exponent whose ink mass matches. Refit whenever the
+// rasterizer changes, since the two are coupled: gamma only acts on partial-coverage pixels and
+// hinting is what removes them. Fitted at 12 and 16px, where the two sizes agree; the zone rounding in
+// std/font compresses a glyph slightly at small sizes and stretches it at large ones, so 24px lands
+// a few percent the other way and no single exponent can serve every size.
+// Eight buckets is what Skia carries too (3 luminance bits), and the whole table is built once on
+// first use, so the per-pixel cost stays a single index.
+global g_txg_lut: Vec<Int>
+global g_txg_has: Int = 0
+fn TXG_BUCKETS() -> Int { return 8 }
+fn txg_build() {
+    g_txg_lut = vec()
+    var b = 0
+    while b < TXG_BUCKETS() {
+        let lum = (to_float(b) + 0.5) / to_float(TXG_BUCKETS())
+        let gm = 1.110 - 0.320 * lum                          // black text 1.09 ... white text 0.81
+        var i = 0
+        while i < 256 { g_txg_lut.push(to_int(255.0 * m::pow(to_float(i) / 255.0, gm) + 0.5))  i = i + 1 }
+        b = b + 1
+    }
+    g_txg_has = 1
+}
+// which table a text colour uses: Rec.601 luminance, quantised to the bucket count.
+fn txg_bucket(r: Int, g: Int, b: Int) -> Int {
+    let lum = (r * 299 + g * 587 + b * 114) / 1000            // 0..255
+    var k = lum * TXG_BUCKETS() / 256
+    if k < 0 { k = 0 }
+    if k >= TXG_BUCKETS() { k = TXG_BUCKETS() - 1 }
+    return k
+}
+fn txgamma(bucket: Int, cv: Int) -> Int {
+    if g_txg_has == 0 { txg_build() }
+    return g_txg_lut[bucket * 256 + cv]
+}
+fn draw_line(c: CpuCanvas, bx: Float, baseline: Int, text: Str, size: Float, col: Color, cl: Clip) {
+    draw_line_g(c, bx, baseline, text, size, col, cl, 0, 0, 0, 0, 0, 0.0, 1.0, 1, 0.0, 0.0, font::BIDI_AUTO(), "", 0)
+}
+// One baseline, optionally filled with a linear colour ramp instead of a flat colour: `gon` = 1
+// turns it on, (gtr,gtg,gtb,gta) is the TO colour, and the ramp runs over [gax, gax+gaxd) along x
+// when `ghoriz` = 1 and along y otherwise. This is the CPU half of PaintPrimitive's has_grad/grad_*
+// and matches the GPU painter's gradient shader, which samples the fragment's screen
+// position, so the parameter is pixel-center (x + 0.5), the same value the GPU's @builtin(position)
+// carries, and the two backends land on the same t. Scalar args only (see blend_px).
+// `dir` is the line's direction (font::BIDI_*; layout says which, AUTO lets the line find its own),
+// `lang` its language, and `stack` the text engine's font stack: 0 draws with the canvas's faces,
+// another stack with the engine pool's faces, the ones layout measured with.
+fn draw_line_g(c: CpuCanvas, bx: Float, baseline: Int, text: Str, size: Float, col: Color, cl: Clip, gon: Int, gtr: Int, gtg: Int, gtb: Int, gta: Int, gax: Float, gaxd: Float, ghoriz: Int, lsp: Float, wsp: Float, dir: Int, lang: Str, stack: Int) {
+    var cr = col.r  var cg = col.g  var cb = col.b  var ca = col.a
+    let gb = txg_bucket(cr, cg, cb)                           // one gamma table for the whole run
+    // blend_px bounds-checks against these four and nothing else, so they are the buffer guard as much
+    // as they are the clip. A caller passing a rect from its own coordinate space (a CSS overflow box
+    // taller than the canvas) would otherwise write past the end of `buf`.
+    var bx0 = imax(cl.x0, 0)  var by0 = imax(cl.y0, 0)
+    var bx1 = imin(cl.x1, c.w)  var by1 = imin(cl.y1, c.h)
+    var cps = font::utf8_codepoints(text)
+    // letter_spacing / word_spacing: one table, shared with measurement and with paint_gpu
+    // (layout::text_spacing_offsets_cps), so the run is drawn at the width it was measured
+    // at and both painters put the same glyph on the same column. A glyph takes the offset of the
+    // character its cluster starts at; the line is shaped, so a ligature, a mark or a conjunct is not
+    // one glyph per codepoint.
+    var xsp = text_spacing_offsets_cps(cps, lsp, wsp)
+    // the line, shaped through the primary face with the fallback face behind it: bidi runs in
+    // visual order, OpenType substitution and positioning (GPOS kerning, marks, Arabic joining,
+    // Indic conjuncts), and per-cluster font choice: a cluster the primary face lacks is drawn from
+    // the fallback, with the fallback's own shaping.
+    let pooled = stack != 0 && text_engine_on()
+    var line = font::ShapedLine { glyphs: vec(), width: 0.0 }
+    if pooled { line = text_engine_shape(text, size, stack, dir, lang) }
+    else { line = font::shape_line_pair(c.f, c.fb, c.has_fb, text, size, dir, lang, "") }
+    var i = 0
+    while i < line.glyphs.len() {
+        let lg = line.glyphs[i]
+        // a color glyph (an emoji: CBDT bitmap or COLR layers) is drawn in its own colors; the text
+        // color is its COLR foreground and its alpha the text's
+        var colored = false
+        if pooled { colored = font::font_has_color(text_engine_face(lg.font)) && font::glyph_is_color(text_engine_face(lg.font), lg.gid) }
+        else if lg.font == 1 { colored = font::font_has_color(c.fb) && font::glyph_is_color(c.fb, lg.gid) }
+        else { colored = font::font_has_color(c.f) && font::glyph_is_color(c.f, lg.gid) }
+        if colored {
+            let fg = (cr << 24) | (cg << 16) | (cb << 8) | 255
+            var cs = font::rasterize_color_span(c.f, lg.gid, size, fg)
+            if pooled { cs = font::rasterize_color_span(text_engine_face(lg.font), lg.gid, size, fg) }
+            else if lg.font == 1 { cs = font::rasterize_color_span(c.fb, lg.gid, size, fg) }
+            var ci = lg.char_index
+            if ci >= xsp.len() { ci = xsp.len() - 1 }
+            let sx = ffloor_i(bx + lg.x + lg.x_off + xsp[ci]) + cs.left
+            let sy = baseline - ffloor_i(lg.y_off + 0.5) - cs.top
+            var oy = 0
+            while oy < cs.h {
+                var ox = 0
+                while ox < cs.w {
+                    let p = font::color_span_at(cs, oy * cs.w + ox)
+                    let pa = p & 255
+                    if pa > 0 {
+                        // un-premultiply for blend_px, which takes a straight color and an alpha
+                        let ur = (((p >> 24) & 255) * 255 + pa / 2) / pa
+                        let ug = (((p >> 16) & 255) * 255 + pa / 2) / pa
+                        let ub = (((p >> 8) & 255) * 255 + pa / 2) / pa
+                        blend_px(c, sx + ox, sy + oy, imin(ur, 255), imin(ug, 255), imin(ub, 255), pa * ca / 255, 255, bx0, by0, bx1, by1)
+                    }
+                    ox = ox + 1
+                }
+                oy = oy + 1
+            }
+            i = i + 1
+            continue
+        }
+        var g = font::rasterize_span(c.f, lg.gid, size)
+        if pooled { g = font::rasterize_span(text_engine_face(lg.font), lg.gid, size) }
+        else if lg.font == 1 { g = font::rasterize_span(c.fb, lg.gid, size) }
+        if g.w > 0 {
+            var ci = lg.char_index
+            if ci >= xsp.len() { ci = xsp.len() - 1 }
+            var sx = ffloor_i(bx + lg.x + lg.x_off + xsp[ci]) + g.left
+            var sy = baseline - ffloor_i(lg.y_off + 0.5) - g.top
+            var gw = g.w
+            var oy = 0
+            while oy < g.h {
+                var ox = 0
+                while ox < gw {
+                    var cv = font::glyph_span_cov(g, oy * gw + ox)
+                    if cv > 0 {
+                        if gon == 1 {
+                            var uu = 0.0
+                            if ghoriz == 1 { uu = (to_float(sx + ox) + 0.5 - gax) / gaxd } else { uu = (to_float(sy + oy) + 0.5 - gax) / gaxd }
+                            uu = fclamp01(uu)
+                            blend_px(c, sx + ox, sy + oy, cr + to_int(to_float(gtr - cr) * uu), cg + to_int(to_float(gtg - cg) * uu), cb + to_int(to_float(gtb - cb) * uu), ca + to_int(to_float(gta - ca) * uu), txgamma(gb, cv), bx0, by0, bx1, by1)
+                        } else { blend_px(c, sx + ox, sy + oy, cr, cg, cb, ca, txgamma(gb, cv), bx0, by0, bx1, by1) }
+                    }
+                    ox = ox + 1
+                }
+                oy = oy + 1
+            }
+        }
+        i = i + 1
+    }
+}
+/// px from a text box's top edge down to its first baseline at `size`: the font's real vertical
+/// metrics (hhea, scaled to px by std/font's font_v_metrics_px), centred in the line box the layout
+/// reserved, by layout::text_baseline_in_box. It is not a `size * k` guess, and not the raw ascent either.
+/// This is the single place paint_cpu turns layout::pp_text's top-left `pos` into a baseline;
+/// paint_gpu::gpu_text_baseline_offset is the same rule on the other backend, and the dock's
+/// TextLabel.top goes through it too, so there is one rule and not two.
+/// A fontless canvas cannot know an ascent and falls back to 0.82 em, which goes
+/// through the same centring so the two cases agree.
+pub fn cpu_text_baseline_offset(c: CpuCanvas, size: Float) -> Float {
+    if !c.has_font { return text_baseline_in_box(size, size * 0.82, size * (0.0 - 0.18), 0.0) }
+    let v = font::font_v_metrics_px(c.f, size)
+    return text_baseline_in_box(size, v.ascent, v.descent, v.line_gap)
+}
+// draw `text` at (pos.x, baseline pos.y) at `size` px via std/font, clipped to `cl`. Splits on '\n'
+// (nori_ui wraps a paragraph into one primitive with newlines) and advances one line height per line.
+pub fn draw_text_cl(c: CpuCanvas, pos: Vec2, text: Str, size: Float, col: Color, cl: Clip) {
+    let nox: Vec<Float> = vec()
+    draw_text_g(c, pos, text, size, col, cl, 0, 0, 0, 0, 0, 0.0, 1.0, 1, 0.0, 0.0, "", nox, 1.0, "", 0)
+}
+// `line_dir` / `line_x` / `lang` / `stack` are the text primitive's (see layout::PaintPrimitive):
+// each line's direction and x offset, scaled here by `xs` (the canvas scale).
+fn draw_text_g(c: CpuCanvas, pos: Vec2, text: Str, size: Float, col: Color, cl: Clip, gon: Int, gtr: Int, gtg: Int, gtb: Int, gta: Int, gax: Float, gaxd: Float, ghoriz: Int, lsp: Float, wsp: Float, line_dir: Str, line_x: Vec<Float>, xs: Float, lang: Str, stack: Int) {
+    if !c.has_font { return }
+    var lines = split_lines(text)
+    // The box's rhythm, not the face's; see the note on paint_gpu::emit_text_g.
+    var line_h = text_line_height(size)
+    var li = 0
+    while li < lines.len() {
+        var baseline = ffloor_i(pos.y + to_float(li) * line_h)
+        var dir = font::BIDI_AUTO()
+        if li < line_dir.len() { if ord(line_dir.at(li)) == 82 { dir = font::BIDI_RTL() } else { dir = font::BIDI_LTR() } }
+        var x = pos.x
+        if li < line_x.len() { x = x + line_x[li] * xs }
+        draw_line_g(c, x, baseline, lines[li], size, col, cl, gon, gtr, gtg, gtb, gta, gax, gaxd, ghoriz, lsp, wsp, dir, lang, stack)
+        li = li + 1
+    }
+}
+
+// The eight outline directions of the text outline dilation:
+// 4 axis-aligned at `w`, 4 diagonal at `w * 0.70710677`).
+fn tofx_dx(w: Float, k: Int) -> Float {
+    if k == 0 { return w }
+    if k == 1 { return 0.0 - w }
+    if k == 2 { return 0.0 }
+    if k == 3 { return 0.0 }
+    if k == 4 { return w * 0.70710677 }
+    if k == 5 { return 0.0 - w * 0.70710677 }
+    if k == 6 { return w * 0.70710677 }
+    return 0.0 - w * 0.70710677
+}
+fn tofx_dy(w: Float, k: Int) -> Float {
+    if k == 0 { return 0.0 }
+    if k == 1 { return 0.0 }
+    if k == 2 { return w }
+    if k == 3 { return 0.0 - w }
+    if k == 4 { return w * 0.70710677 }
+    if k == 5 { return w * 0.70710677 }
+    if k == 6 { return 0.0 - w * 0.70710677 }
+    return 0.0 - w * 0.70710677
+}
+
+/// draw text with the PaintPrimitive text effects: an outline of `ocol` at `ow` px (0 = none) and
+/// an optional linear gradient from `col` to `gto` along [gax, gax+gaxd) (x if `ghoriz`, else y).
+///
+/// The outline is eight offset copies of the run, drawn under the glyphs, rather than an
+/// alpha-dilate of the glyph mask. The reason is parity: a dilate reads
+/// neighbouring glyphs out of a shared atlas, which the CPU rasterizer (it has no atlas, only
+/// one glyph bitmap at a time) cannot reproduce, so the two painters would disagree exactly where
+/// glyphs are packed close. Offset copies are the same drawing on both backends and need no shader.
+pub fn draw_text_fx_cl(c: CpuCanvas, pos: Vec2, text: Str, size: Float, col: Color, cl: Clip, ocol: Color, ow: Float, gon: Bool, gto: Color, gax: Float, gaxd: Float, ghoriz: Bool) { draw_text_fx_sp_cl(c, pos, text, size, col, cl, ocol, ow, gon, gto, gax, gaxd, ghoriz, 0.0, 0.0) }
+/// draw_text_fx_cl carrying the primitive's letter_spacing / word_spacing (px, already scaled).
+pub fn draw_text_fx_sp_cl(c: CpuCanvas, pos: Vec2, text: Str, size: Float, col: Color, cl: Clip, ocol: Color, ow: Float, gon: Bool, gto: Color, gax: Float, gaxd: Float, ghoriz: Bool, lsp: Float, wsp: Float) {
+    let nox: Vec<Float> = vec()
+    draw_text_fx_lines(c, pos, text, size, col, cl, ocol, ow, gon, gto, gax, gaxd, ghoriz, lsp, wsp, "", nox, 1.0, "", 0)
+}
+// draw_text_fx_sp_cl with the primitive's per-line directions and offsets, language and font stack
+fn draw_text_fx_lines(c: CpuCanvas, pos: Vec2, text: Str, size: Float, col: Color, cl: Clip, ocol: Color, ow: Float, gon: Bool, gto: Color, gax: Float, gaxd: Float, ghoriz: Bool, lsp: Float, wsp: Float, line_dir: Str, line_x: Vec<Float>, xs: Float, lang: Str, stack: Int) {
+    // `pos` is the kind-2 text box top-left (layout::pp_text's contract). The rasterizer wants a
+    // baseline, so drop by one real font ascent here, once, before the outline copies, so all
+    // nine stamps land on the same converted origin.
+    var top = vec2(pos.x, pos.y + cpu_text_baseline_offset(c, size))
+    if ow > 0.0 && ocol.a > 0 {
+        var k = 0
+        while k < 8 {
+            draw_text_g(c, vec2(top.x + tofx_dx(ow, k), top.y + tofx_dy(ow, k)), text, size, ocol, cl, 0, 0, 0, 0, 0, 0.0, 1.0, 1, lsp, wsp, line_dir, line_x, xs, lang, stack)
+            k = k + 1
+        }
+    }
+    var gi = 0
+    if gon { gi = 1 }
+    var hi = 0
+    if ghoriz { hi = 1 }
+    var dd = gaxd
+    if dd < 1.0 { dd = 1.0 }
+    draw_text_g(c, top, text, size, col, cl, gi, gto.r, gto.g, gto.b, gto.a, gax, dd, hi, lsp, wsp, line_dir, line_x, xs, lang, stack)
+}
+
+/// fill `r` with `col` (rounded corners of `radius` px) over the whole canvas.
+pub fn fill_rect(c: CpuCanvas, r: Rect, col: Color, radius: Float) { fill_rect_cl(c, dsc_r(c, r), col, dsc(c, radius), clip_full(c)) }
+/// stroke a rounded border ring: `width` px just inside `r`, corners of `radius` px (a circle when
+/// radius = half the box). Coverage = outer rounded rect minus the inner one: an anti-aliased ring.
+// coverage of pixel (px,py) against a rounded rect, valid anywhere (corner_cov assumes the
+// pixel is inside the rect and returns 255 outside, so probing an inner rect from outside for
+// ring strokes would cancel the straight edges, leaving only the corner arcs).
+fn rect_cov(px: Float, py: Float, minx: Float, miny: Float, maxx: Float, maxy: Float, radius: Float) -> Int {
+    var ax = px - minx
+    if maxx - px < ax { ax = maxx - px }
+    var ay = py - miny
+    if maxy - py < ay { ay = maxy - py }
+    let base = fclamp01(ax + 0.5) * fclamp01(ay + 0.5)
+    if base <= 0.0 { return 0 }
+    let cc = corner_cov(px, py, minx, miny, maxx, maxy, radius)
+    return to_int(base * to_float(cc))
+}
+pub fn stroke_round(c: CpuCanvas, r: Rect, col: Color, width: Float, radius: Float) {
+    stroke_round_dev(c, dsc_r(c, r), col, dsc(c, width), dsc(c, radius), clip_full(c))
+}
+/// ...restricted to a clip box (CSS px). A square fill can be clipped by shrinking the rectangle, so
+/// callers do that; a rounded one cannot (trimming its box moves the corners), so `overflow: hidden`
+/// over a rounded child needs the clip carried down to the per-pixel loop, which is here.
+pub fn stroke_round_clip(c: CpuCanvas, r: Rect, col: Color, width: Float, radius: Float, x0: Float, y0: Float, x1: Float, y1: Float) {
+    stroke_round_dev(c, dsc_r(c, r), col, dsc(c, width), dsc(c, radius), clip_px(c, x0, y0, x1, y1))
+}
+/// a rounded `fill_rect` restricted to a clip box (CSS px), the fill counterpart of the above.
+pub fn fill_rect_clip(c: CpuCanvas, r: Rect, col: Color, radius: Float, x0: Float, y0: Float, x1: Float, y1: Float) {
+    fill_rect_cl(c, dsc_r(c, r), col, dsc(c, radius), clip_px(c, x0, y0, x1, y1))
+}
+fn clip_px(c: CpuCanvas, x0: Float, y0: Float, x1: Float, y1: Float) -> Clip {
+    return Clip {
+        x0: imax(0, ffloor_i(dsc(c, x0))), y0: imax(0, ffloor_i(dsc(c, y0))),
+        x1: imin(c.w, fceil_i(dsc(c, x1))), y1: imin(c.h, fceil_i(dsc(c, y1)))
+    }
+}
+fn stroke_round_dev(c: CpuCanvas, r: Rect, col: Color, width: Float, radius: Float, cl: Clip) {
+    var cr = col.r  var cg = col.g  var cb = col.b  var ca = col.a
+    let ominx = r.min.x  let ominy = r.min.y  let omaxx = r.max.x  let omaxy = r.max.y
+    let iminx = ominx + width  let iminy = ominy + width
+    let imaxx = omaxx - width  let imaxy = omaxy - width
+    var irad = radius - width
+    if irad < 0.0 { irad = 0.0 }
+    var x0 = imax(cl.x0, ffloor_i(ominx))
+    var y0 = imax(cl.y0, ffloor_i(ominy))
+    var x1 = imin(cl.x1, fceil_i(omaxx))
+    var y1 = imin(cl.y1, fceil_i(omaxy))
+    var y = y0
+    while y < y1 {
+        var x = x0
+        while x < x1 {
+            let px = to_float(x) + 0.5  let py = to_float(y) + 0.5
+            let co = rect_cov(px, py, ominx, ominy, omaxx, omaxy, radius)
+            var ci = 0
+            if imaxx > iminx && imaxy > iminy { ci = rect_cov(px, py, iminx, iminy, imaxx, imaxy, irad) }
+            let cov = co - ci
+            if cov > 0 { blend_px(c, x, y, cr, cg, cb, ca, cov, cl.x0, cl.y0, cl.x1, cl.y1) }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+/// stroke the outline of `r` with `col`, `width` px thick.
+pub fn stroke(c: CpuCanvas, r: Rect, col: Color, width: Float) { stroke_rect_cl(c, dsc_r(c, r), col, dsc(c, width), clip_full(c)) }
+/// draw `text` at (pos.x, baseline pos.y) at `size` px in `col`.
+pub fn text(c: CpuCanvas, pos: Vec2, str: Str, size: Float, col: Color) { draw_text_cl(c, vec2(dsc(c, pos.x), dsc(c, pos.y)), str, dsc(c, size), col, clip_full(c)) }
+/// like `text`, but clipped to the rectangle (x0,y0)-(x1,y1), for text inside a scrolled/overflowing box.
+pub fn text_clip(c: CpuCanvas, pos: Vec2, str: Str, size: Float, col: Color, x0: Float, y0: Float, x1: Float, y1: Float) {
+    draw_text_cl(c, vec2(dsc(c, pos.x), dsc(c, pos.y)), str, dsc(c, size), col, Clip { x0: to_int(dsc(c, x0)), y0: to_int(dsc(c, y0)), x1: to_int(dsc(c, x1)), y1: to_int(dsc(c, y1)) })
+}
+/// blit a straight RGBA8 image (`src` = iw*ih*4 bytes, byte0=R..byte3=A) into `r` (physical px),
+/// nearest-neighbor scaled and alpha-blended over the canvas. See std/image + render::image.
+pub fn blit_rgba(c: CpuCanvas, r: Rect, src: Int, iw: Int, ih: Int) {
+    blit_rgba_clip_dev(c, dsc_r(c, r), src, iw, ih, 0, 0, c.w, c.h)
+}
+// blit `src` (iw×ih RGBA) scaled to dest rect `r`, clipped to [cbx0,cby0,cbx1,cby1) ∩ canvas. Lets a
+// `cover`-scaled image (larger than its box) be cropped to the box instead of overflowing onto siblings.
+pub fn blit_rgba_clip(c: CpuCanvas, r: Rect, src: Int, iw: Int, ih: Int, cbx0: Int, cby0: Int, cbx1: Int, cby1: Int) {
+    blit_rgba_clip_dev(c, dsc_r(c, r), src, iw, ih, dsc_i(c, cbx0), dsc_i(c, cby0), dsc_i(c, cbx1), dsc_i(c, cby1))
+}
+fn blit_rgba_clip_dev(c: CpuCanvas, r: Rect, src: Int, iw: Int, ih: Int, cbx0: Int, cby0: Int, cbx1: Int, cby1: Int) {
+    blit_rgba_clip_dev_a(c, r, src, iw, ih, cbx0, cby0, cbx1, cby1, 255)
+}
+// …at an overall alpha of `alpha` (0..255): an image primitive faded by a subtree's opacity
+// (layout/fx.nori), which arrives as the primitive's colour alpha. 255 is the unfaded case.
+fn blit_rgba_clip_dev_a(c: CpuCanvas, r: Rect, src: Int, iw: Int, ih: Int, cbx0: Int, cby0: Int, cbx1: Int, cby1: Int, alpha: Int) {
+    if alpha <= 0 { return }
+    if iw <= 0 || ih <= 0 || src == 0 { return }
+    let cl = Clip { x0: imax(0, cbx0), y0: imax(0, cby0), x1: imin(c.w, cbx1), y1: imin(c.h, cby1) }
+    let dw = r.max.x - r.min.x
+    let dh = r.max.y - r.min.y
+    if dw <= 0.0 || dh <= 0.0 { return }
+    let x0 = imax(cl.x0, ffloor_i(r.min.x))
+    let y0 = imax(cl.y0, ffloor_i(r.min.y))
+    let x1 = imin(cl.x1, fceil_i(r.max.x))
+    let y1 = imin(cl.y1, fceil_i(r.max.y))
+    if x1 <= x0 || y1 <= y0 { return }
+    // Finding the source pixel without dividing for it. Working out the source column as
+    // (x + 0.5 - left) / width * iw for every pixel written costs a float division and a float
+    // multiply each. On a video frame (two million pixels, thirty times a second) that would be
+    // the whole frame budget spent deciding which pixel to copy.
+    //
+    // The step between neighbouring source columns is constant, so it is worked out once and added.
+    // 16.16 fixed point, because Int here is 64-bit: iw at 65536 times its value cannot overflow for
+    // any image that fits in memory, and the fraction never drifts because it is never rounded until
+    // it is used.
+    let stepx = to_int((to_float(iw) / dw) * 65536.0)
+    let stepy = to_int((to_float(ih) / dh) * 65536.0)
+    let sx_at_x0 = to_int(((to_float(x0) + 0.5 - r.min.x) / dw) * to_float(iw) * 65536.0)
+    var sy_fx = to_int(((to_float(y0) + 0.5 - r.min.y) / dh) * to_float(ih) * 65536.0)
+    let buf = c.buf
+    let cw = c.w
+    var y = y0
+    while y < y1 {
+        var sy = sy_fx >> 16
+        if sy < 0 { sy = 0 }
+        if sy >= ih { sy = ih - 1 }
+        let srow = src + ((sy * iw) * 4)
+        var dst = buf + ((y * cw + x0) * 4)
+        var sx_fx = sx_at_x0
+        var x = x0
+        while x < x1 {
+            var sx = sx_fx >> 16
+            if sx < 0 { sx = 0 }
+            if sx >= iw { sx = iw - 1 }
+            // One read, not four. The source is RGBA in byte order, which little-endian makes the
+            // word A B G R; the canvas holds 0x00RRGGBB. So the opaque case (every pixel of a
+            // photograph or a video frame) is a swizzle and a store, with nothing to blend.
+            var w32 = 0
+            unsafe { w32 = peek32(srow + (sx * 4)) }
+            var sa = (w32 >> 24) & 255
+            if alpha < 255 { sa = rdiv255(sa * alpha) }
+            if sa >= 255 {
+                unsafe { poke32(dst, ((w32 & 255) << 16) | (w32 & 65280) | ((w32 >> 16) & 255) | over_a(c, 0, 255)) }
+            } else if sa > 0 {
+                blend_px(c, x, y, w32 & 255, (w32 >> 8) & 255, (w32 >> 16) & 255, sa, 255, cl.x0, cl.y0, cl.x1, cl.y1)
+            }
+            dst = dst + 4
+            sx_fx = sx_fx + stepx
+            x = x + 1
+        }
+        sy_fx = sy_fx + stepy
+        y = y + 1
+    }
+}
+/// the 0x00RRGGBB pixel at (x,y) (0 if out of bounds).
+pub fn pixel_at(c: CpuCanvas, x: Int, y: Int) -> Int {
+    if x < 0 || y < 0 || x >= c.w || y >= c.h { return 0 }
+    var px = 0
+    unsafe { px = peek32(c.buf + (y * c.w + x) * 4) }
+    return px
+}
+
+/// walk a ComputedOverlay's paint primitives and draw them into the canvas (fills, borders, text),
+/// honoring each primitive's clip rect.
+pub fn render_overlay(c: CpuCanvas, ov: ComputedOverlay) { render_overlay_opts(c, ov, false) }
+
+/// like render_overlay, but with `shadows` = draw a soft drop shadow behind each rounded, opaque
+/// filled rect (panels/buttons) before it, a visible effect layered on the same primitive set.
+pub fn render_overlay_opts(c: CpuCanvas, ov: ComputedOverlay, shadows: Bool) {
+    render_overlay_scaled(c, ov, shadows, 1.0)
+}
+
+fn cpu_gh(h: Bool) -> Int { if h { return 1 }  return 0 }
+fn scale_rect(r: Rect, s: Float) -> Rect {
+    return rect_min_max(vec2(r.min.x * s, r.min.y * s), vec2(r.max.x * s, r.max.y * s))
+}
+
+// PaintPrimitive kind 3 = image. The primitive carries no pixels and no size: its
+// `text` field holds the path already resolved by ui_layout_media, and `rect` is the panel it must
+// fit inside. Decoding goes through layout's shared cache (keyed on path + byte length + mtime,
+// LRU-evicted to 64 entries) so a document that shows the same image every frame decodes once.
+//
+// Fit rule: letterbox-contain, centered. The image is never stretched and
+// never cropped; the leftover strip on the short axis stays whatever was painted underneath.
+// A path that does not decode draws nothing, silently, matching the resolve failure path.
+fn draw_image_prim(c: CpuCanvas, r: Rect, path: Str, cl: Clip, col: Color) {
+    let alpha = col.a
+    var im = UiMediaImage { ok: false, px: 0, w: 0, h: 0 }
+    if ui_media_is_svg(path) {
+        // drawn at the device size it is shown at: the fit is the rect itself (the SVG's own viewBox
+        // keeps its proportions inside it)
+        im = ui_media_svg_load(path, fceil_i(r.max.x) - ffloor_i(r.min.x), fceil_i(r.max.y) - ffloor_i(r.min.y), col.r, col.g, col.b)
+        if !im.ok { return }
+        let fr = rect_min_max(vec2(to_float(ffloor_i(r.min.x)), to_float(ffloor_i(r.min.y))), vec2(to_float(fceil_i(r.max.x)), to_float(fceil_i(r.max.y))))
+        blit_rgba_clip_dev_a(c, fr, im.px, im.w, im.h, cl.x0, cl.y0, cl.x1, cl.y1, alpha)
+        return
+    }
+    im = ui_media_image_load(path)
+    if !im.ok { return }
+    let fit = ui_media_letterbox(r, im.w, im.h)
+    // The blit is clamped to the clip intersected with the canvas, which blit_rgba_clip_dev applies
+    // anyway; this is only the "< 1px after clamping, don't bother" early out.
+    let x0 = imax(imax(0, cl.x0), ffloor_i(fit.min.x))
+    let y0 = imax(imax(0, cl.y0), ffloor_i(fit.min.y))
+    let x1 = imin(imin(c.w, cl.x1), fceil_i(fit.max.x))
+    let y1 = imin(imin(c.h, cl.y1), fceil_i(fit.max.y))
+    if x1 - x0 < 1 || y1 - y0 < 1 { return }
+    blit_rgba_clip_dev_a(c, fit, im.px, im.w, im.h, cl.x0, cl.y0, cl.x1, cl.y1, alpha)
+}
+
+/// render an overlay laid out in logical coordinates into a buffer that is `s` times larger in each
+/// axis; every geometry (rects, text, radius, borders) is multiplied by `s`. For HiDPI/fractional
+/// scaling: lay out in logical units, render at physical resolution (crisp), and let the compositor's
+/// viewport map the physical buffer back to logical size. `s = 1.0` is the ordinary path.
+pub fn render_overlay_scaled(c: CpuCanvas, ov: ComputedOverlay, shadows: Bool, s: Float) {
+    var full = clip_full(c)
+    var i = 0
+    while i < ov.prims.len() {
+        cpu_draw_prim(c, ov.prims[i], shadows, s, full, full)
+        i = i + 1
+    }
+}
+
+/// one primitive, its own clip narrowed to `within` (the whole canvas, or a damaged region);
+/// `sh_cl` is the clip for its drop shadow, which never takes the primitive's own clip.
+fn cpu_draw_prim(c: CpuCanvas, prim: PaintPrimitive, shadows: Bool, s: Float, within: Clip, sh_cl: Clip) {
+    var cl = within
+    if prim.has_clip { cl = clip_and(clip_of_rect(c, scale_rect(prim.clip, s)), within) }
+    if cl.x1 <= cl.x0 || cl.y1 <= cl.y0 { if !(prim.kind == 0 && shadows) { return } }
+    var r = scale_rect(prim.rect, s)
+    if prim.kind == 0 {
+        if shadows && prim.radius > 0.5 && prim.color.a >= 250 {
+            drop_shadow_r_dev_cl(c, dsc_r(c, r), 0.0, dsc(c, 3.0 * s), dsc(c, 7.0 * s), color_rgb(0, 0, 0), 90, 0.0, sh_cl)   // = drop_shadow(c, r, 0, 3s, 7s, black, 90)
+        }
+        if cl.x1 <= cl.x0 || cl.y1 <= cl.y0 { return }
+        if prim.has_grad { fill_rect_grad_cl(c, r, prim.color, prim.radius * s, cl, prim.grad_to.r, prim.grad_to.g, prim.grad_to.b, prim.grad_to.a, prim.grad_a * s, prim.grad_b * s, cpu_gh(prim.grad_horizontal)) }
+        else { fill_rect_cl(c, r, prim.color, prim.radius * s, cl) }
+    }
+    else if prim.kind == 1 {
+        // A rounded outline when the primitive asks for one; `stroke_round_dev` handles it, so a
+        // bordered rounded box does not come out square.
+        if prim.radius > 0.0 { stroke_round_dev(c, r, prim.color, prim.border_w * s, prim.radius * s, cl) }
+        else { stroke_rect_cl(c, r, prim.color, prim.border_w * s, cl) }
+    }
+    else if prim.kind == 2 { draw_text_fx_lines(c, vec2(prim.pos.x * s, prim.pos.y * s), prim.text, prim.size_px * s, prim.color, cl, prim.outline_color, prim.outline_w * s, prim.has_grad, prim.grad_to, prim.grad_a * s, prim.grad_b * s, prim.grad_horizontal, prim.letter_spacing * s, prim.word_spacing * s, prim.line_dir, prim.line_x, s, prim.lang, prim.font) }
+    else if prim.kind == 3 { draw_image_prim(c, r, prim.text, cl, prim.color) }
+    else if prim.kind == 4 { box_shadow_dev(c, r, prim.radius * s, prim.border_w * s, prim.outline_w * s, prim.letter_spacing * s, prim.word_spacing * s, prim.color, cl) }
+}
+fn clip_and(a: Clip, b: Clip) -> Clip { return Clip { x0: imax(a.x0, b.x0), y0: imax(a.y0, b.y0), x1: imin(a.x1, b.x1), y1: imin(a.y1, b.y1) } }
+
+/// Repaint only what changed. `damage` is a list of logical rects (a retained document's
+/// `rdoc_frame(...).damage`); each is cleared to `bg` and every primitive that reaches into it is
+/// drawn again, clipped to it. Everything outside the damage is left as the previous frame drew it,
+/// so the canvas must hold that frame: draw the first frame (and any `full` one) with
+/// `clear` + `render_overlay_scaled`, and every later one with this.
+///
+/// The result is the same pixels a full repaint gives: every pixel inside a damaged rect is
+/// recomputed from the background up, in paint order, with the same coverage; clipping only
+/// decides which pixels are written, never how. Drop shadows are clipped to the damage and not to
+/// their primitive's clip, as the full repaint draws them.
+pub fn render_overlay_damage(c: CpuCanvas, ov: ComputedOverlay, damage: Vec<Rect>, shadows: Bool, s: Float, bg: Color) {
+    var di = 0
+    while di < damage.len() {
+        let dr = damage[di]
+        let dcl = clip_of_rect(c, scale_rect(dr, s))
+        if dcl.x1 > dcl.x0 && dcl.y1 > dcl.y0 {
+            fill_box(c, dcl, bg)
+            var i = 0
+            while i < ov.prims.len() {
+                // pp_bounds is generous (shadow, glyph overhang): a primitive that cannot reach this
+                // rect is skipped without being drawn
+                let b = pp_bounds(ov.prims[i])
+                if b.max.x >= dr.min.x && b.min.x <= dr.max.x && b.max.y >= dr.min.y && b.min.y <= dr.max.y {
+                    cpu_draw_prim(c, ov.prims[i], shadows, s, dcl, dcl)
+                }
+                i = i + 1
+            }
+        }
+        di = di + 1
+    }
+}
+/// fill an integer box with an opaque colour (the same pixels `clear` writes).
+fn fill_box(c: CpuCanvas, b: Clip, col: Color) {
+    let p = pack_px(c, col)
+    let buf = c.buf
+    var y = b.y0
+    while y < b.y1 {
+        var a = buf + (y * c.w + b.x0) * 4
+        let e = buf + (y * c.w + b.x1) * 4
+        while a < e { unsafe { poke32(a, p) }  a = a + 4 }
+        y = y + 1
+    }
+}
+
+/// pack the canvas into a binary PPM (P6) image string, for headless snapshot/verification.
+// The header is written into the same buffer as the pixels. Building the packed rgb buffer, then
+// the string `str_from_buf` copies out of it, then `hdr + body` would make three copies of the
+// image, and that last concatenation grows by doubling, so a 311MB image would claim a 1GB string.
+// On a very tall page (1280x81000) that costs more than painting it. One buffer, one copy out of it.
+pub fn to_ppm(c: CpuCanvas) -> Str {
+    let hdr = "P6" + (chr(10) + (to_str(c.w) + (" " + (to_str(c.h) + (chr(10) + ("255" + chr(10)))))))
+    let hn = hdr.len()
+    let n = c.w * c.h
+    var buf = 0
+    unsafe { buf = malloc(hn + n * 3) }
+    var k = 0
+    while k < hn { unsafe { poke8(buf + k, ord(hdr.at(k))) }  k = k + 1 }
+    var i = 0
+    while i < n {
+        var px = 0
+        unsafe { px = peek32(c.buf + i * 4) }
+        unsafe {
+            poke8(buf + hn + i * 3, ((px >> 16) & 255))
+            poke8(buf + hn + i * 3 + 1, ((px >> 8) & 255))
+            poke8(buf + hn + i * 3 + 2, (px & 255))
+        }
+        i = i + 1
+    }
+    var out = ""
+    unsafe { out = str_from_buf(buf, hn + n * 3) }
+    unsafe { free(buf) }
+    return out
+}
+
+// --- render std/nori_ui's dock / floating-window draw-lists (DrawRect + TextLabel) ---
+fn draw_rects(c: CpuCanvas, rects: Vec<DrawRect>, s: Float) {
+    var i = 0
+    while i < rects.len() { fill_rect(c, scale_rect(rects[i].rect, s), rects[i].color, 0.0)  i = i + 1 }
+}
+fn draw_labels(c: CpuCanvas, labels: Vec<TextLabel>, s: Float) {
+    var j = 0
+    while j < labels.len() {
+        var lb = labels[j]
+        var col = color_rgb(228, 231, 240)
+        if lb.color.present { col = lb.color.color }
+        var sz = 14.0
+        if lb.has_font_size { sz = lb.font_size }
+        // TextLabel.top is a text box top, the same quantity as a kind-2 pos, so it takes the same
+        // top -> baseline conversion, using the font's real ascent.
+        text(c, vec2(lb.left * s, (lb.top + cpu_text_baseline_offset(c, sz)) * s), lb.text, sz * s, col)
+        j = j + 1
+    }
+}
+/// draw a dock's chrome (panels, tab bars, splitters, buttons) from `layout_dock_ui`, geometry scaled
+/// by `s` (1.0 = logical). Draw per-panel content yourself over it.
+pub fn render_dock(c: CpuCanvas, res: DockLayoutResult, s: Float) { draw_rects(c, res.rects, s)  draw_labels(c, res.labels, s) }
+/// draw floating-window chrome (title bars, borders, buttons) from `layout_windows`, scaled by `s`.
+/// Draw per-window content yourself (iterate `layout_windows(...).windows` for each `content_rect`).
+pub fn render_windows(c: CpuCanvas, wr: WindowLayoutResult, s: Float) { draw_rects(c, wr.rects, s)  draw_labels(c, wr.labels, s) }

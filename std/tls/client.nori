@@ -1,0 +1,409 @@
+// A TLS 1.3 client: the handshake state machine, driven over an already-connected socket.
+//
+// The socket is a parameter and not something this opens, because resolving a name and connecting
+// are not TLS's business, and because it lets the whole handshake be driven over a pipe
+// in a test with no network at all.
+//
+// ---------------------------------------------------------------------------------------------
+// Certificates are verified: the chain is built to a trust anchor, every link is checked, and the
+// hostname must match. See verify.nori, which is where the trust decision actually lives.
+//
+// `--cfg tls_insecure_test` skips all of it. It is a compile-time switch on
+// purpose: there is no runtime option, no field and no argument that turns verification off, so no
+// caller can reach the insecure path by passing something, and in an ordinary build the accepting
+// branch is not in the binary at all. The project's test suite checks that, both ways.
+//
+// It exists so the record layer and handshake can be exercised against servers with self-signed
+// certificates, such as local OpenSSL and Go test servers, and for nothing else.
+// ---------------------------------------------------------------------------------------------
+
+import "std/net" as net
+import "std/crypto" as crypto
+import "std/time" as time
+
+/// A TLS connection. `err` is "" while it is healthy; once set, the connection is finished and
+/// every further operation is a no-op.
+pub struct Conn {
+    fd: Int, hlen: Int, keylen: Int,
+    rx: Keys, tx: Keys,
+    // The traffic secrets each direction's keys came from. A KeyUpdate derives the next secret
+    // from the current secret and not from the key: the key is one expansion further along, and
+    // ratcheting the wrong value produces keys that decrypt nothing with no error to say why.
+    rx_secret: Str, tx_secret: Str,
+    inbuf: Str,             // bytes read from the socket that are not yet a whole record
+    plain: Str,             // decrypted application data not yet handed to the caller
+    closed: Bool, err: Str
+}
+
+fn conn_failed(fd: Int, sink why: Str) -> Conn {
+    return Conn { fd: fd, hlen: 0, keylen: 0,
+                  rx: keys_new("", ""), tx: keys_new("", ""),
+                  rx_secret: "", tx_secret: "",
+                  inbuf: "", plain: "", closed: true, err: why }
+}
+
+// Read until the buffer holds one complete record, or the deadline passes. The size limit is
+// enforced by record_len before anything is read, so a peer that announces an impossible length
+// is refused rather than waited for.
+fn fill_one_record(inout c: Conn, timeout_ms: Int) -> Str {
+    var waited = 0
+    while true {
+        let n = record_len(c.inbuf)
+        if n < 0 { c.err = "peer announced a record over the size limit"  return "" }
+        if n > 0 {
+            let rec = c.inbuf.slice(0, n)
+            c.inbuf = c.inbuf.slice(n, c.inbuf.len())
+            return rec
+        }
+        if waited >= timeout_ms { c.err = "timed out waiting for a record"  return "" }
+        let ready = net::poll_read(c.fd, 200)
+        if ready < 0 { c.err = "socket error"  return "" }
+        if ready == 0 { waited = (waited + 200)  }
+        else {
+            let r = net::tcp_recv(c.fd, 16384)
+            if r.n <= 0 { c.err = "peer closed the connection mid-handshake"  return "" }
+            c.inbuf = (c.inbuf + r.data)
+        }
+    }
+    return ""
+}
+
+fn send_all(fd: Int, data: Str) -> Bool {
+    var off = 0
+    while off < data.len() {
+        let n = net::tcp_send(fd, data.slice(off, data.len()))
+        if n <= 0 { return false }
+        off = (off + n)
+    }
+    return true
+}
+
+/// Whether a server's certificate chain is acceptable. "" means yes.
+///
+/// Two independent things are checked here, and both are required.
+///
+/// The chain says the leaf certificate belongs to this hostname and was issued by someone this
+/// machine trusts. The CertificateVerify says the server holds the private key for that leaf: it
+/// is a signature over the handshake transcript, so it also binds the certificate to this
+/// connection rather than to a recording of someone else's.
+///
+/// Checking only the chain accepts anyone who can copy a certificate off the wire. Checking only
+/// the signature accepts anyone at all, since a self-signed certificate signs its own transcript
+/// perfectly well.
+fn check_certificate(chain: Vec<Str>, host: Str, thash: Str, cv: CertVerify) -> Str {
+    cfg(tls_insecure_test) {
+        // Reachable only in a build made with --cfg tls_insecure_test, which is used to drive the
+        // record layer and handshake against servers with self-signed certificates. It is absent
+        // from every other build.
+        return ""
+    }
+    if chain.len() == 0 { return "the server sent no certificate" }
+    if cv.signature.len() == 0 { return "the server sent no CertificateVerify" }
+    if thash.len() == 0 { return "no transcript to check the signature over" }
+
+    let bad = verify_chain_system(chain, host, time::unix_secs())
+    if bad.len() > 0 { return bad }
+
+    let leaf = parse_cert(chain[0])
+    if leaf.err.len() > 0 { return "the leaf certificate did not parse" }
+    let content = certificate_verify_content(thash, true)
+    let sigbad = verify_transcript_signature(leaf, cv, content)
+    if sigbad.len() > 0 { return sigbad }
+    return ""
+}
+
+fn fatal(inout c: Conn, desc: Int, sink why: Str) -> Conn {
+    // Tell the peer why, on a best-effort basis: if the connection is already keyed the alert is
+    // protected, and if it is not there is nothing to protect it with. A failure to send the alert
+    // changes nothing: the connection is over either way.
+    if c.tx.iv.len() == 12 {
+        let rec = record_seal(c.tx, ct_alert(), alert_fatal(desc))
+        if rec.len() > 0 { let _ = send_all(c.fd, rec) }
+    }
+    c.err = why
+    c.closed = true
+    return copy c
+}
+
+/// Run a TLS 1.3 handshake over `fd`, presenting `host` as the server name.
+///
+/// Returns a Conn whose `err` says what went wrong; there is no success that leaves `err` set and
+/// no failure that leaves it empty. Without `--cfg tls_insecure_test` this always fails, at the
+/// certificate.
+pub fn handshake(fd: Int, host: Str) -> Conn {
+    let hs_timeout = 15000
+
+    // A fresh ephemeral key per connection. `rand_bytes` is the kernel CSPRNG; using std/rand here
+    // would make the private key predictable from the seed.
+    let priv_key = crypto::rand_bytes(32)
+    // No randomness, no handshake. x25519_base reads 32 bytes whatever it is given, so a machine
+    // whose CSPRNG could not be reached would take the process down here rather than say so.
+    if priv_key.len() != 32 { return conn_failed(fd, "no secure randomness available on this system") }
+    let pub_key = crypto::x25519_base(priv_key)
+    if pub_key.len() != 32 { return conn_failed(fd, "could not generate a key share") }
+    let random = crypto::rand_bytes(32)
+    let session_id = crypto::rand_bytes(32)
+
+    let ch = client_hello(host, random, session_id, pub_key)
+    if ch.len() == 0 { return conn_failed(fd, "could not build a ClientHello") }
+
+    var c = Conn { fd: fd, hlen: 0, keylen: 0,
+                   rx: keys_new("", ""), tx: keys_new("", ""),
+                   rx_secret: "", tx_secret: "",
+                   inbuf: "", plain: "", closed: false, err: "" }
+
+    // The initial ClientHello goes out with legacy_record_version 0x0301; everything after is
+    // 0x0303. Both are lies about the version and neither is the negotiation.
+    if !send_all(fd, record_plain(ct_handshake(), version_tls10(), ch)) {
+        return conn_failed(fd, "could not send the ClientHello")
+    }
+
+    // The transcript hash is not known until a cipher suite is chosen, and the suite arrives in the
+    // ServerHello, so the messages are kept as bytes until then and hashed once the hash is known.
+    var transcript_bytes = ch
+    var sh = ServerHello { version: 0, random: "", session_id: "", cipher: 0,
+                           group: 0, key_share: "", is_hrr: false, err: "" }
+    var got_sh = false
+    var hello_retried = false
+
+    while !got_sh {
+        let rec = fill_one_record(c, hs_timeout)
+        if c.err.len() > 0 { return c }
+        if ord(rec.at(0)) == ct_alert() {
+            let a = parse_alert(rec.slice(5, rec.len()))
+            return conn_failed(fd, ("server sent an alert: " + alert_name(a.desc)))
+        }
+        if ord(rec.at(0)) == ct_change_cipher_spec() { continue }   // compatibility noise; ignored
+        if ord(rec.at(0)) != ct_handshake() { return conn_failed(fd, "expected a handshake record") }
+
+        let m = parse_handshake(rec.slice(5, rec.len()))
+        if m.total == 0 { return conn_failed(fd, "ServerHello split across records") }
+        if m.htype != hs_server_hello() { return conn_failed(fd, "expected a ServerHello") }
+        sh = parse_server_hello(m.body)
+        if sh.err.len() > 0 { return conn_failed(fd, ("bad ServerHello: " + sh.err)) }
+
+        if sh.is_hrr {
+            if hello_retried { return conn_failed(fd, "server sent a second HelloRetryRequest") }
+            hello_retried = true
+            if sh.group != group_x25519() {
+                // The server wants a group this client does not implement. Refusing is the honest
+                // outcome: there is no fallback that is not a downgrade.
+                return conn_failed(fd, "server requires a key-exchange group this client does not offer")
+            }
+            // The transcript is rewritten here, not extended (RFC 8446 §4.4.1), but the hash it is
+            // rewritten with depends on the suite, which the HelloRetryRequest has just told us.
+            var t = transcript_new(suite_hash_len(sh.cipher))
+            transcript_add(t, transcript_bytes)
+            transcript_hrr(t)
+            transcript_add(t, rec.slice(5, 5 + m.total))
+            transcript_add(t, ch)
+            transcript_bytes = copy t.data
+            if !send_all(fd, record_plain(ct_handshake(), version_tls12(), ch)) {
+                return conn_failed(fd, "could not send the second ClientHello")
+            }
+            continue
+        }
+        transcript_bytes = (transcript_bytes + rec.slice(5, 5 + m.total))
+        got_sh = true
+    }
+
+    c.hlen = suite_hash_len(sh.cipher)
+    c.keylen = suite_key_len(sh.cipher)
+    if c.hlen == 0 { return conn_failed(fd, "server selected a cipher suite this client does not speak") }
+
+    var tr = transcript_new(c.hlen)
+    transcript_add(tr, transcript_bytes)
+
+    let shared = crypto::x25519_shared(priv_key, sh.key_share)
+    if shared.len() != 32 { return conn_failed(fd, "the server's key share is not a usable point") }
+
+    var sched = schedule_start(c.hlen, "")
+    schedule_handshake(sched, shared)
+    let th_sh = transcript_hash(tr)
+    let c_hs = client_handshake_traffic(sched, th_sh)
+    let s_hs = server_handshake_traffic(sched, th_sh)
+    let sk = traffic_keys(c.hlen, s_hs, c.keylen)
+    let ck = traffic_keys(c.hlen, c_hs, c.keylen)
+    c.rx = keys_new(sink sk.key, sink sk.iv)
+    c.tx = keys_new(sink ck.key, sink ck.iv)
+    c.rx_secret = s_hs
+    c.tx_secret = c_hs
+
+    // The encrypted half of the server's flight: EncryptedExtensions, then optionally a
+    // CertificateRequest, then Certificate, CertificateVerify and Finished. These do not line up
+    // with records: a server may pack them into one or split one across several, so they are
+    // reassembled into a stream and taken from it a message at a time.
+    var flight = ""
+    var chain: Vec<Str> = vec()
+    var cv = CertVerify { algorithm: 0, signature: "", err: "" }
+    var th_before_cv = ""
+    var th_after_server_fin = ""
+    var server_done = false
+    var saw_ee = false
+
+    while !server_done {
+        let rec = fill_one_record(c, hs_timeout)
+        if c.err.len() > 0 { return c }
+        if ord(rec.at(0)) == ct_change_cipher_spec() { continue }
+        let r = record_open(c.rx, rec)
+        if r.err.len() > 0 { return fatal(c, 20, ("could not read the server's flight: " + r.err)) }
+        if r.ctype == ct_alert() {
+            let a = parse_alert(r.body)
+            return fatal(c, 80, ("server sent an alert: " + alert_name(a.desc)))
+        }
+        if r.ctype != ct_handshake() { return fatal(c, 10, "expected handshake data") }
+        flight = (flight + r.body)
+
+        while !server_done {
+            let m = parse_handshake(flight)
+            if m.total == 0 { break }                     // wait for more bytes
+            let raw = flight.slice(0, m.total)
+            flight = flight.slice(m.total, flight.len())
+
+            if m.htype == hs_encrypted_extensions() { saw_ee = true  transcript_add(tr, raw) }
+            else { if m.htype == hs_certificate() {
+                if !saw_ee { return fatal(c, 10, "Certificate arrived before EncryptedExtensions") }
+                chain = parse_certificate(m.body)
+                if chain.len() == 0 { return fatal(c, 42, "the server's Certificate message did not parse") }
+                transcript_add(tr, raw)
+            }
+            else { if m.htype == hs_certificate_verify() {
+                if chain.len() == 0 { return fatal(c, 10, "CertificateVerify arrived before any certificate") }
+                th_before_cv = transcript_hash(tr)
+                cv = parse_certificate_verify(m.body)
+                if cv.err.len() > 0 { return fatal(c, 50, ("bad CertificateVerify: " + cv.err)) }
+                transcript_add(tr, raw)
+            }
+            else { if m.htype == hs_finished() {
+                if cv.signature.len() == 0 { return fatal(c, 10, "Finished arrived before CertificateVerify") }
+                // The server's Finished proves it holds the handshake secret and that the
+                // transcript both sides saw is identical. It is checked with a constant-time
+                // compare, and a mismatch ends the connection.
+                // The server's verify_data covers the transcript up to but not including its own
+                // Finished; the application secrets below cover the transcript including it. Two
+                // different hashes, one message apart, and using one where the other belongs gives
+                // keys that are perfectly well-formed and shared with nobody.
+                let want = verify_data(c.hlen, c.rx_secret, transcript_hash(tr))
+                if !crypto::ct_eq(m.body, want) { return fatal(c, 51, "the server's Finished did not verify") }
+                transcript_add(tr, raw)
+                th_after_server_fin = transcript_hash(tr)
+                server_done = true
+            }
+            else { if m.htype == hs_certificate_request() {
+                // A server asking for a client certificate gets none, and this client will not
+                // pretend otherwise. Refusing is correct: sending an empty Certificate would make
+                // the server decide, and client authentication is out of scope.
+                return fatal(c, 40, "server requested a client certificate, which this client does not have")
+            }
+            else { return fatal(c, 10, ("unexpected handshake message " + to_str(m.htype))) } } } } }
+        }
+    }
+
+    // Everything the server said is now on the transcript, so the certificate can be judged.
+    let bad = check_certificate(chain, host, th_before_cv, cv)
+    if bad.len() > 0 { return fatal(c, 42, bad) }
+
+    // The client's Finished closes the handshake, over the transcript including the server's.
+    let cfin = handshake_msg(hs_finished(), verify_data(c.hlen, c.tx_secret, transcript_hash(tr)))
+    let frec = record_seal(c.tx, ct_handshake(), cfin)
+    if frec.len() == 0 { return fatal(c, 80, "could not seal the client Finished") }
+    if !send_all(fd, frec) { return conn_failed(fd, "could not send the client Finished") }
+    transcript_add(tr, cfin)
+
+    // Application keys, from the transcript through the server's Finished, not through the
+    // client's, which was just added above and must not count here.
+    schedule_master(sched)
+    let c_ap = client_app_traffic(sched, th_after_server_fin)
+    let s_ap = server_app_traffic(sched, th_after_server_fin)
+    let cak = traffic_keys(c.hlen, c_ap, c.keylen)
+    let sak = traffic_keys(c.hlen, s_ap, c.keylen)
+    c.tx = keys_new(sink cak.key, sink cak.iv)
+    c.rx = keys_new(sink sak.key, sink sak.iv)
+    c.tx_secret = c_ap
+    c.rx_secret = s_ap
+    return c
+}
+
+/// Send application data. Returns the number of bytes accepted, or 0 if the connection is done.
+/// Data longer than one record's worth is split across records.
+pub fn conn_send(inout c: Conn, data: Str) -> Int {
+    if c.err.len() > 0 { return 0 }
+    if c.closed { return 0 }
+    var off = 0
+    while off < data.len() {
+        var n = (data.len() - off)
+        if n > max_plaintext() { n = max_plaintext() }
+        let rec = record_seal(c.tx, ct_application_data(), data.slice(off, (off + n)))
+        if rec.len() == 0 { c.err = "could not seal a record"  return off }
+        if !send_all(c.fd, rec) { c.err = "could not send"  return off }
+        off = (off + n)
+    }
+    return off
+}
+
+/// Receive up to `max` bytes of application data. "" means the peer closed cleanly or the
+/// connection has failed: `err` and `closed` say which.
+///
+/// Post-handshake messages arriving here are handled rather than delivered: a NewSessionTicket is
+/// dropped (this client does not resume), and a KeyUpdate is answered by rekeying the read
+/// direction, because ignoring one means every later record fails to decrypt.
+pub fn conn_recv(inout c: Conn, max: Int) -> Str {
+    if c.err.len() > 0 { return "" }
+    while c.plain.len() == 0 {
+        if c.closed { return "" }
+        let rec = fill_one_record(c, 30000)
+        if c.err.len() > 0 { return "" }
+        if ord(rec.at(0)) == ct_change_cipher_spec() { continue }
+        let r = record_open(c.rx, rec)
+        if r.err.len() > 0 { c.err = copy r.err  return "" }
+        if r.ctype == ct_alert() {
+            let a = parse_alert(r.body)
+            c.closed = true
+            if !alert_is_close_notify(a) { c.err = ("server sent an alert: " + alert_name(a.desc)) }
+            return ""
+        }
+        if r.ctype == ct_handshake() {
+            let m = parse_handshake(r.body)
+            if m.htype == hs_key_update() {
+                // Ratchet the read direction from its secret. The sequence number restarts at zero
+                // with the new keys, which keys_new does; carrying the old count over would make
+                // every record after this one fail.
+                c.rx_secret = key_update(c.hlen, c.rx_secret)
+                let k = traffic_keys(c.hlen, c.rx_secret, c.keylen)
+                c.rx = keys_new(sink k.key, sink k.iv)
+                // request_update(1) obliges us to rekey our own write direction and say so. Not
+                // doing it leaves the peer unable to read anything we send afterwards.
+                if m.body.len() > 0 { if ord(m.body.at(0)) == 1 {
+                    c.tx_secret = key_update(c.hlen, c.tx_secret)
+                    let t = traffic_keys(c.hlen, c.tx_secret, c.keylen)
+                    let ku = handshake_msg(hs_key_update(), (("" + chr(0))))   // update_not_requested
+                    let kurec = record_seal(c.tx, ct_handshake(), ku)
+                    if kurec.len() > 0 { let _ = send_all(c.fd, kurec) }
+                    c.tx = keys_new(sink t.key, sink t.iv)
+                } }
+            }
+            continue
+        }
+        if r.ctype != ct_application_data() { c.err = "unexpected record type"  return "" }
+        c.plain = (c.plain + r.body)
+    }
+    var n = c.plain.len()
+    if n > max { n = max }
+    let out = c.plain.slice(0, n)
+    c.plain = c.plain.slice(n, c.plain.len())
+    return out
+}
+
+/// Close the connection, sending close_notify first so the peer can tell a clean end from a
+/// truncated one. That distinction is the whole point of the alert: without it a caller cannot
+/// know whether it received the whole response or the connection was cut.
+pub fn conn_close(inout c: Conn) {
+    if !c.closed {
+        if c.tx.iv.len() == 12 {
+            let rec = record_seal(c.tx, ct_alert(), alert_close_notify())
+            if rec.len() > 0 { let _ = send_all(c.fd, rec) }
+        }
+        c.closed = true
+    }
+    let _ = net::sock_close(c.fd)
+}

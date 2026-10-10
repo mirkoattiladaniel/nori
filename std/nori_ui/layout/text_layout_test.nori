@@ -1,0 +1,326 @@
+// Native tests for text through nori_ui's layout: shaped widths, UAX #14 breaks, paragraph
+// direction and alignment, in Latin, Arabic, Devanagari, CJK and mixed. Run with
+//   noric --test std/nori_ui/layout/text_layout_test.nori compiler/runtime.nori --import-root .
+import "std/nori_ui" as ui
+import "std/font" as font
+
+fn load(path: Str) -> font::Font {
+    let fr = font::font_load(read_file(path))
+    assert_true(fr.ok)
+    return copy fr.font
+}
+// the faces every test measures with: a Latin face, then Arabic, Devanagari and CJK behind it
+fn install() {
+    ui::layout::text_engine_reset()
+    var lat = load("std/font/assets/DejaVuSans.ttf")
+    var ar = load("std/font/assets/NotoSansArabic-subset.ttf")
+    var de = load("std/font/assets/NotoSansDevanagari-subset.ttf")
+    var cj = load("std/font/assets/NotoSansCJKsc-subset.otf")
+    ui::layout::text_engine_set_font(lat)
+    ui::layout::text_engine_add_fallback(ar)
+    ui::layout::text_engine_add_fallback(de)
+    ui::layout::text_engine_add_fallback(cj)
+}
+// the same faces, loaded again into a FontSet of std/font's own: the oracle
+fn oracle_set() -> font::FontSet {
+    var fs = font::fontset_new()
+    font::fontset_add(fs, load("std/font/assets/DejaVuSans.ttf"))
+    font::fontset_add(fs, load("std/font/assets/NotoSansArabic-subset.ttf"))
+    font::fontset_add(fs, load("std/font/assets/NotoSansDevanagari-subset.ttf"))
+    font::fontset_add(fs, load("std/font/assets/NotoSansCJKsc-subset.otf"))
+    return fs
+}
+
+fn latin() -> Str { return "The quick brown fox jumps over the lazy dog while a well-known writer keeps typing words" }
+fn arabic() -> Str { return "السلام عليكم بب ببب دب بد اردو زبان ہے السلام عليكم لا الا لإ لأ لآ" }
+fn deva() -> Str { return "नमस्ते दुनिया क्षत्रिय ज्ञान श्र द्व र्क कर्म धर्म कि कु कृ के कै को कौ" }
+fn cjk() -> Str { return "日本語のテキスト、です。中文字体カタカナ漢字（かんじ）日本語のテキスト、です。" }
+fn mixed() -> Str { return "Hello السلام عليكم and नमस्ते दुनिया with 中文字体 again" }
+fn scripts() -> Vec<Str> {
+    var v: Vec<Str> = vec()
+    v.push(latin())  v.push(arabic())  v.push(deva())  v.push(cjk())  v.push(mixed())
+    return v
+}
+
+fn test_widths_are_the_shaped_widths() {
+    install()
+    var fs = oracle_set()
+    let all = scripts()
+    var i = 0
+    while i < all.len() {
+        let st = ui::layout::text_measure_style(15.0)
+        let w = ui::layout::text_measure_width(all[i], st)
+        let want = font::shape_line(fs, all[i], 15.0, font::BIDI_AUTO(), "", "").width
+        assert_feq(w, want, 0.001)
+        assert_true(w > 50.0)
+        i = i + 1
+    }
+    // a size is a scale: one cache entry serves both
+    let w30 = ui::layout::text_measure_width(arabic(), ui::layout::text_measure_style(30.0))
+    assert_feq(w30, font::shape_line(fs, arabic(), 30.0, font::BIDI_AUTO(), "", "").width, 0.002)
+}
+
+fn test_the_width_cache_is_hit() {
+    install()
+    let st = ui::layout::text_measure_style(13.0)
+    let a = ui::layout::text_engine_width_stats()
+    let w1 = ui::layout::text_measure_width(deva(), st)
+    let b = ui::layout::text_engine_width_stats()
+    let w2 = ui::layout::text_measure_width(deva(), ui::layout::text_measure_style(20.0))
+    let c = ui::layout::text_engine_width_stats()
+    assert_eq(b[1], a[1] + 1)                     // the first is shaped
+    assert_eq(c[1], b[1])                         // the second, at another size, is not
+    assert_eq(c[0], b[0] + 1)
+    assert_feq(w2, w1 * 20.0 / 13.0, 0.001)
+}
+
+// the byte offset in `para` where each line after the first starts (lines are pieces of `para`)
+fn line_starts(para: Str, lines: Vec<Str>) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    var cur = 0
+    var i = 0
+    while i < lines.len() {
+        // find lines[i] at or after cur
+        var at = cur
+        var found = false
+        while !found && at + lines[i].len() <= para.len() {
+            if para.slice(at, at + lines[i].len()) == lines[i] { found = true } else { at = at + 1 }
+        }
+        assert_true(found)
+        if i > 0 { out.push(at) }
+        cur = at + lines[i].len()
+        i = i + 1
+    }
+    return out
+}
+fn tl_nospace(s: Str) -> Str {
+    var o = ""
+    var i = 0
+    while i < s.len() { if s.at(i) != ' ' { o = o + s.at(i) }  i = i + 1 }
+    return o
+}
+fn vhas(v: Vec<Int>, x: Int) -> Bool { var i = 0  while i < v.len() { if v[i] == x { return true }  i = i + 1 }  return false }
+
+// wrap `para` at `max_w`; check every line fits, every break is a UAX #14 opportunity, nothing is
+// lost, and no line could have taken the next segment too (the fill is greedy). Returns the lines.
+fn check_wrap(para: Str, max_w: Float, joiner: Str) -> Vec<Str> {
+    let st = ui::layout::text_measure_style(16.0)
+    let lines = ui::layout::text_wrap_lines(para, max_w, st, false)
+    assert_true(lines.len() >= 3)
+    var joined = ""
+    var i = 0
+    while i < lines.len() {
+        if i > 0 { joined = joined + joiner }
+        joined = joined + lines[i]
+        assert_true(ui::layout::text_measure_width(lines[i], st) <= max_w + 0.001)
+        i = i + 1
+    }
+    // nothing lost: the lines are the paragraph with only the spaces at the breaks taken out (a line
+    // of CJK may break between two ideographs with no space there, so compare without spaces)
+    assert_streq(tl_nospace(joined), tl_nospace(para))
+    let opps = font::line_break_offsets(para)
+    let starts = line_starts(para, lines)
+    i = 0
+    while i < starts.len() {
+        assert_true(vhas(opps, starts[i]))
+        // greedy: the line with the next segment after it does not fit
+        var nx = 0 - 1
+        var k = 0
+        while k < opps.len() && nx < 0 { if opps[k] > starts[i] { nx = opps[k] }  k = k + 1 }
+        var ls = 0
+        if i > 0 { ls = starts[i - 1] }
+        if nx > 0 {
+            var e = nx
+            while e > ls && para.at(e - 1) == ' ' { e = e - 1 }
+            assert_true(ui::layout::text_measure_width(para.slice(ls, e), st) > max_w)
+        }
+        i = i + 1
+    }
+    return lines
+}
+
+fn test_wrapped_paragraphs_in_every_script() {
+    install()
+    let lat = check_wrap(latin(), 160.0, " ")
+    let ar = check_wrap(arabic(), 140.0, " ")
+    let de = check_wrap(deva(), 150.0, " ")
+    let cj = check_wrap(cjk(), 120.0, "")          // ideographs break with no space between
+    let mx = check_wrap(mixed(), 130.0, " ")
+    assert_true(lat.len() + ar.len() + de.len() + cj.len() + mx.len() > 15)
+}
+
+fn test_a_hyphen_is_an_opportunity() {
+    install()
+    // "well-known" may break after the hyphen (UAX #14 HY), which a space-only wrapper would not do
+    let st = ui::layout::text_measure_style(16.0)
+    let w = ui::layout::text_measure_width("a well-", st)
+    let lines = ui::layout::text_wrap_lines("a well-known", w + 1.0, st, false)
+    assert_eq(lines.len(), 2)
+    assert_streq(lines[0], "a well-")
+    assert_streq(lines[1], "known")
+}
+
+fn test_hard_break_splits_between_clusters() {
+    install()
+    // a Devanagari word wider than the line, split: never inside a conjunct or before a vowel sign
+    let word = "क्षत्रियक्षत्रियक्षत्रियक्षत्रिय"
+    let st = ui::layout::text_measure_style(16.0)
+    let lines = ui::layout::text_wrap_lines(word, 40.0, st, true)
+    assert_true(lines.len() > 1)
+    var joined = ""
+    var i = 0
+    while i < lines.len() { joined = joined + lines[i]  i = i + 1 }
+    assert_streq(joined, word)
+    let gs = font::grapheme_offsets(word)
+    let starts = line_starts(word, lines)
+    i = 0
+    while i < starts.len() { assert_true(vhas(gs, starts[i]))  i = i + 1 }
+}
+
+fn test_paragraph_direction() {
+    assert_eq(ui::layout::text_para_dir("Hello", 2), 0)
+    assert_eq(ui::layout::text_para_dir(arabic(), 2), 1)
+    assert_eq(ui::layout::text_para_dir("123 " + arabic(), 2), 1)      // digits are not strong
+    assert_eq(ui::layout::text_para_dir(arabic(), 0), 0)               // an explicit direction wins
+    assert_eq(ui::layout::text_para_dir("Hello", 1), 1)
+    assert_streq(ui::layout::text_para_dirs("Hi\n" + arabic() + "\n" + mixed(), 2), "LRL")
+}
+
+// lay `src` out both ways (immediate and retained) and return the immediate overlay, after checking
+// the two agree primitive for primitive
+fn both(src: Str, w: Float, h: Float) -> ui::layout::ComputedOverlay {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    let vp = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(w, h))
+    let im = ui::layout::doc_layout(r.doc, vp)
+    var r2 = ui::layout::dsl_parse_document(src)
+    var d = ui::layout::rdoc_new()
+    ui::layout::rdoc_set_tree(d, sink r2.doc.tree)
+    ui::layout::rdoc_set_viewport(d, w, h)
+    let _f = ui::layout::rdoc_frame(d, 0.0)
+    let rt = ui::layout::rdoc_overlay(d)
+    assert_eq(im.prims.len(), rt.prims.len())
+    var i = 0
+    while i < im.prims.len() {
+        if !ui::layout::pp_same(im.prims[i], rt.prims[i]) {
+            printl("differs: " + im.prims[i].text + " / " + rt.prims[i].text + " pos " + to_str(im.prims[i].pos.x) + "," + to_str(im.prims[i].pos.y) + " vs " + to_str(rt.prims[i].pos.x) + "," + to_str(rt.prims[i].pos.y) + " dir " + im.prims[i].line_dir + "/" + rt.prims[i].line_dir + " clip " + to_str(im.prims[i].has_clip))
+        }
+        assert_true(ui::layout::pp_same(im.prims[i], rt.prims[i]))
+        i = i + 1
+    }
+    return im
+}
+fn text_prim(ov: ui::layout::ComputedOverlay, needle: Str) -> ui::layout::PaintPrimitive {
+    var i = 0
+    while i < ov.prims.len() {
+        if ov.prims[i].kind == 2 && ov.prims[i].text.len() >= needle.len() && ov.prims[i].text.slice(0, needle.len()) == needle { return copy ov.prims[i] }
+        i = i + 1
+    }
+    assert_true(false)
+    return copy ov.prims[0]
+}
+
+fn test_retained_and_immediate_agree_on_wrapped_text() {
+    install()
+    let src = "column { padding: 0 gap: 4 w: 220 text { text: \"" + latin() + "\" wrap_text: true max_width: 220 } text { text: \"" + arabic() + "\" wrap_text: true max_width: 220 } text { text: \"" + deva() + "\" wrap_text: true max_width: 220 } text { text: \"" + cjk() + "\" wrap_text: true max_width: 220 } text { text: \"" + mixed() + "\" wrap_text: true max_width: 220 dir: rtl } button { label: \"" + "السلام عليكم" + "\" on_click: go } }"
+    let ov = both(src, 400.0, 600.0)
+    // the Arabic paragraph: every line runs right to left and starts at the box's right edge
+    let ap = text_prim(ov, "السلام")
+    assert_true(ap.line_dir.len() >= 2)
+    var k = 0
+    while k < ap.line_dir.len() { assert_eq(ord(ap.line_dir.at(k)), 82)  k = k + 1 }
+    let st = ui::layout::text_measure_style(16.0)
+    // line offsets put each line's right end on one edge
+    let lines = ui::layout::text_wrap_lines(ap.text, 0.0, st, false)
+    assert_eq(lines.len(), ap.line_dir.len())
+    // the box's widest line has offset 0; the others are pushed right
+    var right = 0.0 - 1.0
+    k = 0
+    while k < lines.len() {
+        var off = 0.0
+        if k < ap.line_x.len() { off = ap.line_x[k] }
+        var stl = ui::layout::text_measure_style(ap.size_px)
+        stl.dir = 1
+        let edge = off + ui::layout::text_measure_width(lines[k], stl)
+        if right < 0.0 { right = edge }
+        assert_feq(edge, right, 0.01)
+        k = k + 1
+    }
+    // the Latin paragraph runs left to right with no offsets
+    let lp = text_prim(ov, "The quick")
+    assert_eq(ord(lp.line_dir.at(0)), 76)
+    assert_eq(lp.line_x.len(), 0)
+    // `dir: rtl` on the mixed paragraph: every line R even though it starts with Latin
+    let mp = text_prim(ov, "Hello")
+    assert_eq(ord(mp.line_dir.at(0)), 82)
+}
+
+fn test_dir_lang_and_align_from_ui_and_style() {
+    install()
+    var r = ui::layout::dsl_parse_document("stylesheet { tag text { direction: ltr } } column { text { id: a text: \"abc\" dir: rtl lang: ar } text { id: b text: \"abc\" text_align: end } text { id: c text: \"abc\" } }")
+    assert_true(r.ok)
+    assert_eq(r.doc.tree.children[0].text_dir, 1)
+    assert_streq(r.doc.tree.children[0].lang, "ar")
+    assert_eq(r.doc.tree.children[1].text_align, ui::layout::ta_end())
+    // the .style properties: direction, lang, text_align (start/end follow the direction)
+    var d = ui::layout::rdoc_new()
+    var r2 = ui::layout::dsl_parse_document("column { padding: 0 w: 300 text { text: \"" + arabic() + "\" } text { text: \"abc\" } }")
+    ui::layout::rdoc_set_tree(d, sink r2.doc.tree)
+    let sp = ui::layout::style_parse(".x { } text { lang: fa text_align: start }", "theme.style")
+    assert_true(sp.ok)
+    let e = ui::layout::rdoc_set_styles(d, "theme", sp.styles)
+    assert_streq(e.msg, "")
+    ui::layout::rdoc_set_viewport(d, 300.0, 200.0)
+    let _f = ui::layout::rdoc_frame(d, 0.0)
+    let ov = ui::layout::rdoc_overlay(d)
+    let ap = text_prim(ov, "السلام")
+    assert_streq(ap.lang, "fa")
+    // start-aligned Arabic sits at the right of its 300px column
+    let w = ui::layout::text_measure_width(ap.text, ui::layout::text_measure_style(ap.size_px))
+    assert_true(ap.pos.x + w > 290.0)
+    let lp = text_prim(ov, "abc")
+    assert_true(lp.pos.x < 10.0)
+    // a bad direction is an error
+    var bad = ui::layout::dsl_parse_document("column { text { text: x dir: up } }")
+    assert_false(bad.ok)
+}
+
+fn test_layout_without_a_font_still_wraps() {
+    ui::layout::text_engine_reset()
+    assert_false(ui::layout::text_engine_on())
+    // the heuristic measure, UAX #14 breaks
+    let st = ui::layout::text_measure_style(10.0)
+    let lines = ui::layout::text_wrap_lines("aa bb cc", 30.0, st, true)
+    assert_eq(lines.len(), 2)
+    assert_streq(lines[0], "aa bb")
+    let cj = ui::layout::text_wrap_lines(cjk(), 60.0, st, false)
+    assert_true(cj.len() > 2)
+}
+
+fn test_cpu_paints_an_rtl_line_from_the_right() {
+    install()
+    var f = load("std/font/assets/DejaVuSans.ttf")
+    var fb = load("std/font/assets/NotoSansArabic-subset.ttf")
+    var r = ui::layout::dsl_parse_document("column { padding: 0 w: 300 text { text: \"" + "السلام عليكم" + "\" } }")
+    assert_true(r.ok)
+    let ov = ui::layout::doc_layout(r.doc, ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(300.0, 40.0)))
+    var cv0 = ui::paint_cpu::canvas_new(300, 40, f)
+    var cv = ui::paint_cpu::canvas_with_fallback(cv0, fb)
+    ui::paint_cpu::clear(cv, ui::core::color_rgb(0, 0, 0))
+    ui::paint_cpu::render_overlay(cv, ov)
+    var minx = 1000
+    var maxx = 0 - 1
+    var y = 0
+    while y < 40 {
+        var x = 0
+        while x < 300 {
+            if ui::paint_cpu::pixel_at(cv, x, y) != 0 { if x < minx { minx = x }  if x > maxx { maxx = x } }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    // ink ends at the right edge and starts well right of the left one
+    assert_true(maxx > 285)
+    assert_true(minx > 150)
+    ui::paint_cpu::canvas_free(cv)
+}

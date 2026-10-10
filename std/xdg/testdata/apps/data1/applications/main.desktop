@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Main App
+GenericName=Main One
+Exec=main-app %F
+Icon=main-icon
+Terminal=false
+Categories=Utility;

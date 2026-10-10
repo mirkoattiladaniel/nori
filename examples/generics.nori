@@ -1,0 +1,31 @@
+// Generics by type erasure: one compiled copy of each function/type serves every
+// instantiation. Because every Nori value (Int, Bool, Str, Vec, Map, struct, enum) is a
+// 64-bit value at runtime, a type parameter `T` erases to i64: no monomorphization and no
+// per-type code bloat. Float is the single exception (it's f64), so the checker rejects
+// instantiating a generic with Float.
+
+enum Opt<T> { Some(T) None }
+struct Box<T> { val: T }
+
+fn id<T>(sink x: T) -> T { return x }                 // takes the value and hands it back
+fn firstvec<T>(v: Vec<T>) -> T { return copy v[0] }   // the vector keeps its element; the caller gets its own
+fn unwrap<T>(sink o: Opt<T>, sink d: T) -> T {
+    match sink o {                                    // tears the option down: the payload is the result
+        Opt::Some(x) => { return x }
+        Opt::None    => { return d }
+    }
+}
+
+fn main() -> Int {
+    printl(id(42))                          // 42        (T = Int)
+    printl(id("hello"))                 // hello     (same fn, T = Str)
+    var vi: Vec<Int> = vec()  vi.push(7)  vi.push(8)
+    printl(firstvec(vi))                    // 7         (T = Int)
+    var vs: Vec<Str> = vec()  vs.push("a")  vs.push("b")
+    printl(firstvec(vs))                // a         (same fn, T = Str)
+    printl(unwrap(Opt::Some(99), 0))        // 99        (T = Int)
+    printl(unwrap(Opt::None, 5))            // 5
+    var b = Box { val: 314 }               // Box<Int>
+    printl(b.val)                           // 314
+    return 0
+}

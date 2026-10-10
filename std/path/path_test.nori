@@ -1,0 +1,56 @@
+// Tests for std/path. Run with
+//   noric --test std/path/path_test.nori compiler/runtime.nori --import-root .
+import "std/path" as path
+
+fn test_join() {
+    assert_streq(path::join("src", "main.nori"), "src/main.nori")
+    assert_streq(path::join("src/", "main.nori"), "src/main.nori")
+    assert_streq(path::join("src", "/abs"), "/abs")          // absolute b wins
+    assert_streq(path::join("", "x"), "x")
+    assert_streq(path::join("/", "x"), "/x")
+}
+
+fn test_join_all() {
+    assert_streq(path::join_all(["a", "b", "c"]), "a/b/c")
+    assert_streq(path::join_all([]), "")
+    assert_streq(path::join_all(["solo"]), "solo")
+    assert_streq(path::join_all(["a", "", "c"]), "a/c")      // an empty segment is dropped
+    assert_streq(path::join_all(["a", "/b", "c"]), "/b/c")   // an absolute segment restarts the path
+    assert_streq(path::join_all(["a/", "b"]), "a/b")         // exactly one separator, never two
+    assert_streq(path::join_all(["a/", "/b"]), "/b")         // ...and a leading `/` is absolute, not a separator
+    assert_streq(path::join_all(["", "", ""]), "")
+    assert_streq(path::join_all(["/", "a"]), "/a")
+}
+
+fn test_dir_base() {
+    assert_streq(path::dirname("a/b/c.txt"), "a/b")
+    assert_streq(path::dirname("file"), ".")
+    assert_streq(path::dirname("/a"), "/")
+    assert_streq(path::basename("a/b/c.txt"), "c.txt")
+    assert_streq(path::basename("a/b/"), "b")
+}
+
+fn test_ext_stem() {
+    assert_streq(path::ext("a/b.tar.gz"), "gz")
+    assert_streq(path::ext("noext"), "")
+    assert_streq(path::ext(".bashrc"), "")                   // leading dot is not an extension
+    assert_streq(path::stem("a/b.txt"), "b")
+    assert_streq(path::stem(".bashrc"), ".bashrc")
+    assert_streq(path::with_ext("a/b.txt", "md"), "a/b.md")
+}
+
+fn test_normalize() {
+    assert_streq(path::normalize("a/./b/../c"), "a/c")
+    assert_streq(path::normalize("/a//b/"), "/a/b")
+    assert_streq(path::normalize("a/../.."), "..")
+    assert_streq(path::normalize("/.."), "/")
+    assert_streq(path::normalize("."), ".")
+    assert_true(path::is_abs("/x"))
+    assert_eq((path::split("/a//b/")).len(), 2)
+}
+
+// ---- laws: path invariants (fuzzed by `noric --fuzz-laws` / `roll law`) ----
+law path_normalize_is_idempotent(p: Str) {
+    let once = path::normalize(p)
+    assert(path::normalize(once) == once)
+}

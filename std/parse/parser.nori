@@ -1,0 +1,45 @@
+// ── Layer 3, Parser: recursive-descent helpers over a token vector. You write your grammar as normal
+// functions; this gives peek/check/expect/accept, error accumulation, and error recovery. ────────────
+pub struct Parser { toks: view Vec<Token>, pos: Int, src: view Str, path: view Str, errs: Vec<Str> }
+/// a parser over `toks`, positioned at the first one. `src` is the text those tokens index into
+/// and `path` is what diagnostics name; both are carried only so errors can point at a place.
+pub fn parser(inout toks: Vec<Token>, src: Str, path: Str) -> Parser { return Parser { toks: toks, pos: 0, src: src, path: path, errs: vec() } }
+
+impl Parser {
+    /// past the last token?
+    fn at_end(self) -> Bool { return self.pos >= self.toks.len() }
+    /// the current token (an EOF token positioned at end-of-input when past the last).
+    fn peek_tok(self) -> view Token {
+        if self.pos < self.toks.len() { return self.toks[self.pos] }
+        if self.toks.len() > 0 { return eof_token(tok_span(self.toks[self.toks.len() - 1]).end) }
+        return eof_token(0)
+    }
+    /// the current token's kind (TK_EOF at end).
+    fn peek_kind(self) -> Int { if self.pos < self.toks.len() { return self.toks[self.pos].kind }  return -1 }
+    /// the next token's kind (one lookahead; TK_EOF at end).
+    fn peek2_kind(self) -> Int { let i = self.pos + 1  if i < self.toks.len() { return self.toks[i].kind }  return -1 }
+    /// consume and return the current token.
+    fn advance_tok(inout self) -> Token { let t = copy self.peek_tok()  if self.pos < self.toks.len() { self.pos = self.pos + 1 }  return t }
+    /// is the current token of kind `kind`? (no consume)
+    fn check(self, kind: Int) -> Bool { return self.peek_kind() == kind }
+    /// consume the current token iff it is `kind`; return whether it was.
+    fn accept(inout self, kind: Int) -> Bool { if self.peek_kind() == kind { self.pos = self.pos + 1  return true }  return false }
+    /// consume `kind` or record an "expected <what>" error; return whether it matched.
+    fn expect(inout self, kind: Int, what: Str) -> Bool {
+        if self.peek_kind() == kind { self.pos = self.pos + 1  return true }
+        self.error("expected " + what)
+        return false
+    }
+    /// record a diagnostic at the current token's position.
+    fn error(inout self, msg: Str) {
+        var off = 0
+        if self.pos < self.toks.len() { off = self.toks[self.pos].start }
+        else { if self.toks.len() > 0 { off = self.toks[self.toks.len() - 1].end } }
+        self.errs.push(format_error(self.src, self.path, off, msg, ""))
+    }
+    /// error recovery: skip tokens up to (not past) the next `sync_kind`, or end-of-input.
+    fn recover(inout self, sync_kind: Int) { while !self.at_end() && self.peek_kind() != sync_kind { self.pos = self.pos + 1 } }
+    fn had_errors(self) -> Bool { return self.errs.len() > 0 }
+    fn errors(self) -> view Vec<Str> { return self.errs }
+}
+

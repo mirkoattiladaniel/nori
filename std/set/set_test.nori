@@ -1,0 +1,65 @@
+// Tests for std/set. Run with
+//   noric --test std/set/set_test.nori compiler/runtime.nori --import-root .
+import "std/set" as set
+
+fn test_set() {
+    var st = set::new()
+    assert_true(st.add("x"))
+    assert_false(st.add("x"))
+    assert_true(st.add("y"))
+    assert_eq(st.size(), 2)
+    assert_true(st.contains("x"))
+    assert_true(st.remove("x"))
+    assert_false(st.remove("x"))
+    assert_false(st.contains("x"))
+    assert_eq(st.size(), 1)
+}
+
+// ---- laws: set-algebra invariants (fuzzed by `noric --fuzz-laws` / `roll law`) ----
+// items() is in insertion order, so union commutes only up to set equality (same members), not list equality.
+// `Set` is a private type, so laws hold sets in inferred `let`s and compare via size + contains (no annotation).
+law set_union_commutes(a: Vec<Str>, b: Vec<Str>) {
+    let u1 = set::union(set::from_vec(a), set::from_vec(b))
+    let u2 = set::union(set::from_vec(b), set::from_vec(a))
+    assert(u1.size() == u2.size())
+    let it = u1.items()
+    var i = 0
+    while i < it.len() { assert(u2.contains(it[i]))  i = i + 1 }
+}
+law set_union_idempotent(a: Vec<Str>) {
+    let sa = set::from_vec(a)
+    let u = set::union(sa, sa)
+    assert(u.size() == sa.size())
+    let it = sa.items()
+    var i = 0
+    while i < it.len() { assert(u.contains(it[i]))  i = i + 1 }
+}
+law set_intersect_is_subset(a: Vec<Str>, b: Vec<Str>) {
+    let sa = set::from_vec(a)  let sb = set::from_vec(b)
+    let si = set::intersect(sa, sb)
+    let items = si.items()
+    var i = 0
+    while i < items.len() { assert(sa.contains(items[i]))  assert(sb.contains(items[i]))  i = i + 1 }
+}
+law set_difference_excludes_b(a: Vec<Str>, b: Vec<Str>) {
+    let sa = set::from_vec(a)  let sb = set::from_vec(b)
+    let sd = set::difference(sa, sb)
+    let items = sd.items()
+    var i = 0
+    while i < items.len() { assert(sa.contains(items[i]))  assert(!sb.contains(items[i]))  i = i + 1 }
+}
+
+fn test_iset_basics() {
+    var s = set::inew()
+    assert_true(s.add(42))
+    assert_true(s.add(0 - 7))
+    assert_false(s.add(42))
+    assert_true(s.contains(42))
+    assert_false(s.contains(9))
+    assert_eq(s.size(), 2)
+    assert_true(s.remove(42))
+    assert_false(s.remove(42))
+    assert_eq(s.size(), 1)
+    let it = s.items()
+    assert_eq(it[0], 0 - 7)
+}

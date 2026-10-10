@@ -1,0 +1,633 @@
+// Native tests for std/nori_ui/layout/retained, run with
+//   noric --test std/nori_ui/layout/retained_test.nori compiler/runtime.nori --import-root .
+import "std/nori_ui" as ui
+import "std/font" as font
+
+fn doc_of(src: Str) -> ui::layout::RDoc {
+    var d = ui::layout::rdoc_new()
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    if r.doc.has_sheet { let e = ui::layout::rdoc_set_styles(d, "document", r.doc.rich)  assert_streq(e.msg, "") }
+    ui::layout::rdoc_set_tree(d, sink r.doc.tree)
+    return d
+}
+
+fn test_rdoc_idle_is_free() {
+    var d = doc_of("row { padding: 4 gap: 6 text { id: clock text: \"12:00\" } text { text: \"hello\" } button { label: \"Go\" on_click: go } }")
+    ui::layout::rdoc_set_viewport(d, 400.0, 40.0)
+    let f0 = ui::layout::rdoc_frame(d, 0.0)
+    assert_true(f0.changed)
+    assert_true(f0.full)
+    assert_true(ui::layout::rdoc_overlay(d).prims.len() > 0)
+    var i = 0
+    while i < 5 {
+        let f = ui::layout::rdoc_frame(d, 16.0 * to_float(i + 1))
+        assert_false(f.changed)
+        assert_eq(f.damage.len(), 0)
+        assert_eq(f.laid, 0)
+        i = i + 1
+    }
+}
+
+// ---- the differential test: a retained document draws exactly what the immediate path draws ----
+
+fn feq(a: Float, b: Float) -> Bool {
+    var m = 1.0
+    if a > m { m = a }  if 0.0 - a > m { m = 0.0 - a }
+    if b > m { m = b }  if 0.0 - b > m { m = 0.0 - b }
+    var d = a - b
+    if d < 0.0 { d = 0.0 - d }
+    return d <= 0.000001 * m
+}
+fn req(a: ui::core::Rect, b: ui::core::Rect) -> Bool { return feq(a.min.x, b.min.x) && feq(a.min.y, b.min.y) && feq(a.max.x, b.max.x) && feq(a.max.y, b.max.y) }
+fn ceq(a: ui::core::Color, b: ui::core::Color) -> Bool { return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a }
+fn pp_close(a: ui::layout::PaintPrimitive, b: ui::layout::PaintPrimitive) -> Str {
+    if a.kind != b.kind { return "kind" }
+    if a.kind != 2 && !req(a.rect, b.rect) { return "rect" }
+    if !ceq(a.color, b.color) { return "color" }
+    if !feq(a.radius, b.radius) || !feq(a.border_w, b.border_w) { return "radius/border" }
+    if !(a.text == b.text) { return "text" }
+    if a.kind == 2 && !(feq(a.pos.x, b.pos.x) && feq(a.pos.y, b.pos.y)) { return "pos" }
+    if !feq(a.size_px, b.size_px) { return "size" }
+    if a.has_clip != b.has_clip { return "has_clip" }
+    if a.has_clip && !req(a.clip, b.clip) { return "clip" }
+    if a.font_bold != b.font_bold || a.font_italic != b.font_italic { return "font" }
+    if !ceq(a.outline_color, b.outline_color) || !feq(a.outline_w, b.outline_w) { return "outline" }
+    if a.has_grad != b.has_grad { return "grad" }
+    return ""
+}
+fn sid_eq(a: Str, b: Str) -> Bool {
+    let anon = "_scroll_"
+    if a.len() >= anon.len() && b.len() >= anon.len() && a.slice(0, anon.len()) == anon && b.slice(0, anon.len()) == anon { return true }
+    return a == b
+}
+/// "" when the two overlays agree; else what differs first.
+fn pp_str(p: ui::layout::PaintPrimitive) -> Str {
+    var s = "k" + to_str(p.kind) + " r(" + to_str(p.rect.min.x) + "," + to_str(p.rect.min.y) + "," + to_str(p.rect.max.x) + "," + to_str(p.rect.max.y) + ") '" + p.text + "' pos(" + to_str(p.pos.x) + "," + to_str(p.pos.y) + ")"
+    if p.has_clip { s = s + " clip(" + to_str(p.clip.min.x) + "," + to_str(p.clip.min.y) + "," + to_str(p.clip.max.x) + "," + to_str(p.clip.max.y) + ")" }
+    return s
+}
+fn dump(a: ui::layout::ComputedOverlay) -> Str {
+    var s = ""
+    var i = 0
+    while i < a.prims.len() { s = s + "  " + pp_str(a.prims[i]) + "\n"  i = i + 1 }
+    return s
+}
+fn overlay_diff(a: ui::layout::ComputedOverlay, b: ui::layout::ComputedOverlay) -> Str {
+    if a.prims.len() != b.prims.len() { return "prim count " + to_str(a.prims.len()) + " vs " + to_str(b.prims.len()) + "\n" + dump(a) + " ---\n" + dump(b) }
+    var i = 0
+    while i < a.prims.len() {
+        let w = pp_close(a.prims[i], b.prims[i])
+        if w.len() > 0 { return "prim " + to_str(i) + " (kind " + to_str(a.prims[i].kind) + " '" + a.prims[i].text + "'): " + w }
+        i = i + 1
+    }
+    if a.hits.len() != b.hits.len() { return "hit count " + to_str(a.hits.len()) + " vs " + to_str(b.hits.len()) }
+    var h = 0
+    while h < a.hits.len() {
+        if !(a.hits[h].id == b.hits[h].id && a.hits[h].on_click == b.hits[h].on_click && req(a.hits[h].rect, b.hits[h].rect)) { return "hit " + to_str(h) }
+        h = h + 1
+    }
+    if a.surfaces.len() != b.surfaces.len() { return "surface count" }
+    if a.scrolls.len() != b.scrolls.len() { return "scroll count " + to_str(a.scrolls.len()) + " vs " + to_str(b.scrolls.len()) }
+    var s = 0
+    while s < a.scrolls.len() {
+        if !(sid_eq(a.scrolls[s].id, b.scrolls[s].id) && req(a.scrolls[s].viewport, b.scrolls[s].viewport) && feq(a.scrolls[s].content_extent, b.scrolls[s].content_extent) && a.scrolls[s].axis == b.scrolls[s].axis) { return "scroll " + to_str(s) }
+        s = s + 1
+    }
+    return ""
+}
+fn corpus() -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let files = ["std/nori_ui/layout/testdata/retained_corpus.txt", "std/nori_ui/layout/testdata/retained_corpus_extra.txt"]
+    foreach f in files {
+        let body = read_file(f)
+        let sep = "\n=====\n"
+        var start = 0
+        var i = 0
+        while i + sep.len() <= body.len() {
+            if body.slice(i, i + sep.len()) == sep { out.push(body.slice(start, i))  start = i + sep.len()  i = i + sep.len() } else { i = i + 1 }
+        }
+        out.push(body.slice(start, body.len()))
+    }
+    return out
+}
+/// lay `src` out both ways at w x h with the pointer at (mx, my) (has_mouse when mx >= 0) and the
+/// given scroll offsets, and compare. Returns "" or what differs.
+fn both_ways(src: Str, w: Float, h: Float, mx: Float, my: Float, down: Bool, sids: Vec<Str>, soffs: Vec<Float>) -> Str {
+    var r = ui::layout::dsl_parse_document(src)
+    if !r.ok { return "" }
+    var ids = copy sids
+    var offs = copy soffs
+    var noids: Vec<Str> = vec()
+    var novals: Vec<Str> = vec()
+    ui::layout::apply_binds(r.doc.tree, noids, novals)
+    let vp = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(w, h))
+    var im = ui::layout::overlay_empty()
+    if mx >= 0.0 { im = ui::layout::doc_layout_interactive(r.doc, vp, ids, offs, ui::core::vec2(mx, my), down) }
+    else { im = ui::layout::doc_layout_scrolled(r.doc, vp, ids, offs) }
+    var d = doc_of(src)
+    ui::layout::rdoc_set_viewport(d, w, h)
+    var k = 0
+    while k < sids.len() { ui::layout::rdoc_set_scroll(d, sids[k], soffs[k])  k = k + 1 }
+    if mx >= 0.0 { ui::layout::rdoc_pointer(d, mx, my, down) }
+    let _f = ui::layout::rdoc_frame(d, 0.0)
+    return overlay_diff(im, ui::layout::rdoc_overlay(d))
+}
+fn test_rdoc_matches_immediate() {
+    let docs = corpus()
+    assert_true(docs.len() > 40)
+    var sids: Vec<Str> = vec()
+    var soffs: Vec<Float> = vec()
+    var tried = 0
+    var i = 0
+    while i < docs.len() {
+        var r = ui::layout::dsl_parse_document(docs[i])
+        if r.ok {
+            tried = tried + 1
+            let w = both_ways(docs[i], 640.0, 400.0, 0.0 - 1.0, 0.0, false, sids, soffs)
+            if w.len() > 0 { printl("doc " + to_str(i) + ": " + w + "\n" + docs[i]) }
+            assert_streq(w, "")
+            let w2 = both_ways(docs[i], 300.0, 120.0, 0.0 - 1.0, 0.0, false, sids, soffs)
+            if w2.len() > 0 { printl("doc " + to_str(i) + " (small): " + w2) }
+            assert_streq(w2, "")
+        }
+        i = i + 1
+    }
+    assert_true(tried > 20)
+}
+fn test_rdoc_matches_immediate_pointer_and_scroll() {
+    let docs = corpus()
+    var sids: Vec<Str> = vec()
+    var soffs: Vec<Float> = vec()
+    sids.push("list")  soffs.push(15.0)
+    sids.push("strip")  soffs.push(22.0)
+    sids.push("outer")  soffs.push(9.0)
+    sids.push("hs")  soffs.push(5.0)
+    sids.push("sc")  soffs.push(3.0)
+    let pts = [8.0, 20.0, 45.0, 70.0, 130.0]
+    var i = 0
+    while i < docs.len() {
+        var r = ui::layout::dsl_parse_document(docs[i])
+        if r.ok {
+            foreach px in pts {
+                let w = both_ways(docs[i], 640.0, 400.0, px, px * 0.5, false, sids, soffs)
+                if w.len() > 0 { printl("doc " + to_str(i) + " @" + to_str(px) + ": " + w + "\n" + docs[i]) }
+                assert_streq(w, "")
+                let w2 = both_ways(docs[i], 640.0, 400.0, px, px * 0.3, true, sids, soffs)
+                if w2.len() > 0 { printl("doc " + to_str(i) + " @" + to_str(px) + " down: " + w2 + "\n" + docs[i]) }
+                assert_streq(w2, "")
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ---- incremental behaviour ---------------------------------------------------------------------
+
+fn taskbar_src(clock: Str) -> Str {
+    return "stylesheet { class tb { bg: #1f2937 radius: 6 padding: 6 hover_bg: #374151 } class lbl { text_color: #e5e7eb } } " +
+        "row { padding: 4 gap: 4 bg: #111827 " +
+        "column { id: start class: tb on_click: start text { class: lbl text: \"Start\" } } " +
+        "column { id: b1 class: tb on_click: b1 text { class: lbl text: \"Files\" } } " +
+        "column { id: b2 class: tb on_click: b2 text { class: lbl text: \"Terminal\" } } " +
+        "spacer { } " +
+        "text { id: clock class: lbl text: \"" + clock + "\" } }"
+}
+fn area_of(v: Vec<ui::core::Rect>) -> Float {
+    var a = 0.0
+    var i = 0
+    while i < v.len() { a = a + v[i].width() * v[i].height()  i = i + 1 }
+    return a
+}
+/// every damage rect lies inside `r` grown by `m`.
+fn damage_within(v: Vec<ui::core::Rect>, r: ui::core::Rect, m: Float) -> Bool {
+    var i = 0
+    while i < v.len() {
+        if v[i].min.x < r.min.x - m || v[i].min.y < r.min.y - m || v[i].max.x > r.max.x + m || v[i].max.y > r.max.y + m { return false }
+        i = i + 1
+    }
+    return true
+}
+fn text_prim(ov: ui::layout::ComputedOverlay, t: Str) -> Int {
+    var i = 0
+    while i < ov.prims.len() { if ov.prims[i].kind == 2 && ov.prims[i].text == t { return i }  i = i + 1 }
+    return 0 - 1
+}
+fn immediate_of(src: Str, w: Float, h: Float) -> ui::layout::ComputedOverlay {
+    var r = ui::layout::dsl_parse_document(src)
+    var ids: Vec<Str> = vec()
+    var offs: Vec<Float> = vec()
+    return ui::layout::doc_layout_scrolled(r.doc, ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(w, h)), ids, offs)
+}
+
+fn test_rdoc_one_text_change_damages_only_that_text() {
+    var d = doc_of(taskbar_src("12:00"))
+    ui::layout::rdoc_set_viewport(d, 800.0, 40.0)
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    let n = ui::layout::rdoc_node_count(d)
+    let ci = text_prim(ui::layout::rdoc_overlay(d), "12:00")
+    assert_true(ci >= 0)
+    let before = ui::layout::pp_bounds(ui::layout::rdoc_overlay(d).prims[ci])
+    ui::layout::rdoc_set_text(d, "clock", "12:01")
+    let f = ui::layout::rdoc_frame(d, 1000.0)
+    assert_true(f.changed)
+    assert_false(f.full)
+    assert_true(f.damage.len() >= 1)
+    // the same width text ("12:01" is as wide as "12:00" in a proportional font only roughly), so the
+    // damage is the clock's box, not the bar
+    printl("text change: damage " + to_str(f.damage.len()) + " rects, area " + to_str(area_of(f.damage)) + ", laid " + to_str(f.laid) + ", flattened " + to_str(f.flattened) + ", styled " + to_str(f.styled) + " of " + to_str(n) + " nodes")
+    assert_true(damage_within(f.damage, before, 12.0))
+    assert_true(area_of(f.damage) < 800.0 * 40.0 * 0.15)
+    // only the clock and its ancestors were looked at again, not the buttons
+    assert_true(f.styled <= 1)
+    assert_true(f.laid <= 2)
+    assert_true(f.laid < n)
+    assert_true(text_prim(ui::layout::rdoc_overlay(d), "12:01") >= 0)
+    // and it is the same picture the immediate path draws for the new source
+    assert_streq(overlay_diff(immediate_of(taskbar_src("12:01"), 800.0, 40.0), ui::layout::rdoc_overlay(d)), "")
+    // then idle again
+    let g = ui::layout::rdoc_frame(d, 2000.0)
+    assert_false(g.changed)
+}
+
+fn test_rdoc_rerender_diffs_against_the_tree() {
+    var d = doc_of(taskbar_src("12:00"))
+    ui::layout::rdoc_set_viewport(d, 800.0, 40.0)
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    // the plugin sends its whole document again with one label changed
+    var r = ui::layout::dsl_parse_document(taskbar_src("12:01"))
+    ui::layout::rdoc_set_tree(d, sink r.doc.tree)
+    let f = ui::layout::rdoc_frame(d, 1000.0)
+    assert_true(f.changed)
+    assert_true(f.styled <= 1)
+    assert_true(f.laid <= 2)
+    assert_true(area_of(f.damage) < 800.0 * 40.0 * 0.15)
+    assert_streq(overlay_diff(immediate_of(taskbar_src("12:01"), 800.0, 40.0), ui::layout::rdoc_overlay(d)), "")
+    // the same document again: nothing to do at all
+    var r2 = ui::layout::dsl_parse_document(taskbar_src("12:01"))
+    ui::layout::rdoc_set_tree(d, sink r2.doc.tree)
+    let g = ui::layout::rdoc_frame(d, 2000.0)
+    assert_false(g.changed)
+    assert_eq(g.laid, 0)
+    assert_eq(g.styled, 0)
+}
+
+fn test_rdoc_rerender_adds_and_removes() {
+    let a = "column { padding: 4 gap: 2 text { id: t1 text: one } text { id: t2 text: two } text { id: t3 text: three } }"
+    let b = "column { padding: 4 gap: 2 text { id: t1 text: one } text { id: t3 text: three } text { id: t4 text: four } }"
+    var d = doc_of(a)
+    ui::layout::rdoc_set_viewport(d, 200.0, 100.0)
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    var r = ui::layout::dsl_parse_document(b)
+    ui::layout::rdoc_set_tree(d, sink r.doc.tree)
+    let f = ui::layout::rdoc_frame(d, 1.0)
+    assert_true(f.changed)
+    assert_streq(overlay_diff(immediate_of(b, 200.0, 100.0), ui::layout::rdoc_overlay(d)), "")
+    // the first line did not move, so it is not damaged
+    let one = text_prim(ui::layout::rdoc_overlay(d), "one")
+    let ob = ui::layout::pp_bounds(ui::layout::rdoc_overlay(d).prims[one])
+    var i = 0
+    while i < f.damage.len() { assert_true(f.damage[i].min.y >= ob.min.y + 4.0)  i = i + 1 }
+    // and back, by position this time (no ids)
+    let c = "column { padding: 4 gap: 2 text { text: one } text { text: two } }"
+    let e = "column { padding: 4 gap: 2 text { text: one } text { text: TWO } text { text: three } }"
+    var d2 = doc_of(c)
+    ui::layout::rdoc_set_viewport(d2, 200.0, 100.0)
+    let _g0 = ui::layout::rdoc_frame(d2, 0.0)
+    var r2 = ui::layout::dsl_parse_document(e)
+    ui::layout::rdoc_set_tree(d2, sink r2.doc.tree)
+    let g = ui::layout::rdoc_frame(d2, 1.0)
+    assert_true(g.changed)
+    assert_streq(overlay_diff(immediate_of(e, 200.0, 100.0), ui::layout::rdoc_overlay(d2)), "")
+}
+
+fn test_rdoc_hover_damages_the_hovered_box() {
+    var d = doc_of(taskbar_src("12:00"))
+    ui::layout::rdoc_set_viewport(d, 800.0, 40.0)
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    let ov0 = ui::layout::rdoc_overlay(d)
+    let hb = ui::core::rect_copy(ov0.hits[1].rect)      // b1's box
+    ui::layout::rdoc_pointer(d, hb.center().x, hb.center().y, false)
+    let f = ui::layout::rdoc_frame(d, 16.0)
+    assert_true(f.changed)
+    assert_true(damage_within(f.damage, hb, 12.0))
+    // moving inside the same box changes nothing
+    ui::layout::rdoc_pointer(d, hb.center().x + 1.0, hb.center().y, false)
+    let g = ui::layout::rdoc_frame(d, 32.0)
+    assert_false(g.changed)
+    ui::layout::rdoc_pointer_leave(d)
+    let h = ui::layout::rdoc_frame(d, 48.0)
+    assert_true(h.changed)
+    assert_true(damage_within(h.damage, hb, 12.0))
+    assert_streq(overlay_diff(immediate_of(taskbar_src("12:00"), 800.0, 40.0), ui::layout::rdoc_overlay(d)), "")
+}
+
+fn test_rdoc_resize_is_full() {
+    var d = doc_of(taskbar_src("12:00"))
+    ui::layout::rdoc_set_viewport(d, 800.0, 40.0)
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    ui::layout::rdoc_set_viewport(d, 600.0, 40.0)
+    let f = ui::layout::rdoc_frame(d, 1.0)
+    assert_true(f.full)
+    assert_streq(overlay_diff(immediate_of(taskbar_src("12:00"), 600.0, 40.0), ui::layout::rdoc_overlay(d)), "")
+}
+
+fn pixels_equal(a: ui::paint_cpu::CpuCanvas, b: ui::paint_cpu::CpuCanvas) -> Int {
+    var bad = 0
+    var y = 0
+    while y < ui::paint_cpu::canvas_h(a) {
+        var x = 0
+        while x < ui::paint_cpu::canvas_w(a) {
+            if ui::paint_cpu::pixel_at(a, x, y) != ui::paint_cpu::pixel_at(b, x, y) { bad = bad + 1 }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return bad
+}
+
+/// The damage repaint is the full repaint: frame 0 drawn whole, then each change repainted only
+/// where it damaged, must leave exactly the pixels a full repaint of the new state leaves.
+fn test_rdoc_damage_repaint_is_pixel_exact() {
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    ui::paint_cpu::use_font_metrics(fr.font)
+    let bg = ui::core::color_rgb(5, 6, 7)
+    foreach sc in [1.0, 2.0] {
+        var d = doc_of(taskbar_src("12:00"))
+        ui::layout::rdoc_set_viewport(d, 400.0, 40.0)
+        let _f0 = ui::layout::rdoc_frame(d, 0.0)
+        let pw = to_int(400.0 * sc)
+        let ph = to_int(40.0 * sc)
+        var a = ui::paint_cpu::canvas_new(pw, ph, fr.font)
+        ui::paint_cpu::clear(a, bg)
+        ui::paint_cpu::render_overlay_scaled(a, ui::layout::rdoc_overlay(d), true, sc)
+        var step = 0
+        while step < 4 {
+            if step == 0 { ui::layout::rdoc_set_text(d, "clock", "9:41") }
+            if step == 1 { ui::layout::rdoc_pointer(d, 60.0, 20.0, false) }
+            if step == 2 { ui::layout::rdoc_pointer(d, 60.0, 20.0, true) }
+            if step == 3 { ui::layout::rdoc_pointer_leave(d)  ui::layout::rdoc_set_text(d, "clock", "23:59:59") }
+            let f = ui::layout::rdoc_frame(d, to_float(step + 1) * 16.0)
+            assert_true(f.changed)
+            ui::paint_cpu::render_overlay_damage(a, ui::layout::rdoc_overlay(d), f.damage, true, sc, bg)
+            var b = ui::paint_cpu::canvas_new(pw, ph, fr.font)
+            ui::paint_cpu::clear(b, bg)
+            ui::paint_cpu::render_overlay_scaled(b, ui::layout::rdoc_overlay(d), true, sc)
+            let bad = pixels_equal(a, b)
+            if bad > 0 { printl("scale " + to_str(sc) + " step " + to_str(step) + ": " + to_str(bad) + " pixels differ") }
+            assert_eq(bad, 0)
+            ui::paint_cpu::canvas_free(b)
+            step = step + 1
+        }
+        ui::paint_cpu::canvas_free(a)
+    }
+}
+
+// ---- paint effects: opacity, translate, scale ------------------------------------------------------
+
+fn fx_src() -> Str { return "column { padding: 10 gap: 4 bg: #000000 column { id: menu bg: #2040ff padding: 8 radius: 4 text { text: \"Apps\" } rect { w: 40 h: 10 color: #ff0000 } } text { text: \"below\" } }" }
+fn set_fx(inout n: ui::layout::UiNode, op: Float, tx: Float, ty: Float, sc: Float) {
+    n.children[0].opacity = op
+    n.children[0].translate_x = tx
+    n.children[0].translate_y = ty
+    n.children[0].scale_x = sc
+    n.children[0].scale_y = sc
+}
+fn test_fx_immediate_and_retained_agree() {
+    let vp = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(300.0, 200.0))
+    var r = ui::layout::dsl_parse_document(fx_src())
+    var plain = ui::layout::layout_overlay(r.doc.tree, vp)
+    set_fx(r.doc.tree, 0.5, 7.0, 0.0 - 20.0, 1.5)
+    var im = ui::layout::layout_overlay(r.doc.tree, vp)
+    assert_eq(im.prims.len(), plain.prims.len())
+    // the menu's background: half as opaque, scaled 1.5x about its centre, then moved
+    let pb = plain.prims[1]
+    let mb = im.prims[1]
+    assert_eq(mb.color.a, 128)
+    let c = pb.rect.center()
+    assert_true(feq(mb.rect.min.x, c.x + (pb.rect.min.x - c.x) * 1.5 + 7.0))
+    assert_true(feq(mb.rect.min.y, c.y + (pb.rect.min.y - c.y) * 1.5 - 20.0))
+    assert_true(feq(mb.radius, 6.0))
+    // the text inside moves and grows with it; the text below does not
+    let ti = text_prim(im, "Apps")
+    assert_true(feq(im.prims[ti].size_px, plain.prims[ti].size_px * 1.5))
+    let bi = text_prim(im, "below")
+    assert_true(feq(im.prims[bi].pos.y, plain.prims[bi].pos.y))
+    // retained: the same
+    var r2 = ui::layout::dsl_parse_document(fx_src())
+    set_fx(r2.doc.tree, 0.5, 7.0, 0.0 - 20.0, 1.5)
+    var d = ui::layout::rdoc_new()
+    ui::layout::rdoc_set_tree(d, sink r2.doc.tree)
+    ui::layout::rdoc_set_viewport(d, 300.0, 200.0)
+    let _f = ui::layout::rdoc_frame(d, 0.0)
+    assert_streq(overlay_diff(im, ui::layout::rdoc_overlay(d)), "")
+}
+fn test_fx_change_moves_without_relayout() {
+    var r = ui::layout::dsl_parse_document(fx_src())
+    var d = ui::layout::rdoc_new()
+    ui::layout::rdoc_set_tree(d, sink r.doc.tree)
+    ui::layout::rdoc_set_viewport(d, 300.0, 200.0)
+    let _f = ui::layout::rdoc_frame(d, 0.0)
+    // slide the menu up by 30: its subtree is re-transformed, nothing is measured again
+    var r2 = ui::layout::dsl_parse_document(fx_src())
+    set_fx(r2.doc.tree, 1.0, 0.0, 0.0 - 30.0, 1.0)
+    ui::layout::rdoc_set_tree(d, sink r2.doc.tree)
+    let f = ui::layout::rdoc_frame(d, 16.0)
+    assert_true(f.changed)
+    assert_eq(f.laid, 1)                      // the menu column's own chrome; its children are reused
+    let vp = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(300.0, 200.0))
+    var r3 = ui::layout::dsl_parse_document(fx_src())
+    set_fx(r3.doc.tree, 1.0, 0.0, 0.0 - 30.0, 1.0)
+    assert_streq(overlay_diff(ui::layout::layout_overlay(r3.doc.tree, vp), ui::layout::rdoc_overlay(d)), "")
+}
+
+/// …and while something animates: a menu sliding up and fading in over a bar, a button's colour
+/// transition, frame after frame, each repainted only where it damaged.
+fn test_rdoc_animation_repaint_is_pixel_exact() {
+    var fr = font::font_load(read_file("std/font/assets/DejaVuSans.ttf"))
+    ui::paint_cpu::use_font_metrics(fr.font)
+    let bg = ui::core::color_rgb(5, 6, 7)
+    let st = "keyframes up { from { translate_y: 40 opacity: 0 } to { translate_y: 0 opacity: 1 } }  .menu { bg: #303848 radius: 6 padding: 6 animation: up 160ms ease_out }  .tb { bg: #1f2937 radius: 6 padding: 6 transition: bg 120ms linear }  .tb.on { bg: #2563eb }"
+    var d = ui::layout::rdoc_new()
+    var r = ui::layout::dsl_parse_document("column { padding: 4 gap: 4 bg: #111827 row { gap: 4 column { id: m classes: [menu] text { text: \"Apps\" } text { text: \"Files\" } } spacer { } } row { gap: 4 column { id: t1 classes: [tb] text { text: \"One\" } } column { id: t2 classes: [tb] text { text: \"Two\" } } } }")
+    assert_true(r.ok)
+    ui::layout::rdoc_set_tree(d, sink r.doc.tree)
+    let sp = ui::layout::style_parse(st, "s")
+    assert_true(sp.ok)
+    let _e = ui::layout::rdoc_set_styles(d, "s", sp.styles)
+    ui::layout::rdoc_set_viewport(d, 300.0, 140.0)
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    var a = ui::paint_cpu::canvas_new(300, 140, fr.font)
+    ui::paint_cpu::clear(a, bg)
+    ui::paint_cpu::render_overlay_scaled(a, ui::layout::rdoc_overlay(d), true, 1.0)
+    var t = 16.0
+    var frames = 0
+    var moving = true
+    while moving && frames < 40 {
+        if frames == 3 { ui::layout::rdoc_add_class(d, "t2", "on") }
+        let f = ui::layout::rdoc_frame(d, t)
+        if f.changed {
+            ui::paint_cpu::render_overlay_damage(a, ui::layout::rdoc_overlay(d), f.damage, true, 1.0, bg)
+            var b = ui::paint_cpu::canvas_new(300, 140, fr.font)
+            ui::paint_cpu::clear(b, bg)
+            ui::paint_cpu::render_overlay_scaled(b, ui::layout::rdoc_overlay(d), true, 1.0)
+            let bad = pixels_equal(a, b)
+            if bad > 0 { printl("frame " + to_str(frames) + " t=" + to_str(t) + ": " + to_str(bad) + " pixels differ") }
+            assert_eq(bad, 0)
+            ui::paint_cpu::canvas_free(b)
+        }
+        moving = f.animating || frames < 4
+        t = t + 16.0
+        frames = frames + 1
+    }
+    assert_true(frames > 8)
+    assert_true(frames < 40)                                  // and then it settled
+    ui::paint_cpu::canvas_free(a)
+}
+
+/// a node that moves under a pointer that does not: its hover follows it.
+fn hov_src(first: Str) -> Str {
+    return "stylesheet { class h { bg: #101010 hover_bg: #f0f0f0 padding: 4 } } row { padding: 0 gap: 0 column { id: a class: h text { id: at text: \"" + first + "\" } } column { id: b class: h text { text: \"second\" } } }"
+}
+fn test_rdoc_hover_follows_moving_nodes() {
+    var d = doc_of(hov_src("x"))
+    ui::layout::rdoc_set_viewport(d, 400.0, 30.0)
+    ui::layout::rdoc_pointer(d, 30.0, 10.0, false)        // over `b`, just right of a short `a`
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    var ids: Vec<Str> = vec()
+    var offs: Vec<Float> = vec()
+    var r = ui::layout::dsl_parse_document(hov_src("x"))
+    let vp = ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(400.0, 30.0))
+    assert_streq(overlay_diff(ui::layout::doc_layout_interactive(r.doc, vp, ids, offs, ui::core::vec2(30.0, 10.0), false), ui::layout::rdoc_overlay(d)), "")
+    // `a` grows under the still pointer: now it is hovered and `b` is not
+    ui::layout::rdoc_set_text(d, "at", "a much longer label")
+    let f = ui::layout::rdoc_frame(d, 1.0)
+    assert_true(f.changed)
+    var r2 = ui::layout::dsl_parse_document(hov_src("a much longer label"))
+    var ids2: Vec<Str> = vec()
+    var offs2: Vec<Float> = vec()
+    assert_streq(overlay_diff(ui::layout::doc_layout_interactive(r2.doc, vp, ids2, offs2, ui::core::vec2(30.0, 10.0), false), ui::layout::rdoc_overlay(d)), "")
+}
+
+// ---- what a desktop shell needs ----
+
+/// the colour of the first filled rect primitive whose rect starts at x
+fn fill_at(ov: ui::layout::ComputedOverlay, x: Float) -> ui::core::Color {
+    foreach p in ov.prims { if p.kind == 0 && p.rect.min.x == x { return copy p.color } }
+    return ui::core::color_rgba(0, 0, 0, 0)
+}
+
+/// A rule that reaches a child through its parent (`.front .uline`) lets go of the child when the parent
+/// loses the class: restyling a node whose classes change restyles what is under it.
+fn test_rdoc_descendant_rules_follow_a_parents_class() {
+    var d = ui::layout::rdoc_new()
+    let ss = ui::layout::style_parse(".uline { bg: #000000 }\n.front .uline { bg: #ff0000 }\n", "t.style")
+    assert_true(ss.ok)
+    let e = ui::layout::rdoc_set_styles(d, "t", ss.styles)
+    assert_streq(e.msg, "")
+    ui::layout::rdoc_set_viewport(d, 200.0, 40.0)
+    let e1 = ui::layout::rdoc_set_source(d, "row { column { id: w classes: [wi, front] rect { classes: [uline] w: 30 h: 2 } } }", "")
+    assert_streq(e1.msg, "")
+    let _f1 = ui::layout::rdoc_frame(d, 0.0)
+    let c1 = fill_at(ui::layout::rdoc_overlay(d), 0.0)
+    assert_eq(c1.r, 255)
+    let e2 = ui::layout::rdoc_set_source(d, "row { column { id: w classes: [wi] rect { classes: [uline] w: 30 h: 2 } } }", "")
+    assert_streq(e2.msg, "")
+    let f2 = ui::layout::rdoc_frame(d, 16.0)
+    assert_true(f2.changed)
+    let c2 = fill_at(ui::layout::rdoc_overlay(d), 0.0)
+    assert_eq(c2.r, 0)
+}
+
+/// A container's w/h from its style fix its size (in the retained and the immediate layout alike).
+fn test_container_w_h_from_style() {
+    var d = ui::layout::rdoc_new()
+    let ss = ui::layout::style_parse(".b { w: 32 h: 30 bg: #102030 }\n", "t.style")
+    let _e = ui::layout::rdoc_set_styles(d, "t", ss.styles)
+    ui::layout::rdoc_set_viewport(d, 200.0, 60.0)
+    // (a row's cross axis stretches its children unless it aligns them: this one centres)
+    let _e1 = ui::layout::rdoc_set_source(d, "row { cross_align: center row { classes: [b] on_click: go text { text: \"x\" } } }", "")
+    let _f = ui::layout::rdoc_frame(d, 0.0)
+    let h = ui::layout::rdoc_hit(d, ui::core::vec2(5.0, 30.0))
+    assert_streq(h.on_click, "go")
+    foreach hr in ui::layout::rdoc_overlay(d).hits {
+        if hr.on_click == "go" {
+            assert_true(hr.rect.width() == 32.0)
+            assert_true(hr.rect.height() == 30.0)
+        }
+    }
+}
+
+/// bg_to: a background that is a gradient (the painters' two-colour ramp), horizontal by default
+fn test_bg_to_is_a_gradient() {
+    var d = ui::layout::rdoc_new()
+    let ss = ui::layout::style_parse(".g { w: 100 h: 4 bg: #9fcf6e bg_to: #5fc08a }\n", "t.style")
+    assert_true(ss.ok)
+    let _e = ui::layout::rdoc_set_styles(d, "t", ss.styles)
+    ui::layout::rdoc_set_viewport(d, 200.0, 20.0)
+    let _e1 = ui::layout::rdoc_set_source(d, "row { rect { classes: [g] } }", "")
+    let _f = ui::layout::rdoc_frame(d, 0.0)
+    var found = false
+    foreach p in ui::layout::rdoc_overlay(d).prims {
+        if p.kind == 0 && p.has_grad {
+            found = true
+            assert_eq(p.color.r, 159)
+            assert_eq(p.grad_to.r, 95)
+            assert_true(p.grad_horizontal)
+            assert_true(p.grad_b == 100.0)
+        }
+    }
+    assert_true(found)
+}
+
+/// An `on_click` given to a node that paints nothing changes no pixel, but the hit regions: the frame says so
+/// (hits_changed), so a host routing clicks reads the overlay again.
+fn test_rdoc_hits_change_without_damage() {
+    var d = ui::layout::rdoc_new()
+    ui::layout::rdoc_set_viewport(d, 200.0, 40.0)
+    let _e1 = ui::layout::rdoc_set_source(d, "row { row { padding: 4 text { text: \"x\" } } }", "")
+    let f1 = ui::layout::rdoc_frame(d, 0.0)
+    assert_true(f1.hits_changed == false)
+    let _e2 = ui::layout::rdoc_set_source(d, "row { row { padding: 4 on_click: go text { text: \"x\" } } }", "")
+    let f2 = ui::layout::rdoc_frame(d, 16.0)
+    assert_true(f2.hits_changed)
+    assert_eq(ui::layout::rdoc_overlay(d).hits.len(), 1)
+    let _e3 = ui::layout::rdoc_set_source(d, "row { row { padding: 4 on_click: go text { text: \"x\" } } }", "")
+    let f3 = ui::layout::rdoc_frame(d, 32.0)
+    assert_true(f3.hits_changed == false)
+}
+
+// a blinking caret: the phase off lays out only the fields again, the damage is the caret's, and the caret is
+// gone from the paint list; on again, it is back; telling it the phase it already has is no work
+fn test_caret_blinks() {
+    var d = ui::layout::rdoc_new()
+    var r = ui::layout::dsl_parse_document("column { padding: 10 gap: 4 text { text: \"Search\" } text_input { id: \"q\" value: \"abc\" caret: 3 classes: [focused] } }")
+    assert_true(r.ok)
+    ui::layout::rdoc_set_tree(d, sink r.doc.tree)
+    ui::layout::rdoc_set_viewport(d, 300.0, 100.0)
+    let _f0 = ui::layout::rdoc_frame(d, 0.0)
+    let n0 = caret_bars(ui::layout::rdoc_overlay(d))
+    assert_eq(n0, 1)
+    ui::layout::rdoc_set_caret_on(d, false)
+    let f1 = ui::layout::rdoc_frame(d, 10.0)
+    assert_true(f1.changed)
+    assert_eq(caret_bars(ui::layout::rdoc_overlay(d)), 0)
+    var area = 0.0
+    foreach dr in f1.damage { area = area + dr.width() * dr.height() }
+    assert_true(area < 300.0)
+    ui::layout::rdoc_set_caret_on(d, false)
+    assert_false(ui::layout::rdoc_pending(d))
+    ui::layout::rdoc_set_caret_on(d, true)
+    let f2 = ui::layout::rdoc_frame(d, 20.0)
+    assert_true(f2.changed)
+    assert_eq(caret_bars(ui::layout::rdoc_overlay(d)), 1)
+    // and another document laid out meanwhile is not told the first one's phase
+    ui::layout::rdoc_set_caret_on(d, false)
+    let _f3 = ui::layout::rdoc_frame(d, 30.0)
+    assert_true(ui::layout::caret_on())
+}
+fn caret_bars(ov: ui::layout::ComputedOverlay) -> Int {
+    var n = 0
+    foreach p in ov.prims { if p.kind == 0 && p.rect.width() < 2.0 && p.rect.height() > 8.0 && p.color.a > 0 { n = n + 1 } }
+    return n
+}

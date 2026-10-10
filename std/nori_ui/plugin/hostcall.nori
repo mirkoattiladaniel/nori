@@ -1,0 +1,174 @@
+//! The host callback: the address a loaded plugin uses to call back into its host.
+//!
+//! Without it the conversation is one-way (the host calls `nori_plugin_render` / `nori_plugin_event`
+//! and that is all), so a plugin that needs to ask its host something has to be told everything up
+//! front. The callback gives the plugin an address to call instead of a private service registry
+//! and ad-hoc channels such as `render("svc:KEY:ARG")` or `event(panel, "scene:[…]")`.
+//!
+//! ## Why the address is taken, not exported
+//!
+//! Handing a plugin a callback means handing it the address of a host function, and a whole-program
+//! `noric --build` keeps no symbol for one: a top-level `pub fn` is inlined away and its name is gone
+//! from the executable entirely (`nm` on a built host finds `_start`, `nori_rt0`, and the
+//! allocator, nothing else). `--build-lib --shared` does keep its exports, but splitting the host
+//! into a library plus a thin entry point is not needed.
+//!
+//! **An address does not have to be a symbol, it only has to be taken.**
+//! `cfn_addr(hostcall_entry)` is the address of a C-callable entry for the Nori callback, generated
+//! beside it; taking it keeps the body alive, so an ordinary whole-program host keeps working, built
+//! with the default backend or with `--native`.
+//!
+//! ## The shape
+//!
+//! One address, handed over at init, invoked as `(key: cstr, arg: cstr) -> cstr`. That is the same
+//! JSON-in / JSON-out service call the host bus already speaks, so the whole bus rides on one
+//! callback and nothing new has to be versioned when a service is added.
+//!
+//! ## Who owns the strings
+//!
+//! Two images, two heaps, two `malloc`s: a block from one cannot be returned to the other. So:
+//!
+//!   * **arguments belong to the caller.** The plugin allocates `key` and `arg`, the host copies them
+//!     with `os_from_cstr` and keeps no pointer, and the plugin frees them when the call returns.
+//!   * **the reply belongs to the host**, and the plugin must not free it. The host frees the
+//!     previous reply at the start of the next call, so at most one reply is ever outstanding
+//!     (bounded, rather than a leak per call). The plugin therefore has to copy the reply before it
+//!     calls again, which `dl::host_call` does immediately, on the same line.
+//!
+//! One consequence, and it is the only sharp edge: **a host service must not call back into the
+//! plugin that is calling it.** A reentrant call would free the outer reply buffer before the outer
+//! caller had read it. Services return data; they do not re-enter.
+
+use core::*
+import "std/json" as json
+import "std/os" as os
+
+// The bus itself: the one service registry in the process. A `PluginHost` publishes into it through
+// `host_register_service` and answers `host_invoke_service` out of it, and the callback below routes
+// into the same two vectors, so a service is reachable the same way whoever asks. They are globals
+// because a C-ABI callback has no context parameter to carry a host in; there is one plugin host per
+// process, which is the same assumption the dock already makes.
+global g_hostcall_keys: Vec<Str>
+global g_hostcall_fns: Vec<Fn(Str) -> Str>
+global g_hostcall_bound: Int = 0
+global g_hostcall_last: Int = 0
+
+/// open the bus for the callback. Idempotent; what is already published stays.
+pub fn hostcall_bind() { g_hostcall_bound = 1 }
+
+// The two vectors exist from the first reset on and are emptied in place after that: a global
+// that is assigned a fresh vector keeps nothing of the old one alive, but frees nothing of it
+// either, so popping is what returns a previous host's entries.
+global g_hostcall_alloc: Int = 0
+fn hostcall_clear() {
+    if g_hostcall_alloc == 0 {
+        var ek: Vec<Str> = vec()
+        var ef: Vec<Fn(Str) -> Str> = vec()
+        g_hostcall_keys = ek
+        g_hostcall_fns = ef
+        g_hostcall_alloc = 1
+        return
+    }
+    while g_hostcall_keys.len() > 0 { let _k = g_hostcall_keys.pop() }
+    while g_hostcall_fns.len() > 0 { let _f = g_hostcall_fns.pop() }
+}
+
+/// empty the bus and open it, which is what a new host does, so nothing an earlier host published answers
+/// for it.
+pub fn hostcall_reset() { hostcall_clear()  g_hostcall_bound = 1 }
+
+/// take the bus away again. A callback invoked afterwards answers an error rather than a service
+/// that belonged to a host that is gone.
+pub fn hostcall_unbind() { hostcall_clear()  g_hostcall_bound = 0 }
+
+/// true once a host has bound its bus.
+pub fn hostcall_bound() -> Bool { return g_hostcall_bound == 1 }
+
+/// publish a service on the bus. Re-registering a key replaces its answer.
+pub fn hostcall_register(key: Str, sink f: Fn(Str) -> Str) {
+    var i = 0
+    while i < g_hostcall_keys.len() {
+        if g_hostcall_keys[i] == key { g_hostcall_fns[i] = f  return }
+        i = i + 1
+    }
+    g_hostcall_keys.push(copy key)
+    g_hostcall_fns.push(f)
+}
+
+/// true when the key is published.
+pub fn hostcall_has(key: Str) -> Bool {
+    var i = 0
+    while i < g_hostcall_keys.len() { if g_hostcall_keys[i] == key { return true }  i = i + 1 }
+    return false
+}
+
+/// how many keys are published.
+pub fn hostcall_count() -> Int { return g_hostcall_keys.len() }
+
+/// the published key at `i`, in registration order.
+pub fn hostcall_key_at(i: Int) -> view Str { return g_hostcall_keys[i] }
+
+/// the reply for a key that is not published: the one error shape both sides already speak.
+pub fn hostcall_no_service(key: Str) -> Str { return ("{\"ok\":false,\"error\":\"no such service: " + (json::js_escape(key) + "\"}")) }
+
+/// the published keys, as a JSON array. Reachable over the callback as `host.services`, so a plugin
+/// can discover what its host offers instead of being told at build time.
+fn hostcall_key_list() -> Str {
+    var out = "{\"ok\":true,\"result\":["
+    var i = 0
+    while i < g_hostcall_keys.len() {
+        if i > 0 { out = (out + ",") }
+        out = (out + ("\"" + (json::js_escape(g_hostcall_keys[i]) + "\"")))
+        i = i + 1
+    }
+    return (out + "]}")
+}
+
+/// route one `(key, arg)` to the bus: the reply of the service published under `key`, or the shared
+/// error shape when nothing is.
+pub fn hostcall_route(key: Str, arg: Str) -> Str {
+    if key == "host.services" { return hostcall_key_list() }
+    var i = 0
+    while i < g_hostcall_keys.len() {
+        if g_hostcall_keys[i] == key { var f = g_hostcall_fns[i]  return f(arg) }
+        i = i + 1
+    }
+    return hostcall_no_service(key)
+}
+
+/// **the callback itself**, what a plugin's `nori_plugin_init` is handed the address of.
+///
+/// C-ABI: two `char*` in, one `char*` out, both sides `Int`. Nothing here traps. A null pointer, an
+/// empty key, an unbound bus and an unknown key all come back as a parseable JSON error, because the
+/// caller is across a `.so` boundary and a trap there takes the whole process with it.
+pub fn hostcall_entry(kp: Int, ap: Int) -> Int {
+    var key = ""
+    if kp != 0 { key = os::os_from_cstr(kp) }
+    var arg = "{}"
+    if ap != 0 { arg = os::os_from_cstr(ap) }
+    if arg.len() == 0 { arg = "{}" }
+    var reply = ""
+    if g_hostcall_bound == 0 { reply = "{\"ok\":false,\"error\":\"the host has not bound a service bus\"}" }
+    else if key.len() == 0 { reply = "{\"ok\":false,\"error\":\"empty service key\"}" }
+    else { reply = hostcall_route(key, arg) }
+    let p = os::os_cstr(reply)
+    // the previous reply, not this one: the caller has had its chance to copy it (`dl::host_call`
+    // copies on the same line), and freeing here is the host freeing what the host allocated.
+    if g_hostcall_last != 0 { unsafe { free(g_hostcall_last) } }
+    g_hostcall_last = p
+    return p
+}
+
+/// the address to hand a plugin: what `nori_plugin_init` receives. Never 0.
+pub fn hostcall_addr() -> Int { var r = 0  unsafe { r = cfn_addr(hostcall_entry) }  return r }
+
+/// invoke the callback the way a plugin would, without a plugin. Useful in tests, and for anyone
+/// who wants to check a service answers before shipping it behind a `.so`.
+pub fn hostcall_self_test(key: Str, arg: Str) -> Str {
+    let ck = os::os_cstr(key)
+    let ca = os::os_cstr(arg)
+    let p = hostcall_entry(ck, ca)
+    unsafe { free(ck)  free(ca) }
+    if p == 0 { return "" }
+    return os::os_from_cstr(p)
+}

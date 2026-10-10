@@ -1,0 +1,265 @@
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// Vec2, Rect, Color, HSV<->RGB
+// ===========================================================================
+
+/// 2D vector (position, size, or delta).
+pub struct Vec2 { x: Float, y: Float }
+
+/// construct a Vec2 from components.
+pub fn vec2(x: Float, y: Float) -> Vec2 { return Vec2 { x: x, y: y } }
+/// the zero vector (0, 0).
+pub fn vec2_zero() -> Vec2 { return Vec2 { x: 0.0, y: 0.0 } }
+/// a vector with both components set to `v`.
+pub fn vec2_splat(v: Float) -> Vec2 { return Vec2 { x: v, y: v } }
+
+impl Vec2 {
+    /// component-wise sum.
+    fn add(inout self, o: Vec2) -> Vec2 { return Vec2 { x: self.x + o.x, y: self.y + o.y } }
+    /// component-wise difference.
+    fn sub(self, o: Vec2) -> Vec2 { return Vec2 { x: self.x - o.x, y: self.y - o.y } }
+    /// scale by a scalar.
+    fn mul(self, s: Float) -> Vec2 { return Vec2 { x: self.x * s, y: self.y * s } }
+    /// divide by a scalar.
+    fn div(self, s: Float) -> Vec2 { return Vec2 { x: self.x / s, y: self.y / s } }
+    /// Euclidean length.
+    fn length(self) -> Float { return sqrt(self.x * self.x + self.y * self.y) }
+    /// unit vector, or zero if length is zero.
+    fn normalize(self) -> Vec2 {
+        var len = self.length()
+        if len > 0.0 { return self.div(len) }
+        return Vec2 { x: 0.0, y: 0.0 }
+    }
+    /// true when both components equal the other's.
+    fn eq(self, o: Vec2) -> Bool { return self.x == o.x && self.y == o.y }
+}
+
+/// axis-aligned rectangle stored as min corner + max corner.
+pub struct Rect { min: Vec2, max: Vec2 }
+
+/// rectangle from a min corner and a size.
+pub fn rect_min_size(copy min: Vec2, size: Vec2) -> Rect {
+    let max = Vec2 { x: min.x + size.x, y: min.y + size.y }
+    return Rect { min: min, max: max }
+}
+/// rectangle from min and max corners.
+pub fn rect_min_max(copy min: Vec2, copy max: Vec2) -> Rect { return Rect { min: min, max: max } }
+/// a rectangle of its own with `r`'s corners, for a field or a return that must not share them.
+pub fn rect_copy(r: Rect) -> Rect { return rect_min_max(r.min, r.max) }
+
+impl Rect {
+    /// width (max.x - min.x).
+    fn width(self) -> Float { return self.max.x - self.min.x }
+    /// height (max.y - min.y).
+    fn height(self) -> Float { return self.max.y - self.min.y }
+    /// size as a Vec2.
+    fn size(self) -> Vec2 { return Vec2 { x: self.width(), y: self.height() } }
+    /// center point.
+    fn center(self) -> Vec2 {
+        return Vec2 { x: (self.min.x + self.max.x) * 0.5, y: (self.min.y + self.max.y) * 0.5 }
+    }
+    /// shrink by per-edge insets; size clamps to non-negative.
+    fn inset(self, left: Float, right: Float, top: Float, bottom: Float) -> Rect {
+        var min_x = math::fmin(self.min.x + left, self.max.x)
+        var max_x = math::fmax(self.max.x - right, self.min.x)
+        var min_y = math::fmin(self.min.y + top, self.max.y)
+        var max_y = math::fmax(self.max.y - bottom, self.min.y)
+        return Rect {
+            min: Vec2 { x: min_x, y: min_y },
+            max: Vec2 { x: math::fmax(max_x, min_x), y: math::fmax(max_y, min_y) }
+        }
+    }
+    /// expand by per-edge amounts (positive grows); size clamps to non-negative.
+    fn expand(self, left: Float, right: Float, top: Float, bottom: Float) -> Rect {
+        var min_x = self.min.x - left
+        var min_y = self.min.y - top
+        var w = math::fmax(self.width() + left + right, 0.0)
+        var h = math::fmax(self.height() + top + bottom, 0.0)
+        return rect_min_size(Vec2 { x: min_x, y: min_y }, Vec2 { x: w, y: h })
+    }
+    /// true if point `p` is inside (inclusive of edges).
+    fn contains(self, p: Vec2) -> Bool {
+        return p.x >= self.min.x && p.x <= self.max.x && p.y >= self.min.y && p.y <= self.max.y
+    }
+    /// translate by a delta.
+    fn translate(inout self, d: Vec2) -> Rect { return Rect { min: self.min.add(d), max: self.max.add(d) } }
+    /// smallest rect containing both this and `o`.
+    fn union(self, o: Rect) -> Rect {
+        return Rect {
+            min: Vec2 { x: math::fmin(self.min.x, o.min.x), y: math::fmin(self.min.y, o.min.y) },
+            max: Vec2 { x: math::fmax(self.max.x, o.max.x), y: math::fmax(self.max.y, o.max.y) }
+        }
+    }
+    /// true if this rect overlaps `o` (positive area intersection).
+    fn overlaps(self, o: Rect) -> Bool {
+        var min_x = math::fmax(self.min.x, o.min.x)
+        var min_y = math::fmax(self.min.y, o.min.y)
+        var max_x = math::fmin(self.max.x, o.max.x)
+        var max_y = math::fmin(self.max.y, o.max.y)
+        return min_x < max_x && min_y < max_y
+    }
+    /// intersection rect; Option::None when they do not overlap.
+    fn intersect(self, o: Rect) -> Option<Rect> {
+        var min_x = math::fmax(self.min.x, o.min.x)
+        var min_y = math::fmax(self.min.y, o.min.y)
+        var max_x = math::fmin(self.max.x, o.max.x)
+        var max_y = math::fmin(self.max.y, o.max.y)
+        if min_x >= max_x || min_y >= max_y { return Option::None }
+        return Option::Some(rect_min_max(Vec2 { x: min_x, y: min_y }, Vec2 { x: max_x, y: max_y }))
+    }
+    /// shrink `self` to the larger full-width strip above/below `overlay` that avoids it. Returns self
+    /// unchanged when they don't overlap or when `overlay` spans the full height.
+    fn shrink_to_avoid_overlay(self, overlay: Rect) -> Rect {
+        if !self.overlaps(overlay) { return rect_copy(self) }
+        var has_above = false
+        var above = rect_copy(self)
+        if overlay.min.y > self.min.y {
+            var bottom = math::fmin(self.max.y, overlay.min.y)
+            if bottom > self.min.y { has_above = true  above = rect_min_max(vec2(self.min.x, self.min.y), vec2(self.max.x, bottom)) }
+        }
+        var has_below = false
+        var below = rect_copy(self)
+        if overlay.max.y < self.max.y {
+            var top = math::fmax(self.min.y, overlay.max.y)
+            if self.max.y > top { has_below = true  below = rect_min_max(vec2(self.min.x, top), vec2(self.max.x, self.max.y)) }
+        }
+        if has_above && has_below {
+            if above.width() * above.height() >= below.width() * below.height() { return above }
+            return below
+        }
+        if has_above { return above }
+        if has_below { return below }
+        return rect_copy(self)
+    }
+}
+
+/// RGBA color, 0..=255 per channel.
+pub struct Color { r: Int, g: Int, b: Int, a: Int }
+
+/// a colour packed into one Int, 0xRRGGBBAA. A document's nodes keep their colours this way: a `Color`
+/// is a record of its own (40 bytes and an allocation), and a node has fifteen of them.
+pub fn rgba_pack(c: Color) -> Int {
+    return (cc8(c.r) << 24) | (cc8(c.g) << 16) | (cc8(c.b) << 8) | cc8(c.a)
+}
+/// the Color a packed 0xRRGGBBAA Int holds.
+pub fn rgba_color(v: Int) -> Color { return Color { r: (v >> 24) & 255, g: (v >> 16) & 255, b: (v >> 8) & 255, a: v & 255 } }
+/// packed opaque white / transparent black
+pub fn rgba_white() -> Int { return 4294967295 }
+pub fn rgba_transparent() -> Int { return 0 }
+fn cc8(v: Int) -> Int { if v < 0 { return 0 }  if v > 255 { return 255 }  return v }
+/// opaque color from RGB (alpha = 255).
+pub fn color_rgb(r: Int, g: Int, b: Int) -> Color { return Color { r: r, g: g, b: b, a: 255 } }
+/// color from RGBA.
+pub fn color_rgba(r: Int, g: Int, b: Int, a: Int) -> Color { return Color { r: r, g: g, b: b, a: a } }
+/// fully transparent black.
+pub fn color_transparent() -> Color { return Color { r: 0, g: 0, b: 0, a: 0 } }
+/// opaque white.
+pub fn color_white() -> Color { return Color { r: 255, g: 255, b: 255, a: 255 } }
+/// opaque black.
+pub fn color_black() -> Color { return Color { r: 0, g: 0, b: 0, a: 255 } }
+/// opaque gray (r=g=b=v).
+pub fn color_gray(v: Int) -> Color { return Color { r: v, g: v, b: v, a: 255 } }
+
+impl Color {
+    /// copy with a new alpha.
+    fn with_alpha(self, a: Int) -> Color { return Color { r: self.r, g: self.g, b: self.b, a: a } }
+    /// linear interpolation toward `o`; `t` clamped to [0, 1].
+    fn lerp(self, o: Color, t: Float) -> Color {
+        var u = math::fclamp(t, 0.0, 1.0)
+        return Color {
+            r: lerp_ch(self.r, o.r, u),
+            g: lerp_ch(self.g, o.g, u),
+            b: lerp_ch(self.b, o.b, u),
+            a: lerp_ch(self.a, o.a, u)
+        }
+    }
+    /// copy with alpha multiplied by `scale` (clamped to [0, 1]); truncates toward zero.
+    fn scale_alpha(self, scale: Float) -> Color {
+        var s = math::fclamp(scale, 0.0, 1.0)
+        return Color { r: self.r, g: self.g, b: self.b, a: to_int(to_float(self.a) * s) }
+    }
+    /// true if all channels match.
+    fn eq(self, o: Color) -> Bool {
+        return self.r == o.r && self.g == o.g && self.b == o.b && self.a == o.a
+    }
+}
+
+/// a per-node visual transform: uniform scale about the rect center + a vertical translation.
+pub struct VisualTransform { scale: Float, translate_y: Float }
+/// the identity transform (scale 1, no translation).
+pub fn visual_transform_identity() -> VisualTransform { return VisualTransform { scale: 1.0, translate_y: 0.0 } }
+/// apply `transform` to `rect`: scale about the center (floored at 0.01) then translate vertically.
+pub fn transform_rect(rect: Rect, transform: VisualTransform) -> Rect {
+    var scale = transform.scale
+    if scale < 0.01 { scale = 0.01 }
+    let w = rect.width() * scale
+    let h = rect.height() * scale
+    let cx = (rect.min.x + rect.max.x) * 0.5
+    let cy = (rect.min.y + rect.max.y) * 0.5 + transform.translate_y
+    return rect_min_size(vec2(cx - w * 0.5, cy - h * 0.5), vec2(w, h))
+}
+
+/// interpolate one 0..=255 channel and round to Int (internal helper).
+pub fn lerp_ch(a: Int, b: Int, t: Float) -> Int {
+    var fa = to_float(a)
+    var fb = to_float(b)
+    return to_int(math::round(fa + (fb - fa) * t))
+}
+
+/// HSV color: H in [0, 360), S and V in [0, 1].
+pub struct Hsv { h: Float, s: Float, v: Float }
+
+/// RGB (0..=255) to HSV.
+pub fn rgb_to_hsv(r: Int, g: Int, b: Int) -> Hsv {
+    var rf = to_float(r) / 255.0
+    var gf = to_float(g) / 255.0
+    var bf = to_float(b) / 255.0
+    var mx = math::fmax(rf, math::fmax(gf, bf))
+    var mn = math::fmin(rf, math::fmin(gf, bf))
+    var v = mx
+    var s = 0.0
+    if mx > 0.0001 { s = (mx - mn) / mx }
+    var h = 0.0
+    if mx <= mn {
+        h = 0.0
+    } else if mx == rf {
+        if gf >= bf { h = 60.0 * ((gf - bf) / (mx - mn)) }
+        else { h = 60.0 * ((gf - bf) / (mx - mn) + 6.0) }
+    } else if mx == gf {
+        h = 60.0 * ((bf - rf) / (mx - mn) + 2.0)
+    } else {
+        h = 60.0 * ((rf - gf) / (mx - mn) + 4.0)
+    }
+    h = math::fmod(h, 360.0)
+    return Hsv { h: h, s: s, v: v }
+}
+
+/// HSV to RGB (0..=255).
+pub fn hsv_to_rgb(h: Float, s: Float, v: Float) -> Color {
+    var c = v * s
+    var x = c * (1.0 - math::fabs(math::fmod(h / 60.0, 2.0) - 1.0))
+    var m = v - c
+    var rf = 0.0
+    var gf = 0.0
+    var bf = 0.0
+    if h < 60.0 { rf = c  gf = x  bf = 0.0 }
+    else if h < 120.0 { rf = x  gf = c  bf = 0.0 }
+    else if h < 180.0 { rf = 0.0  gf = c  bf = x }
+    else if h < 240.0 { rf = 0.0  gf = x  bf = c }
+    else if h < 300.0 { rf = x  gf = 0.0  bf = c }
+    else { rf = c  gf = 0.0  bf = x }
+    return Color {
+        r: chan_255(rf + m),
+        g: chan_255(gf + m),
+        b: chan_255(bf + m),
+        a: 255
+    }
+}
+
+/// scale a [0,1] float to a clamped 0..=255 Int (internal helper).
+pub fn chan_255(x: Float) -> Int {
+    return to_int(math::fclamp(math::round(x * 255.0), 0.0, 255.0))
+}
+

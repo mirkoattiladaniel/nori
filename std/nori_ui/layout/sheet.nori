@@ -1,0 +1,901 @@
+use core::*
+import "std/math" as math
+import "std/parse" as parse
+
+// ===========================================================================
+// layout/sheet: `.style` as a customization language.
+//
+// The basic forms (`tag NAME { ... }`, `class NAME { ... }`, the property
+// names, the error texts) stay what they were. On top of them:
+//
+//   vars { --accent: #3b82f6  --radius: 6  --bar-h: 40 }
+//       Theme tokens, used anywhere a value goes: `bg: --accent`. A token may
+//       name another (`--hover: --accent`). Tokens are document-wide, not
+//       inherited down the tree as CSS custom properties are: a theme is a file
+//       of tokens and a plugin's sheet overrides one by defining it again (the
+//       last definition wins), which is the whole of what the desktop asks for
+//       ("dark/light and accent from the system theme, overridable per plugin";
+//       each plugin is its own document). It also keeps a token a table lookup
+//       made once per rule when the sheet is compiled, never per node.
+//       `vars { }` rather than `:root { }` because there is no root element in
+//       the selector sense to hang them on and nothing else about them is a rule.
+//
+//   selectors, CSS's subset:
+//       button   .tb   button.tb.active   *          type / classes / any
+//       .tb:hover  .tb:active  text_input:focus  .tb:disabled
+//       .bar .tb   (descendant)     .bar > .tb   (child)     a, b   (a list)
+//   Specificity is CSS's without ids: (classes + pseudo-classes, types). The
+//   cascade applies every matching rule from the least specific to the most,
+//   and between equals the later in the source wins; legacy `tag X` is a type
+//   selector (0,1) and `class X` a class selector (1,0). A state a plugin sets
+//   on a node (`.urgent`, `.playing`) is an ordinary class the host adds with
+//   rdoc_add_class. There are no `#id` selectors: `#` already starts a comment
+//   or a colour in this syntax.
+//
+//   transition: bg 200ms ease_out, opacity 150ms linear 50ms
+//       property, duration, an easing (linear ease ease_in ease_out ease_in_out
+//       `-` spellings too, or cubic_bezier(x1, y1, x2, y2)), and a delay.
+//       Properties: colours (bg color text_color border_color), opacity, sizes
+//       (w h size_px gap padding border_w min_height), positions (translate,
+//       translate_x/_y, top left right bottom), scale (scale, scale_x/_y),
+//       radius, letter_spacing, or `all`.
+//
+//   keyframes pulse { from { opacity: 1 } 50% { opacity: 0.4 } to { opacity: 1 } }
+//   animation: pulse 1200ms ease_in_out infinite alternate
+//       name, duration, then in any order: easing, delay, an iteration count or
+//       `infinite`, a direction (normal reverse alternate alternate_reverse) and
+//       a fill (none forwards backwards both).
+//
+//   opacity: 0.5   translate: [0, 40]   translate_y: 40   scale: 0.95   w: 50%   gap: 4
+//
+//   font-family: "Noto Sans", "Noto Sans Arabic", sans-serif   font-weight: 600   font-style: italic
+//   direction: rtl   lang: ar   text-align: start
+//       Faces, resolved by layout's text engine through std/font's discovery (a family that is not
+//       installed is skipped). A hyphenated name is the underscored one (`font-family` is
+//       `font_family`), and a value list may be written bare, comma-separated, here and in vars.
+//   vars { --ui-font: "Noto Sans", "Noto Sans Arabic", sans-serif }
+//       The UI font: every node with no family of its own is drawn in it. One token in a theme.
+//
+// Time comes from the caller: a retained document is given `now` every frame
+// (rdoc_frame), never a clock of its own, so a test is deterministic and the
+// compositor can pace animation by vblank.
+//
+// A `.style` source is parsed into a StyleSet (rules and tokens as written, the
+// values unresolved) and compiled into a CSheet once every source that feeds
+// the document (the theme, imports, the plugin's own) is known: tokens are
+// resolved then, so redefining one restyles everything that uses it.
+// ===========================================================================
+
+/// where something went wrong: file, line, column (1-based) and what.
+pub struct UiError { file: Str, line: Int, col: Int, msg: Str }
+pub fn ui_error_none() -> UiError { return UiError { file: "", line: 0, col: 0, msg: "" } }
+pub fn ui_error_dup(e: UiError) -> UiError { return UiError { file: copy e.file, line: e.line, col: e.col, msg: copy e.msg } }
+/// "file:line:col: message" (the file left out when there is none).
+pub fn ui_error_text(e: UiError) -> Str {
+    var head = ""
+    if e.file.len() > 0 { head = e.file + ":" }
+    return head + (to_str(e.line) + (":" + (to_str(e.col) + (": " + e.msg))))
+}
+
+// ---- what a source says ----------------------------------------------------------------------------
+
+/// one compound selector: a type (or "" for any), classes, pseudo-classes.
+pub struct SelPart { tag: Str, classes: Vec<Str>, hover: Bool, active: Bool, focus: Bool, disabled: Bool }
+/// a complex selector, left to right; `combs[i]` joins parts[i] and parts[i+1]: 0 descendant, 1 child.
+pub struct Selector { parts: Vec<SelPart>, combs: Vec<Int>, spec: Int }
+/// an easing curve: 0 linear, 1 cubic bezier (x1, y1, x2, y2).
+pub struct Ease { kind: Int, x1: Float, y1: Float, x2: Float, y2: Float }
+/// one property's transition.
+pub struct TransSpec { prop: Int, dur: Float, delay: Float, ease: Ease }
+/// an animation: keyframes by name, duration and delay (ms), iteration count (-1 infinite),
+/// direction (0 normal 1 reverse 2 alternate 3 alternate_reverse), fill (0 none 1 forwards
+/// 2 backwards 3 both).
+pub struct AnimSpec { name: Str, dur: Float, delay: Float, count: Float, dir: Int, fill: Int, ease: Ease }
+/// one declaration: kind 0 a property (`val`), 1 a transition (`trans`), 2 an animation (`anim`).
+/// `src`/`off`: the source and byte offset of its value (where an error about it is reported).
+pub struct StyleDecl { kind: Int, name: Str, val: DslValue, trans: Vec<TransSpec>, anim: AnimSpec, src: Int, off: Int }
+/// a rule: its selectors and declarations. `legacy`: 1 `tag NAME`, 2 `class NAME`, 0 a selector.
+pub struct StyleRule { sels: Vec<Selector>, decls: Vec<StyleDecl>, legacy: Int, legacy_name: Str }
+pub struct VarDef { name: Str, val: DslValue, src: Int, off: Int }
+pub struct KeyStop { at: Float, decls: Vec<StyleDecl> }
+pub struct KeyframesDef { name: Str, stops: Vec<KeyStop> }
+/// an `import "path"` met in a source (resolved by whoever knows where the source lives).
+pub struct StyleImport { path: Str, src: Int, off: Int }
+/// everything one or more sources said, in source order, unresolved.
+/// `key`: the text of every source as parsed, so two sets from the same text compare equal
+/// without comparing what they hold (a document re-sent unchanged recompiles nothing).
+pub struct StyleSet { files: Vec<Str>, srcs: Vec<Str>, rules: Vec<StyleRule>, vars: Vec<VarDef>, kfs: Vec<KeyframesDef>, imports: Vec<StyleImport>, key: Str }
+
+pub fn style_set_new() -> StyleSet {
+    var f: Vec<Str> = vec()
+    var s: Vec<Str> = vec()
+    var r: Vec<StyleRule> = vec()
+    var v: Vec<VarDef> = vec()
+    var k: Vec<KeyframesDef> = vec()
+    var i: Vec<StyleImport> = vec()
+    return StyleSet { files: f, srcs: s, rules: r, vars: v, kfs: k, imports: i, key: "" }
+}
+/// register a source with a set (its text is kept for error positions); returns its index.
+pub fn style_set_add_source(inout ss: StyleSet, file: Str, src: Str) -> Int {
+    ss.files.push(copy file)
+    ss.srcs.push(copy src)
+    return ss.files.len() - 1
+}
+
+fn ease_linear() -> Ease { return Ease { kind: 0, x1: 0.0, y1: 0.0, x2: 1.0, y2: 1.0 } }
+fn ease_bez(a: Float, b: Float, c: Float, d: Float) -> Ease { return Ease { kind: 1, x1: a, y1: b, x2: c, y2: d } }
+pub fn ease_dup(e: Ease) -> Ease { return Ease { kind: e.kind, x1: e.x1, y1: e.y1, x2: e.x2, y2: e.y2 } }
+pub fn trans_dup(t: TransSpec) -> TransSpec { return TransSpec { prop: t.prop, dur: t.dur, delay: t.delay, ease: ease_dup(t.ease) } }
+pub fn anim_none() -> AnimSpec { return AnimSpec { name: "", dur: 0.0, delay: 0.0, count: 1.0, dir: 0, fill: 0, ease: ease_bez(0.25, 0.1, 0.25, 1.0) } }
+pub fn anim_dup(a: AnimSpec) -> AnimSpec { return AnimSpec { name: copy a.name, dur: a.dur, delay: a.delay, count: a.count, dir: a.dir, fill: a.fill, ease: ease_dup(a.ease) } }
+pub fn dval_dup(v: DslValue) -> DslValue {
+    var a: Vec<DslValue> = vec()
+    var i = 0
+    while i < v.arr.len() { a.push(dval_dup(v.arr[i]))  i = i + 1 }
+    return DslValue { kind: v.kind, s: copy v.s, f: v.f, b: v.b, arr: a }
+}
+fn part_dup(p: SelPart) -> SelPart { return SelPart { tag: copy p.tag, classes: path_copy_str(p.classes), hover: p.hover, active: p.active, focus: p.focus, disabled: p.disabled } }
+pub fn sel_dup(s: Selector) -> Selector {
+    var ps: Vec<SelPart> = vec()
+    var i = 0
+    while i < s.parts.len() { ps.push(part_dup(s.parts[i]))  i = i + 1 }
+    var cs: Vec<Int> = vec()
+    var j = 0
+    while j < s.combs.len() { cs.push(s.combs[j])  j = j + 1 }
+    return Selector { parts: ps, combs: cs, spec: s.spec }
+}
+fn decl_dup(d: StyleDecl, src_shift: Int) -> StyleDecl {
+    var ts: Vec<TransSpec> = vec()
+    var i = 0
+    while i < d.trans.len() { ts.push(trans_dup(d.trans[i]))  i = i + 1 }
+    return StyleDecl { kind: d.kind, name: copy d.name, val: dval_dup(d.val), trans: ts, anim: anim_dup(d.anim), src: d.src + src_shift, off: d.off }
+}
+fn decls_dup(v: Vec<StyleDecl>, src_shift: Int) -> Vec<StyleDecl> {
+    var out: Vec<StyleDecl> = vec()
+    var i = 0
+    while i < v.len() { out.push(decl_dup(v[i], src_shift))  i = i + 1 }
+    return out
+}
+/// append everything `other` says after what `set` says (later wins, so `other` overrides).
+pub fn style_set_append(inout ss: StyleSet, other: StyleSet) {
+    ss.key = ss.key + other.key
+    let shift = ss.files.len()
+    var f = 0
+    while f < other.files.len() { ss.files.push(copy other.files[f])  ss.srcs.push(copy other.srcs[f])  f = f + 1 }
+    var r = 0
+    while r < other.rules.len() {
+        var sels: Vec<Selector> = vec()
+        var q = 0
+        while q < other.rules[r].sels.len() { sels.push(sel_dup(other.rules[r].sels[q]))  q = q + 1 }
+        ss.rules.push(StyleRule { sels: sels, decls: decls_dup(other.rules[r].decls, shift), legacy: other.rules[r].legacy, legacy_name: copy other.rules[r].legacy_name })
+        r = r + 1
+    }
+    var v = 0
+    while v < other.vars.len() { ss.vars.push(VarDef { name: copy other.vars[v].name, val: dval_dup(other.vars[v].val), src: other.vars[v].src + shift, off: other.vars[v].off })  v = v + 1 }
+    var k = 0
+    while k < other.kfs.len() {
+        var stops: Vec<KeyStop> = vec()
+        var s = 0
+        while s < other.kfs[k].stops.len() { stops.push(KeyStop { at: other.kfs[k].stops[s].at, decls: decls_dup(other.kfs[k].stops[s].decls, shift) })  s = s + 1 }
+        ss.kfs.push(KeyframesDef { name: copy other.kfs[k].name, stops: stops })
+        k = k + 1
+    }
+    var m = 0
+    while m < other.imports.len() { ss.imports.push(StyleImport { path: copy other.imports[m].path, src: other.imports[m].src + shift, off: other.imports[m].off })  m = m + 1 }
+}
+pub fn style_set_dup(ss: StyleSet) -> StyleSet {
+    var out = style_set_new()
+    style_set_append(out, ss)
+    return out
+}
+
+// ---- the parser ------------------------------------------------------------------------------------
+
+/// a value as a declaration holds it: dsl_value, and a number with a unit written straight after it
+/// (`50%`, `10vh`, `2ui`) kept as the string "50%"; a rule's values are stored and may be resolved
+/// later, so a unit cannot be left on the cursor for the reader to pick up.
+fn sh_value(inout p: DslP) -> DslValue {
+    var v = dsl_value(p)
+    if p.failed[0] == 1 || v.kind != 1 { return v }
+    let c = dsl_peek(p)
+    if c == 37 || dsl_is_alpha(c) {
+        let st = p.s.at()
+        while dsl_peek(p) == 37 || dsl_is_alpha(dsl_peek(p)) { dsl_bump(p) }
+        var sv = dval(0)
+        sv.s = sh_num_text(v.f) + p.src.slice(st, p.s.at())
+        return sv
+    }
+    return v
+}
+fn sh_num_text(f: Float) -> Str {
+    if f == math::floor(f) && math::fabs(f) < 1000000000.0 { return to_str(to_int(f)) }
+    return to_str(f)
+}
+/// one value, or several separated by commas (`"Noto Sans", "Noto Sans Arabic", sans-serif`) as a
+/// list. A bare name may carry hyphens (`sans-serif`, `ui-monospace`).
+fn sh_list(inout p: DslP) -> DslValue {
+    let first = sh_list_item(p)
+    if p.failed[0] == 1 { return first }
+    let save = p.s.at()
+    dsl_skip(p)
+    if dsl_peek(p) != 44 { p.s.seek(save)  return first }
+    var a = dval(4)
+    a.arr.push(first)
+    while dsl_peek(p) == 44 {
+        dsl_bump(p)
+        a.arr.push(sh_list_item(p))
+        if p.failed[0] == 1 { return a }
+        let sv = p.s.at()
+        dsl_skip(p)
+        if dsl_peek(p) != 44 { p.s.seek(sv) }
+    }
+    return a
+}
+fn sh_list_item(inout p: DslP) -> DslValue {
+    dsl_skip(p)
+    if dsl_is_ident_start(dsl_peek(p)) {
+        let st = p.s.at()
+        while dsl_is_ident_cont(dsl_peek(p)) || (dsl_peek(p) == 45 && dsl_is_ident_start(dsl_peek2(p))) { dsl_bump(p) }
+        var v = dval(3)
+        v.s = p.src.slice(st, p.s.at())
+        if v.s == "true" || v.s == "false" { p.s.seek(st)  return sh_value(p) }
+        return v
+    }
+    return sh_value(p)
+}
+fn sh_has_var(v: DslValue) -> Bool {
+    if v.kind == 5 { return true }
+    var i = 0
+    while i < v.arr.len() { if sh_has_var(v.arr[i]) { return true }  i = i + 1 }
+    return false
+}
+/// a duration: a number and `ms` or `s`, in milliseconds.
+fn sh_duration(inout p: DslP) -> Float {
+    dsl_skip(p)
+    if !dsl_is_digit(dsl_peek(p)) && dsl_peek(p) != 46 { dsl_fail(p, "expected a duration like 200ms or 0.2s")  return 0.0 }
+    let n = dsl_number(p)
+    if p.failed[0] == 1 { return 0.0 }
+    if dsl_peek(p) == 109 && dsl_peek2(p) == 115 { dsl_bump(p)  dsl_bump(p)  return n }       // ms
+    if dsl_peek(p) == 115 { dsl_bump(p)  return n * 1000.0 }                                    // s
+    dsl_fail(p, "expected a duration like 200ms or 0.2s")
+    return 0.0
+}
+/// the next word (letters, digits, `_`, `-`) without consuming it unless `take`.
+fn sh_word_at(inout p: DslP) -> Str {
+    dsl_skip(p)
+    let st = p.s.at()
+    if !(dsl_is_alpha(dsl_peek(p)) || dsl_peek(p) == 95) { return "" }
+    while dsl_is_alpha(dsl_peek(p)) || dsl_is_digit(dsl_peek(p)) || dsl_peek(p) == 95 || dsl_peek(p) == 45 { dsl_bump(p) }
+    let w = p.src.slice(st, p.s.at())
+    p.s.seek(st)
+    return w
+}
+fn sh_skip_word(inout p: DslP, w: Str) { dsl_skip(p)  p.s.seek(p.s.at() + w.len()) }
+/// an easing word -> its curve (kind -1 when it is not one).
+fn sh_ease_word(w: Str) -> Ease {
+    if w == "linear" { return ease_linear() }
+    if w == "ease" { return ease_bez(0.25, 0.1, 0.25, 1.0) }
+    if w == "ease_in" || w == "ease-in" { return ease_bez(0.42, 0.0, 1.0, 1.0) }
+    if w == "ease_out" || w == "ease-out" { return ease_bez(0.0, 0.0, 0.58, 1.0) }
+    if w == "ease_in_out" || w == "ease-in-out" { return ease_bez(0.42, 0.0, 0.58, 1.0) }
+    return Ease { kind: 0 - 1, x1: 0.0, y1: 0.0, x2: 0.0, y2: 0.0 }
+}
+fn sh_is_bezier_word(w: Str) -> Bool { return w == "cubic_bezier" || w == "cubic-bezier" }
+/// an easing at the cursor, or kind -1 (nothing consumed) when the next word is not one.
+fn sh_ease_opt(inout p: DslP) -> Ease {
+    let w = sh_word_at(p)
+    if sh_is_bezier_word(w) {
+        sh_skip_word(p, w)
+        dsl_expect(p, 40, "`(` after cubic_bezier")
+        let a = dsl_number(p)
+        dsl_expect(p, 44, "`,` in cubic_bezier(x1, y1, x2, y2)")
+        let b = dsl_number(p)
+        dsl_expect(p, 44, "`,` in cubic_bezier(x1, y1, x2, y2)")
+        let c = dsl_number(p)
+        dsl_expect(p, 44, "`,` in cubic_bezier(x1, y1, x2, y2)")
+        let d = dsl_number(p)
+        dsl_expect(p, 41, "`)` after cubic_bezier's four numbers")
+        if a < 0.0 || a > 1.0 || c < 0.0 || c > 1.0 { dsl_fail(p, "cubic_bezier's x1 and x2 must be in 0..1") }
+        return ease_bez(a, b, c, d)
+    }
+    let e = sh_ease_word(w)
+    if e.kind >= 0 { sh_skip_word(p, w) }
+    return e
+}
+/// `transition: PROP DUR [EASING] [DELAY] (, ...)*`
+fn sh_transition(inout p: DslP) -> Vec<TransSpec> {
+    var out: Vec<TransSpec> = vec()
+    while true {
+        dsl_skip(p)
+        let w = sh_word_at(p)
+        if w.len() == 0 { dsl_fail(p, "expected a property to transition")  return out }
+        sh_skip_word(p, w)
+        let ids = ap_ids_of(w)
+        if ids.len() == 0 { dsl_fail(p, ("cannot transition `" + (w + "`: it is not an animatable property")))  return out }
+        let dur = sh_duration(p)
+        if p.failed[0] == 1 { return out }
+        var ease = sh_ease_opt(p)
+        if p.failed[0] == 1 { return out }
+        if ease.kind < 0 { ease = ease_bez(0.25, 0.1, 0.25, 1.0) }          // CSS's default: ease
+        var delay = 0.0
+        dsl_skip(p)
+        if dsl_is_digit(dsl_peek(p)) { delay = sh_duration(p) }
+        if p.failed[0] == 1 { return out }
+        var i = 0
+        while i < ids.len() { out.push(TransSpec { prop: ids[i], dur: dur, delay: delay, ease: ease_dup(ease) })  i = i + 1 }
+        dsl_skip(p)
+        if dsl_peek(p) == 44 { dsl_bump(p) } else { return out }
+    }
+    return out
+}
+/// `animation: NAME DUR [EASING] [DELAY] [COUNT|infinite] [DIRECTION] [FILL]` (the optional parts
+/// in any order)
+fn sh_animation(inout p: DslP) -> AnimSpec {
+    var a = anim_none()
+    let w = sh_word_at(p)
+    if w.len() == 0 { dsl_fail(p, "expected the name of a keyframes block")  return a }
+    sh_skip_word(p, w)
+    a.name = copy w
+    a.dur = sh_duration(p)
+    var more = true
+    while more && p.failed[0] == 0 {
+        dsl_skip(p)
+        let c = dsl_peek(p)
+        if dsl_is_digit(c) {
+            // a number with a unit is the delay, a bare one the iteration count
+            let st = p.s.at()
+            let n = dsl_number(p)
+            if dsl_peek(p) == 109 || dsl_peek(p) == 115 { p.s.seek(st)  a.delay = sh_duration(p) }
+            else { a.count = n }
+        } else {
+            let e = sh_ease_opt(p)
+            if e.kind >= 0 { a.ease = e }
+            else {
+                let x = sh_word_at(p)
+                if x == "infinite" { a.count = 0.0 - 1.0  sh_skip_word(p, x) }
+                else if x == "normal" { a.dir = 0  sh_skip_word(p, x) }
+                else if x == "reverse" { a.dir = 1  sh_skip_word(p, x) }
+                else if x == "alternate" { a.dir = 2  sh_skip_word(p, x) }
+                else if x == "alternate_reverse" || x == "alternate-reverse" { a.dir = 3  sh_skip_word(p, x) }
+                else if x == "none" { a.fill = 0  sh_skip_word(p, x) }
+                else if x == "forwards" { a.fill = 1  sh_skip_word(p, x) }
+                else if x == "backwards" { a.fill = 2  sh_skip_word(p, x) }
+                else if x == "both" { a.fill = 3  sh_skip_word(p, x) }
+                else { more = false }
+            }
+        }
+    }
+    if a.dur <= 0.0 && p.failed[0] == 0 { dsl_fail(p, "an animation needs a duration above zero") }
+    return a
+}
+/// a rule body (`{` consumed): declarations to the closing `}`.
+///
+/// A declaration with no variable in it is checked here, where and how the legacy
+/// parser checked it (dsl_style_prop at the cursor after the value), so every legacy error keeps
+/// its text and position; one that names a variable is checked when the sheet is compiled.
+fn sh_decls(inout p: DslP, si: Int) -> Vec<StyleDecl> {
+    var out: Vec<StyleDecl> = vec()
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 { dsl_bump(p)  return out }
+        if dsl_peek(p) < 0 || p.failed[0] == 1 { dsl_fail(p, "unterminated style body")  return out }
+        var name = dsl_ident(p)
+        // CSS's spelling of a name is the same name: `font-family` is `font_family`
+        while dsl_peek(p) == 45 && dsl_is_ident_start(dsl_peek2(p)) { dsl_bump(p)  name = name + "_" + dsl_ident(p) }
+        dsl_expect(p, 58, "`:` after a style property name")
+        if p.failed[0] == 1 { return out }
+        dsl_skip(p)
+        let off = p.s.at()
+        var d = StyleDecl { kind: 0, name: copy name, val: dval(0), trans: vec(), anim: anim_none(), src: si, off: off }
+        if name == "transition" { d.kind = 1  d.trans = sh_transition(p) }
+        else if name == "animation" { d.kind = 2  d.anim = sh_animation(p) }
+        else if name == "font_family" || name == "family" {
+            d.val = sh_list(p)
+            if p.failed[0] == 1 { return out }
+            if !sh_has_var(d.val) { let _ns = dsl_style_prop(p, node_style_empty(), name, d.val) }
+        }
+        else {
+            d.val = sh_value(p)
+            if p.failed[0] == 1 { return out }
+            if !sh_has_var(d.val) { let _ns = dsl_style_prop(p, node_style_empty(), name, d.val) }
+        }
+        if p.failed[0] == 1 { return out }
+        out.push(sink d)
+    }
+    return out
+}
+/// one compound selector at the cursor (nothing skipped before it).
+fn sh_compound(inout p: DslP) -> SelPart {
+    var part = SelPart { tag: "", classes: vec(), hover: false, active: false, focus: false, disabled: false }
+    var any = false
+    let c = dsl_peek(p)
+    if c == 42 { dsl_bump(p)  any = true }
+    else if dsl_is_ident_start(c) {
+        let st = p.s.at()
+        while dsl_is_ident_cont(dsl_peek(p)) { dsl_bump(p) }
+        part.tag = p.src.slice(st, p.s.at())
+        any = true
+    }
+    var go = true
+    while go && p.failed[0] == 0 {
+        if dsl_peek(p) == 46 {
+            dsl_bump(p)
+            let st = p.s.at()
+            while dsl_is_ident_cont(dsl_peek(p)) { dsl_bump(p) }
+            if p.s.at() == st { dsl_fail(p, "expected a class name after `.`")  return part }
+            part.classes.push(p.src.slice(st, p.s.at()))
+            any = true
+        } else if dsl_peek(p) == 58 {
+            dsl_bump(p)
+            let st = p.s.at()
+            while dsl_is_ident_cont(dsl_peek(p)) { dsl_bump(p) }
+            let ps = p.src.slice(st, p.s.at())
+            if ps == "hover" { part.hover = true }
+            else if ps == "active" { part.active = true }
+            else if ps == "focus" { part.focus = true }
+            else if ps == "disabled" { part.disabled = true }
+            else { dsl_fail(p, ("unknown pseudo-class `:" + (ps + "` (use :hover, :active, :focus or :disabled)")))  return part }
+            any = true
+        } else { go = false }
+    }
+    if !any { dsl_fail(p, "expected a selector (a type, `.class`, `:state` or `*`)") }
+    return part
+}
+/// one complex selector, up to (not including) the `,` or `{` after it.
+fn sh_selector(inout p: DslP) -> Selector {
+    var sel = Selector { parts: vec(), combs: vec(), spec: 0 }
+    dsl_skip(p)
+    while p.failed[0] == 0 {
+        sel.parts.push(sh_compound(p))
+        if p.failed[0] == 1 { return sel }
+        let before = p.s.at()
+        dsl_skip(p)
+        let ws = p.s.at() != before
+        let c = dsl_peek(p)
+        if c == 123 || c == 44 { return sh_with_spec(sel) }
+        if c == 62 { dsl_bump(p)  dsl_skip(p)  sel.combs.push(1) }
+        else if ws && (dsl_is_ident_start(c) || c == 46 || c == 58 || c == 42) { sel.combs.push(0) }
+        else { dsl_fail(p, "expected `{`, `,`, `>` or another selector")  return sel }
+    }
+    return sel
+}
+fn sh_with_spec(sink sel: Selector) -> Selector {
+    var a = 0
+    var c = 0
+    var i = 0
+    while i < sel.parts.len() {
+        a = a + sel.parts[i].classes.len()
+        if sel.parts[i].hover { a = a + 1 }
+        if sel.parts[i].active { a = a + 1 }
+        if sel.parts[i].focus { a = a + 1 }
+        if sel.parts[i].disabled { a = a + 1 }
+        if sel.parts[i].tag.len() > 0 { c = c + 1 }
+        i = i + 1
+    }
+    sel.spec = a * 1000 + c
+    return sel
+}
+fn sh_simple_sel(tag: Str, cls: Str) -> Selector {
+    var part = SelPart { tag: copy tag, classes: vec(), hover: false, active: false, focus: false, disabled: false }
+    if cls.len() > 0 { part.classes.push(copy cls) }
+    var sel = Selector { parts: vec(), combs: vec(), spec: 0 }
+    sel.parts.push(sink part)
+    return sh_with_spec(sink sel)
+}
+/// `vars { --name: value ... }` (`{` consumed)
+fn sh_vars(inout p: DslP, inout ss: StyleSet, si: Int) {
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 { dsl_bump(p)  return }
+        if dsl_peek(p) < 0 || p.failed[0] == 1 { dsl_fail(p, "unterminated vars block")  return }
+        if !(dsl_peek(p) == 45 && dsl_peek2(p) == 45) { dsl_fail(p, "expected a variable (`--name: value`) in vars")  return }
+        dsl_bump(p)
+        dsl_bump(p)
+        let st = p.s.at()
+        while dsl_is_var_char(dsl_peek(p)) { dsl_bump(p) }
+        let name = p.src.slice(st, p.s.at())
+        if name.len() == 0 { dsl_fail(p, "expected a variable name after `--`")  return }
+        dsl_expect(p, 58, "`:` after a variable name")
+        dsl_skip(p)
+        let off = p.s.at()
+        let v = sh_list(p)
+        if p.failed[0] == 1 { return }
+        ss.vars.push(VarDef { name: copy name, val: dval_dup(v), src: si, off: off })
+    }
+}
+/// `keyframes NAME { STOP { ... } ... }` (the name read, `{` consumed). A stop is `from`, `to`, or a
+/// percentage; several may share a body (`0%, 100% { ... }`).
+fn sh_keyframes(inout p: DslP, inout ss: StyleSet, si: Int, name: Str) {
+    var kf = KeyframesDef { name: copy name, stops: vec() }
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 { dsl_bump(p)  ss.kfs.push(sink kf)  return }
+        if dsl_peek(p) < 0 || p.failed[0] == 1 { dsl_fail(p, "unterminated keyframes block")  return }
+        var ats: Vec<Float> = vec()
+        var more = true
+        while more {
+            dsl_skip(p)
+            var at = 0.0
+            if dsl_is_digit(dsl_peek(p)) {
+                at = dsl_number(p)
+                if dsl_peek(p) == 37 { dsl_bump(p) }
+                at = at / 100.0
+            } else {
+                let w = dsl_ident(p)
+                if w == "from" { at = 0.0 } else if w == "to" { at = 1.0 } else { dsl_fail(p, "a keyframe is from, to or a percentage")  return }
+            }
+            if p.failed[0] == 1 { return }
+            if at < 0.0 || at > 1.0 { dsl_fail(p, "a keyframe must be between 0% and 100%")  return }
+            ats.push(at)
+            dsl_skip(p)
+            if dsl_peek(p) == 44 { dsl_bump(p) } else { more = false }
+        }
+        dsl_expect(p, 123, "`{` after a keyframe")
+        let decls = sh_decls(p, si)
+        if p.failed[0] == 1 { return }
+        var i = 0
+        while i < ats.len() {
+            var j = 0
+            var dd: Vec<StyleDecl> = vec()
+            while j < decls.len() {
+                if decls[j].kind != 0 { dsl_fail(p, "a keyframe holds properties, not transitions or animations")  return }
+                dd.push(decl_dup(decls[j], 0))
+                j = j + 1
+            }
+            kf.stops.push(KeyStop { at: ats[i], decls: dd })
+            i = i + 1
+        }
+    }
+}
+/// the items of a stylesheet: rules, `vars`, `keyframes`, `import`. `braced`: inside a
+/// `stylesheet { }` block (ends at its `}`), else to the end of the source.
+fn sh_items(inout p: DslP, inout ss: StyleSet, si: Int, braced: Bool) {
+    let key_from = p.s.at()
+    sh_items_body(p, ss, si, braced)
+    ss.key = ss.key + (p.file + (chr(1) + (p.src.slice(key_from, p.s.at()) + chr(2))))
+}
+fn sh_items_body(inout p: DslP, inout ss: StyleSet, si: Int, braced: Bool) {
+    while true {
+        dsl_skip(p)
+        if braced && dsl_peek(p) == 125 { dsl_bump(p)  return }
+        if dsl_peek(p) < 0 {
+            if braced { dsl_fail(p, "unterminated stylesheet block") }
+            return
+        }
+        if p.failed[0] == 1 { return }
+        let start = p.s.at()
+        let first = dsl_probe_ident(p)
+        dsl_skip(p)
+        if first == "vars" && dsl_peek(p) == 123 { dsl_bump(p)  sh_vars(p, ss, si) }
+        else if first == "keyframes" && dsl_is_ident_start(dsl_peek(p)) {
+            let name = dsl_ident(p)
+            dsl_expect(p, 123, "`{` after the keyframes name")
+            if p.failed[0] == 1 { return }
+            sh_keyframes(p, ss, si, name)
+        }
+        else if first == "import" && dsl_peek(p) == 34 {
+            let off = p.s.at()
+            let path = dsl_string(p)
+            ss.imports.push(StyleImport { path: copy path, src: si, off: off })
+        }
+        else if (first == "tag" || first == "class") && dsl_is_ident_start(dsl_peek(p)) {
+            // the basic forms
+            var name = dsl_ident(p)
+            dsl_expect(p, 123, "`{` after the rule name")
+            if p.failed[0] == 1 { return }
+            let decls = sh_decls(p, si)
+            if p.failed[0] == 1 { return }
+            var sels: Vec<Selector> = vec()
+            var lg = 2
+            if first == "tag" { sels.push(sh_simple_sel(name, ""))  lg = 1 } else { sels.push(sh_simple_sel("", name)) }
+            ss.rules.push(StyleRule { sels: sels, decls: decls, legacy: lg, legacy_name: copy name })
+        }
+        else {
+            p.s.seek(start)
+            var sels: Vec<Selector> = vec()
+            var more = true
+            while more {
+                sels.push(sh_selector(p))
+                if p.failed[0] == 1 { return }
+                dsl_skip(p)
+                if dsl_peek(p) == 44 { dsl_bump(p) } else { more = false }
+            }
+            dsl_expect(p, 123, "`{` after a selector")
+            if p.failed[0] == 1 { return }
+            let decls = sh_decls(p, si)
+            if p.failed[0] == 1 { return }
+            ss.rules.push(StyleRule { sels: sels, decls: decls, legacy: 0, legacy_name: "" })
+        }
+        if p.failed[0] == 1 { return }
+    }
+}
+
+/// a parsed `.style` source.
+pub struct StyleParse { ok: Bool, err: UiError, styles: StyleSet }
+/// parse a standalone `.style` source. `file` names it in errors.
+pub fn style_parse(src: Str, file: Str) -> StyleParse {
+    var ss = style_set_new()
+    let si = style_set_add_source(ss, file, src)
+    var p = dsl_new(src)
+    dsl_skip(p)
+    if dsl_peek(p) >= 0 { sh_items(p, ss, si, false) }
+    if p.failed[0] == 1 {
+        return StyleParse { ok: false, err: UiError { file: copy file, line: p.eline[0], col: p.ecol[0], msg: copy p.emsg[0] }, styles: ss }
+    }
+    return StyleParse { ok: true, err: ui_error_none(), styles: ss }
+}
+
+// ---- compiling: tokens resolved, rules ordered -------------------------------------------------------
+
+/// a compiled rule: one selector, its resolved style, and the transition / animation it sets.
+pub struct CRule { sel: Selector, style: NodeStyle, order: Int, has_trans: Bool, trans: Vec<TransSpec>, has_anim: Bool, anim: AnimSpec }
+pub struct CKeyStop { at: Float, style: NodeStyle }
+pub struct CKeyframes { name: Str, stops: Vec<CKeyStop> }
+/// a compiled sheet: rules from least to most specific (source order between equals), keyframes,
+/// and what kinds of selector it holds (so a host knows what a state change can affect).
+///   state:     some rule tests :hover / :active / :focus / :disabled
+///   state_anc: ... on a part that is not the last (a state on an ancestor restyles descendants)
+///   comb:      some rule has a combinator (a node's classes can restyle its descendants)
+///   ui_font:   the `--ui-font` token's family list, "" when no layer defines it: the face every
+///              node without a `font_family` of its own is drawn in (a theme sets the UI font with
+///              one token)
+pub struct CSheet { rules: Vec<CRule>, kfs: Vec<CKeyframes>, state: Bool, state_anc: Bool, comb: Bool, ui_font: Str = "" }
+pub fn csheet_empty() -> CSheet {
+    var r: Vec<CRule> = vec()
+    var k: Vec<CKeyframes> = vec()
+    return CSheet { rules: r, kfs: k, state: false, state_anc: false, comb: false }
+}
+pub struct SheetCompile { ok: Bool, err: UiError, sheet: CSheet }
+
+fn sh_err_at(ss: StyleSet, si: Int, off: Int, msg: Str) -> UiError {
+    if si < 0 || si >= ss.srcs.len() { return UiError { file: "", line: 0, col: 0, msg: copy msg } }
+    let lc = parse::line_col(ss.srcs[si], off)
+    return UiError { file: copy ss.files[si], line: lc.line, col: lc.col, msg: copy msg }
+}
+/// the value of variable `name` with every variable in it resolved; ok=false (and `why`) when one is
+/// undefined or they form a loop.
+struct VarRes { ok: Bool, why: Str, v: DslValue }
+fn sh_resolve(ss: StyleSet, v: DslValue, depth: Int) -> VarRes {
+    if depth > 32 { return VarRes { ok: false, why: "variables refer to each other in a loop", v: dval(0) } }
+    if v.kind == 5 {
+        var i = ss.vars.len() - 1
+        while i >= 0 {
+            if ss.vars[i].name == v.s { return sh_resolve(ss, ss.vars[i].val, depth + 1) }
+            i = i - 1
+        }
+        return VarRes { ok: false, why: ("undefined variable `--" + (v.s + "`")), v: dval(0) }
+    }
+    if v.kind == 4 {
+        var a = dval(4)
+        var j = 0
+        while j < v.arr.len() {
+            let r = sh_resolve(ss, v.arr[j], depth)
+            if !r.ok { return r }
+            a.arr.push(dval_dup(r.v))
+            j = j + 1
+        }
+        return VarRes { ok: true, why: "", v: a }
+    }
+    return VarRes { ok: true, why: "", v: dval_dup(v) }
+}
+/// fold declarations into a NodeStyle (+ the transition and animation they set).
+struct DeclsOut { ok: Bool, err: UiError, style: NodeStyle, has_trans: Bool, trans: Vec<TransSpec>, has_anim: Bool, anim: AnimSpec }
+fn sh_fold(ss: StyleSet, decls: Vec<StyleDecl>) -> DeclsOut {
+    var out = DeclsOut { ok: true, err: ui_error_none(), style: node_style_empty(), has_trans: false, trans: vec(), has_anim: false, anim: anim_none() }
+    var i = 0
+    while i < decls.len() {
+        let d = decls[i]
+        if d.kind == 1 {
+            out.has_trans = true
+            var ts: Vec<TransSpec> = vec()
+            var j = 0
+            while j < d.trans.len() { ts.push(trans_dup(d.trans[j]))  j = j + 1 }
+            out.trans = sink ts
+        } else if d.kind == 2 {
+            out.has_anim = true
+            out.anim = anim_dup(d.anim)
+        } else {
+            let r = sh_resolve(ss, d.val, 0)
+            if !r.ok { out.ok = false  out.err = sh_err_at(ss, d.src, d.off, r.why)  return out }
+            var p = dsl_new("")
+            let ns = dsl_style_prop(p, out.style, d.name, r.v)
+            if p.failed[0] == 1 { out.ok = false  out.err = sh_err_at(ss, d.src, d.off, p.emsg[0])  return out }
+            out.style = node_style_dup(ns)
+        }
+        i = i + 1
+    }
+    return out
+}
+fn sel_has_state(part: SelPart) -> Bool { return part.hover || part.active || part.focus || part.disabled }
+/// compile a set: every token resolved, every rule's declarations folded into a NodeStyle, the
+/// rules ordered by specificity then source order, every animation's keyframes found.
+pub fn style_compile(ss: StyleSet) -> SheetCompile {
+    var sheet = csheet_empty()
+    var order = 0
+    var r = 0
+    while r < ss.rules.len() {
+        let fo = sh_fold(ss, ss.rules[r].decls)
+        if !fo.ok { return SheetCompile { ok: false, err: ui_error_dup(fo.err), sheet: sheet } }
+        var s = 0
+        while s < ss.rules[r].sels.len() {
+            let sel = ss.rules[r].sels[s]
+            var ts: Vec<TransSpec> = vec()
+            var j = 0
+            while j < fo.trans.len() { ts.push(trans_dup(fo.trans[j]))  j = j + 1 }
+            let cr = CRule { sel: sel_dup(sel), style: node_style_dup(fo.style), order: order, has_trans: fo.has_trans, trans: ts, has_anim: fo.has_anim, anim: anim_dup(fo.anim) }
+            if sel.parts.len() > 1 { sheet.comb = true }
+            var q = 0
+            while q < sel.parts.len() {
+                if sel_has_state(sel.parts[q]) { sheet.state = true  if q < sel.parts.len() - 1 { sheet.state_anc = true } }
+                q = q + 1
+            }
+            // insert keeping (spec, order) ascending: the later of two equals goes after
+            var at = sheet.rules.len()
+            while at > 0 && sheet.rules[at - 1].sel.spec > cr.sel.spec { at = at - 1 }
+            sheet.rules.push(cr)
+            var k = sheet.rules.len() - 1
+            while k > at {
+                var tmp = sink sheet.rules[k - 1]
+                sheet.rules[k - 1] = sink sheet.rules[k]
+                sheet.rules[k] = sink tmp
+                k = k - 1
+            }
+            order = order + 1
+            s = s + 1
+        }
+        r = r + 1
+    }
+    var f = 0
+    while f < ss.kfs.len() {
+        var ck = CKeyframes { name: copy ss.kfs[f].name, stops: vec() }
+        var t = 0
+        while t < ss.kfs[f].stops.len() {
+            let fo = sh_fold(ss, ss.kfs[f].stops[t].decls)
+            if !fo.ok { return SheetCompile { ok: false, err: ui_error_dup(fo.err), sheet: sheet } }
+            // keep the stops sorted by offset
+            var at = ck.stops.len()
+            while at > 0 && ck.stops[at - 1].at > ss.kfs[f].stops[t].at { at = at - 1 }
+            ck.stops.push(CKeyStop { at: ss.kfs[f].stops[t].at, style: node_style_dup(fo.style) })
+            var k = ck.stops.len() - 1
+            while k > at {
+                var tmp = sink ck.stops[k - 1]
+                ck.stops[k - 1] = sink ck.stops[k]
+                ck.stops[k] = sink tmp
+                k = k - 1
+            }
+            t = t + 1
+        }
+        // a later definition of the same name replaces an earlier one
+        var at_kf = 0 - 1
+        var g = 0
+        while g < sheet.kfs.len() { if sheet.kfs[g].name == ck.name { at_kf = g }  g = g + 1 }
+        if at_kf >= 0 { sheet.kfs[at_kf] = sink ck } else { sheet.kfs.push(sink ck) }
+        f = f + 1
+    }
+    // the UI font: one token sets the face of everything that names none
+    var vi = ss.vars.len() - 1
+    var found = false
+    while vi >= 0 && !found {
+        if ss.vars[vi].name == "ui-font" {
+            found = true
+            let uf = sh_resolve(ss, ss.vars[vi].val, 0)
+            if !uf.ok { return SheetCompile { ok: false, err: sh_err_at(ss, ss.vars[vi].src, ss.vars[vi].off, uf.why), sheet: sheet } }
+            var up = dsl_new("")
+            let fam = ds_family(up, uf.v)
+            if up.failed[0] == 1 { return SheetCompile { ok: false, err: sh_err_at(ss, ss.vars[vi].src, ss.vars[vi].off, up.emsg[0]), sheet: sheet } }
+            sheet.ui_font = fam
+        }
+        vi = vi - 1
+    }
+    return SheetCompile { ok: true, err: ui_error_none(), sheet: sheet }
+}
+/// the keyframes named `name`, or -1.
+pub fn csheet_kf(sheet: CSheet, name: Str) -> Int {
+    var i = 0
+    while i < sheet.kfs.len() { if sheet.kfs[i].name == name { return i }  i = i + 1 }
+    return 0 - 1
+}
+
+/// the legacy tag/class sheet a set implies, for the immediate path: the `tag X` / `class X` rules
+/// (a later one replacing an earlier one of the same name, as that path always has), and the
+/// new-syntax rules that are exactly one type or one class with no state (merged field by field).
+/// Everything else (states, combinators, lists, transitions) is a retained document's.
+pub fn style_set_legacy(ss: StyleSet) -> OverlayStyleSheet {
+    var sheet = stylesheet_new()
+    var r = 0
+    while r < ss.rules.len() {
+        let rule = ss.rules[r]
+        var plain = rule.legacy > 0
+        var tag = ""
+        var cls = ""
+        if rule.legacy == 1 { tag = copy rule.legacy_name }
+        if rule.legacy == 2 { cls = copy rule.legacy_name }
+        if rule.legacy == 0 && rule.sels.len() == 1 && rule.sels[0].parts.len() == 1 {
+            let pt = rule.sels[0].parts[0]
+            if !sel_has_state(pt) && ((pt.tag.len() > 0 && pt.classes.len() == 0) || (pt.tag.len() == 0 && pt.classes.len() == 1)) {
+                plain = true
+                tag = copy pt.tag
+                if pt.classes.len() == 1 { cls = copy pt.classes[0] }
+            }
+        }
+        if plain {
+            let fo = sh_fold(ss, rule.decls)
+            if fo.ok {
+                if rule.legacy == 1 { var tk = inout sheet.tag_keys  var tsv = inout sheet.tag_styles  dsl_sheet_put(tk, tsv, tag, fo.style) }
+                else if rule.legacy == 2 { var ck = inout sheet.class_keys  var csv = inout sheet.class_styles  dsl_sheet_put(ck, csv, cls, fo.style) }
+                else if tag.len() > 0 { sheet_merge_tag(sheet, tag, fo.style) }
+                else { sheet_merge_class(sheet, cls, fo.style) }
+            }
+        }
+        r = r + 1
+    }
+    return sheet
+}
+
+// ---- matching -----------------------------------------------------------------------------------------
+
+/// what a selector can see of a node: its type, classes and states.
+pub struct MInfo { tag: Str, classes: Vec<Str>, hover: Bool, active: Bool, focus: Bool, disabled: Bool }
+pub fn minfo_dup(m: MInfo) -> MInfo { return MInfo { tag: copy m.tag, classes: path_copy_str(m.classes), hover: m.hover, active: m.active, focus: m.focus, disabled: m.disabled } }
+fn part_match(pt: SelPart, m: MInfo) -> Bool {
+    if pt.tag.len() > 0 && !(pt.tag == m.tag) { return false }
+    if pt.hover && !m.hover { return false }
+    if pt.active && !m.active { return false }
+    if pt.focus && !m.focus { return false }
+    if pt.disabled && !m.disabled { return false }
+    var i = 0
+    while i < pt.classes.len() {
+        var found = false
+        var j = 0
+        while j < m.classes.len() && !found { if m.classes[j] == pt.classes[i] { found = true }  j = j + 1 }
+        if !found { return false }
+        i = i + 1
+    }
+    return true
+}
+/// parts[0..=pi] against the ancestors anc[0..=ai] (anc[last] is the parent), where parts[pi+1]
+/// matched the node at ai+1, backtracking over descendant combinators.
+fn sel_match_from(sel: Selector, pi: Int, anc: Vec<MInfo>, ai: Int) -> Bool {
+    if pi < 0 { return true }
+    if sel.combs[pi] == 1 {
+        if ai < 0 { return false }
+        if !part_match(sel.parts[pi], anc[ai]) { return false }
+        return sel_match_from(sel, pi - 1, anc, ai - 1)
+    }
+    var k = ai
+    while k >= 0 {
+        if part_match(sel.parts[pi], anc[k]) && sel_match_from(sel, pi - 1, anc, k - 1) { return true }
+        k = k - 1
+    }
+    return false
+}
+/// does `sel` match the node `me`, whose ancestors (root first) are `anc`?
+pub fn sel_matches(sel: Selector, me: MInfo, anc: Vec<MInfo>) -> Bool {
+    let last = sel.parts.len() - 1
+    if last < 0 { return false }
+    if !part_match(sel.parts[last], me) { return false }
+    return sel_match_from(sel, last - 1, anc, anc.len() - 1)
+}
+/// the cascade's answer for one node.
+pub struct Cascade { style: NodeStyle, has_trans: Bool, trans: Vec<TransSpec>, has_anim: Bool, anim: AnimSpec }
+/// every rule that matches, least specific first, folded field by field; the last `transition`
+/// and the last `animation` win whole (each is one property).
+pub fn csheet_cascade(sheet: CSheet, me: MInfo, anc: Vec<MInfo>) -> Cascade {
+    var out = Cascade { style: node_style_empty(), has_trans: false, trans: vec(), has_anim: false, anim: anim_none() }
+    var i = 0
+    while i < sheet.rules.len() {
+        if sel_matches(sheet.rules[i].sel, me, anc) {
+            node_style_apply_in(out.style, sheet.rules[i].style)
+            if sheet.rules[i].has_trans {
+                out.has_trans = true
+                var ts: Vec<TransSpec> = vec()
+                var j = 0
+                while j < sheet.rules[i].trans.len() { ts.push(trans_dup(sheet.rules[i].trans[j]))  j = j + 1 }
+                out.trans = sink ts
+            }
+            if sheet.rules[i].has_anim { out.has_anim = true  out.anim = anim_dup(sheet.rules[i].anim) }
+        }
+        i = i + 1
+    }
+    return out
+}

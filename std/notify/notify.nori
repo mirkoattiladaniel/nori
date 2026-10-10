@@ -1,0 +1,107 @@
+//! std/notify: tell the person something when your program is not what they are looking at.
+//!
+//!     import "std/notify" as notify
+//!
+//!     notify::set_app("myapp")
+//!     match notify::try_send(notify::notice("update ready", "version 4fe7346 is available")) {
+//!         Result::Ok(id)   => { ... notify::cancel(id) ... }
+//!         Result::Err(why) => { printl("not notified: " + why) }
+//!     }
+//!
+//! This is not part of std/window or std/nori_ui, because a notification is not your surface. It
+//! works when your program has no window at all (a build finishing, a sync completing, a daemon
+//! with something to say), so requiring a windowing backend to send one would be backwards. And it
+//! is drawn by someone else: the desktop's shell owns the popup's style, its position and its
+//! lifetime. There is nothing for nori_ui to lay out or hit-test.
+//!
+//! Whether it works at all is a runtime question, so it is in the return type. A headless box has
+//! no session bus; a phone can have the permission refused; macOS gives an unsigned binary
+//! nothing. `try_send` says which, and a program decides for itself whether that is worth
+//! reporting.
+//!
+//! `available()` answers the other question, "should I offer a notify-me setting at all?", and it
+//! is a real probe rather than a guess: on Linux it asks the daemon for its capabilities, because
+//! notify_init succeeds on a machine with no bus and then drops everything sent to it.
+//!
+//! Tags decide whether a notification stacks or replaces. An untagged notice is its own popup,
+//! which is what a stream of separate events wants. A tagged one replaces the earlier notice
+//! carrying that tag, so a download reporting progress shows one popup that changes rather than
+//! forty that disagree.
+//!
+//! Per platform, chosen by which C file the program's manifest lists:
+//!   cfile = std/notify/notify_linux.c     libnotify over the session bus, loaded at runtime and
+//!                                         never linked, so a machine without it still starts
+//!   cfile = std/notify/notify_android.c   NotificationManager over JNI: needs a channel, a small
+//!                                         icon, and POST_NOTIFICATIONS
+//!   cfile = std/notify/notify_win32.c     the tray balloon. Real toasts need an AppUserModelID,
+//!                                         which a lone .exe cannot have
+//!   cfile = std/notify/notify_absent.c    everywhere else: available() is false, try_send is Err.
+//!                                         macOS lands here, since its notification API requires
+//!                                         a signed app bundle
+//!
+//! On Android the program must also declare the permission (NORI_APK_PERMISSIONS=POST_NOTIFICATIONS),
+//! and it is a runtime one: the first try_send raises the dialog and returns Err, because a
+//! NativeActivity never sees the answer come back. The next send, once the person has answered,
+//! succeeds.
+import "std/os" as os
+
+extern fn nori_notify_available() -> Int
+extern fn nori_notify_send(Int, Int, Int, Int, Int) -> Int
+extern fn nori_notify_cancel(Int) -> Int
+extern fn nori_notify_set_app(Int)
+extern fn malloc(Int) -> Int
+extern fn free(Int)
+
+/// What to say. `tag` is optional and is what makes a notification replace an earlier one instead
+/// of stacking beside it: send "download" twice with the same tag and the person sees one popup
+/// that changed, not two that disagree. Untagged notices stack, which is right for events that
+/// each happened once.
+pub struct Notice { title: Str, body: Str, tag: Str }
+
+/// a notice that stacks.
+pub fn notice(title: Str, body: Str) -> Notice { return Notice { title: copy title, body: copy body, tag: "" } }
+/// a notice that replaces any earlier one carrying the same tag.
+pub fn tagged(title: Str, body: Str, tag: Str) -> Notice { return Notice { title: copy title, body: copy body, tag: copy tag } }
+
+/// The name the desktop shows as the sender, and on Android the channel's name. Set it before the
+/// first send; after that the service has already registered under whatever it was.
+pub fn set_app(name: Str) {
+    let c = os::os_cstr(name)
+    unsafe { nori_notify_set_app(c) }
+    unsafe { free(c) }
+}
+
+/// Is there anything listening? False on a headless machine, on a build with the absent backend,
+/// or where the person has refused the permission. Ask this to decide whether to offer a
+/// "notify me" setting at all; `try_send` still answers for each individual send.
+pub fn available() -> Bool {
+    var r = 0
+    unsafe { r = nori_notify_available() }
+    return r != 0
+}
+
+/// Send it. Ok(id), where the id cancels or is superseded; Err(why) says what stopped it.
+pub fn try_send(n: Notice) -> Result<Int> {
+    let t = os::os_cstr(n.title)
+    let b = os::os_cstr(n.body)
+    let g = os::os_cstr(n.tag)
+    let e = unsafe_malloc(256)
+    var id = 0
+    unsafe { id = nori_notify_send(t, b, g, e, 256) }
+    var why = ""
+    if id == 0 { why = os::os_from_cstr(e) }
+    unsafe { free(t)  free(b)  free(g)  free(e) }
+    if id != 0 { return Result::Ok(id) }
+    if why.len() == 0 { why = "the notification was not delivered" }
+    return Result::Err(why)
+}
+
+fn unsafe_malloc(n: Int) -> Int { var p = 0  unsafe { p = malloc(n) }  return p }
+
+/// Withdraw one that is still on screen. False if it was never sent, already gone, or the id has
+/// been recycled; in every case there is nothing left to take back.
+pub fn cancel(id: Int) -> Bool {
+    var r = 0
+    unsafe { r = nori_notify_cancel(id) }
+    return r != 0
+}

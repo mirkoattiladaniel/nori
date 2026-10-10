@@ -1,0 +1,337 @@
+// Native .nori tests for the plugin ABI (the host calling into a plugin), run with
+//   noric --test std/nori_ui/plugin/plugin_test.nori compiler/runtime.nori --import-root .
+//
+// Two entry points a plugin exports are dispatched by the host by name:
+// `nori_plugin_service` (the plugin answers a service key its manifest declared) and
+// `nori_plugin_surface` (the plugin fills a named hole with a GPU texture view). Everything here is
+// the host side of that, and none of it needs a `.so`: a `LoadedPlugin` is an ordinary struct, and a
+// function address is an ordinary Int, so a test can stand in for a library by handing over an
+// address it took itself.
+//
+//   * a fake plugin's `f_service` points at `host_call_addr()`, the host's own callback.
+//     Its C signature, `(key: cstr, arg: cstr) -> cstr`, is the same as `nori_plugin_service`'s, so the
+//     call goes over the real `dl::call2_cstr` trampoline with the real string ownership and the
+//     real by-name dispatch, and lands in the host bus where the answer can be checked.
+//   * `pt_surface_addr` is the C entry of a Nori function standing in for `nori_plugin_surface`.
+//     It reports back what it was handed, so `dl::call_s4i`'s five-argument marshalling is checked
+//     rather than assumed.
+//
+// What a `.so` is needed for (a manifest's `surfaces` array parsing through `load`, and
+// a declared service with no `nori_plugin_service` being refused at load) is not covered here;
+// that takes real libraries.
+import "std/nori_ui" as ui
+
+// ---- a fake plugin-side `nori_plugin_surface`. -------------------------------------------------
+// `(id: cstr, device, queue, w, h) -> Int`, the surface entry point's shape. It ignores `id` and returns an
+// arithmetic mix of the four scalars, so a caller can prove each one arrived, in order, unmangled.
+// `cfn_addr` hands out the C-callable entry of each, the same way hostcall.nori takes its own.
+fn pt_fake_surface(id: Int, device: Int, queue: Int, w: Int, h: Int) -> Int {
+    return device * 1000000 + queue * 10000 + w * 100 + h
+}
+
+/// a `nori_plugin_service` that answers NULL whatever it is asked.
+fn pt_null_reply(k: Int, a: Int) -> Int { return 0 }
+
+/// the address of the fake surface entry point.
+fn pt_surface_addr() -> Int { var r = 0  unsafe { r = cfn_addr(pt_fake_surface) }  return r }
+
+/// the address of a `nori_plugin_service` that always answers NULL.
+fn pt_null_reply_addr() -> Int { var r = 0  unsafe { r = cfn_addr(pt_null_reply) }  return r }
+
+// ---- helpers (must not be named test_*) --------------------------------------------------------
+
+/// a `LoadedPlugin` as the loader would have built it, without a library behind it. `svc` and `surf`
+/// are the two by-name entry-point addresses; 0 for either is a plugin that does not export it.
+fn pt_plugin(name: Str, services: Vec<Str>, surfaces: Vec<Str>, abi: Int, svc: Int, surf: Int) -> ui::plugin::LoadedPlugin {
+    var panels: Vec<ui::plugin::PanelDesc> = vec()
+    return ui::plugin::LoadedPlugin {
+        path: (name + ".so"), name: copy name, version: "1.0", handle: 0,
+        f_render: 0, f_event: 0, f_init: 0, abi: abi,
+        f_service: svc, f_surface: surf,
+        panels: panels, services: copy services, surfaces: copy surfaces,
+        stamp: "", ok: true, err: ""
+    }
+}
+
+/// a Vec<Str> of one.
+fn pt_v1(a: Str) -> Vec<Str> { var v: Vec<Str> = vec()  v.push(copy a)  return v }
+/// a Vec<Str> of two.
+fn pt_v2(a: Str, b: Str) -> Vec<Str> { var v: Vec<Str> = vec()  v.push(copy a)  v.push(copy b)  return v }
+/// an empty Vec<Str>.
+fn pt_v0() -> Vec<Str> { var v: Vec<Str> = vec()  return v }
+
+/// the shared "unknown key" reply, which a plugin's services answer with just as the in-process bus does.
+fn pt_no_service(key: Str) -> Str { return ("{\"ok\":false,\"error\":\"no such service: " + (key + "\"}")) }
+
+// ---- surfaces: matching a hole by name ---------------------------------------------------------
+
+/// a plugin fills exactly the ids its manifest listed, and nothing else. The match is a string
+/// compare and the host never learns what "scene.viewport" means; that is the whole mechanism.
+fn test_fills_surface_matches_by_name() {
+    let p = pt_plugin("viewer", pt_v0(), pt_v2("scene.viewport", "scene.preview"), 1, 0, pt_surface_addr())
+    assert_true(ui::plugin::fills_surface(p, "scene.viewport"))
+    assert_true(ui::plugin::fills_surface(p, "scene.preview"))
+    assert_false(ui::plugin::fills_surface(p, "scene.viewpor"))
+    assert_false(ui::plugin::fills_surface(p, "scene.viewportt"))
+    assert_false(ui::plugin::fills_surface(p, "image.canvas"))
+    assert_false(ui::plugin::fills_surface(p, ""))
+}
+
+/// a plugin with no `nori_plugin_surface` fills nothing, however its manifest reads. The loader
+/// refuses that combination outright, so this is a second check: `fills_surface` cannot
+/// hand back an owner the host would then call through a null address.
+fn test_fills_surface_needs_the_entry_point() {
+    let p = pt_plugin("liar", pt_v0(), pt_v1("scene.viewport"), 1, 0, 0)
+    assert_false(ui::plugin::fills_surface(p, "scene.viewport"))
+}
+
+/// a plugin that failed to load claims nothing, even with its fields filled in.
+fn test_fills_surface_ignores_a_failed_plugin() {
+    var p = pt_plugin("broken", pt_v0(), pt_v1("scene.viewport"), 1, 0, pt_surface_addr())
+    p.ok = false
+    assert_false(ui::plugin::fills_surface(p, "scene.viewport"))
+}
+
+// ---- surfaces: the call itself -----------------------------------------------------------------
+
+/// `surface()` marshals the id as a C string and the four scalars in order, and hands back whatever
+/// integer handle the plugin returned. The fake entry point encodes its arguments into the result,
+/// so this is the five-argument trampoline (`dl::call_s4i` -> `dl::call5`) actually being checked.
+fn test_surface_passes_its_scalars_through() {
+    let p = pt_plugin("viewer", pt_v0(), pt_v1("scene.viewport"), 1, 0, pt_surface_addr())
+    assert_eq(ui::plugin::surface(p, "scene.viewport", 7, 9, 12, 34), 7091234)
+    assert_eq(ui::plugin::surface(p, "scene.viewport", 1, 2, 3, 4), 1020304)
+}
+
+/// 0 is "nothing to show this frame", not an error, and it is what a plugin without the entry point
+/// answers as well; the host leaves the hole on its placeholder colour either way.
+fn test_surface_zero_when_there_is_nothing_to_call() {
+    let p = pt_plugin("quiet", pt_v0(), pt_v0(), 1, 0, 0)
+    assert_eq(ui::plugin::surface(p, "scene.viewport", 7, 9, 12, 34), 0)
+}
+
+/// a degenerate rect is never handed to a plugin: a zero-width hole cannot own a texture, and a
+/// negative one is a layout bug the plugin should not be asked to interpret.
+fn test_surface_refuses_a_degenerate_size() {
+    let p = pt_plugin("viewer", pt_v0(), pt_v1("scene.viewport"), 1, 0, pt_surface_addr())
+    assert_eq(ui::plugin::surface(p, "scene.viewport", 7, 9, 0, 34), 0)
+    assert_eq(ui::plugin::surface(p, "scene.viewport", 7, 9, 12, 0), 0)
+    assert_eq(ui::plugin::surface(p, "scene.viewport", 7, 9, -1, 34), 0)
+    assert_eq(ui::plugin::surface(p, "scene.viewport", 7, 9, 12, -1), 0)
+}
+
+// ---- services: answering, and not being able to ------------------------------------------------
+
+/// `serves()` is the one question worth asking before publishing a plugin's keys: does it export
+/// `nori_plugin_service` at all.
+fn test_serves_tracks_the_entry_point() {
+    let yes = pt_plugin("svc", pt_v1("notes.count"), pt_v0(), 1, ui::plugin::host_call_addr(), 0)
+    let no = pt_plugin("nosvc", pt_v1("notes.count"), pt_v0(), 1, 0, 0)
+    assert_true(ui::plugin::serves(yes))
+    assert_false(ui::plugin::serves(no))
+}
+
+/// a plugin that cannot answer at all replies in the shared error shape rather than "", so a caller
+/// parses one thing whether the key was missing, the plugin was missing, or the host had no such key.
+fn test_service_without_the_entry_point_answers_the_shared_shape() {
+    let p = pt_plugin("nosvc", pt_v1("notes.count"), pt_v0(), 1, 0, 0)
+    assert_streq(ui::plugin::service(p, "notes.count", "{}"), pt_no_service("notes.count"))
+    assert_streq(ui::plugin::service(p, "anything.at.all", ""), pt_no_service("anything.at.all"))
+}
+
+/// and the key is JSON-escaped on the way into that reply, so a hostile key cannot produce a reply
+/// the caller then fails to parse.
+fn test_service_escapes_the_key_in_its_error() {
+    let p = pt_plugin("nosvc", pt_v0(), pt_v0(), 1, 0, 0)
+    assert_streq(ui::plugin::service(p, "a\"b", "{}"), "{\"ok\":false,\"error\":\"no such service: a\\\"b\"}")
+}
+
+/// a plugin that failed to load answers the same way rather than being called through.
+fn test_service_ignores_a_failed_plugin() {
+    var p = pt_plugin("broken", pt_v1("notes.count"), pt_v0(), 1, ui::plugin::host_call_addr(), 0)
+    p.ok = false
+    assert_streq(ui::plugin::service(p, "notes.count", "{}"), pt_no_service("notes.count"))
+}
+
+/// the real call, over the real trampoline. `f_service` points at the host's own callback
+/// (the C signature is identical), so the reply comes back through `dl::call2_cstr` as a
+/// `.so`'s would, and lands in the bus this test bound. An unanswered key gives the shared shape,
+/// and an answered one gives the host's own bytes.
+fn test_service_dispatches_by_name_over_the_trampoline() {
+    var h = ui::plugin::host_new()
+    ui::plugin::host_register_service(h, "notes.count", |a: Str| "{\"ok\":true,\"result\":41}")
+    let p = pt_plugin("svc", pt_v1("notes.count"), pt_v0(), 1, ui::plugin::host_call_addr(), 0)
+    assert_streq(ui::plugin::service(p, "notes.count", "{}"), "{\"ok\":true,\"result\":41}")
+    assert_streq(ui::plugin::service(p, "no.such.key", "{}"), pt_no_service("no.such.key"))
+}
+
+/// an empty argument is normalised to `{}` before it crosses, so a plugin always parses a document.
+fn test_service_normalises_an_empty_argument() {
+    var h = ui::plugin::host_new()
+    ui::plugin::host_register_service(h, "echo.arg", |a: Str| ("{\"ok\":true,\"arg\":\"" + (a + "\"}")))
+    let p = pt_plugin("svc", pt_v1("echo.arg"), pt_v0(), 1, ui::plugin::host_call_addr(), 0)
+    assert_streq(ui::plugin::service(p, "echo.arg", ""), "{\"ok\":true,\"arg\":\"{}\"}")
+    assert_streq(ui::plugin::service(p, "echo.arg", "{\"n\":1}"), "{\"ok\":true,\"arg\":\"{\"n\":1}\"}")
+}
+
+// ---- the host side: who owns a hole ------------------------------------------------------------
+
+/// nothing claims an id -> -1, which is how `shell_fill_surfaces` knows to leave the placeholder.
+fn test_surface_owner_is_minus_one_when_unclaimed() {
+    var h = ui::plugin::host_new()
+    assert_eq(ui::plugin::host_surface_owner(h, "scene.viewport"), -1)
+    let _i = ui::plugin::host_add(h, pt_plugin("viewer", pt_v0(), pt_v1("scene.viewport"), 1, 0, pt_surface_addr()))
+    assert_eq(ui::plugin::host_surface_owner(h, "image.canvas"), -1)
+    assert_eq(ui::plugin::host_surface_owner(h, ""), -1)
+}
+
+/// the owner is the library index, and it is found by name across everything loaded.
+fn test_surface_owner_finds_the_claimant() {
+    var h = ui::plugin::host_new()
+    let _a = ui::plugin::host_add(h, pt_plugin("first", pt_v0(), pt_v1("image.canvas"), 1, 0, pt_surface_addr()))
+    let _b = ui::plugin::host_add(h, pt_plugin("second", pt_v0(), pt_v1("scene.viewport"), 1, 0, pt_surface_addr()))
+    assert_eq(ui::plugin::host_surface_owner(h, "image.canvas"), 0)
+    assert_eq(ui::plugin::host_surface_owner(h, "scene.viewport"), 1)
+}
+
+/// two plugins claiming one hole is a misconfiguration, not a silent override: the first claim wins
+/// and the host records the collision, so the frame that shows it can say so.
+fn test_surface_owner_reports_a_second_claimant() {
+    var h = ui::plugin::host_new()
+    let _a = ui::plugin::host_add(h, pt_plugin("first", pt_v0(), pt_v1("scene.viewport"), 1, 0, pt_surface_addr()))
+    let _b = ui::plugin::host_add(h, pt_plugin("second", pt_v0(), pt_v1("scene.viewport"), 1, 0, pt_surface_addr()))
+    let before = ui::plugin::host_error_count(h)
+    assert_eq(ui::plugin::host_surface_owner(h, "scene.viewport"), 0)
+    assert_eq(ui::plugin::host_error_count(h), before + 1)
+    let msg = ui::plugin::host_error_at(h, before)
+    assert_true(msg.len() > 0)
+}
+
+/// discovery: every hole any plugin offers, in load order, with duplicates collapsed. What the host
+/// could fill; what it actually fills is whatever this frame's documents asked for.
+fn test_surface_ids_deduplicates_in_load_order() {
+    var h = ui::plugin::host_new()
+    let _a = ui::plugin::host_add(h, pt_plugin("first", pt_v0(), pt_v2("scene.viewport", "scene.preview"), 1, 0, pt_surface_addr()))
+    let _b = ui::plugin::host_add(h, pt_plugin("second", pt_v0(), pt_v2("scene.viewport", "image.canvas"), 1, 0, pt_surface_addr()))
+    var ids = ui::plugin::host_surface_ids(h)
+    assert_eq(ids.len(), 3)
+    assert_streq(ids[0], "scene.viewport")
+    assert_streq(ids[1], "scene.preview")
+    assert_streq(ids[2], "image.canvas")
+}
+
+/// a host with no libraries offers no holes, and a plugin declaring none adds none.
+fn test_surface_ids_empty_by_default() {
+    var h = ui::plugin::host_new()
+    var none = ui::plugin::host_surface_ids(h)
+    assert_eq(none.len(), 0)
+    let _a = ui::plugin::host_add(h, pt_plugin("plain", pt_v0(), pt_v0(), 1, 0, 0))
+    var still = ui::plugin::host_surface_ids(h)
+    assert_eq(still.len(), 0)
+}
+
+// ---- the host side: publishing a plugin's services ---------------------------------------------
+
+/// `host_add` puts a plugin's declared keys on the bus, routed into the library. From then on a
+/// caller reaches them through `host_invoke_service` with no idea a plugin is behind them.
+fn test_host_add_publishes_declared_services() {
+    var h = ui::plugin::host_new()
+    assert_false(ui::plugin::host_has_service(h, "notes.count"))
+    let _i = ui::plugin::host_add(h, pt_plugin("notes", pt_v2("notes.count", "notes.list"), pt_v0(), 1, ui::plugin::host_call_addr(), 0))
+    assert_true(ui::plugin::host_has_service(h, "notes.count"))
+    assert_true(ui::plugin::host_has_service(h, "notes.list"))
+}
+
+/// but only for a plugin that can answer. `load` refuses that manifest outright (declaring a key
+/// with no `nori_plugin_service` behind it is a load error), so this is a second check: a
+/// hand-built `LoadedPlugin` publishes nothing rather than entries that answer nothing.
+fn test_host_add_does_not_publish_what_cannot_be_answered() {
+    var h = ui::plugin::host_new()
+    let _i = ui::plugin::host_add(h, pt_plugin("old", pt_v2("notes.count", "notes.list"), pt_v0(), 1, 0, 0))
+    assert_false(ui::plugin::host_has_service(h, "notes.count"))
+    assert_false(ui::plugin::host_has_service(h, "notes.list"))
+    assert_eq(ui::plugin::host_lib_count(h), 1)
+}
+
+/// a plugin that failed to load publishes nothing and is not registered; its error is all it
+/// contributes.
+fn test_host_add_refuses_a_failed_plugin() {
+    var h = ui::plugin::host_new()
+    var p = pt_plugin("broken", pt_v1("notes.count"), pt_v0(), 1, ui::plugin::host_call_addr(), 0)
+    p.ok = false
+    p.err = "cannot open"
+    let before = ui::plugin::host_error_count(h)
+    assert_eq(ui::plugin::host_add(h, p), -1)
+    assert_eq(ui::plugin::host_lib_count(h), 0)
+    assert_eq(ui::plugin::host_error_count(h), before + 1)
+    assert_false(ui::plugin::host_has_service(h, "notes.count"))
+}
+
+// ---- version constants -------------------------------------------------------------------------
+
+/// ABI 1 is the one version this host speaks.
+fn test_abi_version() {
+    assert_eq(ui::plugin::ABI_VERSION(), 1)
+}
+
+// ---- the generic host loop -----------------------------------------------------------------
+// `shell_fill_surfaces` is the one place the two halves meet: the holes a document declared against
+// the holes a plugin declared. It is a name match and a rect, with no branch for what is in the
+// hole, so it can be driven here with a fake plugin and two integers standing in for a real device.
+
+/// lay out one document in a `w` x `h` viewport.
+fn pt_overlay(src: Str, w: Float, h: Float) -> ui::layout::ComputedOverlay {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(w, h))
+    return ui::layout::layout_overlay(r.doc.tree, vp)
+}
+
+/// a document with one full-bleed hole named `id`.
+fn pt_doc(id: Str) -> Str { return ("column { padding: 0 gap: 0 surface { id: \"" + (id + "\" fill_w: true fill_h: true } }")) }
+
+/// the claimed hole is filled with what the plugin returned, and the count says how many were.
+fn test_shell_fills_a_claimed_hole() {
+    var h = ui::plugin::host_new()
+    let _i = ui::plugin::host_add(h, pt_plugin("viewer", pt_v0(), pt_v1("scene.viewport"), 1, 0, pt_surface_addr()))
+    var overlay = pt_overlay(pt_doc("scene.viewport"), 100.0, 50.0)
+    var b = ui::layout::surface_bindings()
+    let look = ui::layout::surface_rect_of(overlay, "scene.viewport")
+    assert_true(look.found)
+    let want = 5 * 1000000 + 6 * 10000 + to_int(look.rect.width()) * 100 + to_int(look.rect.height())
+    assert_eq(ui::shell::shell_fill_surfaces(h, overlay, b, 5, 6), 1)
+    let bound = ui::layout::surface_binding_of(b, "scene.viewport")
+    assert_eq(bound.kind, ui::layout::sfb_texture())
+    assert_eq(bound.texture, want)
+}
+
+/// a hole no plugin claims is left alone (unbound), so it paints the placeholder colour.
+fn test_shell_leaves_an_unclaimed_hole_alone() {
+    var h = ui::plugin::host_new()
+    let _i = ui::plugin::host_add(h, pt_plugin("viewer", pt_v0(), pt_v1("scene.viewport"), 1, 0, pt_surface_addr()))
+    var overlay = pt_overlay(pt_doc("image.canvas"), 100.0, 50.0)
+    var b = ui::layout::surface_bindings()
+    assert_eq(ui::shell::shell_fill_surfaces(h, overlay, b, 5, 6), 0)
+    let bound = ui::layout::surface_binding_of(b, "image.canvas")
+    assert_eq(bound.kind, ui::layout::sfb_unbound())
+}
+
+/// no device is no frame: nothing is called and nothing is bound, rather than a plugin being handed
+/// a null device to allocate on.
+fn test_shell_needs_a_device_and_a_queue() {
+    var h = ui::plugin::host_new()
+    let _i = ui::plugin::host_add(h, pt_plugin("viewer", pt_v0(), pt_v1("scene.viewport"), 1, 0, pt_surface_addr()))
+    var overlay = pt_overlay(pt_doc("scene.viewport"), 100.0, 50.0)
+    var b = ui::layout::surface_bindings()
+    assert_eq(ui::shell::shell_fill_surfaces(h, overlay, b, 0, 6), 0)
+    assert_eq(ui::shell::shell_fill_surfaces(h, overlay, b, 5, 0), 0)
+    let bound = ui::layout::surface_binding_of(b, "scene.viewport")
+    assert_eq(bound.kind, ui::layout::sfb_unbound())
+}
+
+/// a plugin that has the entry point and returns NULL from it names itself in the error, so the
+/// failure is attributable rather than an empty string a caller has to guess about.
+fn test_service_reports_a_null_reply_against_the_plugin() {
+    let p = pt_plugin("notes", pt_v1("notes.count"), pt_v0(), 1, pt_null_reply_addr(), 0)
+    assert_streq(ui::plugin::service(p, "notes.count", "{}"), "{\"ok\":false,\"error\":\"notes returned nothing for notes.count\"}")
+}

@@ -1,0 +1,597 @@
+//! std/audio/alsa: the Linux ALSA (libasound) PCM playback backend behind `std/audio`'s `Device`.
+//!
+//! Why this uses `dlopen` rather than linking. Nori can bind a C library three ways, and
+//! the obvious two don't fit here:
+//!
+//!   * `extern alsa "alsa/asoundlib.h" link "asound" { … }` works and is shorter. But `std/audio` is
+//!     imported by `std/src/lib.nori`, which type-checks the whole standard library as one unit, so
+//!     that binding would make ALSA's headers a build dependency of all of std and `libasound` a
+//!     link dependency of every program that touches it. No other std module does that:
+//!     `std/window` and `std/nori_ui`'s wgpu backend both keep their C out of the default build. A
+//!     machine without `libasound2-dev` could not compile std at all.
+//!   * a raw `extern fn` / `std/dl` binding cannot express ALSA's setup path: `snd_pcm_open` takes a
+//!     `snd_pcm_t**` out-parameter and the hardware-parameter API is opaque structs.
+//!
+//! So this file uses an inline `extern c { }` block, which the compiler compiles and links itself
+//! (no `--cfile` or `--clink` for the caller). The block (a) declares the eleven libasound entry points it uses with its
+//! own prototypes, needing no ALSA header, (b) resolves them with `dlopen("libasound.so.2")` +
+//! `dlsym` on first use, needing no link library, and (c) owns the `snd_pcm_t*` behind small helpers
+//! so the struct marshalling never crosses into Nori. `available()` is then a real question with a
+//! real answer: false on a machine with no ALSA installed, where the program still runs.
+//!
+//! The constants. Not including the header means the four enum values below are spelled out. They
+//! are ALSA ABI, fixed since 1.0 and not free to change.
+//!
+//! Writes block (`snd_pcm_writei` on a device opened with mode 0): `write()` returns when the
+//! frames are in the ring buffer, and waits while the buffer is full. This is not a callback/pull
+//! backend and it does not use threads. A game should call `write()` from a loop
+//! that also does other work, sized by `avail()`.
+//!
+//! Native builds. Everything above describes a build through LLVM. A program built with
+//! `noric --build --native` has no C compiler, so the `extern c` block below is not compiled there:
+//! std/native_seams links `std/audio/__native_audio.nori` in its place, which answers the same `naud_*`
+//! calls in Nori, needs no libasound, and leaves the executable static. The device name picks the
+//! protocol, mirroring what libasound does with those names on a desktop:
+//!
+//!   * "default", "pipewire", "pulse", "sysdefault": the PulseAudio native protocol (version 35)
+//!     over the sound server's Unix socket: `$PULSE_SERVER` (unix:PATH), else
+//!     `$XDG_RUNTIME_DIR/pulse/native`, served by PulseAudio or pipewire-pulse. A write blocks until
+//!     the server's flow control has taken every frame; drain waits for the server to play them out.
+//!   * "hw:C,D", "plughw:C,D": the kernel PCM interface on /dev/snd/pcmC{C}D{D}p through its ioctls.
+//!     `hw:` refuses parameters the card does not take with -EINVAL; `plughw:` converts the sample
+//!     format and channel count and changes the rate by linear interpolation (not band-limited). A
+//!     device the sound server holds answers -EBUSY, and `open_default` moves on.
+//!   * "null": accepts the parameters and discards writes at once, as libasound's null PCM does.
+//!
+//! Errors are the same negated errno values with the C library's text, `alsa_available()` is true,
+//! and `alsa_version()` names the native backend and its protocols instead of a libasound version.
+//!
+//! Windows. There is no libasound and no C block: the `cfg(windows)` half below defines the `aud_*` entry
+//! points the functions at the end call (on Linux and macOS they forward to the C block's `naud_*`) in
+//! Nori over winmm's waveOut, one implementation for LLVM and native builds alike.
+//! "default", "pipewire", "pulse" and "sysdefault" open the preferred output (WAVE_MAPPER), "hw:C,D" and
+//! "plughw:C,D" waveOut device C, "null" accepts sane parameters and discards writes; any other name
+//! answers -ENOENT. A write queues its frames and blocks while more than the requested latency's worth is
+//! still waiting to be played, as a write to a full ALSA buffer blocks.
+
+cfg(unix) {
+extern c {
+#include <dlfcn.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdarg.h>
+
+/* ALSA ABI constants, matching alsa/asoundlib.h (see `alsa_abi_const`). */
+#define NAUD_STREAM_PLAYBACK   0    /* SND_PCM_STREAM_PLAYBACK      */
+#define NAUD_ACCESS_RW_INTER   3    /* SND_PCM_ACCESS_RW_INTERLEAVED */
+#define NAUD_FORMAT_S16_LE     2    /* SND_PCM_FORMAT_S16_LE        */
+#define NAUD_FORMAT_FLOAT_LE  14    /* SND_PCM_FORMAT_FLOAT_LE      */
+
+/* The libasound entry points this backend uses, declared here so no ALSA header is needed. Every
+   one takes and returns scalars or opaque pointers, which is why dlsym can reach them at all. */
+typedef int         (*naud_open_fn)(void** pcm, const char* name, int stream, int mode);
+typedef int         (*naud_setp_fn)(void* pcm, int fmt, int access, unsigned ch, unsigned rate,
+                                    int soft_resample, unsigned latency_us);
+typedef long        (*naud_writei_fn)(void* pcm, const void* buf, unsigned long frames);
+typedef long        (*naud_avail_fn)(void* pcm);
+typedef int         (*naud_int_fn)(void* pcm);
+typedef int         (*naud_recover_fn)(void* pcm, int err, int silent);
+typedef const char* (*naud_strerr_fn)(int err);
+typedef const char* (*naud_ver_fn)(void);
+typedef int         (*naud_errh_fn)(void* handler);
+
+static void*           naud_lib     = NULL;
+static int             naud_tried   = 0;
+static naud_open_fn    p_open       = NULL;
+static naud_setp_fn    p_setp       = NULL;
+static naud_writei_fn  p_writei     = NULL;
+static naud_avail_fn   p_avail      = NULL;
+static naud_int_fn     p_drain      = NULL;
+static naud_int_fn     p_drop       = NULL;
+static naud_int_fn     p_close      = NULL;
+static naud_int_fn     p_prepare    = NULL;
+static naud_recover_fn p_recover    = NULL;
+static naud_strerr_fn  p_strerror   = NULL;
+static naud_ver_fn     p_version    = NULL;
+static naud_errh_fn    p_set_errh   = NULL;
+
+
+/* Resolve libasound once. Tries the versioned SONAME first, since that is the file a runtime has:
+   the unversioned `libasound.so` symlink ships only in the -dev package. Returns 1 on success. */
+static int naud_load(void) {
+    if (naud_tried) return naud_lib != NULL;
+    naud_tried = 1;
+    naud_lib = dlopen("libasound.so.2", RTLD_LAZY | RTLD_LOCAL);
+    if (!naud_lib) naud_lib = dlopen("libasound.so", RTLD_LAZY | RTLD_LOCAL);
+    if (!naud_lib) return 0;
+    p_open     = (naud_open_fn)    dlsym(naud_lib, "snd_pcm_open");
+    p_setp     = (naud_setp_fn)    dlsym(naud_lib, "snd_pcm_set_params");
+    p_writei   = (naud_writei_fn)  dlsym(naud_lib, "snd_pcm_writei");
+    p_avail    = (naud_avail_fn)   dlsym(naud_lib, "snd_pcm_avail_update");
+    p_drain    = (naud_int_fn)     dlsym(naud_lib, "snd_pcm_drain");
+    p_drop     = (naud_int_fn)     dlsym(naud_lib, "snd_pcm_drop");
+    p_close    = (naud_int_fn)     dlsym(naud_lib, "snd_pcm_close");
+    p_prepare  = (naud_int_fn)     dlsym(naud_lib, "snd_pcm_prepare");
+    p_recover  = (naud_recover_fn) dlsym(naud_lib, "snd_pcm_recover");
+    p_strerror = (naud_strerr_fn)  dlsym(naud_lib, "snd_strerror");
+    p_version  = (naud_ver_fn)     dlsym(naud_lib, "snd_asoundlib_version");
+    p_set_errh = (naud_errh_fn)    dlsym(naud_lib, "snd_lib_error_set_handler");
+    /* The five that the rest of this file cannot work without. A libasound missing any of them is
+       not a libasound, and pretending otherwise would crash on a null call. */
+    if (!p_open || !p_setp || !p_writei || !p_close || !p_strerror) { naud_lib = NULL; return 0; }
+    return 1;
+}
+
+/* 1 if libasound is installed and usable, 0 otherwise. Everything else returns -ENOSYS (-38) when
+   this is 0, so a program on a box with no ALSA runs and reports, rather than failing to start. */
+long long naud_ready(void) { return naud_load() ? 1 : 0; }
+
+/* libasound's version string as a `const char*` (0 when absent). */
+long long naud_version(void) {
+    if (!naud_load() || !p_version) return 0;
+    return (long long)(intptr_t)p_version();
+}
+
+/* Open `dev` for playback and negotiate rate/channels/format in one call. Returns the snd_pcm_t* as
+   an opaque long (> 0), or the NEGATED ALSA error code (< 0). `latency_us` is the target buffer
+   latency in microseconds; ALSA derives period and buffer sizes from it. soft_resample = 1 lets ALSA
+   resample when the hardware refuses the rate, which is what makes a plain `plughw:` device accept
+   44100 on a card that only does 48000. */
+long long naud_open(const char* dev, long long rate, long long channels, long long fmt, long long latency_us) {
+    if (!naud_load()) return -38;                       /* -ENOSYS: no ALSA on this machine */
+    void* h = NULL;
+    int r = p_open(&h, dev, NAUD_STREAM_PLAYBACK, 0);
+    if (r < 0) return (long)r;
+    int f = (fmt == 1) ? NAUD_FORMAT_FLOAT_LE : NAUD_FORMAT_S16_LE;
+    r = p_setp(h, f, NAUD_ACCESS_RW_INTER, (unsigned)channels, (unsigned)rate, 1, (unsigned)latency_us);
+    if (r < 0) { p_close(h); return (long)r; }
+    return (long long)(intptr_t)h;
+}
+
+/* Write `frames` interleaved frames from the raw buffer `buf`. Returns frames written, or the
+   negated error. An underrun (-EPIPE) or a suspend (-ESTRPIPE) is RECOVERED once and the write
+   retried: an xrun is a normal event on a loaded box, and propagating it would let the first
+   stutter kill the stream. */
+long long naud_write(long long hv, long long buf, long long frames) {
+    void* h = (void*)(intptr_t)hv;
+    if (!naud_load() || !h || frames <= 0) return 0;
+    long n = p_writei(h, (const void*)(intptr_t)buf, (unsigned long)frames);
+    if (n < 0) {
+        int r = p_recover ? p_recover(h, (int)n, 1 /* silent */) : -1;
+        if (r < 0) return n;
+        n = p_writei(h, (const void*)(intptr_t)buf, (unsigned long)frames);
+    }
+    return n;
+}
+
+/* Frames that can be written right now without blocking (< 0 = error). */
+long long naud_avail(long long hv) {
+    void* h = (void*)(intptr_t)hv;
+    if (!naud_load() || !h || !p_avail) return 0;
+    long n = p_avail(h);
+    if (n < 0 && p_recover) { p_recover(h, (int)n, 1); n = p_avail(h); }
+    return n;
+}
+
+/* Block until everything already written has been played out. */
+long long naud_drain(long long hv) {
+    void* h = (void*)(intptr_t)hv;
+    if (!naud_load() || !h || !p_drain) return 0;
+    return (long)p_drain(h);
+}
+
+/* Throw away everything queued and stop now, then put the stream back in a writable state. A
+   dropped stream is left in SETUP and the next writei would fail with -EBADFD. */
+long long naud_drop(long long hv) {
+    void* h = (void*)(intptr_t)hv;
+    if (!naud_load() || !h || !p_drop) return 0;
+    int r = p_drop(h);
+    if (p_prepare) p_prepare(h);
+    return (long)r;
+}
+
+long long naud_close(long long hv) {
+    void* h = (void*)(intptr_t)hv;
+    if (!naud_load() || !h) return 0;
+    return (long)p_close(h);
+}
+
+/* A `const char*` for an ALSA error code (0 when there is no ALSA to ask). */
+long long naud_strerror(long long code) {
+    if (!naud_load()) return 0;
+    return (long long)(intptr_t)p_strerror((int)code);
+}
+
+/* ALSA narrates its own failures to stderr through a global hook ("unable to open slave" and the
+   like, from deep inside the plugin chain), even for a device the caller is only probing. A program
+   walking a fallback list would print those on every start. This replaces the hook with a no-op; the
+   error code still comes back from every call. */
+static void naud_noop_err(const char* f, int l, const char* fn, int e, const char* fmt, ...) {
+    (void)f; (void)l; (void)fn; (void)e; (void)fmt;
+}
+long long naud_quiet(long long on) {
+    if (!naud_load() || !p_set_errh) return 0;
+    return (long)p_set_errh(on ? (void*)naud_noop_err : NULL);
+}
+
+/* Would this device/rate/channels/format negotiate, without keeping the device open? 0 = yes. */
+long long naud_can(const char* dev, long long rate, long long channels, long long fmt) {
+    long long h = naud_open(dev, rate, channels, fmt, 100000);
+    if (h < 0) return h;
+    naud_close(h);
+    return 0;
+}
+
+/* The four ALSA enum values this file hardcodes, so a test can compare them with the header's. */
+long long naud_const(long long which) {
+    if (which == 0) return NAUD_STREAM_PLAYBACK;
+    if (which == 1) return NAUD_ACCESS_RW_INTER;
+    if (which == 2) return NAUD_FORMAT_S16_LE;
+    return NAUD_FORMAT_FLOAT_LE;
+}
+}
+// the entry points the functions below call, by the names the Windows half defines too
+fn aud_ready() -> Int { unsafe { return naud_ready() } }
+fn aud_version() -> Int { unsafe { return naud_version() } }
+fn aud_open(dev: Str, rate: Int, channels: Int, fmt: Int, latency_us: Int) -> Int { unsafe { return naud_open(dev, rate, channels, fmt, latency_us) } }
+fn aud_write(h: Int, buf: Int, frames: Int) -> Int { unsafe { return naud_write(h, buf, frames) } }
+fn aud_avail(h: Int) -> Int { unsafe { return naud_avail(h) } }
+fn aud_drain(h: Int) -> Int { unsafe { return naud_drain(h) } }
+fn aud_drop(h: Int) -> Int { unsafe { return naud_drop(h) } }
+fn aud_close(h: Int) -> Int { unsafe { return naud_close(h) } }
+fn aud_strerror(code: Int) -> Int { unsafe { return naud_strerror(code) } }
+fn aud_quiet(on: Int) -> Int { unsafe { return naud_quiet(on) } }
+fn aud_can(dev: Str, rate: Int, channels: Int, fmt: Int) -> Int { unsafe { return naud_can(dev, rate, channels, fmt) } }
+fn aud_const(which: Int) -> Int { unsafe { return naud_const(which) } }
+}
+
+// ── the Windows waveOut backend (cfg(windows) below) ────────────────────────────────────────────
+// The three records it lays over raw memory, declared once so the compiler computes the offsets:
+//
+//   * NwaDev — the device record, self-owned (calloc'd below). Layout: 0 kind (1 waveOut, 2 null)  8 HWAVEOUT  16 rate  24 channels
+//     32 bytes per frame  40 buffer frames  48 queued headers (an array of pointers)  56 their
+//     count  64 capacity  72 queued frames.
+//   * WaveFmtEx — WAVEFORMATEX, fixed by the Windows ABI: wFormatTag@0, nChannels@2,
+//     nSamplesPerSec@4, nAvgBytesPerSec@8, nBlockAlign@12, wBitsPerSample@14. The ABI packs the
+//     record to 2-byte alignment, so it is `calloc(1, 18)`, not sizeof(WaveFmtEx), which a
+//     field-aligned layout rounds up to 20. Field offsets are identical either way.
+//   * WaveHdr — WAVEHDR: lpData@0, dwBufferLength@8, dwBytesRecorded@12, dwUser@16, dwFlags@24
+//     (WHDR_DONE is bit 0), dwLoops@28, lpNext@32, reserved@40; 48 bytes on this ABI.
+// These sit at top level because a `cstruct` must stand at top level to be laid out, cfg block or no.
+cstruct NwaDev { kind: I64, hw: Ptr, rate: I64, channels: I64, bpf: I64, bufr: I64, hdrs: Ptr, nq: I64, cap: I64, queued: I64 }
+cstruct WaveFmtEx { tag: U16, channels: U16, rate: U32, avg: U32, align: U16, bits: U16 }
+cstruct WaveHdr { data: Ptr, len: U32, recorded: U32, user: Ptr, flags: U32, loops: U32, next: Ptr, reserved: Ptr }
+
+cfg(windows) {
+extern fn malloc(Int) -> Int
+extern fn calloc(Int, Int) -> Int
+extern fn realloc(Int, Int) -> Int
+extern fn free(Int)
+extern fn memcpy(Int, Int, Int) -> Int
+extern fn waveOutOpen(Int, Int, Int, Int, Int, Int) -> Int from "winmm.dll"
+extern fn waveOutPrepareHeader(Int, Int, Int) -> Int from "winmm.dll"
+extern fn waveOutUnprepareHeader(Int, Int, Int) -> Int from "winmm.dll"
+extern fn waveOutWrite(Int, Int, Int) -> Int from "winmm.dll"
+extern fn waveOutReset(Int) -> Int from "winmm.dll"
+extern fn waveOutClose(Int) -> Int from "winmm.dll"
+extern fn Sleep(Int) -> Int from "kernel32.dll"
+
+// The device record is `cstruct NwaDev`, declared above this cfg block.
+
+// a NUL-terminated copy of `s` in malloc'd memory
+fn nwa_str(s: Str) -> Int {
+    var p = 0
+    unsafe {
+        p = malloc(s.len() + 1)
+        foreach i in 0..s.len() { poke8(p + i, ord(s.at(i))) }
+        poke8(p + s.len(), 0)
+    }
+    return p
+}
+
+/// "hw:C,D" / "plughw:C,D" -> C, anything else -> -1
+fn nwa_card(name: Str) -> Int {
+    var at = 0 - 1
+    if name.len() > 3 && name.slice(0, 3) == "hw:" { at = 3 }
+    if name.len() > 7 && name.slice(0, 7) == "plughw:" { at = 7 }
+    if at < 0 { return 0 - 1 }
+    var c = 0
+    var i = at
+    var any = false
+    while i < name.len() && ord(name.at(i)) >= 48 && ord(name.at(i)) <= 57 { c = c * 10 + ord(name.at(i)) - 48  i = i + 1  any = true }
+    if !any { return 0 - 1 }
+    return c
+}
+
+fn aud_ready() -> Int { return 1 }
+
+global g_nwa_version: Int = 0
+fn aud_version() -> Int {
+    unsafe {
+        if g_nwa_version == 0 { g_nwa_version = nwa_str("nori-native 1 (waveOut)") }
+        return g_nwa_version
+    }
+}
+
+fn aud_open(name: Str, rate: Int, channels: Int, fmt: Int, latency_us: Int) -> Int {
+    unsafe {
+        if rate < 1000 || rate > 768000 || channels < 1 || channels > 8 { return 0 - 22 }
+        var bps = 2
+        if fmt == 1 { bps = 4 }
+        var lat = latency_us
+        if lat < 10000 { lat = 10000 }
+        let d: NwaDev = calloc(1, 80)
+        d.rate = rate  d.channels = channels  d.bpf = bps * channels
+        d.bufr = rate * lat / 1000000
+        d.cap = 16  d.hdrs = calloc(16, 8)
+        if name == "null" { d.kind = 2  return d }
+        var devid = 0 - 1
+        if name == "default" || name == "pipewire" || name == "pulse" || name == "sysdefault" { devid = 4294967295 }   // WAVE_MAPPER
+        else { devid = nwa_card(name) }
+        if devid < 0 { free(d.hdrs)  free(d)  return 0 - 2 }
+        let wf: WaveFmtEx = calloc(1, 18)
+        if fmt == 1 { wf.tag = 3 } else { wf.tag = 1 }                  // WAVE_FORMAT_IEEE_FLOAT / PCM
+        wf.channels = channels
+        wf.rate = rate
+        wf.avg = rate * bps * channels
+        wf.align = bps * channels
+        wf.bits = bps * 8
+        let hp = calloc(1, 8)
+        let r = waveOutOpen(hp, devid, wf, 0, 0, 0) & 4294967295       // CALLBACK_NULL
+        free(wf)
+        if r != 0 {
+            free(hp)  free(d.hdrs)  free(d)
+            if r == 2 || r == 6 { return 0 - 19 }                       // MMSYSERR_BADDEVICEID, NODRIVER: -ENODEV
+            if r == 32 { return 0 - 22 }                                // WAVERR_BADFORMAT: -EINVAL
+            if r == 4 { return 0 - 16 }                                 // MMSYSERR_ALLOCATED: -EBUSY
+            return 0 - 5
+        }
+        d.kind = 1
+        d.hw = peek(hp)
+        free(hp)
+        return d
+    }
+}
+
+/// give back every queued buffer the device has finished playing
+fn nwa_reclaim(d: NwaDev) {
+    unsafe {
+        let arr = d.hdrs
+        var n = d.nq
+        var i = 0
+        var o = 0
+        while i < n {
+            let hdr: WaveHdr = peek(arr + i * 8)
+            if (hdr.flags & 1) != 0 {                                   // WHDR_DONE
+                let _u = waveOutUnprepareHeader(d.hw, hdr, 48)
+                d.queued = d.queued - hdr.len / d.bpf
+                free(hdr.data)
+                free(hdr)
+            } else { poke(arr + o * 8, hdr)  o = o + 1 }
+            i = i + 1
+        }
+        d.nq = o
+    }
+}
+
+fn aud_write(d: NwaDev, buf: Int, frames: Int) -> Int {
+    unsafe {
+        if d == 0 || frames <= 0 { return 0 }
+        if d.kind == 2 { return frames }
+        nwa_reclaim(d)
+        var waited = 0
+        while d.queued > 0 && d.queued + frames > d.bufr && waited < 10000 {
+            let _s = Sleep(2)
+            nwa_reclaim(d)
+            waited = waited + 1
+        }
+        let bytes = frames * d.bpf
+        let data = malloc(bytes)
+        memcpy(data, buf, bytes)
+        let hdr: WaveHdr = calloc(1, 48)
+        hdr.data = data
+        hdr.len = bytes
+        if (waveOutPrepareHeader(d.hw, hdr, 48) & 4294967295) != 0 { free(data)  free(hdr)  return 0 - 5 }
+        if (waveOutWrite(d.hw, hdr, 48) & 4294967295) != 0 {
+            let _u = waveOutUnprepareHeader(d.hw, hdr, 48)
+            free(data)  free(hdr)
+            return 0 - 5
+        }
+        if d.nq == d.cap {
+            d.cap = d.cap * 2
+            d.hdrs = realloc(d.hdrs, d.cap * 8)
+        }
+        poke(d.hdrs + d.nq * 8, hdr)
+        d.nq = d.nq + 1
+        d.queued = d.queued + frames
+        return frames
+    }
+}
+
+fn aud_avail(d: NwaDev) -> Int {
+    unsafe {
+        if d == 0 { return 0 }
+        if d.kind == 2 { return d.bufr }
+        nwa_reclaim(d)
+        let a = d.bufr - d.queued
+        if a < 0 { return 0 }
+        return a
+    }
+}
+
+fn aud_drain(d: NwaDev) -> Int {
+    unsafe {
+        if d == 0 || d.kind == 2 { return 0 }
+        nwa_reclaim(d)
+        var waited = 0
+        while d.nq > 0 && waited < 60000 { let _s = Sleep(2)  nwa_reclaim(d)  waited = waited + 1 }
+        return 0
+    }
+}
+
+fn aud_drop(d: NwaDev) -> Int {
+    unsafe {
+        if d == 0 || d.kind == 2 { return 0 }
+        let _r = waveOutReset(d.hw)                                     // marks every queued buffer done
+        nwa_reclaim(d)
+        return 0
+    }
+}
+
+fn aud_close(d: NwaDev) -> Int {
+    unsafe {
+        if d == 0 { return 0 }
+        if d.kind == 1 {
+            let _r = aud_drop(d)
+            let _c = waveOutClose(d.hw)
+        }
+        free(d.hdrs)
+        free(d)
+        return 0
+    }
+}
+
+fn nwa_errtext(e: Int) -> Str {
+    if e == 0 { return "Success" }
+    if e == 2 { return "No such file or directory" }
+    if e == 5 { return "Input/output error" }
+    if e == 16 { return "Device or resource busy" }
+    if e == 19 { return "No such device" }
+    if e == 22 { return "Invalid argument" }
+    if e == 38 { return "Function not implemented" }
+    return "Unknown error " + to_str(e)
+}
+
+global g_nwa_errs: Int = 0
+fn aud_strerror(code: Int) -> Int {
+    unsafe {
+        var e = code
+        if e < 0 { e = 0 - e }
+        var slot = e
+        if slot > 255 { slot = 256 }
+        if g_nwa_errs == 0 { g_nwa_errs = calloc(257, 8) }
+        let cached = peek(g_nwa_errs + slot * 8)
+        if cached != 0 && slot < 256 { return cached }
+        if cached != 0 { free(cached) }
+        let p = nwa_str(nwa_errtext(e))
+        poke(g_nwa_errs + slot * 8, p)
+        return p
+    }
+}
+
+fn aud_quiet(on: Int) -> Int { return 0 }
+
+fn aud_can(dev: Str, rate: Int, channels: Int, fmt: Int) -> Int {
+    let h = aud_open(dev, rate, channels, fmt, 100000)
+    if h < 0 { return h }
+    let _c = aud_close(h)
+    return 0
+}
+
+// SND_PCM_STREAM_PLAYBACK, SND_PCM_ACCESS_RW_INTERLEAVED, SND_PCM_FORMAT_S16_LE, SND_PCM_FORMAT_FLOAT_LE
+fn aud_const(which: Int) -> Int {
+    if which == 0 { return 0 }
+    if which == 1 { return 3 }
+    if which == 2 { return 2 }
+    return 14
+}
+}
+
+extern fn str_from_cstr(Int) -> Str
+
+/// Is libasound installed and usable on this machine? Everything else in this module answers
+/// -ENOSYS (-38) when this is false, so a program with no ALSA still runs.
+pub fn alsa_available() -> Bool {
+    var v = 0
+    unsafe { v = aud_ready() }
+    return v == 1
+}
+
+/// libasound's own version string, e.g. "1.2.14", or "" when it is not installed.
+pub fn alsa_version() -> Str {
+    var p = 0
+    unsafe { p = aud_version() }
+    if p == 0 { return "" }
+    var s = ""
+    unsafe { s = str_from_cstr(p) }
+    return s
+}
+
+/// ALSA's own text for an error code (which this module reports negated, as ALSA does).
+pub fn alsa_strerror(code: Int) -> Str {
+    var p = 0
+    unsafe { p = aud_strerror(code) }
+    if p == 0 { return "error " + to_str(code) + " (libasound not available)" }
+    var s = ""
+    unsafe { s = str_from_cstr(p) }
+    return s
+}
+
+/// Silence libasound's stderr chatter. Error codes are unaffected; only the printing stops.
+pub fn alsa_set_quiet(on: Bool) {
+    var v = 0
+    if on { v = 1 }
+    unsafe { aud_quiet(v) }
+}
+
+/// Open `dev` (an ALSA PCM name: "default", "pipewire", "pulse", "plughw:0,0", "null", …) for
+/// playback. `fmt` is 0 for S16_LE and 1 for FLOAT_LE. Returns an opaque handle > 0, or a negative
+/// ALSA error code — pass it to `alsa_strerror`.
+pub fn alsa_open(dev: Str, rate: Int, channels: Int, fmt: Int, latency_us: Int) -> Int {
+    var h = 0
+    unsafe { h = aud_open(dev, rate, channels, fmt, latency_us) }
+    return h
+}
+
+/// Would `dev` accept this rate/channels/format? 0 = yes, negative = the ALSA error it refused with.
+/// Opens and closes the device, so it answers about the real driver, not a guess.
+pub fn alsa_can_open(dev: Str, rate: Int, channels: Int, fmt: Int) -> Int {
+    var r = 0
+    unsafe { r = aud_can(dev, rate, channels, fmt) }
+    return r
+}
+
+/// Write `frames` interleaved frames from raw memory at `ptr`. Blocks until they are queued.
+/// Returns frames written, or a negative ALSA error.
+pub fn alsa_write_raw(h: Int, ptr: Int, frames: Int) -> Int {
+    var n = 0
+    unsafe { n = aud_write(h, ptr, frames) }
+    return n
+}
+
+/// Frames writable right now without blocking.
+pub fn alsa_avail(h: Int) -> Int {
+    var n = 0
+    unsafe { n = aud_avail(h) }
+    return n
+}
+
+/// Block until the queued audio has played out.
+pub fn alsa_drain(h: Int) -> Int {
+    var r = 0
+    unsafe { r = aud_drain(h) }
+    return r
+}
+
+/// Discard everything queued, stop now, and leave the stream ready for the next write.
+pub fn alsa_drop_pending(h: Int) -> Int {
+    var r = 0
+    unsafe { r = aud_drop(h) }
+    return r
+}
+
+/// Close the device.
+pub fn alsa_close(h: Int) -> Int {
+    var r = 0
+    unsafe { r = aud_close(h) }
+    return r
+}
+
+/// One of the four ALSA enum values this backend hardcodes, so a test can check them against the
+/// real header: 0 = SND_PCM_STREAM_PLAYBACK, 1 = SND_PCM_ACCESS_RW_INTERLEAVED,
+/// 2 = SND_PCM_FORMAT_S16_LE, 3 = SND_PCM_FORMAT_FLOAT_LE.
+pub fn alsa_abi_const(which: Int) -> Int {
+    var v = 0
+    unsafe { v = aud_const(which) }
+    return v
+}

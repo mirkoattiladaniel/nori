@@ -1,0 +1,34 @@
+import "std/log" as log
+
+fn test_level_constants() {
+    assert_eq(log::DEBUG(), 0)
+    assert_eq(log::INFO(), 1)
+    assert_eq(log::WARN(), 2)
+    assert_eq(log::ERROR(), 3)
+}
+
+fn test_level_roundtrip() {
+    assert_eq(log::get_level(), 1)
+    log::set_level(log::DEBUG())
+    assert_eq(log::get_level(), 0)
+    log::set_level(log::ERROR())
+    assert_eq(log::get_level(), 3)
+    log::set_level(log::INFO())
+    assert_eq(log::get_level(), 1)
+}
+
+fn test_calls_return_zero() {
+    log::set_level(log::ERROR())
+    assert_eq(log::debug("x"), 0)
+    assert_eq(log::info("x"), 0)
+    assert_eq(log::warn("x"), 0)
+    assert_eq(log::error("x"), 0)
+    log::set_level(log::INFO())
+}
+
+fn test_timestamps_toggle() {
+    log::set_timestamps(true)
+    assert_eq(log::info("ts on"), 0)
+    log::set_timestamps(false)
+    assert_eq(log::info("ts off"), 0)
+}

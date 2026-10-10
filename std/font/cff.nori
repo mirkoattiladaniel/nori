@@ -1,0 +1,505 @@
+// std/font: CFF (Compact Font Format) outlines: the `CFF ` table of an OpenType font with
+// PostScript outlines (an `.otf`, a face of NotoSansCJK's `.ttc`).
+//
+// A glyph is a Type 2 charstring: a little stack program of moveto/lineto/curveto operators with
+// hint operators to skip and subroutines to call, and comes out as an Outline of cubic segments
+// (FSeg kind 2). Both name-keyed and CID-keyed fonts are read: a CID-keyed font chooses each
+// glyph's Private DICT (and so its local subroutines) through FDSelect.
+//
+// Like every reader in std/font, this one trusts nothing: an offset past the end reads as zero, a
+// subroutine index out of range calls nothing, the stack and the call depth are bounded, and a
+// charstring that runs off its end simply stops.
+
+// ── INDEX ────────────────────────────────────────────────────────────────────────────────────────
+// count u16, offSize u8, (count+1) offsets of offSize bytes (1-based, from the byte before the data),
+// then the data. An empty INDEX is just the count.
+
+fn cff_rd_off(d: Str, p: Int, sz: Int) -> Int {
+    if sz == 1 { return rd_u8(d, p) }
+    if sz == 2 { return rd_u16(d, p) }
+    if sz == 3 { return (rd_u16(d, p) << 8) | rd_u8(d, p + 2) }
+    return rd_u32(d, p)
+}
+fn cff_index_count(d: Str, p: Int) -> Int { if p < 0 { return 0 }  return rd_u16(d, p) }
+// the absolute byte range [start, end) of item `i` of the INDEX at `p`; res[0] = -1 when absent.
+fn cff_index_item(d: Str, p: Int, i: Int, inout res: Vec<Int>) {
+    while res.len() < 2 { res.push(0) }
+    res[0] = 0 - 1  res[1] = 0 - 1
+    if p < 0 { return }
+    let count = rd_u16(d, p)
+    if i < 0 || i >= count { return }
+    let osz = rd_u8(d, p + 2)
+    if osz < 1 || osz > 4 { return }
+    let base = p + 3 + (count + 1) * osz - 1
+    let a = cff_rd_off(d, p + 3 + i * osz, osz)
+    let b = cff_rd_off(d, p + 3 + (i + 1) * osz, osz)
+    if b < a { return }
+    res[0] = base + a
+    res[1] = base + b
+}
+// the offset just past the INDEX at `p`.
+fn cff_index_end(d: Str, p: Int) -> Int {
+    let count = rd_u16(d, p)
+    if count == 0 { return p + 2 }
+    let osz = rd_u8(d, p + 2)
+    if osz < 1 || osz > 4 { return d.len() }
+    return p + 3 + (count + 1) * osz - 1 + cff_rd_off(d, p + 3 + count * osz, osz)
+}
+
+// ── DICT ─────────────────────────────────────────────────────────────────────────────────────────
+// Operands precede their operator. We only need integer operands of a few operators, so a DICT is
+// scanned for one operator at a time and its operands are handed back (reals read as their integer
+// part, which no offset or count ever has).
+
+// read the operands of the first `op` (0..21, or 1200+n for the escaped `12 n`) in the DICT at
+// [p, end) into `out`; false when the DICT does not have it.
+fn cff_dict_find(d: Str, p: Int, end: Int, op: Int, inout out: Vec<Int>) -> Bool {
+    var vals: Vec<Int> = vec()
+    var i = p
+    var steps = 0
+    while i < end && steps < 100000 {
+        steps = steps + 1
+        let b0 = rd_u8(d, i)
+        if b0 <= 21 {
+            var o = b0
+            i = i + 1
+            if b0 == 12 { o = 1200 + rd_u8(d, i)  i = i + 1 }
+            if o == op {
+                while out.len() > 0 { out.pop() }
+                var k = 0
+                while k < vals.len() { out.push(vals[k])  k = k + 1 }
+                return true
+            }
+            while vals.len() > 0 { vals.pop() }
+        } else if b0 == 28 { vals.push(rd_i16(d, i + 1))  i = i + 3 }
+        else if b0 == 29 {
+            var v = rd_u32(d, i + 1)
+            if v >= 2147483648 { v = v - 4294967296 }
+            vals.push(v)
+            i = i + 5
+        } else if b0 == 30 {
+            // a real: nibbles until 0xf. Its value is not needed by anything we read.
+            i = i + 1
+            var done = false
+            while !done && i < end {
+                let nb = rd_u8(d, i)
+                if (nb & 15) == 15 || (nb >> 4) == 15 { done = true }
+                i = i + 1
+            }
+            vals.push(0)
+        } else if b0 >= 32 && b0 <= 246 { vals.push(b0 - 139)  i = i + 1 }
+        else if b0 >= 247 && b0 <= 250 { vals.push((b0 - 247) * 256 + rd_u8(d, i + 1) + 108)  i = i + 2 }
+        else if b0 >= 251 && b0 <= 254 { vals.push(0 - (b0 - 251) * 256 - rd_u8(d, i + 1) - 108)  i = i + 2 }
+        else { i = i + 1 }                                                    // reserved
+    }
+    return false
+}
+
+// the local Subrs INDEX of the Private DICT at [priv, priv+size): its Subrs operand is an offset from
+// the start of the Private DICT. -1 when it has none.
+fn cff_private_subrs(d: Str, priv: Int, size: Int) -> Int {
+    var ops: Vec<Int> = vec()
+    if size <= 0 { return 0 - 1 }
+    if cff_dict_find(d, priv, priv + size, 19, ops) && ops.len() >= 1 && ops[0] > 0 { return priv + ops[0] }
+    return 0 - 1
+}
+
+/// resolve a CFF table's INDEXes into the Font (called by font_load for a font without glyf).
+fn cff_resolve(inout f: Font) {
+    let d = f.d
+    let c = f.cff_off
+    if c < 0 { return }
+    let hdr = rd_u8(d, c + 2)
+    let name_idx = c + hdr
+    let top_idx = cff_index_end(d, name_idx)
+    let str_idx = cff_index_end(d, top_idx)
+    let gsub_idx = cff_index_end(d, str_idx)
+    f.cff_gsubrs = gsub_idx
+    var r: Vec<Int> = vec()
+    cff_index_item(d, top_idx, 0, r)                                         // the first (only) font
+    if r[0] < 0 { return }
+    let tp = r[0]
+    let te = r[1]
+    var ops: Vec<Int> = vec()
+    if cff_dict_find(d, tp, te, 17, ops) && ops.len() >= 1 { f.cff_cs = c + ops[0] }
+    if cff_dict_find(d, tp, te, 1230, ops) {                                  // ROS: CID-keyed
+        f.cff_cid = 1
+        if cff_dict_find(d, tp, te, 1236, ops) && ops.len() >= 1 { f.cff_fdarray = c + ops[0] }
+        if cff_dict_find(d, tp, te, 1237, ops) && ops.len() >= 1 { f.cff_fdselect = c + ops[0] }
+    } else if cff_dict_find(d, tp, te, 18, ops) && ops.len() >= 2 {           // Private: size, offset
+        f.cff_lsubrs = cff_private_subrs(d, c + ops[1], ops[0])
+    }
+}
+
+// the Font DICT a CID-keyed glyph uses (FDSelect format 0 or 3).
+fn cff_fd_of(f: Font, gid: Int) -> Int {
+    let d = f.d
+    let p = f.cff_fdselect
+    if p < 0 { return 0 }
+    let fmt = rd_u8(d, p)
+    if fmt == 0 { return rd_u8(d, p + 1 + gid) }
+    if fmt == 3 {
+        let n = rd_u16(d, p + 1)
+        var lo = 0
+        var hi = n - 1
+        while lo <= hi {                                                      // ranges: first u16, fd u8
+            let mid = (lo + hi) / 2
+            let rp = p + 3 + mid * 3
+            let first = rd_u16(d, rp)
+            let next = rd_u16(d, rp + 3)                                      // the next range's first (or sentinel)
+            if gid < first { hi = mid - 1 }
+            else if gid >= next { lo = mid + 1 }
+            else { return rd_u8(d, rp + 2) }
+        }
+    }
+    return 0
+}
+// the local subroutines a glyph's charstring calls.
+fn cff_local_subrs(f: Font, gid: Int) -> Int {
+    if f.cff_cid == 0 { return f.cff_lsubrs }
+    let d = f.d
+    var r: Vec<Int> = vec()
+    cff_index_item(d, f.cff_fdarray, cff_fd_of(f, gid), r)
+    if r[0] < 0 { return 0 - 1 }
+    var ops: Vec<Int> = vec()
+    if cff_dict_find(d, r[0], r[1], 18, ops) && ops.len() >= 2 { return cff_private_subrs(d, f.cff_off + ops[1], ops[0]) }
+    return 0 - 1
+}
+fn cff_bias(count: Int) -> Int {
+    if count < 1240 { return 107 }
+    if count < 33900 { return 1131 }
+    return 32768
+}
+
+// ── the Type 2 charstring interpreter ────────────────────────────────────────────────────────────
+
+struct CS {
+    st: Vec<Float>,          // the argument stack
+    x: Float, y: Float,      // the current point
+    nstems: Int,
+    have_width: Bool,        // the optional leading width argument has been seen (or ruled out)
+    open: Bool,              // a contour is open
+    sx: Float, sy: Float,    // its start
+    done: Bool,
+    depth: Int,
+    trans: Vec<Float>,       // the transient array (put/get)
+    ops: Int                 // operators executed, bounded
+}
+
+fn cs_close(inout cs: CS, inout ob: OB) {
+    if cs.open {
+        if cs.x != cs.sx || cs.y != cs.sy { ob_lineto(ob, cs.sx, cs.sy) }
+        cs.open = false
+    }
+}
+fn cs_moveto(inout cs: CS, inout ob: OB, dx: Float, dy: Float) {
+    cs_close(cs, ob)
+    cs.x = cs.x + dx
+    cs.y = cs.y + dy
+    ob_moveto(ob, cs.x, cs.y)
+    cs.sx = cs.x
+    cs.sy = cs.y
+    cs.open = true
+}
+fn cs_lineto(inout cs: CS, inout ob: OB, dx: Float, dy: Float) {
+    if !cs.open { cs_moveto(cs, ob, 0.0, 0.0) }
+    cs.x = cs.x + dx
+    cs.y = cs.y + dy
+    ob_lineto(ob, cs.x, cs.y)
+}
+fn cs_curveto(inout cs: CS, inout ob: OB, dxa: Float, dya: Float, dxb: Float, dyb: Float, dxc: Float, dyc: Float) {
+    if !cs.open { cs_moveto(cs, ob, 0.0, 0.0) }
+    let ax = cs.x + dxa
+    let ay = cs.y + dya
+    let bx = ax + dxb
+    let by = ay + dyb
+    cs.x = bx + dxc
+    cs.y = by + dyc
+    ob_cubicto(ob, ax, ay, bx, by, cs.x, cs.y)
+}
+fn cs_clear(inout cs: CS) { while cs.st.len() > 0 { cs.st.pop() } }
+fn cs_arg(cs: CS, i: Int) -> Float { if i < 0 || i >= cs.st.len() { return 0.0 }  return cs.st[i] }
+// the first stack-clearing operator may carry the advance width as an extra first argument; when
+// the count says it does, drop it.
+fn cs_take_width(inout cs: CS, odd_means_width: Bool, expected: Int) {
+    if cs.have_width { return }
+    cs.have_width = true
+    var extra = false
+    if odd_means_width { extra = (cs.st.len() % 2) == 1 }
+    else { extra = cs.st.len() > expected }
+    if extra && cs.st.len() > 0 {
+        var k = 1
+        while k < cs.st.len() { cs.st[k - 1] = cs.st[k]  k = k + 1 }
+        cs.st.pop()
+    }
+}
+
+// run the charstring at [p, end). `gsubrs`/`lsubrs` are the INDEXes subroutines are called from.
+fn cs_run(f: Font, inout cs: CS, inout ob: OB, p0: Int, end: Int, gsubrs: Int, lsubrs: Int) {
+    let d = f.d
+    var p = p0
+    if cs.depth > 10 { cs.done = true  return }
+    while p < end && !cs.done {
+        cs.ops = cs.ops + 1
+        if cs.ops > 200000 { cs.done = true  return }
+        let b0 = rd_u8(d, p)
+        if b0 >= 32 || b0 == 28 {
+            // an operand
+            if cs.st.len() >= 513 { cs.done = true  return }                // over the Type 2 limit: malformed
+            if b0 == 28 { cs.st.push(to_float(rd_i16(d, p + 1)))  p = p + 3 }
+            else if b0 <= 246 { cs.st.push(to_float(b0 - 139))  p = p + 1 }
+            else if b0 <= 250 { cs.st.push(to_float((b0 - 247) * 256 + rd_u8(d, p + 1) + 108))  p = p + 2 }
+            else if b0 <= 254 { cs.st.push(to_float(0 - (b0 - 251) * 256 - rd_u8(d, p + 1) - 108))  p = p + 2 }
+            else {                                                            // 255: 16.16 fixed
+                var v = rd_u32(d, p + 1)
+                if v >= 2147483648 { v = v - 4294967296 }
+                cs.st.push(to_float(v) / 65536.0)
+                p = p + 5
+            }
+        } else {
+            p = p + 1
+            let n = cs.st.len()
+            if b0 == 1 || b0 == 3 || b0 == 18 || b0 == 23 {                   // h/vstem(hm)
+                cs_take_width(cs, true, 0)
+                cs.nstems = cs.nstems + cs.st.len() / 2
+                cs_clear(cs)
+            } else if b0 == 19 || b0 == 20 {                                  // hintmask / cntrmask
+                // operands before it are an implicit vstem
+                cs_take_width(cs, true, 0)
+                cs.nstems = cs.nstems + cs.st.len() / 2
+                cs_clear(cs)
+                p = p + (cs.nstems + 7) / 8
+            } else if b0 == 21 {                                              // rmoveto
+                cs_take_width(cs, false, 2)
+                cs_moveto(cs, ob, cs_arg(cs, 0), cs_arg(cs, 1))
+                cs_clear(cs)
+            } else if b0 == 22 {                                              // hmoveto
+                cs_take_width(cs, false, 1)
+                cs_moveto(cs, ob, cs_arg(cs, 0), 0.0)
+                cs_clear(cs)
+            } else if b0 == 4 {                                               // vmoveto
+                cs_take_width(cs, false, 1)
+                cs_moveto(cs, ob, 0.0, cs_arg(cs, 0))
+                cs_clear(cs)
+            } else if b0 == 5 {                                               // rlineto
+                var i = 0
+                while i + 1 < n { cs_lineto(cs, ob, cs.st[i], cs.st[i + 1])  i = i + 2 }
+                cs_clear(cs)
+            } else if b0 == 6 || b0 == 7 {                                    // hlineto / vlineto, alternating
+                var horiz = b0 == 6
+                var i = 0
+                while i < n {
+                    if horiz { cs_lineto(cs, ob, cs.st[i], 0.0) } else { cs_lineto(cs, ob, 0.0, cs.st[i]) }
+                    horiz = !horiz
+                    i = i + 1
+                }
+                cs_clear(cs)
+            } else if b0 == 8 {                                               // rrcurveto
+                var i = 0
+                while i + 5 < n {
+                    cs_curveto(cs, ob, cs.st[i], cs.st[i + 1], cs.st[i + 2], cs.st[i + 3], cs.st[i + 4], cs.st[i + 5])
+                    i = i + 6
+                }
+                cs_clear(cs)
+            } else if b0 == 24 {                                              // rcurveline
+                var i = 0
+                while i + 5 < n - 2 {
+                    cs_curveto(cs, ob, cs.st[i], cs.st[i + 1], cs.st[i + 2], cs.st[i + 3], cs.st[i + 4], cs.st[i + 5])
+                    i = i + 6
+                }
+                if i + 1 < n { cs_lineto(cs, ob, cs.st[i], cs.st[i + 1]) }
+                cs_clear(cs)
+            } else if b0 == 25 {                                              // rlinecurve
+                var i = 0
+                while i + 1 < n - 6 { cs_lineto(cs, ob, cs.st[i], cs.st[i + 1])  i = i + 2 }
+                if i + 5 < n { cs_curveto(cs, ob, cs.st[i], cs.st[i + 1], cs.st[i + 2], cs.st[i + 3], cs.st[i + 4], cs.st[i + 5]) }
+                cs_clear(cs)
+            } else if b0 == 26 {                                              // vvcurveto
+                var i = 0
+                var dx1 = 0.0
+                if n % 2 == 1 { dx1 = cs.st[0]  i = 1 }
+                while i + 3 < n {
+                    cs_curveto(cs, ob, dx1, cs.st[i], cs.st[i + 1], cs.st[i + 2], 0.0, cs.st[i + 3])
+                    dx1 = 0.0
+                    i = i + 4
+                }
+                cs_clear(cs)
+            } else if b0 == 27 {                                              // hhcurveto
+                var i = 0
+                var dy1 = 0.0
+                if n % 2 == 1 { dy1 = cs.st[0]  i = 1 }
+                while i + 3 < n {
+                    cs_curveto(cs, ob, cs.st[i], dy1, cs.st[i + 1], cs.st[i + 2], cs.st[i + 3], 0.0)
+                    dy1 = 0.0
+                    i = i + 4
+                }
+                cs_clear(cs)
+            } else if b0 == 30 || b0 == 31 {                                  // vhcurveto / hvcurveto
+                var horiz = b0 == 31
+                var i = 0
+                while i + 3 < n {
+                    var extra = 0.0                                           // the final curve may take a 5th arg
+                    if n - i == 5 { extra = cs.st[i + 4] }
+                    if horiz { cs_curveto(cs, ob, cs.st[i], 0.0, cs.st[i + 1], cs.st[i + 2], extra, cs.st[i + 3]) }
+                    else { cs_curveto(cs, ob, 0.0, cs.st[i], cs.st[i + 1], cs.st[i + 2], cs.st[i + 3], extra) }
+                    horiz = !horiz
+                    i = i + 4
+                }
+                cs_clear(cs)
+            } else if b0 == 10 || b0 == 29 {                                  // callsubr / callgsubr
+                if n == 0 { cs.done = true  return }
+                let idx_tab = if b0 == 10 { lsubrs } else { gsubrs }
+                let cnt = cff_index_count(d, idx_tab)
+                let si = to_int(cs.st[n - 1]) + cff_bias(cnt)
+                cs.st.pop()
+                var r: Vec<Int> = vec()
+                cff_index_item(d, idx_tab, si, r)
+                if r[0] < 0 { cs.done = true  return }
+                cs.depth = cs.depth + 1
+                cs_run(f, cs, ob, r[0], r[1], gsubrs, lsubrs)
+                cs.depth = cs.depth - 1
+            } else if b0 == 11 {                                              // return
+                return
+            } else if b0 == 14 {                                              // endchar
+                // (the seac accent form, 4 extra args, is not supported; it draws the base only)
+                cs_take_width(cs, false, 0)
+                cs_close(cs, ob)
+                cs.done = true
+                return
+            } else if b0 == 12 {
+                let b1 = rd_u8(d, p)
+                p = p + 1
+                cs_escape(cs, ob, b1)
+            } else {
+                cs_clear(cs)                                                  // reserved: ignore its args
+            }
+        }
+    }
+}
+
+// the two-byte operators: flex forms and the (rarely used) arithmetic.
+fn cs_escape(inout cs: CS, inout ob: OB, op: Int) {
+    let n = cs.st.len()
+    if op == 35 {                                                             // flex
+        if n >= 12 {
+            cs_curveto(cs, ob, cs.st[0], cs.st[1], cs.st[2], cs.st[3], cs.st[4], cs.st[5])
+            cs_curveto(cs, ob, cs.st[6], cs.st[7], cs.st[8], cs.st[9], cs.st[10], cs.st[11])
+        }
+        cs_clear(cs)
+    } else if op == 34 {                                                      // hflex
+        if n >= 7 {
+            let y0 = cs.y
+            cs_curveto(cs, ob, cs.st[0], 0.0, cs.st[1], cs.st[2], cs.st[3], 0.0)
+            cs_curveto(cs, ob, cs.st[4], 0.0, cs.st[5], y0 - cs.y, cs.st[6], 0.0)
+        }
+        cs_clear(cs)
+    } else if op == 36 {                                                      // hflex1
+        if n >= 9 {
+            let y0 = cs.y
+            cs_curveto(cs, ob, cs.st[0], cs.st[1], cs.st[2], cs.st[3], cs.st[4], 0.0)
+            cs_curveto(cs, ob, cs.st[5], 0.0, cs.st[6], cs.st[7], cs.st[8], y0 - cs.y)
+        }
+        cs_clear(cs)
+    } else if op == 37 {                                                      // flex1
+        if n >= 11 {
+            let x0 = cs.x
+            let y0 = cs.y
+            var dx = 0.0
+            var dy = 0.0
+            var k = 0
+            while k < 10 { dx = dx + cs.st[k]  dy = dy + cs.st[k + 1]  k = k + 2 }
+            cs_curveto(cs, ob, cs.st[0], cs.st[1], cs.st[2], cs.st[3], cs.st[4], cs.st[5])
+            var adx = dx
+            if adx < 0.0 { adx = 0.0 - adx }
+            var ady = dy
+            if ady < 0.0 { ady = 0.0 - ady }
+            if adx > ady {
+                cs_curveto(cs, ob, cs.st[6], cs.st[7], cs.st[8], cs.st[9], cs.st[10], y0 - (cs.y + cs.st[7] + cs.st[9]))
+            } else {
+                cs_curveto(cs, ob, cs.st[6], cs.st[7], cs.st[8], cs.st[9], x0 - (cs.x + cs.st[6] + cs.st[8]), cs.st[10])
+            }
+        }
+        cs_clear(cs)
+    } else if op == 9 {                                                       // abs
+        if n >= 1 && cs.st[n - 1] < 0.0 { cs.st[n - 1] = 0.0 - cs.st[n - 1] }
+    } else if op == 10 {                                                      // add
+        if n >= 2 { cs.st[n - 2] = cs.st[n - 2] + cs.st[n - 1]  cs.st.pop() }
+    } else if op == 11 {                                                      // sub
+        if n >= 2 { cs.st[n - 2] = cs.st[n - 2] - cs.st[n - 1]  cs.st.pop() }
+    } else if op == 12 {                                                      // div
+        if n >= 2 { if cs.st[n - 1] != 0.0 { cs.st[n - 2] = cs.st[n - 2] / cs.st[n - 1] }  cs.st.pop() }
+    } else if op == 14 {                                                      // neg
+        if n >= 1 { cs.st[n - 1] = 0.0 - cs.st[n - 1] }
+    } else if op == 18 {                                                      // drop
+        if n >= 1 { cs.st.pop() }
+    } else if op == 24 {                                                      // mul
+        if n >= 2 { cs.st[n - 2] = cs.st[n - 2] * cs.st[n - 1]  cs.st.pop() }
+    } else if op == 26 {                                                      // sqrt
+        if n >= 1 && cs.st[n - 1] > 0.0 { cs.st[n - 1] = sqrt(cs.st[n - 1]) }
+    } else if op == 27 {                                                      // dup
+        if n >= 1 { cs.st.push(cs.st[n - 1]) }
+    } else if op == 28 {                                                      // exch
+        if n >= 2 { let t = cs.st[n - 1]  cs.st[n - 1] = cs.st[n - 2]  cs.st[n - 2] = t }
+    } else if op == 20 {                                                      // put
+        if n >= 2 {
+            let i = to_int(cs.st[n - 1])
+            if i >= 0 && i < 32 { while cs.trans.len() <= i { cs.trans.push(0.0) }  cs.trans[i] = cs.st[n - 2] }
+            cs.st.pop()  cs.st.pop()
+        }
+    } else if op == 21 {                                                      // get
+        if n >= 1 {
+            let i = to_int(cs.st[n - 1])
+            var v = 0.0
+            if i >= 0 && i < cs.trans.len() { v = cs.trans[i] }
+            cs.st[n - 1] = v
+        }
+    } else {
+        cs_clear(cs)                                                          // and/or/not/eq/ifelse/random/index/roll: rare; drop
+    }
+}
+
+/// the outline of CFF glyph `gid` (cubic segments, font units); an empty outline when the glyph is
+/// out of range or its charstring is unreadable.
+fn cff_outline(f: Font, gid: Int) -> Outline {
+    var empty: Vec<Contour> = vec()
+    var out = Outline { contours: empty, xmin: 0.0, ymin: 0.0, xmax: 0.0, ymax: 0.0 }
+    let d = f.d
+    var r: Vec<Int> = vec()
+    cff_index_item(d, f.cff_cs, gid, r)
+    if r[0] < 0 { return out }
+    var st: Vec<Float> = vec()
+    var tr: Vec<Float> = vec()
+    var cs = CS { st: st, x: 0.0, y: 0.0, nstems: 0, have_width: false, open: false, sx: 0.0, sy: 0.0,
+        done: false, depth: 0, trans: tr, ops: 0 }
+    var ob = ob_new()
+    cs_run(f, cs, ob, r[0], r[1], f.cff_gsubrs, cff_local_subrs(f, gid))
+    cs_close(cs, ob)
+    ob_flush(ob)
+    out.contours = sink ob.contours
+    // CFF carries no per-glyph box; take it from the points (control points included, which bounds
+    // the curve and is what a rasterizer's canvas needs).
+    var first = true
+    var ci = 0
+    while ci < out.contours.len() {
+        let ct = out.contours[ci]
+        if first { out.xmin = ct.sx  out.xmax = ct.sx  out.ymin = ct.sy  out.ymax = ct.sy  first = false }
+        else { out.xmin = fmin(out.xmin, ct.sx)  out.xmax = fmax(out.xmax, ct.sx)  out.ymin = fmin(out.ymin, ct.sy)  out.ymax = fmax(out.ymax, ct.sy) }
+        var si = 0
+        while si < ct.segs.len() {
+            let sg = ct.segs[si]
+            out.xmin = fmin(out.xmin, sg.x)  out.xmax = fmax(out.xmax, sg.x)
+            out.ymin = fmin(out.ymin, sg.y)  out.ymax = fmax(out.ymax, sg.y)
+            if sg.kind >= 1 {
+                out.xmin = fmin(out.xmin, sg.cx)  out.xmax = fmax(out.xmax, sg.cx)
+                out.ymin = fmin(out.ymin, sg.cy)  out.ymax = fmax(out.ymax, sg.cy)
+            }
+            if sg.kind == 2 {
+                out.xmin = fmin(out.xmin, sg.c2x)  out.xmax = fmax(out.xmax, sg.c2x)
+                out.ymin = fmin(out.ymin, sg.c2y)  out.ymax = fmax(out.ymax, sg.c2y)
+            }
+            si = si + 1
+        }
+        ci = ci + 1
+    }
+    return out
+}

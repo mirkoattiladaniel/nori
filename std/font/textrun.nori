@@ -1,0 +1,430 @@
+// std/font: runs of text: itemization, font fallback, and shaped lines.
+//
+//   var fs = font::fontset_new()
+//   font::fontset_add(fs, font::font_load(read_file("NotoSans-Regular.ttf")).font)
+//   font::fontset_add(fs, font::font_load(read_file("NotoSansArabic-Regular.ttf")).font)
+//   let line = font::shape_line(fs, "Hello مرحبا 😀", 16.0, font::BIDI_AUTO(), "", "")
+//   // line.glyphs: visual order; each has its font (index into fs), glyph, cluster and pen position
+//
+// A line of mixed text is split into runs: maximal stretches with one bidi level, one script and
+// one font: each run is shaped on its own (shape(), cached), and the runs are laid out left to
+// right in the visual order the bidi levels give (UAX #9 L2).
+//
+// Font choice is per grapheme cluster: the first font in the set that has every character of the
+// cluster (a base and its marks, an emoji ZWJ sequence, a flag pair, a keycap). Spaces and other
+// Common characters stay in the previous cluster's font when it has them, so a word of Arabic does
+// not split its run at every space.
+
+/// an ordered list of fonts: the first that covers a cluster draws it.
+pub struct FontSet { fonts: Vec<Font> }
+/// an empty font set.
+pub fn fontset_new() -> FontSet { var v: Vec<Font> = vec()  return FontSet { fonts: v } }
+/// append a font (it is tried after the ones already there).
+pub fn fontset_add(inout fs: FontSet, sink f: Font) { fs.fonts.push(sink f) }
+/// how many fonts the set holds.
+pub fn fontset_len(fs: FontSet) -> Int { return fs.fonts.len() }
+/// font `i` of the set.
+pub fn fontset_font(fs: FontSet, i: Int) -> view Font { return fs.fonts[i] }
+
+/// a run of a line: bytes [start, end) of the text, its bidi level (odd = right to left), its script
+/// (an SC_ value) and the index of its font in the set.
+pub struct TextRun { start: Int, end: Int, level: Int, script: Int, font: Int }
+
+/// a glyph of a shaped line: `font` indexes the FontSet; `cluster` is the UTF-8 byte offset of the
+/// first character it came from and `char_index` that character's index; `x` is the pen position
+/// (px from the line start, left to right), (`x_off`, `y_off`) the offset to draw at (y up), and
+/// `advance` how far the pen moves. `level` is the bidi level of its run.
+pub struct LineGlyph { gid: Int, font: Int, cluster: Int, char_index: Int, x: Float, x_off: Float, y_off: Float, advance: Float, level: Int }
+/// a shaped line: glyphs in visual (left-to-right) order, and its total advance in px.
+pub struct ShapedLine { glyphs: Vec<LineGlyph>, width: Float }
+
+// ── grapheme clusters for font choice ────────────────────────────────────────────────────────────
+// the same continuation rule the shaper forms clusters with (HarfBuzz's): marks, a ZWJ and the
+// pictograph after it, skin tones, variation selectors, tags, the second regional indicator
+fn is_cluster_continuation(prev: Int, cp: Int, prev_was_ri_cont: Bool) -> Bool {
+    let gc = ucd_gc(cp)
+    if gc_is_mark(gc) { return true }
+    if cp == 8205 { return true }                                         // ZWJ
+    if prev == 8205 && ucd_is_extended_pictographic(cp) { return true }
+    if cp >= 127995 && cp <= 127999 { return true }                       // skin tones
+    if is_variation_selector(cp) { return true }
+    if cp >= 917536 && cp <= 917631 { return true }                       // tags
+    if (cp >= 65438 && cp <= 65439) { return true }
+    if is_regional_indicator(cp) && is_regional_indicator(prev) && !prev_was_ri_cont { return true }
+    return false
+}
+
+// does `f` have code point `cp` (directly, or its canonical decomposition)?
+fn font_covers_cp(f: Font, cp: Int, depth: Int) -> Bool {
+    if font_glyph_index(f, cp) != 0 { return true }
+    if depth > 3 { return false }
+    var pr: Vec<Int> = vec()
+    if ucd_decompose(cp, pr) {
+        if !font_covers_cp(f, pr[0], depth + 1) { return false }
+        if pr[1] != 0 && !font_covers_cp(f, pr[1], depth + 1) { return false }
+        return true
+    }
+    return false
+}
+// does `f` cover every character of the cluster [a, b) (ignorables and selectors need nothing)?
+fn font_covers_cluster(f: Font, cps: Vec<Int>, a: Int, b: Int) -> Bool {
+    var i = a
+    while i < b {
+        let c = cps[i]
+        if !hb_is_default_ignorable(c) && !is_variation_selector(c) && !(c >= 917536 && c <= 917631) {
+            if !font_covers_cp(f, c, 0) { return false }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn script_is_common(s: Int) -> Bool { return s == SC_Zyyy() || s == SC_Zinh() || s == SC_Zzzz() }
+
+// the bidi level and resolved script of every character of `text` (and its code points and byte
+// offsets): the part of itemizing that does not depend on fonts
+fn itemize_core(text: Str, dir: Int, inout cps: Vec<Int>, inout offs: Vec<Int>, inout lv: Vec<Int>, inout sc: Vec<Int>) {
+    utf8_decode_offsets(text, cps, offs)
+    let n = cps.len()
+    if n == 0 { return }
+    var i = 0
+    if dir != BIDI_RTL() && !needs_bidi(cps) {
+        // left-to-right text with nothing right-to-left in it: every level is 0, no algorithm needed
+        while i < n { lv.push(0)  i = i + 1 }
+    } else {
+        let br = bidi_resolve(cps, dir)
+        // levels: X9-removed characters take their neighbour's
+        var last = br.para_level
+        while i < n {
+            if br.levels[i] < 0 { lv.push(last) } else { lv.push(br.levels[i])  last = br.levels[i] }
+            i = i + 1
+        }
+    }
+    // scripts: Inherited takes the previous character's, Common the surrounding real script
+    var prev_real = 0 - 1
+    i = 0
+    while i < n {
+        let s = ucd_script(cps[i])
+        if script_is_common(s) { sc.push(prev_real) } else { sc.push(s)  prev_real = s }
+        i = i + 1
+    }
+    var next_real = 0 - 1
+    i = n - 1
+    while i >= 0 {
+        if sc[i] < 0 { sc[i] = next_real } else { next_real = sc[i] }
+        i = i - 1
+    }
+    let common = SC_Zyyy()
+    i = 0
+    while i < n { if sc[i] < 0 { sc[i] = common }  i = i + 1 }
+}
+
+// cut the characters into runs of equal level, script and font
+fn make_runs(text: Str, offs: Vec<Int>, lv: Vec<Int>, sc: Vec<Int>, fi: Vec<Int>) -> Vec<TextRun> {
+    var runs: Vec<TextRun> = vec()
+    let n = offs.len()
+    var a = 0
+    while a < n {
+        var b = a + 1
+        while b < n && lv[b] == lv[a] && sc[b] == sc[a] && fi[b] == fi[a] { b = b + 1 }
+        var e = text.len()
+        if b < n { e = offs[b] }
+        runs.push(TextRun { start: offs[a], end: e, level: lv[a], script: sc[a], font: fi[a] })
+        a = b
+    }
+    return runs
+}
+
+// the candidate fonts are either a FontSet or a primary/fallback pair of views (a painter that holds
+// its faces by view): `pair` picks which, `npair` is 1 or 2
+// A third form: a pool of fonts the caller keeps (a UI's face pool) and the indices of the ones to
+// try, in order (`idx` empty = the whole pool, in pool order): fonts tried without being copied
+// into a FontSet.
+fn cand_font(pool: Vec<Font>, idx: Vec<Int>, f0: Font, f1: Font, pair: Bool, k: Int) -> view Font {
+    if !pair {
+        if idx.len() == 0 { return pool[k] }
+        return pool[idx[k]]
+    }
+    if k == 0 { return f0 }
+    return f1
+}
+fn cand_count(pool: Vec<Font>, idx: Vec<Int>, pair: Bool, npair: Int) -> Int {
+    if pair { return npair }
+    if idx.len() == 0 { return pool.len() }
+    return idx.len()
+}
+
+/// split `text` into runs of one bidi level, script and font, in logical order (bidi_visual_runs
+/// gives their display order). `dir` is BIDI_AUTO/BIDI_LTR/BIDI_RTL.
+pub fn itemize(fs: FontSet, text: Str, dir: Int) -> Vec<TextRun> {
+    let none = font_empty()
+    let all: Vec<Int> = vec()
+    return itemize_with(fs.fonts, all, none, none, false, 0, text, dir)
+}
+/// `itemize` over a primary font and, when `has_fallback`, a fallback.
+pub fn itemize_pair(primary: Font, fallback: Font, has_fallback: Bool, text: Str, dir: Int) -> Vec<TextRun> {
+    let none = fontset_new()
+    var n = 1
+    if has_fallback { n = 2 }
+    let all: Vec<Int> = vec()
+    return itemize_with(none.fonts, all, primary, fallback, true, n, text, dir)
+}
+/// `itemize` over fonts `idx` (tried in that order) of a pool the caller holds; a run's `font` is a
+/// position in `idx`.
+pub fn itemize_pool(pool: Vec<Font>, idx: Vec<Int>, text: Str, dir: Int) -> Vec<TextRun> {
+    let none = font_empty()
+    return itemize_with(pool, idx, none, none, false, 0, text, dir)
+}
+fn itemize_with(pool: Vec<Font>, idx: Vec<Int>, f0: Font, f1: Font, pair: Bool, npair: Int, text: Str, dir: Int) -> Vec<TextRun> {
+    var cps: Vec<Int> = vec()
+    var offs: Vec<Int> = vec()
+    var lv: Vec<Int> = vec()
+    var sc: Vec<Int> = vec()
+    itemize_core(text, dir, cps, offs, lv, sc)
+    let n = cps.len()
+    // fonts, per cluster
+    var fi: Vec<Int> = vec()
+    var i = 0
+    while i < n { fi.push(0)  i = i + 1 }
+    var start = 0
+    var prev_font = 0 - 1
+    while start < n {
+        var end = start + 1
+        var rc = false
+        while end < n && is_cluster_continuation(cps[end - 1], cps[end], rc) {
+            rc = is_regional_indicator(cps[end]) && is_regional_indicator(cps[end - 1]) && !rc
+            end = end + 1
+        }
+        var chosen = 0 - 1
+        let base_common = script_is_common(ucd_script(cps[start]))
+        let nf = cand_count(pool, idx, pair, npair)
+        if base_common && prev_font >= 0 && prev_font < nf && font_covers_cluster(cand_font(pool, idx, f0, f1, pair, prev_font), cps, start, end) { chosen = prev_font }
+        var k = 0
+        while chosen < 0 && k < nf {
+            if font_covers_cluster(cand_font(pool, idx, f0, f1, pair, k), cps, start, end) { chosen = k }
+            k = k + 1
+        }
+        // nobody has the whole cluster: whoever has its base, else the first font
+        k = 0
+        while chosen < 0 && k < nf {
+            if font_covers_cp(cand_font(pool, idx, f0, f1, pair, k), cps[start], 0) { chosen = k }
+            k = k + 1
+        }
+        if chosen < 0 { chosen = 0 }
+        var q = start
+        while q < end { fi[q] = chosen  q = q + 1 }
+        prev_font = chosen
+        start = end
+    }
+    return make_runs(text, offs, lv, sc, fi)
+}
+/// `itemize` for a single font: runs of one bidi level and script.
+pub fn itemize_one(text: Str, dir: Int) -> Vec<TextRun> {
+    var cps: Vec<Int> = vec()
+    var offs: Vec<Int> = vec()
+    var lv: Vec<Int> = vec()
+    var sc: Vec<Int> = vec()
+    itemize_core(text, dir, cps, offs, lv, sc)
+    var fi: Vec<Int> = vec()
+    var i = 0
+    while i < cps.len() { fi.push(0)  i = i + 1 }
+    return make_runs(text, offs, lv, sc, fi)
+}
+
+/// the display order of runs (indices into `runs`), from their bidi levels (L2).
+pub fn bidi_visual_runs(runs: Vec<TextRun>) -> Vec<Int> {
+    var lv: Vec<Int> = vec()
+    var i = 0
+    while i < runs.len() { lv.push(runs[i].level)  i = i + 1 }
+    return bidi_reorder(lv, 0)
+}
+
+/// decode UTF-8 into code points and the byte offset each starts at (the shaper's decoder rules:
+// a malformed sequence is U+FFFD for its first byte)
+pub fn utf8_decode_offsets(text: Str, inout cps: Vec<Int>, inout offs: Vec<Int>) {
+    let n = text.len()
+    var i = 0
+    while i < n {
+        let b0 = rd_u8(text, i)
+        var cp = 65533
+        var len = 1
+        if b0 < 128 { cp = b0 }
+        else if b0 >= 194 && b0 <= 223 {
+            let b1 = rd_u8(text, i + 1)
+            if i + 1 < n && (b1 & 192) == 128 { cp = ((b0 & 31) << 6) | (b1 & 63)  len = 2 }
+        } else if b0 >= 224 && b0 <= 239 {
+            let b1 = rd_u8(text, i + 1)
+            let b2 = rd_u8(text, i + 2)
+            if i + 2 < n && (b1 & 192) == 128 && (b2 & 192) == 128 {
+                let v = ((b0 & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63)
+                if v >= 2048 && (v < 55296 || v > 57343) { cp = v  len = 3 }
+            }
+        } else if b0 >= 240 && b0 <= 244 {
+            let b1 = rd_u8(text, i + 1)
+            let b2 = rd_u8(text, i + 2)
+            let b3 = rd_u8(text, i + 3)
+            if i + 3 < n && (b1 & 192) == 128 && (b2 & 192) == 128 && (b3 & 192) == 128 {
+                let v = ((b0 & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63)
+                if v >= 65536 && v <= 1114111 { cp = v  len = 4 }
+            }
+        }
+        cps.push(cp)
+        offs.push(i)
+        i = i + len
+    }
+}
+// is there anything in `cps` that could make a bidi level other than 0 in a left-to-right
+// paragraph? (strong right-to-left letters, Arabic numbers, explicit embeddings and isolates)
+fn needs_bidi(cps: Vec<Int>) -> Bool {
+    var i = 0
+    while i < cps.len() {
+        let c = cps[i]
+        if c >= 1424 {                                                    // nothing below U+0590 is R/AL/AN or a control
+            let bc = ucd_bidi_class(c)
+            if bc == BC_R() || bc == BC_AL() || bc == BC_AN() || bc == BC_RLE() || bc == BC_LRE() || bc == BC_RLO()
+                || bc == BC_LRO() || bc == BC_PDF() || bc == BC_RLI() || bc == BC_LRI() || bc == BC_FSI() || bc == BC_PDI() { return true }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ── the shaped-run cache ─────────────────────────────────────────────────────────────────────────
+// A desktop lays out the same labels every frame. Shaping is cached per (face, script, direction,
+// language, features, text) in font units, so one entry serves every pixel size. Entries live in
+// flat global vectors (globals are never auto-freed, and the hit path copies plain Ints out); when
+// the store passes its budget the whole cache is dropped and refilled, which keeps the hit path a
+// single map lookup with no bookkeeping.
+
+global g_sc_on: Int = 0
+global g_sc_idx: Map<Str, Int>
+global g_sc_off: Vec<Int>
+global g_sc_n: Vec<Int>
+global g_sc_data: Vec<Int>
+global g_sc_hits: Int = 0
+global g_sc_misses: Int = 0
+fn SC_BUDGET() -> Int { return 2000000 }      // Ints of glyph data (6 per glyph): ~16 MB
+
+fn sc_reset() {
+    var m: Map<Str, Int> = map()
+    g_sc_idx = m
+    g_sc_off = vec()
+    g_sc_n = vec()
+    g_sc_data = vec()
+    g_sc_on = 1
+}
+
+/// `shape`, memoized: the same text in the same face, script, direction, language and features is
+/// shaped once.
+pub fn shape_cached(f: Font, text: Str, script: Str, dir: Int, lang: Str, features: Str) -> Vec<ShapedGlyph> {
+    if g_sc_on == 0 { sc_reset() }
+    let key = to_str(font_disc(f)) + "/" + to_str(f.d.len()) + "/" + script + "/" + to_str(dir) + "/" + lang + "/" + features + "/" + text
+    var out: Vec<ShapedGlyph> = vec()
+    if g_sc_idx.has(key) {
+        let slot = g_sc_idx.get(key)
+        let o = g_sc_off[slot]
+        let n = g_sc_n[slot]
+        var i = 0
+        while i < n {
+            let p = o + i * 6
+            out.push(ShapedGlyph { gid: g_sc_data[p], cluster: g_sc_data[p + 1], x_advance: g_sc_data[p + 2],
+                y_advance: g_sc_data[p + 3], x_offset: g_sc_data[p + 4], y_offset: g_sc_data[p + 5] })
+            i = i + 1
+        }
+        g_sc_hits = g_sc_hits + 1
+        return out
+    }
+    g_sc_misses = g_sc_misses + 1
+    let gs = shape(f, text, script, dir, lang, features)
+    if g_sc_data.len() + gs.len() * 6 > SC_BUDGET() { sc_reset() }
+    let slot = g_sc_off.len()
+    g_sc_off.push(g_sc_data.len())
+    g_sc_n.push(gs.len())
+    var i = 0
+    while i < gs.len() {
+        let g = gs[i]
+        g_sc_data.push(g.gid)  g_sc_data.push(g.cluster)  g_sc_data.push(g.x_advance)
+        g_sc_data.push(g.y_advance)  g_sc_data.push(g.x_offset)  g_sc_data.push(g.y_offset)
+        out.push(ShapedGlyph { gid: g.gid, cluster: g.cluster, x_advance: g.x_advance, y_advance: g.y_advance, x_offset: g.x_offset, y_offset: g.y_offset })
+        i = i + 1
+    }
+    g_sc_idx.put(key, slot)
+    return out
+}
+/// the shaped-run cache's hit and miss counts so far (for measuring).
+pub fn shape_cache_stats() -> Vec<Int> { var v: Vec<Int> = vec()  v.push(g_sc_hits)  v.push(g_sc_misses)  return v }
+/// drop every cached shaped run.
+pub fn shape_cache_clear() { sc_reset() }
+
+// ── shaped lines ─────────────────────────────────────────────────────────────────────────────────
+
+/// shape one line of `text` with fallback through `fs` at `px` pixels per em: itemize, shape each
+/// run (cached), and lay the runs out in visual order. `dir` is the paragraph direction
+/// (BIDI_AUTO/BIDI_LTR/BIDI_RTL); `lang` and `features` go to every run.
+pub fn shape_line(fs: FontSet, text: Str, px: Float, dir: Int, lang: Str, features: Str) -> ShapedLine {
+    var glyphs: Vec<LineGlyph> = vec()
+    if fs.fonts.len() == 0 { return ShapedLine { glyphs: glyphs, width: 0.0 } }
+    let runs = itemize(fs, text, dir)
+    let none = font_empty()
+    let all: Vec<Int> = vec()
+    return lay_out_runs(fs.fonts, all, none, none, false, text, runs, px, lang, features)
+}
+/// `shape_line` over fonts `idx` of a pool the caller holds (tried in that order, nothing copied):
+/// a glyph's `font` is its position in `idx`. With `idx` empty the whole pool is tried in order.
+pub fn shape_line_pool(pool: Vec<Font>, idx: Vec<Int>, text: Str, px: Float, dir: Int, lang: Str, features: Str) -> ShapedLine {
+    var glyphs: Vec<LineGlyph> = vec()
+    if cand_count(pool, idx, false, 0) == 0 { return ShapedLine { glyphs: glyphs, width: 0.0 } }
+    let runs = itemize_pool(pool, idx, text, dir)
+    let none = font_empty()
+    return lay_out_runs(pool, idx, none, none, false, text, runs, px, lang, features)
+}
+/// `shape_line` over a primary font and, when `has_fallback`, one fallback font (both held by the
+/// caller): a glyph's `font` is 0 for the primary, 1 for the fallback.
+pub fn shape_line_pair(primary: Font, fallback: Font, has_fallback: Bool, text: Str, px: Float, dir: Int, lang: Str, features: Str) -> ShapedLine {
+    let runs = itemize_pair(primary, fallback, has_fallback, text, dir)
+    let none = fontset_new()
+    let all: Vec<Int> = vec()
+    return lay_out_runs(none.fonts, all, primary, fallback, true, text, runs, px, lang, features)
+}
+/// `shape_line` with one font (no fallback): bidi and script runs, shaped and laid out.
+pub fn shape_line_font(f: Font, text: Str, px: Float, dir: Int, lang: Str, features: Str) -> ShapedLine {
+    let runs = itemize_one(text, dir)
+    let none = fontset_new()
+    let all: Vec<Int> = vec()
+    return lay_out_runs(none.fonts, all, f, f, true, text, runs, px, lang, features)
+}
+
+fn lay_out_runs(pool: Vec<Font>, idx: Vec<Int>, f0: Font, f1: Font, pair: Bool, text: Str, runs: Vec<TextRun>, px: Float, lang: Str, features: Str) -> ShapedLine {
+    var glyphs: Vec<LineGlyph> = vec()
+    let order = bidi_visual_runs(runs)
+    // byte offset -> character index
+    var cidx: Vec<Int> = vec()
+    var cps: Vec<Int> = vec()
+    var offs: Vec<Int> = vec()
+    utf8_decode_offsets(text, cps, offs)
+    var k = 0
+    while k <= text.len() { cidx.push(0)  k = k + 1 }
+    k = 0
+    while k < offs.len() { cidx[offs[k]] = k  k = k + 1 }
+    var pen = 0.0
+    var oi = 0
+    while oi < order.len() {
+        let r = runs[order[oi]]
+        var rdir = DIR_LTR()
+        if (r.level & 1) == 1 { rdir = DIR_RTL() }
+        let rf = cand_font(pool, idx, f0, f1, pair, r.font)
+        let gs = shape_cached(rf, text.slice(r.start, r.end), script_code(r.script), rdir, lang, features)
+        let s = font_scale(rf, px)
+        var i = 0
+        while i < gs.len() {
+            let g = gs[i]
+            let cl = r.start + g.cluster
+            glyphs.push(LineGlyph { gid: g.gid, font: r.font, cluster: cl, char_index: cidx[cl], x: pen,
+                x_off: to_float(g.x_offset) * s, y_off: to_float(g.y_offset) * s, advance: to_float(g.x_advance) * s, level: r.level })
+            pen = pen + to_float(g.x_advance) * s
+            i = i + 1
+        }
+        oi = oi + 1
+    }
+    return ShapedLine { glyphs: glyphs, width: pen }
+}

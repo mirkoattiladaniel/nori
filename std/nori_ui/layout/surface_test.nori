@@ -1,0 +1,466 @@
+// Native .nori tests for layout/surface.nori (surfaces, without the GPU blit).
+// Run with
+//   noric --test std/nori_ui/layout/surface_test.nori compiler/runtime.nori --import-root .
+// A root file of std/nori_ui/layout, so it shares the module scope and can call the parser
+// directly.
+import "std/nori_ui" as ui
+
+// ---- helpers (must not be named test_*) ----
+
+/// parse `src` as a whole document and return its root node; asserts the parse succeeded.
+fn sft_root(src: Str) -> ui::layout::UiNode {
+    var r = ui::layout::dsl_parse_document(src)
+    assert_true(r.ok)
+    return sink r.doc.tree
+}
+/// lay `src`'s root out in a `w` x `h` viewport at the origin.
+fn sft_lay(src: Str, w: Float, h: Float) -> ui::layout::ComputedOverlay {
+    var root = sft_root(src)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(w, h))
+    return ui::layout::layout_overlay(root, vp)
+}
+/// lay `src`'s root out with one host-provided scroll offset for region `rid`.
+fn sft_lay_scrolled(src: Str, w: Float, h: Float, rid: Str, off: Float) -> ui::layout::ComputedOverlay {
+    var root = sft_root(src)
+    var vp = ui::core::rect_min_size(ui::core::vec2_zero(), ui::core::vec2(w, h))
+    var ids: Vec<Str> = vec()
+    var offs: Vec<Float> = vec()
+    ids.push(copy rid)
+    offs.push(off)
+    return ui::layout::layout_overlay_scrolled(root, vp, ids, offs)
+}
+/// assert a rect equals (x0, y0, x1, y1).
+fn sft_rect_eq(r: ui::core::Rect, x0: Float, y0: Float, x1: Float, y1: Float) {
+    assert_feq(r.min.x, x0, 0.01)
+    assert_feq(r.min.y, y0, 0.01)
+    assert_feq(r.max.x, x1, 0.01)
+    assert_feq(r.max.y, y1, 0.01)
+}
+/// a newline, for building multi-line `.ui` sources.
+fn sft_nl() -> Str { return chr(10) + "" }
+/// join two lines with a newline.
+fn sft_ln(a: Str, b: Str) -> Str { return (a + sft_nl()) + b }
+/// feed one frame of pointer input at (x, y).
+fn sft_frame(inout inp: ui::layout::SurfaceInput, x: Float, y: Float, down: Bool) { ui::layout::surface_input_frame(inp, ui::core::vec2(x, y), down) }
+
+/// a header strip over a fill-the-rest surface: the minimal viewport panel.
+fn sft_panel_src() -> Str { return "column { padding: 0 gap: 0 rect { w: fill h: 40 color: [10,10,10,255] } surface { id: \"viewport\" fill_w: true fill_h: true } }" }
+
+/// A scene-viewer panel document, as written apart from the
+/// `{{raw:...}}` template holes (the class lists dropped, `checked` given a literal). The
+/// template engine is a separate concern and this test is about the surface.
+fn sft_scene_viewer_src() -> Str {
+    var s = "column {"
+    s = sft_ln(s, "  classes: [panel_root]")
+    s = sft_ln(s, "  fill_w: true")
+    s = sft_ln(s, "  fill_h: true")
+    s = sft_ln(s, "  padding: 0")
+    s = sft_ln(s, "  gap: 0")
+    s = sft_ln(s, "  row {")
+    s = sft_ln(s, "    classes: [panel_header]")
+    s = sft_ln(s, "    padding: 8")
+    s = sft_ln(s, "    cross_align: start")
+    s = sft_ln(s, "    text { text: \"Scene\" classes: [scene_viewer_title] }")
+    s = sft_ln(s, "  }")
+    s = sft_ln(s, "  divider { h: 1 }")
+    s = sft_ln(s, "  row {")
+    s = sft_ln(s, "    classes: [panel_header]")
+    s = sft_ln(s, "    gap: 6")
+    s = sft_ln(s, "    padding: 6")
+    s = sft_ln(s, "    cross_align: center")
+    s = sft_ln(s, "    button { label: \"View\" on_click: mode_view }")
+    s = sft_ln(s, "    button { label: \"Move\" on_click: mode_move }")
+    s = sft_ln(s, "    button { label: \"Rotate\" on_click: mode_rotate }")
+    s = sft_ln(s, "    button { label: \"Scale\" on_click: mode_scale }")
+    s = sft_ln(s, "    button { label: \"Rect\" on_click: mode_rect }")
+    s = sft_ln(s, "    button { label: \"Transform\" on_click: mode_transform }")
+    s = sft_ln(s, "    checkbox {")
+    s = sft_ln(s, "      id: \"toggle_colliders\"")
+    s = sft_ln(s, "      label: \"Colliders\"")
+    s = sft_ln(s, "      checked: true")
+    s = sft_ln(s, "    }")
+    s = sft_ln(s, "  }")
+    s = sft_ln(s, "  divider { h: 1 }")
+    s = sft_ln(s, "  surface { id: \"viewport\" fill_w: true fill_h: true }")
+    return sft_ln(s, "}")
+}
+
+// ---- surface_screen_rect ----
+
+fn test_surface_docked_panel_screen_rect() {
+    // a 400x300 panel docked at (120, 60): the header takes 40px, the surface takes the rest.
+    var ov = sft_lay(sft_panel_src(), 400.0, 300.0)
+    assert_eq(ui::layout::surface_count(ov), 1)
+    assert_streq(ui::layout::surface_id_at(ov, 0), "viewport")
+    // document-local first...
+    var local = ui::layout::surface_rect_of(ov, "viewport")
+    assert_true(local.found)
+    sft_rect_eq(local.rect, 0.0, 40.0, 400.0, 300.0)
+    // ...then translated to the dock's screen origin, which is all surface_screen_rect does.
+    var scr = ui::layout::surface_screen_rect(ov.surfaces, 120.0, 60.0, "viewport")
+    assert_true(scr.found)
+    assert_streq(scr.id, "viewport")
+    sft_rect_eq(scr.rect, 120.0, 100.0, 520.0, 360.0)
+}
+
+fn test_surface_screen_rect_unknown_id_is_a_clear_miss() {
+    var ov = sft_lay(sft_panel_src(), 400.0, 300.0)
+    var miss = ui::layout::surface_screen_rect(ov.surfaces, 120.0, 60.0, "no_such_hole")
+    assert_false(miss.found)
+    assert_streq(miss.id, "no_such_hole")            // the miss says which id was not there
+    sft_rect_eq(miss.rect, 0.0, 0.0, 0.0, 0.0)       // and an empty rect, not the panel origin
+    assert_streq(ui::layout::surface_id_at(ov, 7), "")
+    // an overlay with no surfaces at all misses too, rather than trapping.
+    var bare = sft_lay("column { padding: 0 text { text: \"hi\" } }", 200.0, 100.0)
+    assert_eq(ui::layout::surface_count(bare), 0)
+    assert_false(ui::layout::surface_rect_of(bare, "viewport").found)
+}
+
+fn test_surface_several_in_one_document() {
+    var src = "row { padding: 0 gap: 0 surface { id: \"left\" w: 100 h: 80 } surface { id: \"mid\" w: 120 h: 80 } surface { id: \"right\" w: 100 h: 80 } }"
+    var ov = sft_lay(src, 400.0, 80.0)
+    assert_eq(ui::layout::surface_count(ov), 3)
+    assert_streq(ui::layout::surface_id_at(ov, 0), "left")
+    assert_streq(ui::layout::surface_id_at(ov, 2), "right")
+    sft_rect_eq(ui::layout::surface_rect_of(ov, "left").rect, 0.0, 0.0, 100.0, 80.0)
+    sft_rect_eq(ui::layout::surface_rect_of(ov, "mid").rect, 100.0, 0.0, 220.0, 80.0)
+    sft_rect_eq(ui::layout::surface_rect_of(ov, "right").rect, 220.0, 0.0, 320.0, 80.0)
+    // each hole keeps its own identity through the offset, and one lookup never returns another's rect.
+    sft_rect_eq(ui::layout::surface_screen_rect(ov.surfaces, 10.0, 5.0, "mid").rect, 110.0, 5.0, 230.0, 85.0)
+}
+
+fn test_surface_real_scene_viewer_panel() {
+    // The shape this is designed for: chrome on top, one full-bleed hole below.
+    var ov = sft_lay(sft_scene_viewer_src(), 640.0, 480.0)
+    assert_eq(ui::layout::surface_count(ov), 1)
+    var look = ui::layout::surface_screen_rect(ov.surfaces, 100.0, 50.0, "viewport")
+    assert_true(look.found)
+    // The chrome's height depends on text metrics, so assert the relationships, not the pixels:
+    // full width, flush to the panel's bottom edge, below the toolbar, and non-degenerate.
+    assert_feq(look.rect.min.x, 100.0, 0.01)
+    assert_feq(look.rect.max.x, 740.0, 0.01)
+    assert_feq(look.rect.max.y, 530.0, 0.01)
+    assert_true(look.rect.min.y > 50.0)
+    assert_true(look.rect.height() > 100.0)
+    // and the toolbar buttons are still hits, sitting entirely above the hole.
+    assert_true(ov.hits.len() >= 6)
+    var i = 0
+    while i < ov.hits.len() {
+        assert_true(ov.hits[i].rect.max.y <= look.rect.min.y - 50.0 + 1.0)
+        i = i + 1
+    }
+}
+
+// ---- clipping by an enclosing scroll viewport ----
+
+// A 200-wide column whose content is 140 tall. Laid out in a viewport shorter than that it
+// overflows, and a scrolling column reserves the width its bar will need, so the children,
+// and every rect derived from them, are a scrollbar track narrower than the viewport (190,
+// not 200). Laid out in a viewport at least 140 tall nothing overflows and they keep all 200.
+fn sft_scroll_src(min_h: Float) -> Str {
+    return ("scroll_column { id: \"sc\" padding: 0 gap: 0 min_height: " + to_str(min_h)) + " rect { w: 200 h: 60 color: [1,2,3,255] } surface { id: \"cam\" w: 200 h: 80 } }"
+}
+
+fn test_surface_in_scroll_fully_visible() {
+    // viewport 200 tall, content 140 tall: the hole at y 60..140 is entirely inside.
+    var ov = sft_lay_scrolled(sft_scroll_src(200.0), 200.0, 200.0, "sc", 0.0)
+    var look = ui::layout::surface_rect_of(ov, "cam")
+    assert_true(look.found)
+    sft_rect_eq(look.rect, 0.0, 60.0, 200.0, 140.0)
+    assert_feq(look.rect.height(), 80.0, 0.01)
+}
+
+fn test_surface_in_scroll_half_scrolled_out() {
+    // Same document, viewport only 100 tall: the hole spans y 60..140 and the viewport ends at
+    // 100, so half of it is scrolled away. merge_clipped_overlay already intersected the region;
+    // surface_screen_rect must report the clipped rect, not the wished-for one.
+    var ov = sft_lay_scrolled(sft_scroll_src(100.0), 200.0, 100.0, "sc", 0.0)
+    var look = ui::layout::surface_rect_of(ov, "cam")
+    assert_true(look.found)
+    sft_rect_eq(look.rect, 0.0, 60.0, 190.0, 100.0)
+    assert_feq(look.rect.height(), 40.0, 0.01)      // 40 of 80 survives
+    // scrolled down by 60, the same hole is whole again and sits at the top.
+    var ov2 = sft_lay_scrolled(sft_scroll_src(100.0), 200.0, 100.0, "sc", 60.0)
+    var l2 = ui::layout::surface_rect_of(ov2, "cam")
+    assert_true(l2.found)
+    sft_rect_eq(l2.rect, 0.0, 0.0, 190.0, 80.0)
+    // scrolled far enough, it leaves the viewport entirely and is not reported at all.
+    var ov3 = sft_lay_scrolled(sft_scroll_src(100.0), 200.0, 100.0, "sc", 400.0)
+    assert_false(ui::layout::surface_rect_of(ov3, "cam").found)
+}
+
+// ---- interaction sensing ----
+
+fn test_surface_sense_hover_inside_and_not_outside() {
+    var ov = sft_lay(sft_panel_src(), 400.0, 300.0)         // hole = (0,40)-(400,300)
+    var inp = ui::layout::surface_input_new()
+    // no pointer yet: nothing hovers.
+    var r0 = ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp, ui::layout::surface_sense_click_and_drag())
+    assert_true(r0.found)
+    assert_false(r0.hovered)
+    // inside
+    sft_frame(inp, 200.0, 150.0, false)
+    var r1 = ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp, ui::layout::surface_sense_click_and_drag())
+    assert_true(r1.hovered)
+    assert_feq(r1.local.x, 200.0, 0.01)
+    assert_feq(r1.local.y, 110.0, 0.01)                     // rect-local, not panel-local
+    // in the header, above the hole
+    sft_frame(inp, 200.0, 10.0, false)
+    assert_false(ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp, ui::layout::surface_sense_click_and_drag()).hovered)
+    // an unknown hole senses nothing and says so
+    var rn = ui::layout::surface_sense(ov, 0.0, 0.0, "nope", inp, ui::layout::surface_sense_click_and_drag())
+    assert_false(rn.found)
+    assert_false(rn.hovered)
+    // sense_none reports nothing even dead centre: the ladder is honoured, not a Bool
+    sft_frame(inp, 200.0, 150.0, false)
+    assert_false(ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp, ui::layout::surface_sense_none()).hovered)
+}
+
+fn test_surface_sense_click_needs_press_and_release_inside() {
+    var ov = sft_lay(sft_panel_src(), 400.0, 300.0)
+    var inp = ui::layout::surface_input_new()
+    var sense = ui::layout::surface_sense_click()
+    sft_frame(inp, 200.0, 150.0, false)
+    assert_false(ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp, sense).clicked)
+    sft_frame(inp, 200.0, 150.0, true)                      // press
+    assert_false(ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp, sense).clicked)
+    sft_frame(inp, 200.0, 150.0, false)                     // release
+    var up = ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp, sense)
+    assert_true(up.clicked)
+    assert_true(up.changed)
+    assert_false(up.dragged)                                // CLICK does not sense drag
+    // press in the header, release in the hole: the press-origin gate rejects it.
+    var inp2 = ui::layout::surface_input_new()
+    sft_frame(inp2, 200.0, 10.0, false)
+    sft_frame(inp2, 200.0, 10.0, true)
+    sft_frame(inp2, 200.0, 150.0, false)
+    assert_false(ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp2, sense).clicked)
+    // and a release outside the hole after a press inside is not a click either.
+    var inp3 = ui::layout::surface_input_new()
+    sft_frame(inp3, 200.0, 150.0, true)
+    sft_frame(inp3, 200.0, 10.0, false)
+    assert_false(ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp3, sense).clicked)
+}
+
+fn test_surface_sense_drag_keeps_ownership() {
+    var ov = sft_lay(sft_panel_src(), 400.0, 300.0)
+    var inp = ui::layout::surface_input_new()
+    var sense = ui::layout::surface_sense_click_and_drag()
+    sft_frame(inp, 200.0, 150.0, false)
+    sft_frame(inp, 200.0, 150.0, true)                      // press inside
+    var d0 = ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp, sense)
+    assert_true(d0.drag_started)
+    assert_false(d0.dragged)                                // no movement yet
+    sft_frame(inp, 230.0, 170.0, true)                      // orbit
+    var d1 = ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp, sense)
+    assert_true(d1.dragged)
+    assert_true(d1.changed)
+    assert_false(d1.drag_started)                           // started once, not every frame
+    assert_feq(d1.drag_delta.x, 30.0, 0.01)
+    assert_feq(d1.drag_delta.y, 20.0, 0.01)
+    // the drag keeps delivering after the pointer leaves the hole; that is the point of a
+    // drag latch, and a viewport orbit that stopped at the panel edge would be unusable.
+    sft_frame(inp, 260.0, 10.0, true)
+    var d2 = ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp, sense)
+    assert_false(d2.hovered)
+    assert_true(d2.dragged)
+    assert_feq(d2.drag_delta.x, 30.0, 0.01)
+    sft_frame(inp, 260.0, 10.0, false)                      // release outside: latch clears
+    ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp, sense)
+    sft_frame(inp, 300.0, 20.0, true)
+    assert_false(ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp, sense).dragged)
+    // SENSE_CLICK never reports a drag at all.
+    var inp2 = ui::layout::surface_input_new()
+    sft_frame(inp2, 200.0, 150.0, true)
+    sft_frame(inp2, 240.0, 150.0, true)
+    assert_false(ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp2, ui::layout::surface_sense_click()).dragged)
+    // and the pointer leaving the window drops hover and the latch together.
+    ui::layout::surface_input_leave(inp2)
+    assert_false(ui::layout::surface_sense(ov, 0.0, 0.0, "viewport", inp2, sense).hovered)
+}
+
+fn test_surface_sense_ignores_the_scrolled_away_part() {
+    // The hole wants y 60..140 but the scroll viewport ends at 100. A click at y=120 is over the
+    // part that is not on screen; it must not land. This is the easiest thing here to get wrong.
+    var ov = sft_lay_scrolled(sft_scroll_src(100.0), 200.0, 100.0, "sc", 0.0)
+    sft_rect_eq(ui::layout::surface_rect_of(ov, "cam").rect, 0.0, 60.0, 190.0, 100.0)
+    var sense = ui::layout::surface_sense_click_and_drag()
+    // y = 80: inside the visible half.
+    var inp = ui::layout::surface_input_new()
+    sft_frame(inp, 100.0, 80.0, false)
+    assert_true(ui::layout::surface_sense(ov, 0.0, 0.0, "cam", inp, sense).hovered)
+    sft_frame(inp, 100.0, 80.0, true)
+    sft_frame(inp, 100.0, 80.0, false)
+    assert_true(ui::layout::surface_sense(ov, 0.0, 0.0, "cam", inp, sense).clicked)
+    // y = 120: inside the hole's unclipped rect, outside the scroll viewport. Nothing lands.
+    var inp2 = ui::layout::surface_input_new()
+    sft_frame(inp2, 100.0, 120.0, false)
+    assert_false(ui::layout::surface_sense(ov, 0.0, 0.0, "cam", inp2, sense).hovered)
+    sft_frame(inp2, 100.0, 120.0, true)
+    assert_false(ui::layout::surface_sense(ov, 0.0, 0.0, "cam", inp2, sense).drag_started)
+    sft_frame(inp2, 100.0, 120.0, false)
+    assert_false(ui::layout::surface_sense(ov, 0.0, 0.0, "cam", inp2, sense).clicked)
+    // scrolled into view, that same point is the hole.
+    var ov2 = sft_lay_scrolled(sft_scroll_src(100.0), 200.0, 100.0, "sc", 60.0)
+    var inp3 = ui::layout::surface_input_new()
+    sft_frame(inp3, 100.0, 40.0, false)
+    assert_true(ui::layout::surface_sense(ov2, 0.0, 0.0, "cam", inp3, sense).hovered)
+}
+
+fn test_surface_hit_region_carries_the_event_string() {
+    var ov = sft_lay(sft_panel_src(), 400.0, 300.0)
+    assert_streq(ui::layout::surface_event("viewport", "click"), "surface:viewport:click")
+    var hits_before = ov.hits.len()
+    assert_true(ui::layout::surface_push_hit(ov, 0.0, 0.0, "viewport", ui::layout::surface_event("viewport", "click")))
+    assert_eq(ov.hits.len(), hits_before + 1)
+    // hit-testing inside the hole finds it; the header above it does not.
+    var got = ui::layout::overlay_hit_test(ov, ui::core::vec2(200.0, 150.0))
+    assert_streq(got.id, "viewport")
+    assert_streq(got.on_click, "surface:viewport:click")
+    // pushed largest first: a smaller gizmo hit pushed after wins the backwards walk.
+    ov.hits.push(ui::layout::HitRegion { id: "gizmo_x", on_click: "surface:viewport:gizmo:x", rect: ui::core::rect_min_max(ui::core::vec2(180.0, 140.0), ui::core::vec2(220.0, 160.0)) })
+    assert_streq(ui::layout::overlay_hit_test(ov, ui::core::vec2(200.0, 150.0)).id, "gizmo_x")
+    assert_streq(ui::layout::overlay_hit_test(ov, ui::core::vec2(300.0, 250.0)).id, "viewport")
+    assert_false(ui::layout::surface_push_hit(ov, 0.0, 0.0, "nope", "surface:nope:click"))
+}
+
+// ---- consuming the surfaces in the host draw path ----
+
+fn test_surface_draw_list_splits_blits_from_fills() {
+    var src = "row { padding: 0 gap: 0 surface { id: \"scene\" w: 100 h: 80 } surface { id: \"preview\" w: 100 h: 80 } surface { id: \"empty\" w: 100 h: 80 } }"
+    var ov = sft_lay(src, 400.0, 80.0)
+    var b = ui::layout::surface_bindings()
+    ui::layout::surface_bind_texture(b, "scene", 77)
+    ui::layout::surface_bind_color(b, "preview", ui::core::color_rgb(200, 30, 40))
+    var dl = ui::layout::surface_draw_list(ov, b, 10.0, 5.0)
+    // the texture-bound hole is a blit and nothing else; no CPU round trip is implied anywhere.
+    assert_eq(dl.blits.len(), 1)
+    assert_streq(dl.blits[0].id, "scene")
+    assert_eq(dl.blits[0].texture, 77)
+    sft_rect_eq(dl.blits[0].rect, 10.0, 5.0, 110.0, 85.0)
+    // the colour-bound and the unbound ones are ordinary fill prims the existing backends draw.
+    assert_eq(dl.prims.len(), 2)
+    assert_eq(dl.prims[0].kind, 0)
+    assert_eq(dl.prims[0].color.r, 200)
+    sft_rect_eq(dl.prims[0].rect, 110.0, 5.0, 210.0, 85.0)
+    assert_eq(dl.prims[1].color.r, ui::layout::surface_placeholder_color().r)
+    sft_rect_eq(dl.prims[1].rect, 210.0, 5.0, 310.0, 85.0)
+    // rebinding replaces rather than shadows, and unbinding falls back to the placeholder.
+    ui::layout::surface_bind_texture(b, "scene", 99)
+    assert_eq(ui::layout::surface_binding_of(b, "scene").texture, 99)
+    ui::layout::surface_unbind(b, "preview")
+    assert_eq(ui::layout::surface_binding_of(b, "preview").kind, ui::layout::sfb_unbound())
+    assert_eq(ui::layout::surface_draw_list(ov, b, 0.0, 0.0).prims.len(), 2)
+}
+
+fn test_surface_paint_into_needs_no_backend_change() {
+    var ov = sft_lay(sft_panel_src(), 400.0, 300.0)
+    var before = ov.prims.len()
+    var b = ui::layout::surface_bindings()
+    var blits = ui::layout::surface_paint_into(ov, b)
+    assert_eq(blits.len(), 0)                                // nothing bound: nothing for the GPU
+    assert_eq(ov.prims.len(), before + 1)                    // one placeholder fill, in overlay.prims
+    var fill = ov.prims[ov.prims.len() - 1]
+    assert_eq(fill.kind, 0)
+    sft_rect_eq(fill.rect, 0.0, 40.0, 400.0, 300.0)
+    // bind a texture and the fill goes away: the hole becomes the GPU's problem, not the painter's.
+    var ov2 = sft_lay(sft_panel_src(), 400.0, 300.0)
+    var before2 = ov2.prims.len()
+    ui::layout::surface_bind_texture(b, "viewport", 12)
+    var blits2 = ui::layout::surface_paint_into(ov2, b)
+    assert_eq(blits2.len(), 1)
+    assert_eq(blits2[0].texture, 12)
+    assert_eq(ov2.prims.len(), before2)
+    // a clipped hole hands the GPU the clipped rect, so a blit cannot spill out of a scroll region.
+    var ov3 = sft_lay_scrolled(sft_scroll_src(100.0), 200.0, 100.0, "sc", 0.0)
+    var b3 = ui::layout::surface_bindings()
+    ui::layout::surface_bind_texture(b3, "cam", 5)
+    var blits3 = ui::layout::surface_paint_into(ov3, b3)
+    assert_eq(blits3.len(), 1)
+    sft_rect_eq(blits3[0].rect, 0.0, 60.0, 190.0, 100.0)
+}
+
+// ---- gizmos, scoped (= clipped) to the surface ----
+
+fn test_surface_gizmos_are_clipped_to_the_hole() {
+    var ov = sft_lay(sft_panel_src(), 400.0, 300.0)          // hole = (0,40)-(400,300)
+    var p = ui::layout::surface_painter(ov, 0.0, 0.0, "viewport")
+    assert_true(p.found)
+    sft_rect_eq(p.clip, 0.0, 40.0, 400.0, 300.0)
+    var white = ui::core::color_rgb(255, 255, 255)
+    // 1. wholly inside, survives untouched.
+    ui::layout::surface_fill(p, ui::core::rect_min_max(ui::core::vec2(100.0, 100.0), ui::core::vec2(140.0, 140.0)), white, 0.0)
+    // 2. straddling the bottom-right corner, must be cut at the hole's edge.
+    ui::layout::surface_stroke(p, ui::core::rect_min_max(ui::core::vec2(350.0, 280.0), ui::core::vec2(500.0, 400.0)), white, 2.0)
+    // 3. straddling the top edge, i.e. reaching up into the header, cut there too.
+    ui::layout::surface_fill(p, ui::core::rect_min_max(ui::core::vec2(10.0, 10.0), ui::core::vec2(30.0, 60.0)), white, 0.0)
+    // 4. wholly outside, dropped.
+    ui::layout::surface_fill(p, ui::core::rect_min_max(ui::core::vec2(500.0, 500.0), ui::core::vec2(600.0, 600.0)), white, 0.0)
+    // 5. a label inside, and one anchored in the header: kept and dropped respectively.
+    ui::layout::surface_label(p, ui::core::vec2(50.0, 200.0), "x", white, 12.0)
+    ui::layout::surface_label(p, ui::core::vec2(50.0, 5.0), "leak", white, 12.0)
+    assert_eq(ui::layout::surface_painter_len(p), 6)
+    var before = ov.prims.len()
+    var kept = ui::layout::surface_painter_flush(p, ov)
+    assert_eq(kept, 4)                                       // 4 and the header label are gone
+    assert_eq(ov.prims.len(), before + 4)
+    assert_eq(ui::layout::surface_painter_len(p), 0)          // the painter is emptied for reuse
+    var g0 = ov.prims[before]
+    sft_rect_eq(g0.rect, 100.0, 100.0, 140.0, 140.0)
+    var g1 = ov.prims[before + 1]
+    assert_eq(g1.kind, 1)
+    sft_rect_eq(g1.rect, 350.0, 280.0, 400.0, 300.0)          // clipped, not 500x400
+    var g2 = ov.prims[before + 2]
+    sft_rect_eq(g2.rect, 10.0, 40.0, 30.0, 60.0)              // the header half is gone
+    var g3 = ov.prims[before + 3]
+    assert_eq(g3.kind, 2)
+    assert_streq(g3.text, "x")
+    assert_true(g3.has_clip)                                  // text carries the scissor rect
+    sft_rect_eq(g3.clip, 0.0, 40.0, 400.0, 300.0)
+    // every surviving gizmo lies inside the hole. That is the claim in one loop.
+    var i = before
+    while i < ov.prims.len() {
+        if ov.prims[i].kind != 2 {
+            assert_true(ov.prims[i].rect.min.y >= 40.0 - 0.01)
+            assert_true(ov.prims[i].rect.max.x <= 400.0 + 0.01)
+            assert_true(ov.prims[i].rect.max.y <= 300.0 + 0.01)
+        }
+        i = i + 1
+    }
+}
+
+fn test_surface_gizmo_line_and_unknown_hole() {
+    var ov = sft_lay(sft_panel_src(), 400.0, 300.0)
+    var p = ui::layout::surface_painter(ov, 0.0, 0.0, "viewport")
+    var green = ui::core::color_rgb(0, 255, 0)
+    ui::layout::surface_line(p, ui::core::vec2(20.0, 100.0), ui::core::vec2(380.0, 100.0), 2.0, green)   // horizontal
+    ui::layout::surface_line(p, ui::core::vec2(200.0, 60.0), ui::core::vec2(200.0, 280.0), 2.0, green)   // vertical
+    var before = ov.prims.len()
+    assert_eq(ui::layout::surface_painter_flush(p, ov), 2)
+    sft_rect_eq(ov.prims[before].rect, 20.0, 99.0, 380.0, 101.0)
+    sft_rect_eq(ov.prims[before + 1].rect, 199.0, 60.0, 201.0, 280.0)
+    // A painter for a hole that is not there draws nothing, rather than scribbling at (0,0).
+    var q = ui::layout::surface_painter(ov, 0.0, 0.0, "ghost")
+    assert_false(q.found)
+    ui::layout::surface_fill(q, ui::core::rect_min_max(ui::core::vec2(0.0, 0.0), ui::core::vec2(400.0, 300.0)), green, 0.0)
+    ui::layout::surface_line(q, ui::core::vec2(0.0, 0.0), ui::core::vec2(10.0, 0.0), 1.0, green)
+    assert_eq(ui::layout::surface_painter_len(q), 0)
+    var n = ov.prims.len()
+    assert_eq(ui::layout::surface_painter_flush(q, ov), 0)
+    assert_eq(ov.prims.len(), n)
+}
+
+fn test_surface_gizmos_follow_the_scroll_clip() {
+    // A gizmo drawn at the bottom of a half-scrolled-out hole is cut by the scroll viewport too:
+    // the painter clips to the already-clipped surface rect, so there is one clip, not two.
+    var ov = sft_lay_scrolled(sft_scroll_src(100.0), 200.0, 100.0, "sc", 0.0)
+    var p = ui::layout::surface_painter(ov, 0.0, 0.0, "cam")
+    assert_true(p.found)
+    sft_rect_eq(p.clip, 0.0, 60.0, 190.0, 100.0)
+    var red = ui::core::color_rgb(255, 0, 0)
+    ui::layout::surface_fill(p, ui::core::rect_min_max(ui::core::vec2(50.0, 70.0), ui::core::vec2(150.0, 130.0)), red, 0.0)
+    ui::layout::surface_fill(p, ui::core::rect_min_max(ui::core::vec2(50.0, 110.0), ui::core::vec2(150.0, 130.0)), red, 0.0)
+    var before = ov.prims.len()
+    assert_eq(ui::layout::surface_painter_flush(p, ov), 1)   // the wholly-scrolled-away one is gone
+    sft_rect_eq(ov.prims[before].rect, 50.0, 70.0, 150.0, 100.0)
+}

@@ -1,0 +1,794 @@
+use core::*
+import "std/math" as math
+
+// ===========================================================================
+// layout/code_editor: a syntax-highlighted editor view.
+//
+// `multiline_edit.nori` owns the hard half: buffer, caret, selection,
+// undo/redo, find, word movement, hit-testing and a virtualized paint. What it
+// paints is one flat `pp_text` per line in a single colour, because it backs
+// the `text_area`, which has no gutter and no colours.
+//
+// This file is the other widget, the `code_editor` node rather than the
+// `text_area`. It reuses every `me_*` helper and re-implements only the paint,
+// splitting each visible line into coloured runs. `syntax.nori` provides the
+// palette, the token classes, the visible-line window and bracket matching;
+// the tokenizer is here, and a pluggable highlighter registry is host
+// integration that is not part of this file. A language whose lexer is not
+// here highlights as plain text.
+//
+// State is not owned here. There is no id-keyed registry: the caller
+// passes a MultilineEditState in and keeps it between frames. That is what lets
+// a plugin own its own buffer, caret and undo stack across the `.ui` documents
+// it emits, with this file staying a pure function of the state it is handed.
+// ===========================================================================
+
+// ---- the Nori lexer -------------------------------------------------------
+// Line-based, and that is sound rather than a shortcut: Nori has no block
+// comment and no multi-line string literal, so no token can span a newline and
+// a line can be coloured without looking at its neighbours. That keeps the
+// visible-window virtualization cheap: colouring line 4000 costs the same
+// whether or not lines 0..3999 were ever scanned.
+
+/// true when `c` can start an identifier.
+fn ce_ident_start(c: Int) -> Bool { return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 }
+/// true when `c` can continue an identifier.
+fn ce_ident_cont(c: Int) -> Bool { return ce_ident_start(c) || (c >= 48 && c <= 57) }
+/// true when `c` is a decimal digit.
+fn ce_digit(c: Int) -> Bool { return c >= 48 && c <= 57 }
+
+/// true when `w` is in `list`.
+fn ce_in(list: Vec<Str>, w: Str) -> Bool {
+    var i = 0
+    while i < list.len() { if (list[i] == w) { return true }  i = i + 1 }
+    return false
+}
+
+/// `s` split on spaces. Writing the keyword tables as one string each keeps them
+/// readable and diffable against `editors/nori.nvim/syntax/nori.vim`, which is
+/// where every word below came from.
+fn ce_words(s: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var cur = ""
+    var i = 0
+    while i < s.len() {
+        let c = s.at(i)
+        if ord(c) == 32 { if cur.len() > 0 { out.push(cur)  cur = "" } } else { cur = (cur + c) }
+        i = i + 1
+    }
+    if cur.len() > 0 { out.push(cur) }
+    return out
+}
+
+/// control flow, declarations and the parallelism forms. Mirrors the `noriKeyword`/`noriStorage`/
+/// `noriConv`/`noriBool` groups of the Vim syntax file, which splits them only to hang different
+/// highlight links off them; all four land on `keyword` here.
+pub fn nori_keywords() -> Vec<Str> {
+    return ce_words("fn let var return if else while foreach in break continue match region reduce over schedule spawn lock as import struct enum trait impl pub global use unsafe inout sink set true false")
+}
+
+/// the built-in types (`noriType`).
+pub fn nori_types() -> Vec<Str> {
+    return ce_words("Int Float Bool Str Vec Map Pool Id I8 I16 I32 I64 U8 U16 U32 U64 F32 F64")
+}
+
+/// the built-in functions (`noriBuiltin`).
+pub fn nori_builtins() -> Vec<Str> {
+    return ce_words("print printl print_str print_uint print_float concat slen char_at substr to_str parse_int chr ord eq_str len push pop vset has lookup map vec pool put get insert fill fill2 rows cols read_file write_file arg argc argv0 system fail to_int to_float free")
+}
+
+/// highlight spans for one line of Nori, left to right, non-overlapping.
+///
+/// Columns are byte offsets into `line`. A run the caller should draw in the default colour is
+/// simply not covered by any span, which is why the painter walks the gaps rather than expecting a
+/// span per character.
+pub fn nori_line_spans(line: Str) -> Vec<HighlightSpan> {
+    var out: Vec<HighlightSpan> = vec()
+    var kw = nori_keywords()
+    var ty = nori_types()
+    var bi = nori_builtins()
+    var n = line.len()
+    var i = 0
+    while i < n {
+        let c = ord(line.at(i))
+
+        // `//` to end of line: checked before the operator table, where a lone `/` also lives.
+        if c == 47 && i + 1 < n && ord(line.at(i + 1)) == 47 {
+            out.push(highlight_span(i, n, "comment"))
+            return out
+        }
+
+        // "…" with backslash escapes. An unterminated string colours to end of line, which is what
+        // an editor should show while you are still typing it.
+        if c == 34 {
+            var j = i + 1
+            var closed = false
+            while j < n && !closed {
+                let d = ord(line.at(j))
+                if d == 92 { j = j + 1 }
+                else if d == 34 { closed = true }
+                j = j + 1
+            }
+            out.push(highlight_span(i, j, "string"))
+            i = j
+        }
+        // '…' character literal, escaped or not.
+        else if c == 39 {
+            var j = i + 1
+            if j < n && ord(line.at(j)) == 92 { j = j + 1 }
+            if j < n { j = j + 1 }
+            if j < n && ord(line.at(j)) == 39 { j = j + 1 }
+            out.push(highlight_span(i, j, "string"))
+            i = j
+        }
+        // a number, integer or float. A `.` is only consumed when a digit follows, so `1.max(2)`
+        // keeps the method call out of the literal.
+        else if ce_digit(c) {
+            var j = i
+            while j < n && ce_digit(ord(line.at(j))) { j = j + 1 }
+            if j + 1 < n && ord(line.at(j)) == 46 && ce_digit(ord(line.at(j + 1))) {
+                j = j + 1
+                while j < n && ce_digit(ord(line.at(j))) { j = j + 1 }
+            }
+            out.push(highlight_span(i, j, "number"))
+            i = j
+        }
+        // an identifier: keyword, type, builtin, call, or nothing.
+        else if ce_ident_start(c) {
+            var j = i
+            while j < n && ce_ident_cont(ord(line.at(j))) { j = j + 1 }
+            let w = line.slice(i, j)
+            var cls = ""
+            if ce_in(kw, w) { cls = "keyword" }
+            else if ce_in(ty, w) { cls = "type" }
+            else if ce_in(bi, w) { cls = "function" }
+            else {
+                // `name(` is a call; `Name` is a type. Both are what the Vim syntax file's
+                // noriFunction / noriVariant matches decide, reached from the other direction:
+                // there is no parser here, so the character after the word is the only evidence available.
+                var k = j
+                while k < n && ord(line.at(k)) == 32 { k = k + 1 }
+                if k < n && ord(line.at(k)) == 40 { cls = "function" }
+                else if c >= 65 && c <= 90 { cls = "type" }
+            }
+            if cls.len() > 0 { out.push(highlight_span(i, j, cls)) }
+            i = j
+        }
+        // two-character operators before one-character ones, so `->` does not colour as `-`.
+        else if ce_op2(line, i, n) { out.push(highlight_span(i, i + 2, "operator"))  i = i + 2 }
+        else if ce_op1(c) { out.push(highlight_span(i, i + 1, "operator"))  i = i + 1 }
+        else { i = i + 1 }
+    }
+    return out
+}
+
+/// true when a two-character operator starts at `i` (`->`, `::`, `..`, `&&`, `||`, `==`, `!=`, `<=`,
+/// `>=`, the Vim syntax file's noriOperator).
+fn ce_op2(line: Str, i: Int, n: Int) -> Bool {
+    if i + 1 >= n { return false }
+    let a = ord(line.at(i))
+    let b = ord(line.at(i + 1))
+    if a == 45 && b == 62 { return true }               // ->
+    if a == 58 && b == 58 { return true }               // ::
+    if a == 46 && b == 46 { return true }               // ..
+    if a == 38 && b == 38 { return true }               // &&
+    if a == 124 && b == 124 { return true }             // ||
+    if b == 61 { return a == 61 || a == 33 || a == 60 || a == 62 }   // == != <= >=
+    return false
+}
+
+/// true when `c` is a single-character operator. `/` is included: the `//` case already returned.
+fn ce_op1(c: Int) -> Bool {
+    return c == 45 || c == 43 || c == 42 || c == 47 || c == 60 || c == 62 || c == 61 || c == 33
+}
+
+/// highlight spans for one line of `language`. An unknown language yields none, which paints the
+/// line in the default text colour, the right answer for plain text.
+pub fn language_line_spans(language: Str, line: Str) -> Vec<HighlightSpan> {
+    if (language == "nori") { return nori_line_spans(line) }
+    if (language == "manifest") { return manifest_line_spans(line) }
+    if (language == "diagnostics") { return diagnostics_line_spans(line) }
+    var none: Vec<HighlightSpan> = vec()
+    return none
+}
+
+/// one line of a compiler report, coloured.
+///
+/// Purely syntactic, like every other language here: what a line's shape is, never what it means.
+/// This paints the report `noric` and `roll` write, the one a person reads, so that the
+/// same text can be selected and copied out of a panel instead of being redrawn as rows of labels
+/// that no pointer can take a span of.
+///
+/// The shapes, and nothing beyond them:
+///
+///   `== package <dir>`     a package boundary in a `--all` run
+///   `◆ …` / `▲ …`          the severity marker, and the message on the same line
+///   `  <file> · <L>:<C>`   where it is
+///   `▸ …`                  the suggested fix
+///   `  123 ▏ …`            the echoed source line, and the `━━━` underline beneath it
+///
+/// The glyphs are matched by bytes: the buffer is byte-indexed, and each of these is multi-byte
+/// UTF-8: ◆ is E2 97 86, ▲ is E2 96 B2, ▸ is E2 96 B8, · is C2 B7, ━ is E2 94 81, ▏ is E2 96 8F.
+pub fn diagnostics_line_spans(line: Str) -> Vec<HighlightSpan> {
+    var out: Vec<HighlightSpan> = vec()
+    let n = line.len()
+    if n == 0 { return out }
+    var a = 0
+    while a < n && ord(line.at(a)) == 32 { a = a + 1 }
+    if a >= n { return out }
+
+    // `== package <dir>`, the heading of one package's run
+    if n > a + 2 {
+        if ord(line.at(a)) == 61 && ord(line.at(a + 1)) == 61 {
+            out.push(highlight_span(a, n, "keyword"))
+            return out
+        }
+    }
+    // a severity marker, which owns the line: the message is part of it. A location standing right
+    // after the marker (`◆  file:12:3  message`, the shape a problem list is written in, as opposed
+    // to the compiler's own two-line form) is lifted out of it as a link, because that is the part
+    // you click.
+    if n >= a + 3 && ord(line.at(a)) == 226 {
+        let b = ord(line.at(a + 1))
+        let c = ord(line.at(a + 2))
+        var sev = ""
+        if b == 151 && c == 134 { sev = "error" }        // ◆
+        if b == 150 && c == 178 { sev = "warning" }      // ▲
+        if b == 150 && c == 184 { sev = "hint" }         // ▸
+        if sev.len() > 0 {
+            var t0 = a + 3
+            while t0 < n && ord(line.at(t0)) == 32 { t0 = t0 + 1 }
+            var t1 = t0
+            while t1 < n && !(ord(line.at(t1)) == 32) { t1 = t1 + 1 }
+            if t1 > t0 && looks_like_location(line.slice(t0, t1)) {
+                out.push(highlight_span(a, t0, sev))
+                out.push(highlight_span(t0, t1, "link"))
+                out.push(highlight_span(t1, n, sev))
+                return out
+            }
+            out.push(highlight_span(a, n, sev))
+            return out
+        }
+    }
+    // a location: `  <file> · <L>:<C>`. The path and the numbers are coloured apart, because the
+    // path is the thing a person reaches for and the numbers are how far down it.
+    var dot = 0 - 1
+    var i = a
+    while i + 1 < n { if ord(line.at(i)) == 194 && ord(line.at(i + 1)) == 183 { dot = i }  i = i + 1 }
+    if dot > a {
+        // The whole location is the link: the file and the line:column together, because that is
+        // what you click and what it takes to open the right place. Split across two classes it
+        // read as two pieces of coloured text and looked like neither.
+        out.push(highlight_span(a, n, "link"))
+        return out
+    }
+    // the underline under an echoed source line, and whatever it says
+    var bar = 0 - 1
+    i = a
+    while i + 2 < n {
+        if ord(line.at(i)) == 226 && ord(line.at(i + 1)) == 148 && ord(line.at(i + 2)) == 129 { bar = i  i = n }   // ━
+        i = i + 1
+    }
+    if bar >= 0 { out.push(highlight_span(bar, n, "operator"))  return out }
+    // the gutter of an echoed source line: `  123 ▏ …`. Only the number and the rule are painted;
+    // the code after them is somebody else's language and guessing at it would be worse than plain.
+    var d = a
+    while d < n && ord(line.at(d)) >= 48 && ord(line.at(d)) <= 57 { d = d + 1 }
+    if d > a {
+        var j = d
+        while j < n && ord(line.at(j)) == 32 { j = j + 1 }
+        if j + 2 < n {
+            if ord(line.at(j)) == 226 && ord(line.at(j + 1)) == 150 && ord(line.at(j + 2)) == 143 {   // ▏
+                out.push(highlight_span(a, d, "comment"))
+                out.push(highlight_span(j, j + 3, "comment"))
+            }
+        }
+    }
+    return out
+}
+
+/// whether `t` is `<something>:<digits>:<digits>`, a place, written the way every compiler and
+/// every editor writes one.
+///
+/// Shape, not existence. Whether that file is there is not a question this module can ask, and a
+/// location that has been deleted since the run should still look like the location it is.
+fn looks_like_location(t: Str) -> Bool {
+    var c2 = 0 - 1
+    var c1 = 0 - 1
+    var i = 0
+    while i < t.len() {
+        if ord(t.at(i)) == 58 { c1 = c2  c2 = i }
+        i = i + 1
+    }
+    if c1 <= 0 || c2 <= c1 + 1 || c2 >= t.len() - 1 { return false }
+    var k = c1 + 1
+    while k < c2 { if ord(t.at(k)) < 48 || ord(t.at(k)) > 57 { return false }  k = k + 1 }
+    k = c2 + 1
+    while k < t.len() { if ord(t.at(k)) < 48 || ord(t.at(k)) > 57 { return false }  k = k + 1 }
+    return true
+}
+
+/// one line of a `nori.manifest`, coloured.
+///
+/// Purely syntactic: what a line's shape is, never what its words mean. Whether `auto-loop` is a
+/// key that exists is a question for `std/manifest`, which owns the schema; this module has no
+/// business importing a build system to paint a word, and a manifest for a toolchain that grew a
+/// key yesterday should still colour correctly today.
+///
+/// Four shapes and no more: a comment, a `[section]`, a `key = value`, and a blank.
+pub fn manifest_line_spans(line: Str) -> Vec<HighlightSpan> {
+    var out: Vec<HighlightSpan> = vec()
+    var a = 0
+    while a < line.len() && ord(line.at(a)) == 32 { a = a + 1 }
+    if a >= line.len() { return out }
+    let c = ord(line.at(a))
+    if c == 35 { out.push(highlight_span(a, line.len(), "comment"))  return out }
+    if c == 91 {
+        var close = line.len()
+        var k = a
+        while k < line.len() { if ord(line.at(k)) == 93 && close == line.len() { close = k + 1 }  k = k + 1 }
+        out.push(highlight_span(a, close, "type"))
+        if close < line.len() { mf_tail_comment(out, line, close) }
+        return out
+    }
+    var eq = 0 - 1
+    var j = a
+    while j < line.len() { if ord(line.at(j)) == 61 && eq < 0 { eq = j }  j = j + 1 }
+    if eq < 0 {
+        // not a pair: nothing to say about it in colour; `std/manifest` is what calls it an error
+        return out
+    }
+    var ke = eq
+    while ke > a && ord(line.at(ke - 1)) == 32 { ke = ke - 1 }
+    out.push(highlight_span(a, ke, "keyword"))
+    out.push(highlight_span(eq, eq + 1, "operator"))
+    var vs = eq + 1
+    while vs < line.len() && ord(line.at(vs)) == 32 { vs = vs + 1 }
+    var ve = line.len()
+    var h = vs
+    while h < line.len() { if ord(line.at(h)) == 35 && ve == line.len() { ve = h }  h = h + 1 }
+    var te = ve
+    while te > vs && ord(line.at(te - 1)) == 32 { te = te - 1 }
+    if te > vs {
+        // A number looks like one. `opt = 2` and `version = 0.1.0` read as values rather than as
+        // prose, which is the only distinction worth drawing in a file this small.
+        if mf_numeric(line, vs, te) { out.push(highlight_span(vs, te, "number")) }
+        else { out.push(highlight_span(vs, te, "string")) }
+    }
+    if ve < line.len() { mf_tail_comment(out, line, ve) }
+    return out
+}
+
+/// the trailing `# …` of a line, if there is one.
+fn mf_tail_comment(inout out: Vec<HighlightSpan>, line: Str, from: Int) {
+    var i = from
+    while i < line.len() {
+        if ord(line.at(i)) == 35 { out.push(highlight_span(i, line.len(), "comment"))  return }
+        i = i + 1
+    }
+}
+
+/// is `line[a..b]` digits and dots?
+fn mf_numeric(line: Str, a: Int, b: Int) -> Bool {
+    if b <= a { return false }
+    var i = a
+    while i < b {
+        let c = ord(line.at(i))
+        if !((c >= 48 && c <= 57) || c == 46) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ---- the paint ------------------------------------------------------------
+
+/// push `pr` scissored to `clip`.
+///
+/// `visible_line_range` returns five lines of overscan either side of the viewport, so
+/// a scrolled editor always emits primitives above and below its own rectangle. That is the
+/// contract, and the caller is expected to scissor; without it a scrolled editor would paint its
+/// overscan straight over the toolbar and the menu bar above it.
+///
+/// Rect primitives are intersected as well as clipped, the way `merge_clipped_overlay` does it;
+/// text carries the clip and is left to the renderer's scissor, because a partially visible top
+/// line is normal in an editor and dropping it on an anchor test would make scrolling flicker.
+fn ce_push(inout prims: Vec<PaintPrimitive>, pr: PaintPrimitive, clip: Rect) {
+    var own = copy pr
+    own.has_clip = true
+    // One push, at the end. Pushing in the text branch and then writing `own.rect` in the other
+    // reads as writing through a value a container already owns, even though the branches are
+    // exclusive.
+    if own.kind != 2 {
+        if let Option::Some(cut) = own.rect.intersect(clip) { own.rect = cut } else { return }
+    }
+    own.clip = rect_dup(clip)
+    prims.push(own)
+}
+
+// ---- visual rows -----------------------------------------------------------------------------
+// A logical line is what the buffer has between newlines. A visual row is what gets one line box on
+// screen. They are the same thing until word wrap is on, and then one logical line becomes several.
+//
+// Everything downstream (the paint, the caret's pixel position, the hit test) works in visual
+// rows, because they are what the screen is made of. Building them is the only place the two models
+// meet, which is what keeps a wrapped click landing on the character it was aimed at.
+
+/// one visual row: a slice [start, end) of the buffer, and which logical line it came from.
+pub struct CeRow { line: Int, start: Int, end: Int }
+
+/// the visual rows of `state.text` laid out for a content width of `content_w`.
+///
+/// With `wrap` false this is one row per logical line and `content_w` is ignored. With it true, a
+/// line too wide to fit is broken at the last space that fits; a run with no space in it, such as a long
+/// path or a base64 blob, is broken mid-word rather than allowed to overflow, because a wrap mode
+/// that sometimes does not wrap is worse than one that occasionally splits a token.
+///
+/// Cost: this walks the whole buffer, so it is O(document) per call and the virtualization above it
+/// only saves the painting, not the measuring. That is fine for source files and would not be for a
+/// log; the fix, when it is needed, is caching these against a buffer revision.
+pub fn code_editor_rows(state: MultilineEditState, content_w: Float, size_px: Float, wrap: Bool) -> Vec<CeRow> {
+    var out: Vec<CeRow> = vec()
+    // One pass over the text, finding each line end as we reach it.
+    //
+    // Asking `me_line_start(text, li)` and `me_line_end_index(text, ls)` for every line would
+    // rescan from offset 0 each time, making the row list O(lines x characters). A frame builds it
+    // two or three times (once to lay the widget out, once more inside code_editor_caret_pos, and
+    // again in code_editor_caret_at for every mouse-move of a selection drag), so a single sweep
+    // keeps the cost linear: twice the file is twice the work rather than four times.
+    let n = state.text.len()
+    var li = 0
+    var ls = 0
+    var more = true
+    while more {
+        var le = ls
+        while le < n && ord(state.text.at(le)) != 10 { le = le + 1 }
+        if !wrap || content_w <= 0.0 {
+            out.push(CeRow { line: li, start: ls, end: le })
+        } else {
+            var rs = ls
+            while rs <= le {
+                if rs == le { out.push(CeRow { line: li, start: rs, end: le })  rs = le + 1 }
+                else {
+                    var w = 0.0
+                    var i = rs
+                    var last_space = 0 - 1
+                    var brk = 0 - 1
+                    while i < le && brk < 0 {
+                        let c = ord(state.text.at(i))
+                        if c == 32 || c == 9 { last_space = i }
+                        w = w + fallback_char_advance(c, size_px)
+                        if w > content_w {
+                            // break after the space, so the space stays on the row it ended
+                            if last_space > rs { brk = last_space + 1 } else { brk = i }
+                            if brk <= rs { brk = rs + 1 }
+                        }
+                        i = i + 1
+                    }
+                    // a row never ends inside a character or a grapheme cluster
+                    if brk > rs && brk < le {
+                        let snapped = text_snap_cluster(state.text, brk)
+                        if snapped > rs { brk = snapped } else { brk = text_next_cluster(state.text, rs) }
+                    }
+                    if brk < 0 { out.push(CeRow { line: li, start: rs, end: le })  rs = le + 1 }
+                    else { out.push(CeRow { line: li, start: rs, end: brk })  rs = brk }
+                }
+            }
+        }
+        li = li + 1
+        // a trailing newline still starts an empty last line, which is what me_line_count counts
+        if le >= n { more = false } else { ls = le + 1 }
+    }
+    if out.len() == 0 { out.push(CeRow { line: 0, start: 0, end: 0 }) }
+    return out
+}
+
+/// the index of the visual row holding `off`, or the last row.
+///
+/// A caret at a wrap point belongs to the row it starts, not the one it ends, which is what makes
+/// pressing End then Right move to the next visual row rather than sitting still.
+pub fn ce_row_of(rows: Vec<CeRow>, off: Int) -> Int {
+    var i = 0
+    while i < rows.len() {
+        if off >= rows[i].start && off <= rows[i].end {
+            // prefer the row that starts here when two rows touch
+            if off == rows[i].end && i + 1 < rows.len() {
+                if rows[i + 1].start == off { return i + 1 }
+            }
+            return i
+        }
+        i = i + 1
+    }
+    return rows.len() - 1
+}
+
+/// the caret's pixel position (top-left of its cell) for a widget at `rect`.
+pub fn code_editor_caret_pos(state: MultilineEditState, rect: Rect, size_px: Float, line_numbers: Bool, wrap: Bool) -> Vec2 {
+    var content = code_editor_content_rect(state, rect, size_px, line_numbers)
+    var rows = code_editor_rows(state, content.width(), size_px, wrap)
+    var style = text_measure_style(size_px)
+    var line_h = text_line_height(style.size_px)
+    var ri = ce_row_of(rows, state.caret)
+    var r = rows[ri]
+    var x = content.min.x - state.scroll_x + text_measure_width(state.text.slice(r.start, state.caret), style)
+    var y = content.min.y - state.scroll_y + to_float(ri) * line_h
+    return vec2(x, y)
+}
+
+/// the width of the widest row, which is what a horizontal scrollbar has to span.
+pub fn code_editor_content_width(state: MultilineEditState, rows: Vec<CeRow>, size_px: Float) -> Float {
+    var style = text_measure_style(size_px)
+    var w = 0.0
+    var i = 0
+    while i < rows.len() {
+        var rw = text_measure_width(state.text.slice(rows[i].start, rows[i].end), style)
+        if rw > w { w = rw }
+        i = i + 1
+    }
+    return w
+}
+
+/// the rectangle the text occupies inside `rect`: past the gutter, inside the padding.
+///
+/// Shared by the paint and the hit test. A click maps back to a caret only if it is
+/// measured against the same content rect the glyphs were placed in, and two copies of
+/// `gw + 8` would eventually disagree, putting the caret one column off near the gutter.
+pub fn code_editor_content_rect(state: MultilineEditState, rect: Rect, size_px: Float, line_numbers: Bool) -> Rect {
+    var gw = me_gutter_width(me_line_count(state.text), size_px, line_numbers)
+    return rect_min_max(vec2(rect.min.x + gw + 8.0, rect.min.y + 8.0), vec2(rect.max.x - 8.0, rect.max.y - 8.0))
+}
+
+/// the caret offset for a point in widget-local coordinates, where (0,0) is the widget's top-left.
+///
+/// Local rather than absolute because the caller that needs this is usually a plugin, which is told
+/// the size of its widget but not where the shell put it. Scroll is already in `state`, so this is
+/// the inverse of what `layout_code_editor` drew.
+pub fn code_editor_caret_at(state: MultilineEditState, w: Float, h: Float, size_px: Float, line_numbers: Bool, wrap: Bool, lx: Float, ly: Float) -> Int {
+    var rect = rect_min_size(vec2(0.0, 0.0), vec2(w, h))
+    var content = code_editor_content_rect(state, rect, size_px, line_numbers)
+    var rows = code_editor_rows(state, content.width(), size_px, wrap)
+    var style = text_measure_style(size_px)
+    var line_h = text_line_height(style.size_px)
+
+    var ri = to_int(math::floor((ly - content.min.y + state.scroll_y) / line_h))
+    if ri < 0 { ri = 0 }
+    if ri > rows.len() - 1 { ri = rows.len() - 1 }
+    var r = rows[ri]
+
+    // nearest caret stop by advance width, within this row's slice (the same walk me_hit_to_caret
+    // does per logical line, which is why a wrapped row cannot be hit-tested by that function). The
+    // stops are between grapheme clusters, measured the way the row is drawn: its runs in order
+    // (a code editor draws a row's coloured runs left to right; it does not reorder them).
+    var rel_x = math::fmax(lx - content.min.x + state.scroll_x, 0.0)
+    let tc = text_carets(state.text.slice(r.start, r.end), style, 0, false)
+    if !tc.bidi { return r.start + text_carets_hit(tc, rel_x) }   // a tie rounds to the higher column
+    let cum = text_measure_cumulative_x(state.text.slice(r.start, r.end), style)
+    var best = 0
+    var bestd = 0.0 - 1.0
+    var k = 0
+    while k < tc.gs.len() {
+        var d = cum[tc.gs[k]] - rel_x
+        if d < 0.0 { d = 0.0 - d }
+        if bestd < 0.0 || d <= bestd { bestd = d  best = tc.gs[k] }
+        k = k + 1
+    }
+    return r.start + best
+}
+
+/// lay a syntax-highlighted editor out into `rect`.
+///
+/// Structurally the same pass as `layout_multiline_edit` (gutter numbers, current-line highlight,
+/// per-line selection rects, visible lines with overscan, caret) with the single flat `pp_text` per
+/// line replaced by one `pp_text` per coloured run. `opts.line_numbers` and `opts.highlight_current`
+/// are honoured rather than forced off, because unlike `text_area` this widget is the gutter one.
+///
+/// `pal` supplies the colours; build it with `palette_defaults(opts.text_color)` for the built-in
+/// scheme, or `palette_new(default, sheet)` to let a stylesheet override token classes.
+pub fn layout_code_editor(state: MultilineEditState, rect: Rect, size_px: Float, focused: Bool, opts: MultilinePaintOpts, pal: SyntaxTokenPalette, language: Str, wrap: Bool) -> Vec<PaintPrimitive> {
+    var prims: Vec<PaintPrimitive> = vec()
+    var style = text_measure_style(size_px)
+    var line_h = text_line_height(style.size_px)
+    var gw = me_gutter_width(me_line_count(state.text), size_px, opts.line_numbers)
+    var content = code_editor_content_rect(state, rect, size_px, opts.line_numbers)
+    var rows = code_editor_rows(state, content.width(), size_px, wrap)
+    var vr = visible_line_range(content.height(), state.scroll_y, line_h, rows.len(), 5)
+
+    // Two clips, not one. The gutter is pinned and the text scrolls under it, so text clipped to the
+    // whole widget would slide straight over the line numbers as soon as `scroll_x` is non-zero.
+    // Everything that moves with the text is scissored at the content's left edge instead; only the gutter gets the full
+    // rectangle, and it never moves.
+    var textclip = rect_min_max(vec2(content.min.x, rect.min.y), vec2(rect.max.x, rect.max.y))
+    let (sa, sb) = me_selection(state)
+    var cri = ce_row_of(rows, state.caret)
+
+    // the bracket under the caret and its partner, so both can be boxed. Computed once for the
+    // document, not per row, because the partner is usually off-screen.
+    var bm = bracket_partner_index(state.text, state.caret)
+
+    var ri = vr.start
+    while ri < vr.end {
+        var r = rows[ri]
+        var ls = r.start
+        var le = r.end
+        var y = content.min.y - state.scroll_y + to_float(ri) * line_h
+
+        if opts.highlight_current && focused && ri == cri {
+            ce_push(prims, pp_rect(rect_min_size(vec2(content.min.x, y), vec2(content.width(), line_h)), opts.current_line_color, 0.0), textclip)
+        }
+
+        if sa != sb && sa < le + 1 && sb > ls {
+            var segs = sa
+            if segs < ls { segs = ls }
+            var sege = sb
+            if sege > le { sege = le }
+            var x0 = content.min.x - state.scroll_x + text_measure_width(state.text.slice(ls, segs), style)
+            var x1 = content.min.x - state.scroll_x + text_measure_width(state.text.slice(ls, sege), style)
+            if sb > le { x1 = x1 + size_px * 0.26 }   // the selection spills past the row end
+            ce_push(prims, pp_rect(rect_min_size(vec2(x0, y), vec2(math::fmax(x1 - x0, 1.0), line_h)), opts.sel_color, 0.0), textclip)
+        }
+
+        // The gutter numbers the logical line, and only on the row that starts it. A wrapped line
+        // showing its number three times would read as three lines; showing nothing on the
+        // continuation rows is how every editor says "this is the same line, still".
+        if opts.line_numbers {
+            var first_of_line = true
+            if ri > 0 { if rows[ri - 1].line == r.line { first_of_line = false } }
+            if first_of_line {
+                var numtext = to_str(r.line + 1)
+                var nw = text_measure_width(numtext, style)
+                ce_push(prims, pp_text(vec2(rect.min.x + gw - nw - 6.0, y), numtext, opts.gutter_text_color, size_px), rect)
+            }
+        }
+
+        // What the checker said about this row: the span underlined where it actually is, and a
+        // dot in the margin in the same colour.
+        //
+        // A diagnostic's column counts from the start of the logical line, while a row is a slice
+        // of one, so the span is resolved against the line and then clipped to the row, which is
+        // also what makes an underline continue correctly onto the next row of a wrapped line
+        // instead of stopping at the fold. Painted whether or not the row is `lit`: an error on a
+        // line the xray has dimmed is still an error.
+        var diag_here = false
+        var dj = 0
+        while dj < opts.diags.len() {
+            if opts.diags[dj].line == r.line + 1 {
+                diag_here = true
+                var dcol = opts.diag_warn_color
+                if opts.diags[dj].sev == 1 { dcol = opts.diag_err_color }
+                let lstart = me_line_start(state.text, r.line)
+                var a0 = lstart + opts.diags[dj].col - 1
+                var a1 = a0 + opts.diags[dj].len
+                if a0 < ls { a0 = ls }
+                if a1 > le { a1 = le }
+                if a1 > a0 {
+                    var ux0 = content.min.x - state.scroll_x + text_measure_width(state.text.slice(ls, a0), style)
+                    var ux1 = content.min.x - state.scroll_x + text_measure_width(state.text.slice(ls, a1), style)
+                    ce_push(prims, pp_rect(rect_min_size(vec2(ux0, y + line_h - 2.0), vec2(math::fmax(ux1 - ux0, 2.0), 1.5)), dcol, 0.0), textclip)
+                }
+                var firstd = true
+                if ri > 0 { if rows[ri - 1].line == r.line { firstd = false } }
+                if firstd {
+                    var g = "▲"
+                    if opts.diags[dj].sev == 1 { g = "●" }
+                    ce_push(prims, pp_text(vec2(rect.min.x + 2.0, y), g, dcol, size_px), rect)
+                }
+            }
+            dj = dj + 1
+        }
+        // The mark rail, left of the numbers, on the row that starts the logical line: a lifeline
+        // drawn three times down a wrapped line would read as three values.
+        if r.line < opts.marks.len() {
+            var first_mark = true
+            if ri > 0 { if rows[ri - 1].line == r.line { first_mark = false } }
+            if first_mark { if opts.marks[r.line].len() > 0 {
+                // Out of the dot's way when a line has both. They share this column, and a lifeline
+                // drawn on top of an error dot loses both.
+                var railx = rect.min.x + 2.0
+                if diag_here { railx = railx + size_px * 0.72 }
+                ce_push(prims, pp_text(vec2(railx, y), opts.marks[r.line], opts.mark_color, size_px), rect)
+            } }
+        }
+        // Outside the focus, a line is painted flat and dim, with no syntax colours at all. Losing the
+        // colouring is the point: what is left reads as background, and the lit span reads as the
+        // answer without anything being added to the screen to say so.
+        var lit = true
+        if opts.focus_to > 0 { if r.line + 1 < opts.focus_from || r.line + 1 > opts.focus_to { lit = false } }
+        if le > ls { if !lit {
+            ce_push(prims, pp_text(vec2(content.min.x - state.scroll_x, y), state.text.slice(ls, le), opts.note_color, size_px), textclip)
+        } }
+        if le > ls && lit {
+            var line = state.text.slice(ls, le)
+            // Which logical line this row belongs to, so a hovered link can be drawn as hovered. A
+            // wrapped line is several rows and one line; the caller's `hot_line` counts lines.
+            let (hl, _hc) = me_line_col_at(state.text, ls)
+            ce_paint_line(prims, line, language, pal, opts, content.min.x - state.scroll_x, y, size_px, style, textclip, hl == opts.hot_line)
+            ce_bracket_box(prims, state, bm, ls, le, line, style, content.min.x - state.scroll_x, y, line_h, pal, textclip)
+            // ...and what the compiler said about this line, after it and dim, so it reads as an aside
+            // rather than as code.
+            if r.line < opts.notes.len() { if opts.notes[r.line].len() > 0 {
+                var lastrow = true
+                if ri + 1 < rows.len() { if rows[ri + 1].line == r.line { lastrow = false } }
+                if lastrow {
+                    var lw = text_measure_width(line, style)
+                    ce_push(prims, pp_text(vec2(content.min.x - state.scroll_x + lw + size_px * 1.2, y),
+                                           opts.notes[r.line], opts.note_color, size_px), textclip)
+                }
+            } }
+        }
+        ri = ri + 1
+    }
+
+    if focused && caret_on() {
+        var cpos = code_editor_caret_pos(state, rect, size_px, opts.line_numbers, wrap)
+        ce_push(prims, pp_rect(rect_min_size(cpos, vec2(1.5, line_h)), opts.caret_color, 0.0), textclip)
+    }
+    return prims
+}
+
+/// paint one row as coloured runs: each span in its token colour, each gap in the default.
+///
+/// The lexer runs on the row's slice, not the logical line's. For unwrapped text those are the same
+/// string. For a wrapped one they are not, and a `//` comment or a string literal that opened on an
+/// earlier row of the same line is not recognised on its continuation: the continuation is lexed
+/// as though it began there. Correcting that needs the lexer to carry state across rows, which is
+/// the same machinery a block comment would need, and neither exists.
+///
+/// Every run's x is measured from the start of the line rather than accumulated, so a
+/// proportional font cannot drift; the selection rects above measure from `ls` for the same reason.
+fn ce_paint_line(inout prims: Vec<PaintPrimitive>, line: Str, language: Str, pal: SyntaxTokenPalette, opts: MultilinePaintOpts, x0: Float, y: Float, size_px: Float, style: TextMeasureStyle, clip: Rect, hot: Bool) {
+    var spans = language_line_spans(language, line)
+    var n = line.len()
+    var at = 0
+    var si = 0
+    while si < spans.len() {
+        var sp = spans[si]
+        var s0 = sp.start_col
+        var s1 = sp.end_col
+        if s0 > n { s0 = n }
+        if s1 > n { s1 = n }
+        if s0 > at {
+            ce_push(prims, pp_text(vec2(x0 + text_measure_width(line.slice(0, at), style), y), line.slice(at, s0), opts.text_color, size_px), clip)
+        }
+        if s1 > s0 {
+            let rx = x0 + text_measure_width(line.slice(0, s0), style)
+            // a link on the hovered line is drawn in its own colour, which is the whole of the
+            // hover: brighter text and a heavier rule, so the pointer being on it is visible
+            // without moving anything.
+            var cls = sp.cls
+            if hot && sp.cls == "link" { cls = "link_hot" }
+            ce_push(prims, pp_text(vec2(rx, y), line.slice(s0, s1), palette_color(pal, cls), size_px), clip)
+            // A `link` run is underlined, because that is what says it can be clicked.
+            //
+            // As a rect rather than a text decoration: a PaintPrimitive carries no decoration field
+            // (`text_decoration` on a `text` node builds separate rects too), and a rule under one
+            // run of a line is not something the node-level attribute could express anyway.
+            if sp.cls == "link" {
+                let lw = text_measure_width(line.slice(s0, s1), style)
+                var rule = 1.0
+                if hot { rule = 2.0 }
+                ce_push(prims, pp_rect(rect_min_size(vec2(rx, y + size_px + 1.0), vec2(lw, rule)),
+                                       palette_color(pal, cls), 0.0), clip)
+            }
+            at = s1
+        }
+        si = si + 1
+    }
+    if at < n {
+        ce_push(prims, pp_text(vec2(x0 + text_measure_width(line.slice(0, at), style), y), line.slice(at, n), opts.text_color, size_px), clip)
+    }
+}
+
+/// box the bracket at the caret and its partner, when either falls on this line.
+fn ce_bracket_box(inout prims: Vec<PaintPrimitive>, state: MultilineEditState, bm: BracketMatch, ls: Int, le: Int, line: Str, style: TextMeasureStyle, x0: Float, y: Float, line_h: Float, pal: SyntaxTokenPalette, clip: Rect) {
+    if !bm.present { return }
+    var col = palette_color(pal, "bracket_match")
+    ce_box_at(prims, state.caret, ls, le, line, style, x0, y, line_h, col, clip)
+    ce_box_at(prims, bm.index, ls, le, line, style, x0, y, line_h, col, clip)
+}
+
+/// a one-character box at document offset `idx`, if it lies on the line [ls, le).
+fn ce_box_at(inout prims: Vec<PaintPrimitive>, idx: Int, ls: Int, le: Int, line: Str, style: TextMeasureStyle, x0: Float, y: Float, line_h: Float, copy col: Color, clip: Rect) {
+    if idx < ls || idx >= le { return }
+    var a = x0 + text_measure_width(line.slice(0, idx - ls), style)
+    var b = x0 + text_measure_width(line.slice(0, idx - ls + 1), style)
+    ce_push(prims, pp_rect(rect_min_size(vec2(a, y), vec2(math::fmax(b - a, 1.0), line_h)), col, 0.0), clip)
+}

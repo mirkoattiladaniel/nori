@@ -1,0 +1,50 @@
+use core::*
+import "std/math" as math
+
+// ===========================================================================
+// The measure and layout dispatch for the node kinds added on top of the overlay
+// core: image, checkbox, slider, dropdown, number, text_input, text_area,
+// picker.
+//
+// `ui_measure` and `ui_layout_node` in runtime_document.nori are single long
+// if/else chains. Adding eight kinds inline would put eight families of
+// geometry into two functions that are already the two longest in the library.
+// Instead runtime_document.nori asks `ui_kind_is_ext` once and delegates here,
+// and this file fans out to one pair of functions per family, each living in
+// that family's own root file:
+//
+//     dsl_widgets.nori   checkbox, slider, dropdown   (divider is a rect)
+//     dsl_input.nori     number, text_input, text_area, picker
+//     dsl_media.nori     image
+//
+// All of these are root files of std/nori_ui/layout and share one scope, so the
+// calls below need no imports and no `pub`.
+//
+// The geometry is derived from layout/widget.nori rather than delegating to it:
+// widget.nori emits DrawRect/TextLabel and needs a Theme, and the .ui path
+// emits PaintPrimitive and has none.
+
+/// true for the kinds whose measure/layout lives in a family file rather than in
+/// runtime_document.nori's own if/else chains.
+pub fn ui_kind_is_ext(kind: Int) -> Bool {
+    return kind == nk_image() || kind == nk_checkbox() || kind == nk_slider() || kind == nk_scrollbar() || kind == nk_dropdown() || kind == nk_number() || kind == nk_text_input() || kind == nk_text_area() || kind == nk_picker() || kind == nk_code_editor()
+}
+
+/// intrinsic size of an ext kind. Mirrors the shape of the `nk_button` arm in ui_measure.
+fn ui_measure_ext(node: UiNode, ctx: LayoutLengthContext) -> Vec2 {
+    var k = node.kind
+    if k == nk_image() { return ui_measure_media(node, ctx) }
+    if k == nk_checkbox() || k == nk_slider() || k == nk_scrollbar() || k == nk_dropdown() { return ui_measure_widgets(node, ctx) }
+    return ui_measure_input(node, ctx)
+}
+
+/// paint + hit an ext kind into `out`. Chrome (bg / hover / border) has already been emitted by
+/// ui_emit_chrome, and the generic whole-rect HitRegion has already been pushed when the node
+/// carries an `on_click`; a family that needs sub-region hits pushes them itself, largest rect first
+/// (overlay_hit_test walks backwards, so the last push wins).
+fn ui_layout_ext(inout node: UiNode, rect: Rect, ctx: LayoutLengthContext, inout out: ComputedOverlay) {
+    var k = node.kind
+    if k == nk_image() { ui_layout_media(node, rect, ctx, out)  return }
+    if k == nk_checkbox() || k == nk_slider() || k == nk_scrollbar() || k == nk_dropdown() { ui_layout_widgets(node, rect, ctx, out)  return }
+    ui_layout_input(node, rect, ctx, out)
+}

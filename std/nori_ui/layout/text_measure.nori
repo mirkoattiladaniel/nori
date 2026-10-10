@@ -1,0 +1,255 @@
+use core::*
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// text metrics
+//
+// With a face installed in the text engine (text_engine.nori; every painter's use_font_metrics
+// installs one), a width is the shaped width std/font gives: kerning, ligatures, Arabic joining,
+// Indic conjuncts, fallback faces. Without one this estimates: a per-character
+// advance table (set_char_advances) or a flat heuristic keyed off the font size.
+// ===========================================================================
+
+/// font/style inputs for measurement (size in px plus bold/italic/family and the two spacings), and
+/// what the text engine shapes with: the font stack (0 = the default; see text_engine.nori), the
+/// paragraph direction (dir_ltr/dir_rtl/dir_auto) and the language (BCP 47, "" for none).
+pub struct TextMeasureStyle { size_px: Float, font_bold: Bool, font_italic: Bool, has_font_family: Bool, font_family: Str, letter_spacing: Float, word_spacing: Float, stack: Int = 0, dir: Int = 2, lang: Str = "" }
+
+/// a measure style with just a size (no bold/italic/family, no extra spacing).
+pub fn text_measure_style(size_px: Float) -> TextMeasureStyle {
+    return TextMeasureStyle { size_px: size_px, font_bold: false, font_italic: false, has_font_family: false, font_family: "", letter_spacing: 0.0, word_spacing: 0.0 }
+}
+/// a measure style carrying `letter_spacing` / `word_spacing` (px). Both are clamped to >= 0 where
+/// they are applied.
+pub fn text_measure_style_sp(size_px: Float, letter_spacing: Float, word_spacing: Float) -> TextMeasureStyle {
+    return TextMeasureStyle { size_px: size_px, font_bold: false, font_italic: false, has_font_family: false, font_family: "", letter_spacing: letter_spacing, word_spacing: word_spacing }
+}
+
+// ---------------------------------------------------------------------------
+// letter_spacing / word_spacing
+//
+// The rule, following the usual text-width behaviour:
+//
+//     width = advances + (glyphs - 1) * max(letter_spacing, 0) + (words - 1) * max(word_spacing, 0)
+//
+// so letter spacing sits in the gaps between glyphs (a one-glyph line gets none, and there is no
+// trailing gap after the last glyph), and word spacing sits in the gaps between whitespace-separated
+// words (`split_whitespace().count() - 1`), which is not "once per space": a run of two spaces is
+// one gap, and leading/trailing whitespace is no gap at all.
+//
+// Measurement and both painters go through the same offsets table, because a string measured
+// at one width and drawn at another is worse than no support at all: text_spacing_offsets_cps is
+// the painters' entry (they already have the codepoints) and text_spacing_offsets_bytes is
+// measurement's (carets are byte offsets). The byte form is the codepoint form plus a byte -> glyph
+// map, so there is one rule and not two.
+// ---------------------------------------------------------------------------
+fn tms_is_ws(cp: Int) -> Bool { return cp == 32 || cp == 9 || cp == 13 || cp == 10 }
+/// cumulative extra advance before each of the `n` glyphs in `cps`, plus a final total: a table of
+/// `n + 1` floats where entry `i` is what to add to glyph `i`'s pen x and entry `n` is the whole
+/// line's extra width. Zero spacing gives an all-zero table (and costs one pass).
+pub fn text_spacing_offsets_cps(cps: Vec<Int>, letter_spacing: Float, word_spacing: Float) -> Vec<Float> {
+    var out: Vec<Float> = vec()
+    let g = cps.len()
+    var ls = letter_spacing
+    if ls < 0.0 { ls = 0.0 }
+    var ws = word_spacing
+    if ws < 0.0 { ws = 0.0 }
+    var cum = 0.0
+    var seen = false                                   // a non-space has been passed (no leading gap)
+    var k = 0
+    while k <= g {
+        out.push(cum)
+        if k < g {
+            var ex = 0.0
+            if k + 1 < g { ex = ex + ls }              // gaps = glyphs - 1, never a trailing gap
+            if ws > 0.0 && seen && tms_is_ws(cps[k]) && k + 1 < g && !tms_is_ws(cps[k + 1]) { ex = ex + ws }
+            if !tms_is_ws(cps[k]) { seen = true }
+            cum = cum + ex
+        }
+        k = k + 1
+    }
+    return out
+}
+/// the same table indexed by byte offset into `text` (`text.len() + 1` entries): entry `i` is the
+/// extra advance accumulated before the caret at byte `i`, and the last entry is the line total.
+/// A UTF-8 continuation byte carries its lead byte's value, so a multi-byte character is one glyph
+/// for spacing purposes, the same count the painters make from the decoded codepoints.
+pub fn text_spacing_offsets_bytes(text: Str, letter_spacing: Float, word_spacing: Float) -> Vec<Float> {
+    var out: Vec<Float> = vec()
+    let n = text.len()
+    var cps: Vec<Int> = vec()
+    var i = 0
+    while i < n {
+        let b = ord(text.at(i))
+        if b < 128 || b >= 192 { cps.push(b) }
+        i = i + 1
+    }
+    var off = text_spacing_offsets_cps(cps, letter_spacing, word_spacing)
+    var k = 0 - 1
+    i = 0
+    while i < n {
+        let b = ord(text.at(i))
+        if b < 128 || b >= 192 { k = k + 1 }
+        out.push(off[k])
+        i = i + 1
+    }
+    out.push(off[cps.len()])
+    return out
+}
+/// the total extra width `letter_spacing` / `word_spacing` add to one line of `text`.
+pub fn text_spacing_extra(text: Str, letter_spacing: Float, word_spacing: Float) -> Float {
+    if letter_spacing <= 0.0 && word_spacing <= 0.0 { return 0.0 }
+    var off = text_spacing_offsets_bytes(text, letter_spacing, word_spacing)
+    return off[off.len() - 1]
+}
+
+/// line metrics (height of a line box and its top offset).
+pub struct TextLineMetrics { line_height: Float, line_top: Float }
+
+/// the height of a line box at `size_px`. A line box's height is a function of the size alone, so
+/// callers that want only the number ask for it here instead of measuring a line and reading one
+/// field off the result.
+pub fn text_line_height(size_px: Float) -> Float { return size_px + 5.0 }
+
+/// px from a line box's top edge down to its baseline, for a face with these vertical metrics.
+///
+/// The baseline is placed relative to the box rather than hung from the face's ascender. The line
+/// box is `size + 5` and knows nothing about the face, so hanging glyphs from the ascent would move
+/// every glyph in the window down or up inside a box that had not moved whenever the font changed.
+/// DejaVuSansMono ascends 0.928 em and JetBrainsMono Nerd 1.020 em, which at 13px is a 1.2px
+/// drop of every label, every row of source and every button caption at once.
+///
+/// Instead the face's ink is centred in the box reserved for it. The leftover leading
+/// (box minus (ascent - descent + line_gap)) is split evenly above and below, so a taller face eats
+/// its own extra height symmetrically instead of pushing everything downwards. The same two faces
+/// then differ by 0.19px rather than 1.2px, and a face with a big descender (a Nerd font's icons)
+/// does not hang out of the bottom of its row.
+///
+/// `descent` is negative, as `font_v_metrics_px` reports it.
+pub fn text_baseline_in_box(size_px: Float, ascent: Float, descent: Float, line_gap: Float) -> Float {
+    let ink = ascent - descent + line_gap
+    return (text_line_height(size_px) - ink) * 0.5 + ascent
+}
+
+/// fallback line metrics for a font size (height = size + 5, top = 0).
+pub fn text_line_metrics_fallback(size_px: Float) -> TextLineMetrics { return TextLineMetrics { line_height: text_line_height(size_px), line_top: 0.0 } }
+
+// An optional real-metrics table: 256 per-byte advances at 1px em (i.e. advance_units / units_per_em),
+// so `advance(px) = table[byte] * px`. A consumer with an actual font (e.g. std/nori_ui/paint_cpu, which has
+// std/font) installs it via set_char_advances; nori_ui stays font-independent and falls back to the
+// heuristic when it is unset. This makes auto-sized elements (buttons, wrapping) match the pixels a
+// real rasterizer draws, instead of the flat 0.52em guess.
+// Advances are stored as 16.16 fixed point (advance_per_em * 65536) in a Vec<Int>, not Vec<Float>:
+// indexing a `global Vec<Float>` reads the element as raw Int bits,
+// so the table is kept as integers and converted on read.
+global g_char_adv: Vec<Int>
+global g_has_adv: Int = 0
+/// install a 256-entry per-byte advance table so text measurement matches a real font. Each entry is
+/// `advance_units / units_per_em * 65536` (16.16 fixed point). Clears to the heuristic if `< 256`.
+pub fn set_char_advances(adv: Vec<Int>) {
+    if adv.len() < 256 { g_has_adv = 0  return }
+    g_char_adv = copy adv
+    g_has_adv = 1
+}
+
+/// approximate advance width of one ASCII byte `ch` at `size_px`: the installed real-metrics table
+/// if set (see set_char_advances), else the flat heuristic.
+pub fn fallback_char_advance(ch: Int, size_px: Float) -> Float {
+    // A UTF-8 continuation byte is not a character, and is worth no width.
+    //
+    // Every caller walks bytes (`while i < n { sum = sum + fallback_char_advance(ord(text.at(i))`),
+    // so without this a three-byte glyph would be charged three character widths. The renderer shapes
+    // glyphs and draws one, so the two would disagree by two cells for every non-ASCII character in
+    // the line, and the disagreement would accumulate left to right: clicking the middle of a line
+    // would put the caret near its end.
+    //
+    // Zero, rather than a share of the glyph's width, so that the running total is exact at every
+    // glyph boundary, which is where a caret is allowed to land. The `<=` in the hit-test walk then
+    // carries the caret past the whole glyph rather than into the middle of one, and a `slice` at
+    // the caret cannot cut a character in half.
+    if ch >= 128 && ch < 192 { return 0.0 }
+    if g_has_adv == 1 && ch >= 0 && ch < 256 { return to_float(g_char_adv[ch]) * size_px / 65536.0 }
+    var digit_w = size_px * 0.52
+    if ch >= 48 && ch <= 57 { return digit_w }          // 0-9
+    if ch == 46 || ch == 44 { return digit_w * 0.42 }   // . ,
+    if ch == 45 || ch == 43 { return digit_w * 0.55 }   // - +
+    return digit_w
+}
+
+/// approximate width of the first `caret` chars of `text` at `size_px` (fallback heuristic).
+pub fn fallback_advance_to_caret(text: Str, caret: Int, size_px: Float) -> Float {
+    var sum = 0.0
+    var i = 0
+    var n = caret
+    if n > text.len() { n = text.len() }
+    while i < n { sum = sum + fallback_char_advance(ord(text.at(i)), size_px)  i = i + 1 }
+    return sum
+}
+
+/// cumulative caret X for every position 0..=len(text) (table for caret placement), in logical
+/// order: entry `i` is the advance of the text before byte `i`. With the text engine on this is the
+/// shaped line's (a ligature's advance shared over the clusters inside it).
+pub fn text_measure_cumulative_x(text: Str, style: TextMeasureStyle) -> Vec<Float> {
+    var xs: Vec<Float> = vec()
+    if text.len() == 0 { xs.push(0.0)  return xs }
+    var off = text_spacing_offsets_bytes(text, style.letter_spacing, style.word_spacing)
+    if text_engine_on() {
+        let lx = text_engine_logical_x(text, style.size_px, style.stack, style.dir, style.lang)
+        var k = 0
+        while k <= text.len() { xs.push(lx[k] + off[k])  k = k + 1 }
+        return xs
+    }
+    // a running sum: the same additions in the same order as fallback_advance_to_caret(text, i) makes
+    // for each i, so the table is bit-identical to measuring every prefix, in one pass
+    var sum = 0.0
+    var i = 0
+    while i <= text.len() {
+        xs.push(sum + off[i])
+        if i < text.len() { sum = sum + fallback_char_advance(ord(text.at(i)), style.size_px) }
+        i = i + 1
+    }
+    return xs
+}
+
+/// total advance width of `text` at the style's size.
+pub fn text_measure_width(text: Str, style: TextMeasureStyle) -> Float {
+    if text.len() == 0 { return 0.0 }
+    if text_engine_on() { return text_engine_width(text, style.size_px, style.stack, style.dir, style.lang) + text_spacing_extra(text, style.letter_spacing, style.word_spacing) }
+    return fallback_advance_to_caret(text, text.len(), style.size_px) + text_spacing_extra(text, style.letter_spacing, style.word_spacing)
+}
+
+/// caret X at index `caret` from a precomputed cumulative table (clamped to the table).
+pub fn text_measure_width_from_cumulative(cumulative_x: Vec<Float>, caret: Int) -> Float {
+    if cumulative_x.len() == 0 { return 0.0 }
+    var idx = caret
+    if idx < 0 { idx = 0 }
+    if idx > cumulative_x.len() - 1 { idx = cumulative_x.len() - 1 }
+    return cumulative_x[idx]
+}
+
+/// caret X at index `caret` within `text` (reshapes; prefer the cumulative form in hot loops).
+pub fn text_measure_width_to_caret(text: Str, caret: Int, style: TextMeasureStyle) -> Float {
+    return text_measure_width_from_cumulative(text_measure_cumulative_x(text, style), caret)
+}
+
+/// line metrics for `text` (fallback: depends only on the font size).
+pub fn text_measure_line(style: TextMeasureStyle, text: Str) -> TextLineMetrics {
+    return text_line_metrics_fallback(style.size_px)
+}
+
+/// visual glyph top + height for `text` (fallback: the line box top/height).
+pub fn text_measure_glyph_extent(text: Str, style: TextMeasureStyle) -> TextLineMetrics {
+    return text_line_metrics_fallback(style.size_px)
+}
+
+/// top-left position to anchor `text` inside `bounds`; anchors ax/ay in [0,1] (0=start, 1=end).
+pub fn text_measure_draw_pos(bounds: Rect, text: Str, style: TextMeasureStyle, ax: Float, ay: Float) -> Vec2 {
+    var sample = text
+    if sample.len() == 0 { sample = " " }
+    var text_w = text_measure_width(sample, style)
+    var text_h = style.size_px + 5.0
+    var cax = math::fclamp(ax, 0.0, 1.0)
+    var cay = math::fclamp(ay, 0.0, 1.0)
+    return vec2(bounds.min.x + (bounds.width() - text_w) * cax, bounds.min.y + (bounds.height() - text_h) * cay)
+}

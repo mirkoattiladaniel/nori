@@ -1,0 +1,37 @@
+# A comment line — "Lines beginning with a '#' are comments" (spec) and are ignored.
+# This file exercises: groups, localized keys + the fallback chain, actions, lists, booleans, Exec.
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Text Editor
+Name[hu]=Szövegszerkesztő
+Name[hu_HU]=Szövegszerkesztő (HU)
+Name[hu_HU@mod]=Szövegszerkesztő (HU mod)
+GenericName=Multipurpose editor
+GenericName[hu]=Általános szerkesztő
+Comment=Edit text files
+Comment[hu]=Szövegfájlok szerkesztése
+Icon=accessories-text-editor
+Exec=editor-ng %F
+TryExec=editor-ng
+Path=/usr/bin
+Terminal=false
+NoDisplay=false
+Hidden=false
+Categories=Utility;TextEditor;
+Keywords=edit;text;file;
+MimeType=text/plain;text/markdown;
+StartupWMClass=editor-ng
+OnlyShowIn=GNOME;KDE;
+NotShowIn=XFCE;
+Actions=New;Print;
+
+[Desktop Action New]
+Name=New Window
+Name[hu]=Új ablak
+Exec=editor-ng --new %u
+Icon=window-new
+
+[Desktop Action Print]
+Name=Print
+Exec=editor-ng --print %F

@@ -1,0 +1,498 @@
+// roll: `nori.manifest`, reading a key out of a section, writing a dependency back, build profiles, and the
+// flags a profile or a `[never]`/freestanding project contributes to a build.
+//
+// One directory module of roll (see src/main.nori for the layout). It reaches the others through
+// their aliases below, and only what another module uses is `pub`. The modules import each other
+// freely (`cmds` and `deps` call in both directions); cycles between directory modules are fine.
+
+import "std/os" as os
+import "../util" as util
+
+use util::*
+
+// ---------- manifest ----------
+pub fn load_manifest() -> Str {
+    if os::path_exists("nori.manifest") {
+        return read_file("nori.manifest")
+    }
+    fail("roll: no nori.manifest here — run `roll init` first")
+    return ""
+}
+// A `#` after a value ends the value, as in `std/manifest` (mf_parse_line: "the value runs to a `#`
+// or to the end"). Without this, `lto = thin   # why` would be read as the value "thin   # why",
+// and `opt = 3  # fastest` would reach the compiler as `--opt "3  # fastest"`.
+fn strip_inline_comment(v: Str) -> Str {
+    var i = 0
+    while i < v.len() {
+        if ord(v.at(i)) == 35 { return trim(v.slice(0, i)) }
+        i = i + 1
+    }
+    return copy v
+}
+// the value of `key` within `[section]` ("" = the top-level, before any section). The manifest is one
+// `key = value` per line; `[section]` headers scope the keys below them; `#` lines are comments.
+pub fn section_get(src: Str, section: Str, key: Str) -> Str {
+    let n = src.len()
+    var cur = ""
+    var start = 0
+    var i = 0
+    while i <= n {
+        if i == n || ord(src.at(i)) == 10 {
+            let line = trim(src.slice(start, i))
+            if line.len() > 0 {
+                let c0 = ord(line.at(0))
+                if c0 == 91 {
+                    // '[': section header, strip the brackets
+                    let rb = index_of(line, 93) // ']'
+                    if rb > 1 {
+                        cur = trim(line.slice(1, rb))
+                    }
+                } else if c0 != 35 { // not a '#' comment
+                    let eq = index_of(line, 61) // '='
+                    if eq >= 0 {
+                        if(cur == section) {
+                            let k = trim(line.slice(0, eq))
+                            if(k == key) {
+                                return strip_inline_comment(trim(line.slice(eq + 1, line.len())))
+                            }
+                    } }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ---------- build profiles ----------
+// which profile to build: --release -> release, --profile NAME -> NAME, else dev.
+pub fn selected_profile() -> Str {
+    if has_flag("--release") {
+        return "release"
+    }
+    var k = 1
+    while k < argc() {
+        if(arg(k) == "--profile") {
+            if k + 1 < argc() {
+                return arg(k + 1)
+            }
+        }
+        k = k + 1
+    }
+    return "dev"
+}
+// translate a profile's options into noric build flags. Recognised keys (all optional; absent = noric's
+// default): auto-order = true|false ; simd = true|false|force ; erasure = true|false.
+pub fn profile_flags(mf: Str, prof: Str) -> Vec<Str> {
+    let sect = ("profile." + prof)
+    var f: Vec<Str> = vec()
+    // `auto-free` is not a key: the ownership tree frees every owner at the end of its scope in
+    // every build, so there is nothing to select. A manifest that carries the line is not an error;
+    // the key is simply ignored.
+    let ao = section_get(mf, sect, "auto-order")
+    if(ao == "true") {
+        f.push("--auto-order")
+    } else if(ao == "false") {
+        f.push("--no-auto-order")
+    }
+    // auto-parallelism: an explicit `true` turns it on; absent or false keeps it off (so projects
+    // such as std stay serial unless they opt in). `roll new` writes `true`.
+    let ap = section_get(mf, sect, "auto-parallel")
+    if(ap == "true") {
+        f.push("--auto-par")
+    } else {
+        f.push("--no-auto-par")
+    }
+    let sd = section_get(mf, sect, "simd")
+    if(sd == "true") {
+        f.push("--simd")
+    } else if(sd == "false") {
+        f.push("--no-simd")
+    } else if(sd == "force") {
+        f.push("--simd-force")
+    }
+    let er = section_get(mf, sect, "erasure")
+    if(er == "false") {
+        f.push("--no-erasure")
+    }
+    let oc = section_get(mf, sect, "overflow-checks")
+    if(oc == "true") {
+        f.push("--overflow-checks")
+    } else if(oc == "false") {
+        f.push("--no-overflow-checks")
+    }
+    // signed + - * trap instead of wrapping
+    let dbg = section_get(mf, sect, "debug")
+    if(dbg == "true") {
+        f.push("--debug")
+    }
+    // emit source locations + backtraces for traps/fail() (implies --dwarf)
+    let dw = section_get(mf, sect, "dwarf")
+    if(dw == "true") {
+        f.push("--dwarf")
+    }
+    // DWARF line tables only (gdb/lldb/perf see file:line; no backtrace runtime)
+    let mp = section_get(mf, sect, "memprof")
+    if(mp == "true") {
+        f.push("--memprof")
+    }
+    // per-allocation-site memory profiling (implies --debug; dump to stderr at exit)
+    let op = section_get(mf, sect, "opt")
+    if !(op == "") {
+        f.push("--opt")
+        f.push(op)
+    }
+    // clang -O level: 0|1|2|3|s|z (default 2)
+    let lt = section_get(mf, sect, "lto")
+    if(lt == "false") {
+        f.push("--no-lto")
+    }
+    // LTO is on by default; turn it off here
+    if(lt == "thin") {
+        f.push("--thin-lto")
+    }
+    // ThinLTO: parallel per-module opt + summary inlining (faster link, ~full-LTO runtime)
+    // the program loads compiled units at run time (noric --build-unit): export its symbols and
+    // route closures that arrive from a unit
+    if(section_get(mf, sect, "unit_host") == "true") {
+        f.push("--unit-host")
+    }
+    let inc = section_get(mf, sect, "incremental")
+    if(inc == "true") {
+        f.push("--incremental")
+    }
+    // per-module cached + parallel backend (no LTO; dev/fast path)
+    // user-defined conditional compilation: `cfg = ["devtools", ...]` -> `--cfg devtools ...`, so
+    // cfg(devtools){…} blocks compile in for this profile and are provably absent from others (e.g.
+    // `[profile.dev] cfg = ["devtools"]` keeps dev tools out of `roll build --release`). No source edits.
+    let cfgs = section_get(mf, sect, "cfg")
+    if !(cfgs == "") {
+        var cur = ""
+        var ci = 0
+        let cn = cfgs.len()
+        while ci <= cn {
+            var sep = ci == cn
+            if !sep {
+                let c = ord(cfgs.at(ci))
+                sep = (c == 91) || (c == 93) || (c == 34) || (c == 44) || (c == 32)
+            }
+            // [ ] " , space
+            if sep {
+                if !(cur == "") {
+                    f.push("--cfg")
+                    f.push(cur)
+                    cur = ""
+                }
+            } else {
+                cur = (cur + cfgs.slice(ci, ci + 1))
+            }
+            ci = ci + 1
+        }
+    }
+    return f
+}
+
+// bare-metal builds: a manifest `[freestanding]` section turns `roll build` into a kernel build.
+//   [freestanding]
+//   enable = true
+//   asm    = boot/boot.S              # comma-separated for several sources
+//   linker = boot/kernel.lds
+//   flatbin = true                    # also emit a raw image (build/<prof>/<name>.bin)
+//   general-regs-only = true          # keep the kernel's code out of the SSE registers
+//   state = true                      # describe the program's state in the image, for a new build of it
+//                                     # (--state-manifest <out>.state: a kernel's live update)
+// Paths are relative to the project root (where roll runs). Returns true if the section enabled it.
+pub fn is_freestanding(mf: Str) -> Bool {
+    return(section_get(mf, "freestanding", "enable") == "true")
+}
+pub fn add_freestanding_flags(inout cmd: Vec<Str>, mf: Str, out: Str) {
+    cmd.push("--freestanding")
+    let asms = section_get(mf, "freestanding", "asm")
+    if !(asms == "") {
+        var start = 0
+        var i = 0
+        let n = asms.len()
+        while i <= n {
+            if i == n || asms.at(i) == ',' {
+                let one = str_trim(asms.slice(start, i))
+                if !(one == "") {
+                    cmd.push("--asm")
+                    cmd.push(one)
+                }
+                start = i + 1
+            }
+            i = i + 1
+        }
+    }
+    let lds = section_get(mf, "freestanding", "linker")
+    if !(lds == "") {
+        cmd.push("--lds")
+        cmd.push(str_trim(lds))
+    }
+    if(section_get(mf, "freestanding", "flatbin") == "true") {
+        cmd.push("--flatbin")
+    }
+    if(section_get(mf, "freestanding", "general-regs-only") == "true") {
+        cmd.push("--general-regs-only")
+    }
+    if(section_get(mf, "freestanding", "state") == "true") {
+        cmd.push("--state-manifest")
+        cmd.push(out + ".state")
+    }
+}
+// trim leading/trailing ASCII whitespace.
+fn str_trim(s: Str) -> Str {
+    let n = s.len()
+    var a = 0
+    while a < n && (s.at(a) == ' ' || ord(s.at(a)) == 9) {
+        a = a + 1
+    }
+    var b = n
+    while b > a && (s.at(b - 1) == ' ' || ord(s.at(b - 1)) == 9) {
+        b = b - 1
+    }
+    return s.slice(a, b)
+}
+// is `name` already a key in the manifest's [deps] section?
+pub fn dep_present(mf: Str, name: Str) -> Bool {
+    let n = mf.len()
+    var cur = ""
+    var start = 0
+    var i = 0
+    while i <= n {
+        if i == n || ord(mf.at(i)) == 10 {
+            let line = trim(mf.slice(start, i))
+            if line.len() > 0 {
+                if ord(line.at(0)) == 91 {
+                    let rb = index_of(line, 93)
+                    if rb > 1 {
+                        cur = trim(line.slice(1, rb))
+                    }
+                }
+                else {
+                    if ord(line.at(0)) != 35 {
+                        if(cur == "deps") {
+                            let eq = index_of(line, 61)
+                            if eq >= 0 {
+                                if(trim(line.slice(0, eq)) == name) {
+                                    return true
+                                }
+                            }
+                } } }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+// set `key = value` within `[section]` of a TOML `src`, preserving every other line/section/comment.
+// Replaces an existing key, else inserts under an existing header, else appends a fresh section.
+pub fn toml_set(src: Str, section: Str, key: Str, value: Str) -> Str {
+    let exists = !(section_get(src, section, key) == "")
+    let entry = (key + (" = " + value))
+    let n = src.len()
+    var out = ""
+    var cur = ""
+    var start = 0
+    var i = 0
+    var placed = false
+    while i <= n {
+        if i == n || ord(src.at(i)) == 10 {
+            if !(i == n && start == n) {
+                let raw = src.slice(start, i)
+                let line = trim(raw)
+                var emit = true
+                if line.len() > 0 {
+                    if ord(line.at(0)) == 91 {
+                        let rb = index_of(line, 93)
+                        var sec = copy cur
+                        if rb > 1 {
+                            sec = trim(line.slice(1, rb))
+                        }
+                        out = join_line(out, raw) emit = false cur = copy sec
+                        if(sec == section) && !exists && !placed {
+                            out = join_line(out, entry)
+                            placed = true
+                        }
+                    } else { if ord(line.at(0)) != 35 && (cur == section) && exists && !placed {
+                            let eq = index_of(line, 61)
+                            if eq >= 0 {
+                                if(trim(line.slice(0, eq)) == key) {
+                                    out = join_line(out, entry)
+                                    placed = true
+                                    emit = false
+                                }
+                            }
+                    } }
+                }
+                if emit {
+                    out = join_line(out, raw)
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if !placed {
+        out = join_line(out, "")
+        out = join_line(out, ("[" + (section + "]")))
+        out = join_line(out, entry)
+    }
+    return(out + "\n")
+}
+// `mf` with the [deps] entry `name = source` set: replace an existing entry, else insert under an existing
+// [deps] header, else append a fresh [deps] section. Comments, ordering and spacing are preserved.
+pub fn manifest_set_dep(mf: Str, name: Str, source: Str) -> Str {
+    let exists = dep_present(mf, name)
+    let entry = (name + (" = " + source))
+    let n = mf.len()
+    var out = ""
+    var cur = ""
+    var start = 0
+    var i = 0
+    var placed = false
+    while i <= n {
+        if i == n || ord(mf.at(i)) == 10 {
+            if !(i == n && start == n) {
+                // skip the empty tail after a trailing newline
+                let raw = mf.slice(start, i)
+                let line = trim(raw)
+                var emit = true
+                if line.len() > 0 {
+                    if ord(line.at(0)) == 91 {
+                        let rb = index_of(line, 93)
+                        var sec = copy cur
+                        if rb > 1 {
+                            sec = trim(line.slice(1, rb))
+                        }
+                        out = join_line(out, raw) emit = false cur = copy sec
+                        if(sec == "deps") && !exists && !placed {
+                            out = join_line(out, entry)
+                            placed = true
+                        }
+                    } else { if ord(line.at(0)) != 35 && (cur == "deps") && exists && !placed {
+                            let eq = index_of(line, 61)
+                            if eq >= 0 {
+                                if(trim(line.slice(0, eq)) == name) {
+                                    out = join_line(out, entry)
+                                    placed = true
+                                    emit = false
+                                }
+                            }
+                    } }
+                }
+                if emit {
+                    out = join_line(out, raw)
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if !placed {
+        out = join_line(out, "")
+        out = join_line(out, "[deps]")
+        out = join_line(out, entry)
+    }
+    return(out + "\n")
+}
+// `mf` with the [deps] entry for `name` removed (other lines untouched).
+pub fn manifest_del_dep(mf: Str, name: Str) -> Str {
+    let n = mf.len()
+    var out = ""
+    var cur = ""
+    var start = 0
+    var i = 0
+    while i <= n {
+        if i == n || ord(mf.at(i)) == 10 {
+            if !(i == n && start == n) {
+                let raw = mf.slice(start, i)
+                let line = trim(raw)
+                var emit = true
+                if line.len() > 0 {
+                    if ord(line.at(0)) == 91 {
+                        let rb = index_of(line, 93)
+                        if rb > 1 {
+                            cur = trim(line.slice(1, rb))
+                        }
+                    }
+                    else {
+                        if ord(line.at(0)) != 35 && (cur == "deps") {
+                            let eq = index_of(line, 61)
+                            if eq >= 0 {
+                                if(trim(line.slice(0, eq)) == name) {
+                                    emit = false
+                                }
+                            }
+                    } }
+                }
+                if emit {
+                    out = join_line(out, raw)
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return(out + "\n")
+}
+// ---- `[caps]`: compile-time capability sandboxing (supply-chain defense) ----
+// Manifest entries `NAME = cap,cap` under [caps] deny those capabilities for dependency NAME's
+// files; the reserved name `program` applies to the whole tree. `roll build`/`roll check` run
+// `noric --caps` (the whole-tree escape-surface classifier: net/fs/exec/env/time/rawmem/ffi) and
+// fail with file:line on any violation, so a dependency update that grows its capability set
+// cannot slip through. `roll caps` prints the classified surface.
+pub fn section_keys(src: Str, section: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let n = src.len()
+    var cur = ""
+    var start = 0
+    var i = 0
+    while i <= n {
+        if i == n || ord(src.at(i)) == 10 {
+            let line = trim(src.slice(start, i))
+            if line.len() > 0 {
+                let c0 = ord(line.at(0))
+                if c0 == 91 {
+                    let rb = index_of(line, 93)
+                    if rb > 1 {
+                        cur = trim(line.slice(1, rb))
+                    }
+                }
+                else if c0 != 35 {
+                    let eq = index_of(line, 61)
+                    if eq >= 0 {
+                        if(cur == section) {
+                            out.push(trim(line.slice(0, eq)))
+                        }
+                    }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+// Forward a manifest `[never]` section as `--never 'CLAUSE'` flags, so a library carries its
+// own whole-program policies (enforced when it is built/checked). Each entry is `label = "CLAUSE"`, e.g.
+//   [never]
+//   no-ffi-in-parser = "extern reached from parse_*"
+//   no-exfil         = "fs after net"
+pub fn add_never_flags(inout cmd: Vec<Str>, mf: Str) {
+    let keys = section_keys(mf, "never")
+    var i = 0
+    while i < keys.len() {
+        var clause = section_get(mf, "never", keys[i])
+        if clause.len() >= 2 && ord(clause.at(0)) == 34 && ord(clause.at(clause.len() - 1)) == 34 {
+            clause = clause.slice(1, clause.len() - 1)
+        }
+        if !(clause == "") {
+            cmd.push("--never")
+            cmd.push(clause)
+        }
+        i = i + 1
+    }
+}

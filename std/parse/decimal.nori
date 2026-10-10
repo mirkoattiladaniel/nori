@@ -1,0 +1,256 @@
+//! std/parse decimal: decimal text -> Float, correctly rounded.
+//!
+//! Why this exists: Nori has no string-to-float in the language (`to_float(Str)` is not a parser).
+//! The obvious accumulator (`v = v + digit * scale` with `scale = scale * 0.1`) is wrong, because
+//! neither `0.1` nor its powers are representable in binary and the error compounds.
+//! The next-obvious fix (accumulate an integer mantissa, scale once by an exact power of ten) is
+//! Clinger's fast path: correct while the mantissa is below 2^53 and `|exp10| <= 22`, and approximate
+//! everywhere else.
+//!
+//! The algorithm here has no such window over the range a real literal reaches. A decimal literal is
+//! exactly the rational `mant * 10^exp10`. Rewrite it as `num / den` with both sides exact 64-bit
+//! integers, then produce the binary mantissa by long division (one bit at a time, in integers, with
+//! the running remainder carried as the sticky bit) and round half-to-even on a 54th guard bit. No
+//! floating-point arithmetic touches the value: the finished significand is assembled straight into
+//! its IEEE-754 fields, so there is nothing for error to accumulate in. This is the construction
+//! `strtod` uses, restricted to the range where numerator and denominator both fit in an Int.
+//!
+//! What widens that range is splitting the power of ten: `10^k` is `5^k * 2^k`, and the `2^k` half is
+//! free: it rides in the exponent field of the assembled result and is never an operation. So only
+//! `5^k` has to fit in 63 bits, which roughly doubles the exponent reach compared with folding whole
+//! powers of ten (`5^26` fits where `10^18` was the limit).
+//!
+//! Overflow safety: `den = 5^k <= 5^26 < 2^62`, the remainder is always `< den`, and the only
+//! operation on it is `rem * 2 < 2^63`. The numerator stays below `2^63` because a fold only happens
+//! while `m <= (2^63-1)/5`. The working significand never exceeds 2^54.
+//!
+//! Where it is not exact: all four cases are reported rather than silent (`ParsedFloat.exact == false`):
+//!   · more than 18 significant digits: the tail is dropped (its non-zero-ness is kept as a sticky
+//!     hint, so the value is at worst about one ulp out, but a tie could round the wrong way);
+//!   · a net power of ten too large for any `5^k` to absorb, beyond roughly `10^±26` after the
+//!     mantissa is normalised. The residual is then applied in Float in chunks of `10^22` (the largest
+//!     power of ten that is still an exact double), one rounding per chunk;
+//!   · subnormal results, which are reached by halving a normal value;
+//!   · overflow to infinity, which is not the rounded value of anything.
+//!
+//!   import "std/parse" as parse
+//!   let r = parse::parse_float("0.25882354378700256")
+//!   if r.ok && r.exact { use(r.value) }
+
+// raw IEEE-754 bit assembly, so the finished significand becomes a Float without a rounding step in
+// between. The scratch cell is a per-thread i64 (threadlocal), so concurrent callers cannot clobber
+// each other's reinterpret. (Same approach as std/math's `bitsf`, duplicated rather than imported so
+// std/parse has no dependencies.)
+extern fn malloc(Int) -> Int
+threadlocal global g_dec_cell: Int = 0
+fn dec_cell() -> Int {
+    if g_dec_cell == 0 { unsafe { g_dec_cell = malloc(8) } }
+    return g_dec_cell
+}
+fn dec_bitsf(b: Int) -> Float { let p = dec_cell()  unsafe { poke(p, b)  return peekf64(p) } }
+
+/// the result of a decimal->Float conversion.
+///
+/// `ok` is whether the text was a number at all; `exact` is whether the conversion is provably the
+/// correctly rounded nearest double (see the module header for the four cases where it is not);
+/// `value` is the number; `used` is how many bytes were consumed; `error` explains an `ok == false`.
+/// The `exact` flag is the point of the type: a parser that can say "I could not represent this
+/// exactly" is more useful than one that silently cannot.
+pub struct ParsedFloat { ok: Bool, exact: Bool, value: Float, used: Int, error: Str }
+
+fn dec_bitlen(x: Int) -> Int { var v = x  var n = 0  while v > 0 { v = v >> 1  n = n + 1 }  return n }
+
+/// 5^k as an exact Int, for `0 <= k <= 26`; -1 outside. 26 is the limit that keeps `2 * 5^k` inside a
+/// signed 64-bit integer, which is what the long division below does to the remainder every step.
+pub fn pow5_int(k: Int) -> Int {
+    if k < 0 || k > 26 { return -1 }
+    var v = 1
+    var i = 0
+    while i < k { v = v * 5  i = i + 1 }
+    return v
+}
+
+/// `bits * 2^exp` where `bits` is a normalised 53-bit significand (2^52 <= bits < 2^53).
+fn dec_ldexp53(bits: Int, exp: Int) -> Float {
+    let be = exp + 52 + 1023
+    if be >= 2047 { return dec_bitsf(9218868437227405312) }        // 0x7FF0..: +inf
+    if be > 0 { return dec_bitsf((be << 52) | (bits - (1 << 52))) }
+    // subnormal / tiny: build the [1,2) significand and scale it by halving. Approximate (each halving
+    // that crosses into the subnormals rounds), and the caller is told so.
+    var f = dec_bitsf((1023 << 52) | (bits - (1 << 52)))
+    var e2 = exp + 52
+    while e2 < 0 { f = f * 0.5  e2 = e2 + 1 }
+    while e2 > 0 { f = f * 2.0  e2 = e2 - 1 }
+    return f
+}
+
+/// `(num / den) * 2^exp2`, correctly rounded (ties to even). Requires `num >= 0`, `0 < den <= 2^62`.
+///
+/// `sticky_in` folds in "digits were dropped below the numerator", so that a value which only *looks*
+/// like an exact tie is still rounded away from the tie. The quotient is developed one binary digit at
+/// a time in integer arithmetic; the surviving remainder is the sticky bit that decides the tie. The
+/// `exp2` scaling is free: it is added to the exponent field of the assembled result, never applied
+/// as an arithmetic operation, which is what lets the caller split `10^k` into `5^k * 2^k` and pay
+/// integer range only for the `5^k`.
+pub fn float_from_ratio(num: Int, den: Int, exp2: Int, sticky_in: Bool) -> Float {
+    if num == 0 { return 0.0 }
+    var ip = num / den
+    var rem = num - ip * den
+    if sticky_in && rem == 0 { rem = 1 }
+    var exp = exp2
+    var bits = 0
+    var nb = 0
+    if ip > 0 {
+        bits = ip
+        nb = dec_bitlen(ip)
+        if nb > 54 {
+            let drop = nb - 54
+            let mask = (1 << drop) - 1
+            if (bits & mask) != 0 { rem = 1 }
+            bits = bits >> drop
+            nb = 54
+            exp = exp + drop
+        }
+    } else {
+        var go = true
+        while go {
+            rem = rem * 2
+            exp = exp - 1
+            if rem >= den { rem = rem - den  go = false }
+        }
+        bits = 1
+        nb = 1
+    }
+    while nb < 54 {
+        rem = rem * 2
+        var b = 0
+        if rem >= den { b = 1  rem = rem - den }
+        bits = bits * 2 + b
+        nb = nb + 1
+        exp = exp - 1
+    }
+    let guard = bits & 1
+    bits = bits >> 1
+    exp = exp + 1
+    if guard == 1 {
+        if rem != 0 || (bits & 1) == 1 {
+            bits = bits + 1
+            if bits == (1 << 53) { bits = bits >> 1  exp = exp + 1 }
+        }
+    }
+    return dec_ldexp53(bits, exp)
+}
+
+/// `mant * 10^exp10` (negated when `neg`) as the nearest double, with `exact` saying whether it
+/// provably is. Set `truncated` when significant digits below `mant` were dropped by the caller.
+///
+/// The decomposition: `10^k` is `5^k * 2^k`, and the `2^k` half costs nothing (it rides in the
+/// exponent field). So only the `5^k` half has to fit in an Int, which roughly doubles the decimal
+/// exponent range that stays exact compared with folding whole powers of ten. What is left over after
+/// that (a decimal exponent too large for any `5^k` to absorb) is applied in Float, in chunks of
+/// `10^22` (the largest power of ten that is still an exact double, so each chunk costs one rounding
+/// instead of twenty-two), and `exact` is set false to say so.
+pub fn float_scale10(neg: Bool, mant: Int, exp10: Int, truncated: Bool) -> ParsedFloat {
+    // a zero literal is a zero, but `-0` is negative zero, which the ratio path cannot produce
+    // (`0.0 - 0.0` is `+0.0`) and Nori cannot spell as a literal, so assemble it from its bits.
+    if mant == 0 {
+        if neg { return ParsedFloat { ok: true, exact: true, value: dec_bitsf(1 << 63), used: 0, error: "" } }
+        return ParsedFloat { ok: true, exact: true, value: 0.0, used: 0, error: "" }
+    }
+    var m = mant
+    var e = exp10
+    var exact = !truncated
+    while (m % 10) == 0 { m = m / 10  e = e + 1 }        // trailing zeros are exponent, not precision
+    var exp2 = 0
+    var den = 1
+    if e > 0 {
+        // Fold one 5 at a time while the numerator has room; each fold also buys its power of two for
+        // free, in `exp2`. Splitting 10 into 5*2 this way roughly doubles the decimal exponent that
+        // stays exact, because only the 5s have to fit in 63 bits.
+        while e > 0 && m <= 1844674407370955161 { m = m * 5  exp2 = exp2 + 1  e = e - 1 }
+    } else {
+        if e < 0 {
+            var k = 0 - e
+            if k > 26 { k = 26 }
+            den = pow5_int(k)
+            exp2 = 0 - k
+            e = e + k
+        }
+    }
+    var v = float_from_ratio(m, den, exp2, truncated)
+    // whatever power of ten is left over could not be absorbed exactly: apply it in Float, and say so
+    while e >= 22 { v = v * 1e22  e = e - 22  exact = false }
+    while e > 0 { v = v * 10.0  e = e - 1  exact = false }
+    while e <= 0 - 22 { v = v / 1e22  e = e + 22  exact = false }
+    while e < 0 { v = v / 10.0  e = e + 1  exact = false }
+    // the two remaining caveats: a subnormal was reached by halving a normal (see
+    // `dec_ldexp53`), and an overflow to infinity is not a rounded value of anything.
+    if v != 0.0 && v < 2.2250738585072014e-308 { exact = false }
+    if v > 1.7976931348623157e308 { exact = false }
+    if neg { v = 0.0 - v }
+    return ParsedFloat { ok: true, exact: exact, value: v, used: 0, error: "" }
+}
+
+fn dec_is_digit(c: Int) -> Bool { return c >= 48 && c <= 57 }
+fn dec_byte(s: Str, i: Int) -> Int { if i < 0 || i >= s.len() { return -1 }  return ord(s.at(i)) }
+
+/// read one JSON-shaped number (`-?digits[.digits][eE[+-]digits]`) out of `s` starting at `start`.
+///
+/// `used` is how many bytes it ate, so a caller driving a cursor can advance by it; `ok == false` with
+/// `used == 0` means there was no number there at all. A leading `+` and a bare fraction (`.5`) are
+/// accepted, which is more than JSON allows; reject those in the caller if the grammar is strict.
+pub fn scan_float(s: Str, start: Int) -> ParsedFloat {
+    var i = start
+    var neg = false
+    if dec_byte(s, i) == 45 { neg = true  i = i + 1 }
+    else { if dec_byte(s, i) == 43 { i = i + 1 } }
+    var mant = 0
+    var exp10 = 0
+    var truncated = false
+    let cap = 100000000000000000                      // 10^17: room for one more digit
+    var saw = false
+    while dec_is_digit(dec_byte(s, i)) {
+        let d = dec_byte(s, i) - 48
+        saw = true
+        if mant < cap { mant = mant * 10 + d } else { exp10 = exp10 + 1  if d != 0 { truncated = true } }
+        i = i + 1
+    }
+    if dec_byte(s, i) == 46 {
+        i = i + 1
+        while dec_is_digit(dec_byte(s, i)) {
+            let d = dec_byte(s, i) - 48
+            saw = true
+            if mant < cap { mant = mant * 10 + d  exp10 = exp10 - 1 } else { if d != 0 { truncated = true } }
+            i = i + 1
+        }
+    }
+    if !saw { return ParsedFloat { ok: false, exact: false, value: 0.0, used: 0, error: "decimal: not a number" } }
+    let c = dec_byte(s, i)
+    if c == 101 || c == 69 {
+        var j = i + 1
+        var eneg = false
+        let sgn = dec_byte(s, j)
+        if sgn == 43 { j = j + 1 } else { if sgn == 45 { eneg = true  j = j + 1 } }
+        if dec_is_digit(dec_byte(s, j)) {
+            var ex = 0
+            while dec_is_digit(dec_byte(s, j)) {
+                if ex < 100000 { ex = ex * 10 + (dec_byte(s, j) - 48) }
+                j = j + 1
+            }
+            if eneg { exp10 = exp10 - ex } else { exp10 = exp10 + ex }
+            i = j
+        }
+    }
+    let r = float_scale10(neg, mant, exp10, truncated)
+    return ParsedFloat { ok: true, exact: r.exact, value: r.value, used: i - start, error: "" }
+}
+
+/// the whole string as one number. Trailing text is an error; this is a parser, not a prefix scan.
+/// This is the correctly-rounded replacement for the `to_float(Str)` the language does not have.
+pub fn parse_float(s: Str) -> ParsedFloat {
+    if s.len() == 0 { return ParsedFloat { ok: false, exact: false, value: 0.0, used: 0, error: "decimal: empty string" } }
+    let r = scan_float(s, 0)
+    if !r.ok { return ParsedFloat { ok: false, exact: false, value: 0.0, used: 0, error: ("decimal: not a number: `" + (s + "`")) } }
+    if r.used != s.len() { return ParsedFloat { ok: false, exact: false, value: 0.0, used: r.used, error: ("decimal: trailing text after the number: `" + (s + "`")) } }
+    return r
+}

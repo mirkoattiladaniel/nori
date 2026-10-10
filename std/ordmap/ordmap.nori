@@ -1,0 +1,49 @@
+//! std/ordmap: an insertion-ordered string-keyed map to `Int` values (i64-uniform, so values may be any
+//! handle/Bool/Char). The map companion to std/set: O(1) lookup via the runtime Str `Map`, plus a Vec that
+//! preserves insertion order for `keys`/`values` iteration. Re-inserting a key updates its value and keeps
+//! its original position.
+//!   import "std/ordmap" as ordmap
+//!   var m = ordmap::new()
+//!   m.insert("a", 1)  m.insert("b", 2)
+//!   m.get("a")               // 1
+//!   m.keys()                 // ["a", "b"]
+//!
+//! The operations are methods on `OrdMap`, as in std/set: `insert`, `get`, `keys` and `values` are
+//! built-ins' names, and a top-level function wearing one is a function nothing can call.
+
+pub struct OrdMap { m: Map<Str, Int>, order: Vec<Str> }
+
+/// a new empty map.
+pub fn new() -> OrdMap { var mm: Map<Str, Int> = map()  var k: Vec<Str> = vec()  return OrdMap { m: mm, order: k } }
+
+impl OrdMap {
+    /// number of entries.
+    fn size(self) -> Int { return self.order.len() }
+    /// is the map empty?
+    fn is_empty(self) -> Bool { return self.order.len() == 0 }
+    /// does `key` exist?
+    fn contains(self, key: Str) -> Bool { return self.m.has(key) }
+
+    /// set `key` to `val` (appended on first insert; value updated in place if it already exists).
+    fn insert(inout self, key: Str, val: Int) {
+        if !self.m.has(key) { self.order.push(copy key) }
+        self.m.put(key, val)
+    }
+    /// the value for `key` (call only when `contains` is true).
+    fn get(self, key: Str) -> Int { return self.m.get(key) }
+    /// the value for `key`, or `dflt` if absent.
+    fn get_or(self, key: Str, dflt: Int) -> Int {
+        if self.m.has(key) { return self.m.get(key) }
+        return dflt
+    }
+
+    /// the keys in insertion order.
+    fn keys(self) -> view Vec<Str> { return self.order }
+    /// the values in insertion order.
+    fn values(self) -> Vec<Int> {
+        var out: Vec<Int> = vec()
+        var i = 0
+        while i < self.order.len() { out.push(self.m.get(self.order[i]))  i = i + 1 }
+        return out
+    }
+}

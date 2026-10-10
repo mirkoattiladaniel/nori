@@ -1,0 +1,40 @@
+// std: the Nori standard library.
+//
+// Import individual modules by name, e.g. `import "std/os" as os`. This entry pulls them all in so
+// the library type-checks as a unit (`roll check`); it is not meant to be imported itself.
+//
+// Each module is imported under its own alias, so the unit check namespaces every module's top-level
+// functions as `alias::name`. A function name only has to be unique within its module, so two modules may
+// each define e.g. `new` (`set::new`, `rand::new`). Type names are namespaced the same way: a struct is
+// mangled per module (`nori_ui__layout__Tree`), so two modules may each define e.g. `Vec2`
+// (`math::Vec2`, `nori_ui::Vec2`) or `Rect` and this unit check accepts both. Module-private function
+// symbols are the exception: they are global link names, so prefix a private helper with its module.
+import "std/os" as os
+import "std/sys" as sys
+import "std/http" as http
+import "std/crypto" as crypto
+import "std/archive" as archive
+import "std/time" as time
+import "std/net" as net
+import "std/math" as math
+import "std/geometry" as geometry
+import "std/result" as result
+import "std/strutil" as strutil
+import "std/iter" as iter
+import "std/fmt" as fmt
+import "std/set" as set
+import "std/tui" as tui
+import "std/json" as json
+import "std/sort" as sort
+import "std/rand" as rand
+import "std/hashmap" as hashmap
+import "std/regex" as regex
+import "std/flag" as flag
+import "std/log" as log
+import "std/nori_ui" as nori_ui
+import "std/font" as font
+import "std/image" as image
+import "std/audio" as audio
+import "std/parse" as parse
+import "std/c" as c
+import "std/xdg" as xdg

@@ -1,0 +1,587 @@
+// roll: the verbs that run a tool over the project rather than building it: the language server, the
+// formatter, the native test runner, and the doc extractor.
+//
+// One directory module of roll (see src/main.nori for the layout). It reaches the others through
+// their aliases below, and only what another module uses is `pub`. The modules import each other
+// freely (`cmds` and `deps` call in both directions); cycles between directory modules are fine.
+
+import "std/os" as os
+import "../cmds" as cmds
+import "../deps" as deps
+import "../manifest" as manifest
+import "../ui" as ui
+import "../util" as util
+
+use cmds::*
+use deps::*
+use manifest::*
+use ui::*
+use util::*
+
+// `roll lsp`: run the Nori language server (nori-lsp) from the toolchain, wired to the active compiler.
+pub fn lsp_cmd() -> Int {
+    let bin = (nori_home() + "/nori-lsp")
+    if !os::path_exists(bin) {
+        eprintl(("roll: nori-lsp not found at " + bin))
+        eprintl("  build it:  noric --build tools/lsp.nori <NORI_HOME>/nori-lsp compiler/runtime.nori --import-root <nori-src>")
+        return 1
+    }
+    let _ = os::set_env("NORIC", noric_path()) // the server runs `noric --emit-checked` for diagnostics
+    let _h = os::set_env("NORI_HOME", nori_home()) // …and needs std/ on its import path (like roll build)
+    let _r = os::set_env("ROLL", argv0()) // …and `roll lsp-flags` to resolve a project's git deps
+    var cmd: Vec<Str> = vec()
+    cmd.push(bin)
+    return os::run(cmd)
+}
+// `roll lsp-flags <project-dir> --out <file>`: write (newline-separated) the exact noric import flags
+// roll would use for that project (`--import-root $NORI_HOME`, `--os <host>`, and `--import-map name=…`
+// for every (transitive) git dependency). The language server invokes this so a file that `import`s a git
+// dep resolves the same way `roll build` does. We redirect our stdout to /dev/null first so the resolver's
+// own output cannot corrupt the caller's stream; the flags go to the explicit --out file.
+pub fn lsp_flags_cmd() -> Int {
+    var dir = ""
+    var outp = ""
+    var k = 1
+    while k < argc() {
+        let a = arg(k)
+        if(a == "--out") {
+            k = k + 1
+            if k < argc() {
+                outp = arg(k)
+            }
+        }
+        else {
+            if(dir == "") {
+                dir = copy a
+            }
+        }
+        k = k + 1
+    }
+    if !(dir == "") {
+        let _ = os::set_cwd(dir)
+    }
+    let _q = redirect_stdout("/dev/null")
+    var v: Vec<Str> = vec()
+    if os::path_exists("nori.manifest") {
+        let mf = load_manifest()
+        v.push("--import-root") v.push(nori_home())
+        v.push("--os") v.push(host_os())
+        let req = section_get(mf, "", "nori")
+        if !(req == "") {
+            v.push("--require-nori")
+            v.push(req)
+        }
+        if(section_get(mf, "", "auto-type") == "false") {
+            v.push("--no-auto-type")
+        }
+        let locks = load_lock()
+        var lk: Vec<Str> = vec()
+        lk.push("")
+        var dirs: Map<Str, Str> = map()
+        var names: Vec<Str> = vec()
+        resolve_graph(mf, locks, lk, dirs, names, true) // direct + transitive, vendor-aware (read-only: no lock write)
+        var i = 0
+        while i < names.len() {
+            let nm = names[i]
+            if dirs.has(nm) {
+                v.push("--import-map")
+                v.push((nm + ("=" + module_in(dirs.get(nm)))))
+            }
+            i = i + 1
+        }
+    }
+    var s = ""
+    var j = 0
+    while j < v.len() {
+        s = (s + (v[j] + chr(10)))
+        j = j + 1
+    }
+    if !(outp == "") {
+        write_file(outp, s)
+    }
+    return 0
+}
+// `roll fmt`: canonical-format every .nori file under src/ + tests/ (in place). Whitespace-only; idempotent.
+// Directories `roll fmt` never descends into: build outputs, vendored dependencies, VCS and editor
+// state, and test fixtures: a fixture may be malformed on purpose, and reformatting one changes
+// what the test is testing.
+fn fmt_skip_seg(seg: Str) -> Bool {
+    if(seg == "") {
+        return false
+    }
+    if(seg == ".") {
+        return false
+    }
+    if(seg == "..") {
+        return false
+    }
+    if starts_with(seg, ".") {
+        return true
+    }
+    // .git, .cache, editor state
+    return(seg == "build") || (seg == "vendor_nori") || (seg == "target") || (seg == "testdata")
+    || (seg == "node_modules")
+}
+fn fmt_skipped(path: Str) -> Bool {
+    var st = 0
+    var i = 0
+    while i <= path.len() {
+        if i == path.len() || ord(path.at(i)) == 47 {
+            if fmt_skip_seg(path.slice(st, i)) {
+                return true
+            }
+            st = i + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+// one target: a `.nori` file formats as itself, a directory contributes every `.nori` under it.
+fn fmt_collect(path: Str, inout out: Vec<Str>) -> Bool {
+    if !os::path_exists(path) {
+        eprintl(("roll fmt: no such file or directory: " + path))
+        return false
+    }
+    if os::is_dir(path) {
+        let files = os::list_tree(path)
+        var i = 0
+        while i < files.len() {
+            if ends_with(files[i], ".nori") {
+                if !fmt_skipped(files[i]) {
+                    out.push(copy files[i])
+                }
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if !ends_with(path, ".nori") {
+        eprintl(("roll fmt: not a Nori source file: " + path))
+        return false
+    }
+    out.push(copy path) // named explicitly: format it, skip list or not
+    return true
+}
+pub fn fmt_cmd() -> Int {
+    var targets: Vec<Str> = vec()
+    var k = 1
+    while k < argc() {
+        let a = arg(k)
+        if !starts_with(a, "-") {
+            targets.push(a)
+        }
+        k = k + 1
+    }
+    var files: Vec<Str> = vec()
+    var label = ""
+    if targets.len() > 0 {
+        // Explicit paths need no manifest: `roll fmt FILE.nori` and `roll fmt DIR` work anywhere,
+        // including in a tree whose sources are not laid out as a roll project at all.
+        var t = 0
+        while t < targets.len() {
+            if !fmt_collect(targets[t], files) {
+                return 1
+            }
+            t = t + 1
+        }
+        label = targets[0]
+        if targets.len() > 1 {
+            label = (label + ((" +" + (targets.len() - 1)) + " more"))
+        }
+    } else {
+        // No argument: the whole project, not just `src/` and `tests/`, since a project's sources may
+        // live elsewhere (`std` keeps its modules in `std/<name>/`).
+        let mf = load_manifest()
+        label = section_get(mf, "", "name")
+        if !fmt_collect(".", files) {
+            return 1
+        }
+    }
+    if files.len() == 0 {
+        printl("no .nori files to format")
+        return 0
+    }
+    eprintl((verb("Formatting", "1;36") + (" " + label)))
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--fmt")
+    var i = 0
+    while i < files.len() {
+        cmd.push(copy files[i])
+        i = i + 1
+    }
+    let rc = os::run(cmd) // noric prints each file it actually changed
+    if rc == 0 {
+        eprintl((verb("Finished", "1;32") + (" " + dim((("" + files.len()) + " file(s) checked")))))
+    }
+    return rc
+}
+// how many `fn test_*` a file defines. `noric --test` runs exactly these and does nothing else, so a
+// file with none is not a test file however it is named, and reporting it as passed would report
+// green for a file that was never compiled.
+fn count_test_fns(src: Str) -> Int {
+    var n = 0
+    let ln = src.len()
+    var start = 0
+    var i = 0
+    while i <= ln {
+        if i == ln || src.at(i) == chr(10) {
+            var line = src.slice(start, i)
+            while line.len() > 0 && ((line.at(0) == ' ') || (line.at(0) == chr(9))) {
+                line = line.slice(1, line.len())
+            }
+            if starts_with(line, "pub ") {
+                line = line.slice(4, line.len())
+            }
+            if starts_with(line, "fn test_") {
+                n = n + 1
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+// `roll test`: run every tests/*.nori through `noric --test` (each defines `fn test_*` + uses std/test).
+// A file with no `fn test_*` is type-checked and reported as skipped, never as a pass.
+pub fn test_cmd() -> Int {
+    let mf = load_manifest()
+    eprintl((verb("Testing", "1;36") + (" " + section_get(mf, "", "name"))))
+    if !os::path_exists("tests") {
+        printl("no tests/ directory (put `fn test_*()` in tests/*.nori)")
+        return 0
+    }
+    let files = os::list_tree("tests")
+    var ran = 0 // files `--test` actually ran (passed or failed)
+    var failed = 0
+    var skipped = 0 // no `fn test_*`, but they type-check
+    var total = 0
+    var i = 0
+    while i < files.len() {
+        let f = files[i]
+        if ends_with(f, ".nori") {
+            total = total + 1
+            if count_test_fns(read_file(f)) == 0 {
+                // nothing for `--test` to run here, so check the file instead; a `fn main` harness
+                // sitting in tests/ must not be counted as a pass without being compiled.
+                var ck: Vec<Str> = vec()
+                ck.push(noric_path()) ck.push("--check") ck.push(copy f)
+                add_import_flags(ck, mf)
+                if os::run(ck) != 0 {
+                    failed = failed + 1
+                }
+                else {
+                    skipped = skipped + 1
+                    eprintl((verb("Skipped", "1;33") + (" " + (f + dim(" — no `fn test_*`; type-checked only")))))
+                }
+            } else {
+                var cmd: Vec<Str> = vec()
+                cmd.push(noric_path()) cmd.push("--test") cmd.push(copy f)
+                // The same back-end choice `roll build` makes: the native one by default, the LLVM
+                // pipeline where a test's project links C or targets what the native one cannot.
+                if util::has_flag("--llvm") || (section_get(mf, "build", "backend") == "llvm")
+                   || deps::needs_llvm(mf, deps::native_platform_of(""), false) { cmd.push("--llvm") }
+                add_import_flags(cmd, mf)
+                if os::run(cmd) != 0 {
+                    failed = failed + 1
+                }
+                ran = ran + 1
+            }
+        }
+        i = i + 1
+    }
+    if ran == 0 && failed == 0 {
+        printl(("no tests found (put `fn test_*()` in tests/*.nori)" + skip_note(skipped)))
+        return 0
+    }
+    if failed == 0 {
+        eprintl((verb("Finished", "1;32") + (" " + dim(((("" + ran) + " test file(s) passed") + skip_note(skipped))))))
+        return 0
+    }
+    eprintl((verb("FAILED", "1;31") + (" " + (("" + failed) + (" of " + (("" + total) + (" test file(s)" + skip_note(skipped))))))))
+    return 1
+}
+// ", N skipped", omitted entirely when nothing was skipped
+fn skip_note(n: Int) -> Str {
+    if n == 0 {
+        return ""
+    }
+    return(", " + (("" + n) + " skipped"))
+}
+
+// the last `/`-separated segment of a path ("std/tui" -> "tui").
+fn doc_last_seg(path: Str) -> Str {
+    var i = path.len() - 1
+    while i >= 0 {
+        if path.at(i) == '/' {
+            return path.slice(i + 1, path.len())
+        }
+        i = i - 1
+    }
+    return copy path
+}
+// resolve an import path to its .nori file under NORI_HOME: directory module `<home>/<path>/<seg>.nori`,
+// else flat `<home>/<path>.nori`; "" if neither exists.
+fn doc_pkg_file(pkgpath: Str) -> Str {
+    let home = nori_home()
+    let c1 = (home + ("/" + (pkgpath + ("/" + (doc_last_seg(pkgpath) + ".nori")))))
+    if os::path_exists(c1) {
+        return c1
+    }
+    let c2 = (home + ("/" + (pkgpath + ".nori")))
+    if os::path_exists(c2) {
+        return c2
+    }
+    return ""
+}
+// the quoted import path in `import "PATH" ...`, or "".
+fn doc_imp_path(line: Str) -> Str {
+    let n = line.len()
+    var i = 0
+    while i < n && (line.at(i) == ' ' || ord(line.at(i)) == 9) {
+        i = i + 1
+    }
+    if i + 7 > n {
+        return ""
+    }
+    if !(line.slice(i, i + 7) == "import ") {
+        return ""
+    }
+    var q1 = 0 - 1
+    while i < n {
+        if line.at(i) == '"' {
+            q1 = i
+            i = n
+        } else {
+            i = i + 1
+        }
+    }
+    if q1 < 0 {
+        return ""
+    }
+    var j = q1 + 1
+    while j < n {
+        if line.at(j) == '"' {
+            return line.slice(q1 + 1, j)
+        }
+        j = j + 1
+    }
+    return ""
+}
+// is `c` a letter, digit, or underscore (an identifier char)?
+fn doc_ident_char(c: Byte) -> Bool {
+    return(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+// the alias in `import "PATH" as ALIAS`, or "" if none.
+fn doc_imp_alias(line: Str) -> Str {
+    let n = line.len()
+    var i = 0
+    while i + 3 < n {
+        if line.at(i) == ' ' && line.at(i + 1) == 'a' && line.at(i + 2) == 's' && line.at(i + 3) == ' ' {
+            var j = i + 4
+            while j < n && line.at(j) == ' ' {
+                j = j + 1
+            }
+            var s = j
+            while j < n && doc_ident_char(line.at(j)) {
+                j = j + 1
+            }
+            return line.slice(s, j)
+        } i = i + 1 }
+    return ""
+}
+// map an import alias (or bare module name) used in the project to its import path, or "" if unknown.
+fn doc_alias_path(name: Str) -> Str {
+    let mf = load_manifest()
+    let dir = dirname(section_get(mf, "", "entry"))
+    let files = os::list_tree(dir)
+    var fi = 0
+    while fi < files.len() {
+        let f = files[fi]
+        if ends_with(f, ".nori") {
+            let src = read_file(f)
+            let n = src.len()
+            var start = 0
+            var i = 0
+            while i <= n {
+                if i == n || src.at(i) == chr(10) {
+                    let line = src.slice(start, i)
+                    let path = doc_imp_path(line)
+                    if !(path == "") {
+                        let al = doc_imp_alias(line)
+                        if(al == name) {
+                            return path
+                        }
+                        if(al == "") {
+                            if(doc_last_seg(path) == name) {
+                                return path
+                            }
+                        }
+                    }
+                    start = i + 1
+                }
+                i = i + 1
+            }
+        }
+        fi = fi + 1
+    }
+    return ""
+}
+// populate the dependency graph (name -> cached dir), or nothing if there's no manifest.
+fn doc_dep_dirs(inout dirs: Map<Str, Str>, inout names: Vec<Str>) {
+    if !os::path_exists("nori.manifest") {
+        return
+    }
+    let mf = load_manifest()
+    let locks = load_lock()
+    var lk: Vec<Str> = vec() lk.push("")
+    resolve_graph(mf, locks, lk, dirs, names, true)
+}
+// resolve a package reference to its source files (appended to `out`): a dependency (its whole src/),
+// a std module under NORI_HOME (one file), via either the import path (`std/tui`, `mydep`) or the alias
+// used in the project (`tui`). `out` stays empty if `name` isn't a known package.
+fn doc_pkg_files(name: Str, inout out: Vec<Str>) {
+    var key = name // map an alias used in the project to its import path/name
+    let ap = doc_alias_path(name)
+    if !(ap == "") {
+        key = ap
+    }
+    // 1. a dependency named `key`? -> list every .nori under its src dir
+    var dirs: Map<Str, Str> = map()
+    var names: Vec<Str> = vec()
+    doc_dep_dirs(dirs, names)
+    if dirs.has(key) {
+        let sdir = module_in(dirs.get(key))
+        let files = os::list_tree(sdir)
+        var i = 0
+        while i < files.len() {
+            if ends_with(files[i], ".nori") {
+                out.push(copy files[i])
+            }
+            i = i + 1
+        }
+        return
+    }
+    // 2. a std module under NORI_HOME -> a single file
+    let f = doc_pkg_file(key)
+    if !(f == "") {
+        out.push(f)
+    }
+}
+// run `noric --doc FILE` with the given mode/sym.
+fn doc_run(file: Str, mode: Str, sym: Str) -> Int {
+    var cmd: Vec<Str> = vec()
+    cmd.push(noric_path()) cmd.push("--doc") cmd.push(copy file)
+    if(mode == "sym") {
+        cmd.push("--sym")
+        cmd.push(copy sym)
+    }
+    else if(mode == "listpub") {
+        cmd.push("--list")
+        cmd.push("--public")
+    }
+    // imported pkg: documented API only
+    else {
+        cmd.push("--list")
+    }
+    return os::run(cmd)
+}
+// did the user pass --all / -a (show every symbol, incl. internal helpers + extern)?
+fn doc_want_all() -> Bool {
+    var i = 1
+    while i < argc() {
+        if(arg(i) == "--all") || (arg(i) == "-a") {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+// `roll doc`               -> the local package's API index (signatures + synopsis)
+// `roll doc <Symbol>`      -> a local symbol's full doc; or a whole package if <Symbol> names one
+// `roll doc <pkg>`         -> an imported package's index   (e.g. `roll doc std/tui` or `roll doc tui`)
+// `roll doc <pkg>::<Sym>`  -> one symbol in an imported package
+pub fn doc_cmd() -> Int {
+    var q = ""
+    var qi0 = 1
+    while qi0 < argc() {
+        if !starts_with(arg(qi0), "-") {
+            q = arg(qi0)
+            qi0 = argc()
+        } else {
+            qi0 = qi0 + 1
+        }
+    }
+    // first non-flag arg
+    let allflag = doc_want_all()
+
+    // `pkg::sym` form
+    var ci = 0 - 1
+    var qi = 0
+    while qi + 1 < q.len() {
+        if q.at(qi) == ':' && q.at(qi + 1) == ':' {
+            ci = qi
+            qi = q.len()
+        } else {
+            qi = qi + 1
+        }
+    }
+    if ci >= 0 {
+        let pkg = q.slice(0, ci)
+        let sym = q.slice(ci + 2, q.len())
+        var pf: Vec<Str> = vec()
+        doc_pkg_files(pkg, pf)
+        if pf.len() == 0 {
+            printl(("roll doc: unknown package `" + (pkg + "`")))
+            return 1
+        }
+        var i = 0
+        while i < pf.len() {
+            doc_run(pf[i], "sym", sym)
+            i = i + 1
+        }
+        return 0
+    }
+
+    let mf = load_manifest()
+    let dir = dirname(section_get(mf, "", "entry"))
+    let files = os::list_tree(dir)
+
+    if(q == "") {
+        // local package index
+        var i = 0
+        while i < files.len() {
+            if ends_with(files[i], ".nori") {
+                doc_run(files[i], "list", "")
+            }
+            i = i + 1
+        }
+        return 0
+    }
+
+    // a bare name: an imported package (std or dependency)? Show its documented API only
+    // (use `--all` for every symbol, incl. internal helpers + extern).
+    var pf: Vec<Str> = vec()
+    doc_pkg_files(q, pf)
+    if pf.len() > 0 {
+        var pmode = "listpub"
+        if allflag {
+            pmode = "list"
+        }
+        var i = 0
+        while i < pf.len() {
+            doc_run(pf[i], pmode, "")
+            i = i + 1
+        }
+        return 0
+    }
+
+    // else a local symbol
+    var i = 0
+    while i < files.len() {
+        if ends_with(files[i], ".nori") {
+            doc_run(files[i], "sym", q)
+        }
+        i = i + 1
+    }
+    return 0
+}

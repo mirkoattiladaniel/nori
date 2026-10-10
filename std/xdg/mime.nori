@@ -1,0 +1,789 @@
+// std/xdg/mime.nori: what kind of file a file is, and which application opens it: the Shared MIME-info
+// Database specification (0.21: globs2, magic, subclasses, aliases, icons, generic-icons and the per-type XML
+// for a type's name) and the MIME Applications Associations specification (1.0.1: mimeapps.list's default,
+// added and removed associations, over the desktop entries' MimeType=).
+//
+//   var db = xdg::mime_db_load()                              // every <data dir>/mime, the spec's order
+//   let t = xdg::mime_guess(db, "photo.JPG", head)             // the name's globs, the head's magic: "image/jpeg"
+//   xdg::mime_is_a(db, "image/svg+xml", "application/xml")    // subclasses, aliases, the implicit parents
+//   xdg::mime_icon_names(db, t)                               // ["image-jpeg", "image-x-generic"]
+//   xdg::mime_comment(db, t, "hu")                            // "JPEG kép" (the type's XML; English without)
+//   var ma = xdg::mimeapps_load()
+//   xdg::apps_for_mime(ma, db, apps, t)                       // desktop ids, the default first
+//
+// The database is read from its text files (globs2, magic, …), not the binary mime.cache: they are what
+// update-mime-database writes beside it in every database, and reading them needs no second format.
+
+import "std/os" as os
+import "std/strutil" as su
+
+/// one glob of globs2: `weight:type:pattern[:flags]`; kind 0 a literal name, 1 `*SUFFIX`, 2 any other glob
+pub struct MimeGlob { weight: Int, mime: Str, pat: Str, cs: Bool, kind: Int }
+
+/// one line of a magic rule (a "matchlet"): at `off` (to `off + range - 1`), `value` under `mask`; `wsize` is the
+/// word size whose bytes are swapped on a little-endian machine (1: none)
+pub struct MagicLet { indent: Int, off: Int, value: Str, mask: Str, wsize: Int, range: Int }
+
+/// a `[priority:type]` section of the magic file
+pub struct MagicRule { prio: Int, mime: Str, lets: Vec<MagicLet> }
+
+/// a loaded database: the globs indexed (literal names and `*SUFFIX` patterns by their lower-case text), the magic
+/// rules by priority, and the type relations
+pub struct MimeDb {
+    ok: Bool,
+    dirs: Vec<Str>,                         // the `mime` directories read, the most important first
+    globs: Vec<MimeGlob>,
+    lits: Map<Str, Vec<Int>>,               // lower-case literal name -> globs
+    sufs: Map<Str, Vec<Int>>,               // lower-case suffix ("*.tar.gz" -> ".tar.gz") -> globs
+    maxsuf: Int,
+    fulls: Vec<Int>,                        // the other globs, tried one by one
+    magic: Vec<MagicRule>,                  // the highest priority first
+    parents: Map<Str, Vec<Str>>,            // subclasses: type -> its parents
+    aliases: Map<Str, Str>,                 // alias -> the canonical type
+    icons: Map<Str, Str>,                   // icons: type -> icon name
+    gicons: Map<Str, Str>                   // generic-icons: type -> generic icon name
+}
+
+/// an empty database (every guess is the text/binary fallback)
+pub fn mime_db_empty() -> MimeDb {
+    return MimeDb { ok: false, dirs: vec(), globs: vec(), lits: map(), sufs: map(), maxsuf: 0, fulls: vec(), magic: vec(),
+                    parents: map(), aliases: map(), icons: map(), gicons: map() }
+}
+
+/// The database of this machine: `mime/` under $XDG_DATA_HOME and each of $XDG_DATA_DIRS (the spec's order: the
+/// first the most important), plus `extra` data directories after them (another root's share, say).
+pub fn mime_db_load_with(extra: Vec<Str>) -> MimeDb {
+    var dirs: Vec<Str> = vec()
+    foreach d in data_search_paths() { dirs.push(d + "/mime") }
+    foreach e in extra { dirs.push(e + "/mime") }
+    return mime_db_load_dirs(dirs)
+}
+
+/// mime_db_load_with, nothing extra
+pub fn mime_db_load() -> MimeDb {
+    var none: Vec<Str> = vec()
+    return mime_db_load_with(none)
+}
+
+/// The database in these `mime` directories, the most important first. Directories that do not exist are
+/// skipped; `ok` says whether any held a database (globs2 or magic).
+pub fn mime_db_load_dirs(dirs: Vec<Str>) -> MimeDb {
+    var db = mime_db_empty()
+    // least important first, so a more important directory's __NOGLOBS__ can take back what came before it
+    var k = dirs.len() - 1
+    while k >= 0 {
+        let d = dirs[k]
+        if os::is_dir(d) {
+            db.dirs.push(copy d)
+            if is_file(d + "/globs2") { db.ok = true  m_load_globs(db, read_file(d + "/globs2")) }
+            if is_file(d + "/magic") { db.ok = true  m_load_magic(db, read_file(d + "/magic")) }
+            m_load_pairs(db, read_file_or(d + "/subclasses"), 0)
+            m_load_pairs(db, read_file_or(d + "/aliases"), 1)
+            m_load_pairs(db, read_file_or(d + "/icons"), 2)
+            m_load_pairs(db, read_file_or(d + "/generic-icons"), 3)
+        }
+        k = k - 1
+    }
+    // dirs was filled least important first: the most important first, as the field says
+    var rd: Vec<Str> = vec()
+    var j = db.dirs.len() - 1
+    while j >= 0 { rd.push(copy db.dirs[j])  j = j - 1 }
+    db.dirs = rd
+    m_index(db)
+    m_sort_magic(db)
+    return db
+}
+
+fn read_file_or(p: Str) -> Str { if is_file(p) { return read_file(p) }  return "" }
+
+fn m_lines(text: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var s = 0
+    var i = 0
+    while i <= text.len() {
+        if i == text.len() || text.at(i) == '\n' {
+            if i > s { out.push(text.slice(s, i)) }
+            s = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn m_lower(s: Str) -> Str {
+    var out = ""
+    var i = 0
+    var start = 0
+    // only ASCII letters change (the spec's case-insensitive match is ASCII case folding in practice)
+    while i < s.len() {
+        let c = ord(s.at(i))
+        if c >= 65 && c <= 90 {
+            out = out + s.slice(start, i) + chr(c + 32)
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start == 0 { return copy s }
+    return out + s.slice(start, s.len())
+}
+
+// a value appended to a key's list
+fn m_adds(inout m: Map<Str, Vec<Str>>, k: Str, v: Str) {
+    var l: Vec<Str> = vec()
+    if m.has(k) { l = copy m.get(k) }
+    l.push(copy v)
+    m.put(k, l)
+}
+fn m_addi(inout m: Map<Str, Vec<Int>>, k: Str, v: Int) {
+    var l: Vec<Int> = vec()
+    if m.has(k) { l = copy m.get(k) }
+    l.push(v)
+    m.put(k, l)
+}
+
+fn m_has_wild(p: Str) -> Bool {
+    var i = 0
+    while i < p.len() { let c = p.at(i)  if c == '*' || c == '?' || c == '[' { return true }  i = i + 1 }
+    return false
+}
+
+// globs2: `weight:type:pattern[:flags]`; `__NOGLOBS__` as the pattern drops the type's globs from the less important
+// directories read before this one
+fn m_load_globs(inout db: MimeDb, text: Str) {
+    var nog: Vec<Str> = vec()
+    var mine: Vec<MimeGlob> = vec()
+    foreach ln in m_lines(text) {
+        if ln.at(0) == '#' { continue }
+        let f = su::split(ln, ":")
+        if f.len() < 3 { continue }
+        if f[2] == "__NOGLOBS__" { nog.push(copy f[1])  continue }
+        var cs = false
+        if f.len() >= 4 { foreach fl in su::split(f[3], ",") { if fl == "cs" { cs = true } } }
+        var kind = 2
+        let p = f[2]
+        if !m_has_wild(p) { kind = 0 }
+        else if p.at(0) == '*' && !m_has_wild(p.slice(1, p.len())) { kind = 1 }
+        mine.push(MimeGlob { weight: parse_int(f[0]), mime: copy f[1], pat: copy p, cs: cs, kind: kind })
+    }
+    if nog.len() > 0 {
+        var kept: Vec<MimeGlob> = vec()
+        foreach g in db.globs {
+            var drop = false
+            foreach t in nog { if t == g.mime { drop = true } }
+            if !drop { kept.push(copy g) }
+        }
+        db.globs = kept
+    }
+    foreach g2 in mine { db.globs.push(copy g2) }
+}
+
+fn m_index(inout db: MimeDb) {
+    var lits: Map<Str, Vec<Int>> = map()
+    var sufs: Map<Str, Vec<Int>> = map()
+    var fulls: Vec<Int> = vec()
+    var maxsuf = 0
+    var i = 0
+    while i < db.globs.len() {
+        let g = db.globs[i]
+        let gi = i
+        if g.kind == 0 { m_addi(lits, m_lower(g.pat), gi) }
+        else if g.kind == 1 {
+            let sx = m_lower(g.pat.slice(1, g.pat.len()))
+            if sx.len() > maxsuf { maxsuf = sx.len() }
+            m_addi(sufs, sx, gi)
+        } else { fulls.push(gi) }
+        i = i + 1
+    }
+    db.lits = lits
+    db.sufs = sufs
+    db.fulls = fulls
+    db.maxsuf = maxsuf
+}
+
+// subclasses (0), aliases (1), icons (2), generic-icons (3): `type other` or `type:icon`
+fn m_load_pairs(inout db: MimeDb, text: Str, which: Int) {
+    foreach ln in m_lines(text) {
+        if ln.at(0) == '#' { continue }
+        var sep = 0 - 1
+        var i = 0
+        while i < ln.len() && sep < 0 {
+            if (which <= 1 && ln.at(i) == ' ') || (which >= 2 && ln.at(i) == ':') { sep = i }
+            i = i + 1
+        }
+        if sep <= 0 { continue }
+        let a = ln.slice(0, sep)
+        let b = su::trim(ln.slice(sep + 1, ln.len()))
+        if b.len() == 0 { continue }
+        if which == 0 {
+            m_adds(db.parents, a, b)
+        }
+        else if which == 1 { db.aliases.put(a, copy b) }
+        else if which == 2 { db.icons.put(a, copy b) }
+        else { db.gicons.put(a, copy b) }
+    }
+}
+
+// a decimal number at text[i..]: (value, the index after it); (-1, i) when there is none
+fn m_num(text: Str, i: Int, inout end: Int) -> Int {
+    var v = 0
+    var j = i
+    while j < text.len() && ord(text.at(j)) >= 48 && ord(text.at(j)) <= 57 { v = v * 10 + ord(text.at(j)) - 48  j = j + 1 }
+    end = j
+    if j == i { return 0 - 1 }
+    return v
+}
+
+// the magic file: "MIME-Magic\0\n", then sections `[priority:type]\n` of lines
+// `[indent]>offset=LLvalue[&mask][~word-size][+range-length]\n` (LL the value's length, two bytes, big-endian)
+fn m_load_magic(inout db: MimeDb, text: Str) {
+    let hdr = "MIME-Magic" + chr(0) + "\n"
+    if text.len() < hdr.len() || !(text.slice(0, hdr.len()) == hdr) { return }
+    var i = hdr.len()
+    var cur = MagicRule { prio: 0, mime: "", lets: vec() }
+    var have = false
+    let n = text.len()
+    while i < n {
+        if text.at(i) == '[' {
+            if have { db.magic.push(sink cur) }
+            cur = MagicRule { prio: 0, mime: "", lets: vec() }
+            have = false
+            var e = 0
+            let pr = m_num(text, i + 1, e)
+            var j = e
+            if j < n && text.at(j) == ':' {
+                j = j + 1
+                let ts = j
+                while j < n && !(text.at(j) == ']') && !(text.at(j) == '\n') { j = j + 1 }
+                if j < n && text.at(j) == ']' {
+                    cur.prio = pr
+                    cur.mime = text.slice(ts, j)
+                    have = true
+                }
+            }
+            while j < n && !(text.at(j) == '\n') { j = j + 1 }
+            i = j + 1
+            continue
+        }
+        // a matchlet
+        var e2 = 0
+        var indent = 0
+        if !(text.at(i) == '>') { indent = m_num(text, i, e2)  if indent < 0 { indent = 0 }  i = e2 }
+        if i >= n || !(text.at(i) == '>') {
+            // not a matchlet this reader knows: the rest of the line is skipped
+            while i < n && !(text.at(i) == '\n') { i = i + 1 }
+            i = i + 1
+            continue
+        }
+        let off = m_num(text, i + 1, e2)
+        i = e2
+        if i + 2 >= n || !(text.at(i) == '=') { while i < n && !(text.at(i) == '\n') { i = i + 1 }  i = i + 1  continue }
+        let vl = ord(text.at(i + 1)) * 256 + ord(text.at(i + 2))
+        i = i + 3
+        if i + vl > n { return }
+        let value = text.slice(i, i + vl)
+        i = i + vl
+        var mask = ""
+        var wsize = 1
+        var range = 1
+        var bad = false
+        while i < n && !(text.at(i) == '\n') && !bad {
+            let c = text.at(i)
+            if c == '&' {
+                if i + 1 + vl > n { return }
+                mask = text.slice(i + 1, i + 1 + vl)
+                i = i + 1 + vl
+            } else if c == '~' { wsize = m_num(text, i + 1, e2)  i = e2 }
+            else if c == '+' { range = m_num(text, i + 1, e2)  i = e2 }
+            else { bad = true }
+        }
+        while i < n && !(text.at(i) == '\n') { i = i + 1 }
+        i = i + 1
+        if bad || off < 0 { continue }
+        if range < 1 { range = 1 }
+        if wsize < 1 { wsize = 1 }
+        // the value and the mask are written big-endian: words of 2 or 4 bytes are compared swapped on this
+        // little-endian machine
+        var v2 = copy value
+        var m2 = copy mask
+        if wsize == 2 || wsize == 4 { v2 = m_swap(value, wsize)  if mask.len() > 0 { m2 = m_swap(mask, wsize) } }
+        if have { cur.lets.push(MagicLet { indent: indent, off: off, value: v2, mask: m2, wsize: wsize, range: range }) }
+    }
+    if have { db.magic.push(sink cur) }
+}
+
+fn m_swap(s: Str, w: Int) -> Str {
+    if s.len() % w != 0 { return copy s }
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        var k = w - 1
+        while k >= 0 { out = out + s.slice(i + k, i + k + 1)  k = k - 1 }
+        i = i + w
+    }
+    return out
+}
+
+// the magic rules, the highest priority first (a stable insertion sort: within a priority, file order)
+fn m_sort_magic(inout db: MimeDb) {
+    var idx: Vec<Int> = vec()
+    var i = 0
+    while i < db.magic.len() {
+        var j = idx.len()
+        idx.push(i)
+        while j > 0 && db.magic[idx[j - 1]].prio < db.magic[i].prio { idx[j] = idx[j - 1]  j = j - 1 }
+        idx[j] = i
+        i = i + 1
+    }
+    var out: Vec<MagicRule> = vec()
+    foreach x in idx { out.push(copy db.magic[x]) }
+    db.magic = out
+}
+
+// does matchlet `m` match `data` at one of its offsets?
+fn m_let_matches(m: MagicLet, data: Str) -> Bool {
+    let vl = m.value.len()
+    var o = m.off
+    while o < m.off + m.range {
+        if o + vl > data.len() { return false }
+        var ok = true
+        var k = 0
+        while k < vl && ok {
+            var d = ord(data.at(o + k))
+            if m.mask.len() > 0 { d = d & ord(m.mask.at(k)) }
+            if d != ord(m.value.at(k)) { ok = false }
+            k = k + 1
+        }
+        if ok { return true }
+        o = o + 1
+    }
+    return false
+}
+
+// the matchlet at `i` and its subtree: it matches, and it has no children or one of them matches
+fn m_tree(lets: Vec<MagicLet>, i: Int, data: Str) -> Bool {
+    if !m_let_matches(lets[i], data) { return false }
+    let ind = lets[i].indent
+    var j = i + 1
+    var any_child = false
+    while j < lets.len() && lets[j].indent > ind {
+        if lets[j].indent == ind + 1 {
+            any_child = true
+            if m_tree(lets, j, data) { return true }
+        }
+        j = j + 1
+    }
+    return !any_child
+}
+
+/// does the magic rule match the data?
+pub fn magic_rule_matches(r: MagicRule, data: Str) -> Bool {
+    var i = 0
+    while i < r.lets.len() {
+        if r.lets[i].indent == 0 && m_tree(r.lets, i, data) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+/// The type the data's first bytes say by the magic rules (the highest priority that matches; "" when none does).
+/// Hand it the file's first few kilobytes: 4096 bytes cover every rule shared-mime-info ships but a handful.
+pub fn mime_by_data(db: MimeDb, data: Str) -> Str {
+    if data.len() == 0 { return "" }
+    foreach r in db.magic { if magic_rule_matches(r, data) { return copy r.mime } }
+    return ""
+}
+
+/// The glob `pat` against `name` (fnmatch's `*`, `?` and `[...]`, `[!...]`; no path separators involved).
+pub fn mime_glob_match(pat: Str, name: Str) -> Bool { return m_fn(pat, 0, name, 0) }
+
+fn m_fn(p: Str, pi: Int, s: Str, si: Int) -> Bool {
+    var i = pi
+    var j = si
+    while i < p.len() {
+        let c = p.at(i)
+        if c == '*' {
+            while i < p.len() && p.at(i) == '*' { i = i + 1 }
+            if i == p.len() { return true }
+            var k = j
+            while k <= s.len() { if m_fn(p, i, s, k) { return true }  k = k + 1 }
+            return false
+        }
+        if j >= s.len() { return false }
+        if c == '?' { i = i + 1  j = j + 1  continue }
+        if c == '[' {
+            var e = i + 1
+            if e < p.len() && (p.at(e) == '!' || p.at(e) == '^') { e = e + 1 }
+            if e < p.len() && p.at(e) == ']' { e = e + 1 }
+            while e < p.len() && !(p.at(e) == ']') { e = e + 1 }
+            if e >= p.len() {                              // no closing bracket: a literal '['
+                if !(s.at(j) == '[') { return false }
+                i = i + 1  j = j + 1  continue
+            }
+            var neg = false
+            var q = i + 1
+            if p.at(q) == '!' || p.at(q) == '^' { neg = true  q = q + 1 }
+            var hit = false
+            var first = true
+            let ch = ord(s.at(j))
+            while q < e || (first && q == e) {
+                if q == e && !first { break }
+                if q + 2 < e && p.at(q + 1) == '-' {
+                    if ch >= ord(p.at(q)) && ch <= ord(p.at(q + 2)) { hit = true }
+                    q = q + 3
+                } else {
+                    if ch == ord(p.at(q)) { hit = true }
+                    q = q + 1
+                }
+                first = false
+            }
+            if hit == neg { return false }
+            i = e + 1
+            j = j + 1
+            continue
+        }
+        if !(c == s.at(j)) { return false }
+        i = i + 1
+        j = j + 1
+    }
+    return j == s.len()
+}
+
+/// The types the name's globs give, after the spec's pruning: only the biggest weight, then only the longest
+/// pattern; distinct types, in globs2's order. Empty when no glob matches.
+pub fn mime_by_name(db: MimeDb, name: Str) -> Vec<Str> {
+    var hits: Vec<Int> = vec()
+    let low = m_lower(name)
+    if db.lits.has(low) { foreach x in db.lits.get(low) { if !db.globs[x].cs || db.globs[x].pat == name { hits.push(x) } } }
+    if hits.len() == 0 {
+        var k = 1
+        while k <= db.maxsuf && k <= low.len() {
+            let sx = low.slice(low.len() - k, low.len())
+            if db.sufs.has(sx) {
+                foreach y in db.sufs.get(sx) {
+                    let g = db.globs[y]
+                    if !g.cs || name.slice(name.len() - k, name.len()) == g.pat.slice(1, g.pat.len()) { hits.push(y) }
+                }
+            }
+            k = k + 1
+        }
+        foreach z in db.fulls {
+            let g2 = db.globs[z]
+            if g2.cs { if mime_glob_match(g2.pat, name) { hits.push(z) } }
+            else if mime_glob_match(m_lower(g2.pat), low) { hits.push(z) }
+        }
+    }
+    var out: Vec<Str> = vec()
+    if hits.len() == 0 { return out }
+    // a case-sensitive glob that matched (its case exactly) is the stronger evidence: "x.C" is C++, though "*.c"
+    // matches it too without regard to case
+    var csh: Vec<Int> = vec()
+    foreach hc in hits { if db.globs[hc].cs { csh.push(hc) } }
+    if csh.len() > 0 { hits = csh }
+    var bw = 0 - 1
+    foreach h in hits { if db.globs[h].weight > bw { bw = db.globs[h].weight } }
+    var bl = 0
+    foreach h2 in hits { if db.globs[h2].weight == bw && db.globs[h2].pat.len() > bl { bl = db.globs[h2].pat.len() } }
+    foreach h3 in hits {
+        let g3 = db.globs[h3]
+        if g3.weight == bw && g3.pat.len() == bl {
+            var seen = false
+            foreach t in out { if t == g3.mime { seen = true } }
+            if !seen { out.push(copy g3.mime) }
+        }
+    }
+    return out
+}
+
+/// Text or not, by the spec's advice: no ASCII control character in the first 128 bytes but the ones text has
+/// (tab, newline, form feed, carriage return, escape); high bytes are text (UTF-8).
+pub fn mime_looks_text(data: Str) -> Bool {
+    var i = 0
+    while i < data.len() && i < 128 {
+        let c = ord(data.at(i))
+        if c < 32 && c != 9 && c != 10 && c != 12 && c != 13 && c != 27 { return false }
+        if c == 127 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+/// The canonical name of a type (aliases followed).
+pub fn mime_unalias(db: MimeDb, t: Str) -> Str {
+    if db.aliases.has(t) { return copy db.aliases.get(t) }
+    return copy t
+}
+
+/// Is `t` the type `p`, or a subclass of it? Aliases followed; besides subclasses, every text/* type is a
+/// text/plain and every type but inode/* an application/octet-stream (the spec's implicit parents).
+pub fn mime_is_a(db: MimeDb, t: Str, p: Str) -> Bool {
+    let a = mime_unalias(db, t)
+    let b = mime_unalias(db, p)
+    return m_is_a(db, a, b, 0)
+}
+
+fn m_is_a(db: MimeDb, a: Str, b: Str, depth: Int) -> Bool {
+    if a == b { return true }
+    if depth > 16 { return false }
+    if b == "text/plain" && a.len() > 5 && a.slice(0, 5) == "text/" { return true }
+    if b == "application/octet-stream" && !(a.len() > 6 && a.slice(0, 6) == "inode/") { return true }
+    if db.parents.has(a) {
+        foreach x in db.parents.get(a) { if m_is_a(db, mime_unalias(db, x), b, depth + 1) { return true } }
+    }
+    return false
+}
+
+/// A type's parents: its subclasses lines, then the implicit text/plain (for text/*) and application/octet-stream.
+pub fn mime_parents(db: MimeDb, t: Str) -> Vec<Str> {
+    let a = mime_unalias(db, t)
+    var out: Vec<Str> = vec()
+    if db.parents.has(a) { foreach x in db.parents.get(a) { out.push(mime_unalias(db, x)) } }
+    if a.len() > 5 && a.slice(0, 5) == "text/" && !(a == "text/plain") { out.push("text/plain") }
+    return out
+}
+
+/// The type of a file by its name and its first bytes (`data`; "" when they are not at hand), by the spec's
+/// recommended order: one glob type wins outright; otherwise the magic decides; a glob type that is the magic's
+/// type or a subclass of it, else the magic's type when no glob matched, else the first glob type; with neither,
+/// text/plain for text and application/octet-stream for the rest.
+pub fn mime_guess(db: MimeDb, name: Str, data: Str) -> Str {
+    let gl = mime_by_name(db, name)
+    if gl.len() == 1 { return mime_unalias(db, gl[0]) }
+    let sn = mime_by_data(db, data)
+    if gl.len() > 1 {
+        if sn.len() > 0 { foreach g in gl { if mime_is_a(db, g, sn) { return mime_unalias(db, g) } } }
+        return mime_unalias(db, gl[0])
+    }
+    if sn.len() > 0 { return mime_unalias(db, sn) }
+    if data.len() > 0 && mime_looks_text(data) { return "text/plain" }
+    return "application/octet-stream"
+}
+
+/// The icon names a theme is asked for, in order: the database's icon for the type, the type's own name
+/// (`image/png` -> `image-png`), its generic icon (generic-icons, else `<media>-x-generic`).
+pub fn mime_icon_names(db: MimeDb, t: Str) -> Vec<Str> {
+    let a = mime_unalias(db, t)
+    var out: Vec<Str> = vec()
+    if db.icons.has(a) { out.push(copy db.icons.get(a)) }
+    out.push(su::replace(a, "/", "-"))
+    if db.gicons.has(a) { out.push(copy db.gicons.get(a)) }
+    else {
+        var sl = 0
+        while sl < a.len() && !(a.at(sl) == '/') { sl = sl + 1 }
+        out.push(a.slice(0, sl) + "-x-generic")
+    }
+    return out
+}
+
+/// What the type is called, for people: the `<comment>` of `<dir>/<type>.xml` in the most important directory that
+/// has one, in `locale` (`hu_HU.UTF-8`, `hu`: the language and then the plain one) when it says one; "" when no
+/// directory describes the type.
+pub fn mime_comment(db: MimeDb, t: Str, locale: Str) -> Str {
+    let a = mime_unalias(db, t)
+    foreach d in db.dirs {
+        let p = d + "/" + a + ".xml"
+        if is_file(p) {
+            let x = read_file(p)
+            var lang = copy locale
+            var cut = 0
+            while cut < lang.len() && !(lang.at(cut) == '.') && !(lang.at(cut) == '@') { cut = cut + 1 }
+            lang = lang.slice(0, cut)
+            if lang.len() > 0 && !(lang == "C") && !(lang == "POSIX") {
+                let full = m_xml_tag(x, "<comment xml:lang=\"" + lang + "\">")
+                if full.len() > 0 { return full }
+                var us = 0
+                while us < lang.len() && !(lang.at(us) == '_') { us = us + 1 }
+                if us < lang.len() {
+                    let short = m_xml_tag(x, "<comment xml:lang=\"" + lang.slice(0, us) + "\">")
+                    if short.len() > 0 { return short }
+                }
+            }
+            let plain = m_xml_tag(x, "<comment>")
+            if plain.len() > 0 { return plain }
+        }
+    }
+    return ""
+}
+
+fn m_xml_tag(x: Str, open: Str) -> Str {
+    let i = su::index_of(x, open)
+    if i < 0 { return "" }
+    let rest = x.slice(i + open.len(), x.len())
+    let e = su::index_of(rest, "</comment>")
+    if e < 0 { return "" }
+    var s = rest.slice(0, e)
+    s = su::replace(s, "&lt;", "<")
+    s = su::replace(s, "&gt;", ">")
+    s = su::replace(s, "&quot;", "\"")
+    s = su::replace(s, "&apos;", "'")
+    return su::replace(s, "&amp;", "&")
+}
+
+// ---- mimeapps.list (MIME Applications Associations 1.0.1) --------------------------------------------------------
+
+/// the associations of every mimeapps.list, merged: per type, the default applications in preference order, the
+/// added associations in preference order, and what each file removed (applied to its own and less important
+/// files' associations: `blocked`)
+pub struct MimeApps {
+    files: Vec<Str>,                         // the files read, the most important first
+    defaults: Map<Str, Vec<Str>>,
+    added: Map<Str, Vec<Str>>,
+    blocked: Map<Str, Vec<Str>>              // removed associations, as the merge left them
+}
+
+/// The mimeapps.list files in the spec's order, the most important first, for the desktops named (lower-case,
+/// `XDG_CURRENT_DESKTOP`'s): `$XDG_CONFIG_HOME/{desktop-,}mimeapps.list`, the same in each config dir, then the
+/// (deprecated) `applications/` of the data home and data dirs.
+pub fn mimeapps_files(desktops: Vec<Str>) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var bases: Vec<Str> = vec()
+    bases.push(config_home())
+    foreach c in config_dirs() { bases.push(copy c) }
+    bases.push(data_home() + "/applications")
+    foreach d in data_dirs() { bases.push(d + "/applications") }
+    foreach b in bases {
+        foreach dk in desktops { out.push(b + "/" + dk + "-mimeapps.list") }
+        out.push(b + "/mimeapps.list")
+    }
+    return out
+}
+
+/// the desktops XDG_CURRENT_DESKTOP names, lower-case
+pub fn current_desktops() -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    foreach d in su::split(os::env("XDG_CURRENT_DESKTOP"), ":") { if d.len() > 0 { out.push(m_lower(d)) } }
+    return out
+}
+
+/// The associations of this machine (XDG_CURRENT_DESKTOP's desktops' files included).
+pub fn mimeapps_load() -> MimeApps { return mimeapps_load_files(mimeapps_files(current_desktops())) }
+
+/// The associations of these files, the most important first (files that do not exist are skipped).
+pub fn mimeapps_load_files(paths: Vec<Str>) -> MimeApps {
+    var ma = MimeApps { files: vec(), defaults: map(), added: map(), blocked: map() }
+    foreach p in paths {
+        if !is_file(p) { continue }
+        ma.files.push(copy p)
+        let e = parse_desktop(read_file(p))
+        // added first: the removals of this file apply to the less important ones (and to MimeType= entries)
+        foreach g in e.groups {
+            if g.name == "Default Applications" {
+                foreach kd in g.keys { foreach id in d_split_list(kd.value) { m_adds(ma.defaults, kd.key, id) } }
+            }
+        }
+        foreach g2 in e.groups {
+            if g2.name == "Added Associations" {
+                foreach ka in g2.keys {
+                    foreach id2 in d_split_list(ka.value) {
+                        if !m_in(ma.blocked, ka.key, id2) { m_adds(ma.added, ka.key, id2) }
+                    }
+                }
+            }
+        }
+        foreach g3 in e.groups {
+            if g3.name == "Removed Associations" {
+                foreach kr in g3.keys { foreach id3 in d_split_list(kr.value) { m_adds(ma.blocked, kr.key, id3) } }
+            }
+        }
+    }
+    return ma
+}
+
+// mimeapps.list names applications by their desktop file id with `.desktop`; App.id is without it
+fn m_bare(id: Str) -> Str {
+    if id.len() > 8 && id.slice(id.len() - 8, id.len()) == ".desktop" { return id.slice(0, id.len() - 8) }
+    return copy id
+}
+
+fn m_in(m: Map<Str, Vec<Str>>, k: Str, id: Str) -> Bool {
+    if !m.has(k) { return false }
+    let b = m_bare(id)
+    foreach x in m.get(k) { if m_bare(x) == b { return true } }
+    return false
+}
+
+fn m_app_handles(db: MimeDb, a: App, t: Str) -> Bool {
+    foreach mt in app_mime_type(a) { if mime_unalias(db, mt) == t { return true } }
+    return false
+}
+
+fn m_has_app(apps: Vec<App>, id: Str) -> Bool {
+    let b = m_bare(id)
+    foreach a in apps { if a.id == b { return true } }
+    return false
+}
+
+fn m_push_once(inout out: Vec<Str>, id: Str) {
+    foreach x in out { if x == id { return } }
+    out.push(copy id)
+}
+
+/// The applications (the ids of `apps`, the installed ones: App.id, without `.desktop`) that open type `t`, best first: the default
+/// applications mimeapps.list names, its added associations, the entries whose MimeType= lists the type; then the
+/// same for each parent type, nearest first. Removed associations are left out (not from the defaults).
+pub fn apps_for_mime(ma: MimeApps, db: MimeDb, apps: Vec<App>, t: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var types: Vec<Str> = vec()
+    types.push(mime_unalias(db, t))
+    var qi = 0
+    while qi < types.len() && qi < 32 {
+        let ty = copy types[qi]
+        // the names mimeapps.list may use: the type and its aliases
+        var names: Vec<Str> = vec()
+        names.push(copy ty)
+        foreach al in db.aliases.keys() { if db.aliases.get(al) == ty { names.push(copy al) } }
+        foreach nm in names { if ma.defaults.has(nm) { foreach d in ma.defaults.get(nm) { if m_has_app(apps, d) { m_push_once(out, m_bare(d)) } } } }
+        foreach nm2 in names { if ma.added.has(nm2) { foreach d2 in ma.added.get(nm2) { if m_has_app(apps, d2) { m_push_once(out, m_bare(d2)) } } } }
+        foreach a in apps {
+            if m_app_handles(db, a, ty) {
+                var blocked = false
+                foreach nm3 in names { if m_in(ma.blocked, nm3, a.id) { blocked = true } }
+                if !blocked { m_push_once(out, a.id) }
+            }
+        }
+        foreach p in mime_parents(db, ty) { m_push_once(types, p) }
+        qi = qi + 1
+    }
+    return out
+}
+
+/// The application that opens type `t` by default: the first of apps_for_mime ("" when nothing opens it).
+pub fn default_app_for_mime(ma: MimeApps, db: MimeDb, apps: Vec<App>, t: Str) -> Str {
+    let l = apps_for_mime(ma, db, apps, t)
+    if l.len() == 0 { return "" }
+    return copy l[0]
+}
+
+/// Make `id` (a desktop file id; `.desktop` is added when it lacks it) the default application of type `t` in the
+/// mimeapps.list at `path` (the user's is
+/// `config_home() + "/mimeapps.list"`): its `[Default Applications]` line for the type replaced, or added, the rest
+/// of the file as it was. False when the file could not be written.
+pub fn mimeapps_set_default(path: Str, t: Str, id0: Str) -> Bool {
+    let id = m_bare(id0) + ".desktop"
+    var text = ""
+    if is_file(path) { text = read_file(path) }
+    var out = ""
+    var in_def = false
+    var done = false
+    var saw_def = false
+    foreach ln in su::split(text, "\n") {
+        let tl = su::trim(ln)
+        if tl.len() > 0 && tl.at(0) == '[' {
+            if in_def && !done { out = out + t + "=" + id + ";\n"  done = true }
+            in_def = tl == "[Default Applications]"
+            if in_def { saw_def = true }
+            out = out + ln + "\n"
+            continue
+        }
+        if in_def && tl.len() > t.len() && tl.slice(0, t.len() + 1) == t + "=" {
+            if !done { out = out + t + "=" + id + ";\n"  done = true }
+            continue
+        }
+        if ln.len() > 0 || tl.len() > 0 { out = out + ln + "\n" }
+    }
+    if in_def && !done { out = out + t + "=" + id + ";\n"  done = true }
+    if !saw_def { out = out + "[Default Applications]\n" + t + "=" + id + ";\n" }
+    var sl = path.len() - 1
+    while sl > 0 && !(path.at(sl) == '/') { sl = sl - 1 }
+    if sl > 0 { let _m = os::make_dir_p(path.slice(0, sl)) }
+    return write_file(path, out) == 0
+}

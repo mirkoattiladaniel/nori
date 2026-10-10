@@ -1,0 +1,296 @@
+use core::*
+import "std/math" as math
+
+// ===========================================================================
+// layout/anim: what transitions and keyframe animations move (the animatable
+// properties), their values, easing curves, and interpolation.
+//
+// A value is four floats (AVal): a colour's r g b a, a length's value and unit,
+// a number's value. Interpolation is per property kind; a colour going to or
+// from fully transparent keeps the other end's hue (so a fade-in of a blue
+// background is translucent blue all the way, not a detour through black).
+// ===========================================================================
+
+// the animatable properties, by id
+pub fn ap_bg() -> Int { return 0 }
+pub fn ap_color() -> Int { return 1 }
+pub fn ap_border_color() -> Int { return 2 }
+pub fn ap_radius() -> Int { return 3 }
+pub fn ap_padding() -> Int { return 4 }
+pub fn ap_border_w() -> Int { return 5 }
+pub fn ap_opacity() -> Int { return 6 }
+pub fn ap_translate_x() -> Int { return 7 }
+pub fn ap_translate_y() -> Int { return 8 }
+pub fn ap_scale_x() -> Int { return 9 }
+pub fn ap_scale_y() -> Int { return 10 }
+pub fn ap_w() -> Int { return 11 }
+pub fn ap_h() -> Int { return 12 }
+pub fn ap_size_px() -> Int { return 13 }
+pub fn ap_gap() -> Int { return 14 }
+pub fn ap_top() -> Int { return 15 }
+pub fn ap_left() -> Int { return 16 }
+pub fn ap_right() -> Int { return 17 }
+pub fn ap_bottom() -> Int { return 18 }
+pub fn ap_min_height() -> Int { return 19 }
+pub fn ap_letter_spacing() -> Int { return 20 }
+pub fn ap_count() -> Int { return 21 }
+fn ap_is_color(p: Int) -> Bool { return p <= 2 }
+fn ap_is_length(p: Int) -> Bool { return p == 11 || p == 12 }
+
+/// the property ids a `.style` name stands for in a transition (`translate` and `scale` are two,
+/// `all` is every one); empty when the name is not animatable.
+pub fn ap_ids_of(name: Str) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    if name == "all" { var i = 0  while i < ap_count() { out.push(i)  i = i + 1 }  return out }
+    if name == "translate" { out.push(ap_translate_x())  out.push(ap_translate_y())  return out }
+    if name == "scale" { out.push(ap_scale_x())  out.push(ap_scale_y())  return out }
+    var id = 0 - 1
+    if name == "bg" { id = ap_bg() }
+    else if name == "color" || name == "text_color" { id = ap_color() }
+    else if name == "border_color" { id = ap_border_color() }
+    else if name == "radius" { id = ap_radius() }
+    else if name == "padding" || name == "pad" { id = ap_padding() }
+    else if name == "border_w" || name == "border_width" { id = ap_border_w() }
+    else if name == "opacity" { id = ap_opacity() }
+    else if name == "translate_x" { id = ap_translate_x() }
+    else if name == "translate_y" { id = ap_translate_y() }
+    else if name == "scale_x" { id = ap_scale_x() }
+    else if name == "scale_y" { id = ap_scale_y() }
+    else if name == "w" || name == "width" { id = ap_w() }
+    else if name == "h" || name == "height" { id = ap_h() }
+    else if name == "size_px" || name == "font_size" || name == "text_size" { id = ap_size_px() }
+    else if name == "gap" { id = ap_gap() }
+    else if name == "top" { id = ap_top() }
+    else if name == "left" { id = ap_left() }
+    else if name == "right" { id = ap_right() }
+    else if name == "bottom" { id = ap_bottom() }
+    else if name == "min_height" || name == "min_h" { id = ap_min_height() }
+    else if name == "letter_spacing" { id = ap_letter_spacing() }
+    if id >= 0 { out.push(id) }
+    return out
+}
+
+/// one animatable value.
+pub struct AVal { a: Float, b: Float, c: Float, d: Float }
+pub fn aval(a: Float) -> AVal { return AVal { a: a, b: 0.0, c: 0.0, d: 0.0 } }
+fn aval_c(c: Color) -> AVal { return AVal { a: to_float(c.r), b: to_float(c.g), c: to_float(c.b), d: to_float(c.a) } }
+fn aval_l(l: UiLength) -> AVal { return AVal { a: l.value, b: to_float(l.unit), c: 0.0, d: 0.0 } }
+pub fn aval_dup(v: AVal) -> AVal { return AVal { a: v.a, b: v.b, c: v.c, d: v.d } }
+pub fn aval_eq(x: AVal, y: AVal) -> Bool { return x.a == y.a && x.b == y.b && x.c == y.c && x.d == y.d }
+fn ch255(f: Float) -> Int { var v = to_int(math::round(f))  if v < 0 { v = 0 }  if v > 255 { v = 255 }  return v }
+fn color_of(v: AVal) -> Color { return color_rgba(ch255(v.a), ch255(v.b), ch255(v.c), ch255(v.d)) }
+
+/// the drawn value of property `p` on a node (a colour the node does not draw is transparent).
+pub fn av_get(n: UiNode, p: Int) -> AVal {
+    if p == 0 { if n.has_bg { return aval_c(rgba_color(n.bg)) }  return AVal { a: 0.0, b: 0.0, c: 0.0, d: 0.0 } }
+    if p == 1 { if n.has_color { return aval_c(rgba_color(n.color)) }  return AVal { a: 255.0, b: 255.0, c: 255.0, d: 255.0 } }
+    if p == 2 { if n.has_border { return aval_c(rgba_color(n.border_color)) }  return AVal { a: 0.0, b: 0.0, c: 0.0, d: 0.0 } }
+    if p == 3 { return aval(n.radius) }
+    if p == 4 { return aval(n.padding) }
+    if p == 5 { return aval(n.border_w) }
+    if p == 6 { return aval(n.opacity) }
+    if p == 7 { return aval(n.translate_x) }
+    if p == 8 { return aval(n.translate_y) }
+    if p == 9 { return aval(n.scale_x) }
+    if p == 10 { return aval(n.scale_y) }
+    if p == 11 { return aval_l(n.w) }
+    if p == 12 { return aval_l(n.h) }
+    if p == 13 { return aval(n.size_px) }
+    if p == 14 { return aval(n.gap) }
+    if p == 15 { return aval(n.top) }
+    if p == 16 { return aval(n.left) }
+    if p == 17 { return aval(n.right) }
+    if p == 18 { return aval(n.bottom) }
+    if p == 19 { return aval(n.min_height) }
+    return aval(n.letter_spacing)
+}
+/// set property `p` on a node to `v`.
+pub fn av_set(inout n: UiNode, p: Int, v: AVal) {
+    if p == 0 { n.has_bg = true  n.bg = rgba_pack(color_of(v))  return }
+    if p == 1 { n.has_color = true  n.color = rgba_pack(color_of(v))  return }
+    if p == 2 { n.has_border = true  n.border_color = rgba_pack(color_of(v))  return }
+    if p == 3 { n.radius = v.a  return }
+    if p == 4 { n.padding = v.a  return }
+    if p == 5 { n.border_w = v.a  if v.a > 0.0 { n.has_border = true }  return }
+    if p == 6 { n.opacity = v.a  return }
+    if p == 7 { n.translate_x = v.a  return }
+    if p == 8 { n.translate_y = v.a  return }
+    if p == 9 { n.scale_x = v.a  return }
+    if p == 10 { n.scale_y = v.a  return }
+    if p == 11 { n.w = UiLength { unit: to_int(v.b), value: v.a }  return }
+    if p == 12 { n.h = UiLength { unit: to_int(v.b), value: v.a }  return }
+    if p == 13 { n.size_px = v.a  return }
+    if p == 14 { n.gap = v.a  return }
+    if p == 15 { n.has_top = true  n.top = v.a  return }
+    if p == 16 { n.has_left = true  n.left = v.a  return }
+    if p == 17 { n.has_right = true  n.right = v.a  return }
+    if p == 18 { n.has_bottom = true  n.bottom = v.a  return }
+    if p == 19 { n.min_height = v.a  return }
+    n.has_letter_spacing = true
+    n.letter_spacing = v.a
+}
+/// the value a NodeStyle (a keyframe) sets for property `p`; `has` false when it sets none.
+pub struct AValOpt { has: Bool, v: AVal }
+pub fn ns_av(s: NodeStyle, p: Int) -> AValOpt {
+    if p == 0 && s.has_bg { return AValOpt { has: true, v: aval_c(rgba_color(s.bg)) } }
+    if p == 1 && s.has_text_color { return AValOpt { has: true, v: aval_c(rgba_color(s.text_color)) } }
+    if p == 1 && s.has_color { return AValOpt { has: true, v: aval_c(rgba_color(s.color)) } }
+    if p == 2 && s.has_border_color { return AValOpt { has: true, v: aval_c(rgba_color(s.border_color)) } }
+    if p == 3 && s.has_radius { return AValOpt { has: true, v: aval(s.radius) } }
+    if p == 4 && s.has_padding { return AValOpt { has: true, v: aval(s.padding) } }
+    if p == 5 && s.has_border_w { return AValOpt { has: true, v: aval(s.border_w) } }
+    if p == 6 && s.has_opacity { return AValOpt { has: true, v: aval(s.opacity) } }
+    if p == 7 && s.has_translate_x { return AValOpt { has: true, v: aval(s.translate_x) } }
+    if p == 8 && s.has_translate_y { return AValOpt { has: true, v: aval(s.translate_y) } }
+    if p == 9 && s.has_scale_x { return AValOpt { has: true, v: aval(s.scale_x) } }
+    if p == 10 && s.has_scale_y { return AValOpt { has: true, v: aval(s.scale_y) } }
+    if p == 11 && s.has_w { return AValOpt { has: true, v: AVal { a: s.w_val, b: to_float(s.w_unit), c: 0.0, d: 0.0 } } }
+    if p == 12 && s.has_h { return AValOpt { has: true, v: AVal { a: s.h_val, b: to_float(s.h_unit), c: 0.0, d: 0.0 } } }
+    if p == 13 && s.has_size_px { return AValOpt { has: true, v: aval(s.size_px) } }
+    if p == 14 && s.has_gap { return AValOpt { has: true, v: aval(s.gap) } }
+    if p == 15 && s.has_top { return AValOpt { has: true, v: aval(s.top) } }
+    if p == 16 && s.has_left { return AValOpt { has: true, v: aval(s.left) } }
+    if p == 17 && s.has_right { return AValOpt { has: true, v: aval(s.right) } }
+    if p == 18 && s.has_bottom { return AValOpt { has: true, v: aval(s.bottom) } }
+    if p == 19 && s.has_min_height { return AValOpt { has: true, v: aval(s.min_height) } }
+    if p == 20 && s.has_letter_spacing { return AValOpt { has: true, v: aval(s.letter_spacing) } }
+    return AValOpt { has: false, v: aval(0.0) }
+}
+/// `x` to `y` at `t` (0..1, may overshoot with a bezier that does).
+pub fn av_lerp(p: Int, x: AVal, y: AVal, t: Float) -> AVal {
+    if ap_is_color(p) {
+        var x2 = aval_dup(x)
+        var y2 = aval_dup(y)
+        if x2.d == 0.0 { x2.a = y2.a  x2.b = y2.b  x2.c = y2.c }
+        if y2.d == 0.0 { y2.a = x2.a  y2.b = x2.b  y2.c = x2.c }
+        return AVal { a: x2.a + (y2.a - x2.a) * t, b: x2.b + (y2.b - x2.b) * t, c: x2.c + (y2.c - x2.c) * t, d: x2.d + (y2.d - x2.d) * t }
+    }
+    if ap_is_length(p) && x.b != y.b {
+        // two different units do not interpolate: the value jumps half way
+        if t < 0.5 { return aval_dup(x) }
+        return aval_dup(y)
+    }
+    return AVal { a: x.a + (y.a - x.a) * t, b: y.b, c: 0.0, d: 0.0 }
+}
+
+// ---- easing -----------------------------------------------------------------------------------------
+
+fn bez(a: Float, b: Float, t: Float) -> Float {
+    // the 1-D cubic bezier with control points 0, a, b, 1
+    let u = 1.0 - t
+    return 3.0 * u * u * t * a + 3.0 * u * t * t * b + t * t * t
+}
+fn bez_d(a: Float, b: Float, t: Float) -> Float {
+    let u = 1.0 - t
+    return 3.0 * u * u * a + 6.0 * u * t * (b - a) + 3.0 * t * t * (1.0 - b)
+}
+/// the eased progress at `t` in 0..1.
+pub fn ease_at(e: Ease, t: Float) -> Float {
+    if t <= 0.0 { return 0.0 }
+    if t >= 1.0 { return 1.0 }
+    if e.kind == 0 { return t }
+    // find the curve parameter whose x is `t`: Newton's method from t, bisection if it stalls
+    var s = t
+    var i = 0
+    var done = false
+    while i < 8 && !done {
+        let x = bez(e.x1, e.x2, s) - t
+        if math::fabs(x) < 0.000001 { done = true }
+        else {
+            let dx = bez_d(e.x1, e.x2, s)
+            if math::fabs(dx) < 0.000001 { i = 8 } else { s = s - x / dx }
+        }
+        i = i + 1
+    }
+    if !done || s < 0.0 || s > 1.0 {
+        var lo = 0.0
+        var hi = 1.0
+        s = t
+        var k = 0
+        while k < 40 {
+            let x = bez(e.x1, e.x2, s)
+            if math::fabs(x - t) < 0.000001 { k = 40 }
+            else {
+                if x < t { lo = s } else { hi = s }
+                s = (lo + hi) * 0.5
+            }
+            k = k + 1
+        }
+    }
+    return bez(e.y1, e.y2, s)
+}
+
+// ---- running transitions and animations -----------------------------------------------------------------
+
+/// one property in transition on one node.
+pub struct RTrans { prop: Int, from: AVal, to: AVal, start: Float, dur: Float, delay: Float, ease: Ease }
+/// the transition spec for property `p` in `ts`, or -1.
+pub fn trans_find(ts: Vec<TransSpec>, p: Int) -> Int {
+    var i = ts.len() - 1
+    while i >= 0 { if ts[i].prop == p { return i }  i = i - 1 }
+    return 0 - 1
+}
+/// a running transition's value at `now`, and whether it has finished.
+pub fn rtrans_value(t: RTrans, now: Float) -> AVal {
+    let el = now - t.start - t.delay
+    if el <= 0.0 { return aval_dup(t.from) }
+    if t.dur <= 0.0 || el >= t.dur { return aval_dup(t.to) }
+    return av_lerp(t.prop, t.from, t.to, ease_at(t.ease, el / t.dur))
+}
+pub fn rtrans_done(t: RTrans, now: Float) -> Bool { return now - t.start - t.delay >= t.dur }
+
+/// where an animation is at `now`: `on` false before it starts (unless it fills backwards) and
+/// after it ends (unless it fills forwards); `f` the progress through the keyframes (0..1), with
+/// the direction applied; `done` true once it can never change again.
+pub struct AnimAt { on: Bool, f: Float, done: Bool }
+pub fn anim_at(a: AnimSpec, start: Float, now: Float) -> AnimAt {
+    let el = now - start - a.delay
+    if a.dur <= 0.0 { return AnimAt { on: false, f: 0.0, done: true } }
+    if el < 0.0 {
+        if a.fill == 2 || a.fill == 3 { return AnimAt { on: true, f: anim_dir_f(a.dir, 0, 0.0), done: false } }
+        return AnimAt { on: false, f: 0.0, done: false }
+    }
+    let it = el / a.dur
+    if a.count >= 0.0 && it >= a.count {
+        // finished: the end of the last iteration
+        var last = to_int(math::ceil(a.count)) - 1
+        if last < 0 { last = 0 }
+        var frac = a.count - to_float(last)
+        if frac <= 0.0 { frac = 1.0 }
+        if a.fill == 1 || a.fill == 3 { return AnimAt { on: true, f: anim_dir_f(a.dir, last, frac), done: true } }
+        return AnimAt { on: false, f: 0.0, done: true }
+    }
+    let i = to_int(math::floor(it))
+    return AnimAt { on: true, f: anim_dir_f(a.dir, i, it - to_float(i)), done: false }
+}
+fn anim_dir_f(dir: Int, iter: Int, f: Float) -> Float {
+    if dir == 1 { return 1.0 - f }
+    if dir == 2 { if iter % 2 == 0 { return f }  return 1.0 - f }
+    if dir == 3 { if iter % 2 == 0 { return 1.0 - f }  return f }
+    return f
+}
+/// the value of property `p` at progress `f` through keyframes `kf`, easing each segment between
+/// two stops that set it; `base` stands in at 0% and 100% where no stop sets the property.
+/// `has` false when no stop sets `p` at all.
+pub fn kf_value(kf: CKeyframes, p: Int, f: Float, base: AVal, e: Ease) -> AValOpt {
+    var any = false
+    var ax = 0.0
+    var av = aval_dup(base)
+    var bx = 1.0
+    var bv = aval_dup(base)
+    var have_b = false
+    var i = 0
+    while i < kf.stops.len() {
+        let o = ns_av(kf.stops[i].style, p)
+        if o.has {
+            any = true
+            let at = kf.stops[i].at
+            if at <= f { ax = at  av = aval_dup(o.v) }
+            else if !have_b { bx = at  bv = aval_dup(o.v)  have_b = true }
+        }
+        i = i + 1
+    }
+    if !any { return AValOpt { has: false, v: aval(0.0) } }
+    if bx <= ax { return AValOpt { has: true, v: av } }
+    return AValOpt { has: true, v: av_lerp(p, av, bv, ease_at(e, (f - ax) / (bx - ax))) }
+}

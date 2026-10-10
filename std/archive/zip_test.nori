@@ -1,0 +1,95 @@
+// .nori tests for zip writing, run with
+//   noric --test std/archive/zip_test.nori compiler/runtime.nori --import-root .
+//
+// The project's test suite also reads the archive this builds back with `unzip -t`; what is checked here
+// is the structure, because a zip can be wrong in ways that still open. Stale offsets in the central
+// directory are the classic one: a forgiving reader scans for local headers and never notices, a
+// strict one fails, and the difference only shows up on someone else's machine.
+import "std/archive" as ar
+
+fn le16(s: Str, at: Int) -> Int { return ord(s.at(at)) | (ord(s.at(at + 1)) << 8) }
+fn le32(s: Str, at: Int) -> Int {
+    return ord(s.at(at)) | (ord(s.at(at + 1)) << 8) | (ord(s.at(at + 2)) << 16) | (ord(s.at(at + 3)) << 24)
+}
+// the smallest legal zip: no entries, just an end-of-central-directory record
+fn empty_zip() -> Str {
+    var z = ""
+    z = z + chr(80) + chr(75) + chr(5) + chr(6)          // PK\5\6
+    var i = 0
+    while i < 18 { z = z + chr(0)  i = i + 1 }
+    return z
+}
+fn find_eocd(z: Str) -> Int {
+    var at = z.len() - 22
+    while at >= 0 { if le32(z, at) == 101010256 { return at }  at = at - 1 }
+    return 0 - 1
+}
+
+fn test_add_to_empty() {
+    let z = ar::zip_add_stored(empty_zip(), "a.txt", "hello")
+    assert_true(z.len() > 0)
+    let names = ar::zip_names(z)
+    assert_eq(names.len(), 1)
+    assert_streq(names[0], "a.txt")
+    let e = find_eocd(z)
+    assert_eq(le16(z, e + 10), 1)                        // one entry
+    // the local header is where the central directory says it is, not merely present somewhere
+    let cdoff = le32(z, e + 16)
+    let loff = le32(z, cdoff + 42)
+    assert_eq(le32(z, loff), 67324752)                   // 0x04034B50
+    assert_eq(le16(z, loff + 8), 0)                      // method 0 = stored
+}
+
+fn test_data_survives() {
+    let payload = "the quick brown fox" + chr(0) + chr(255) + "tail"   // NULs and high bytes included
+    let z = ar::zip_add_stored(empty_zip(), "d.bin", payload)
+    let e = find_eocd(z)
+    let cdoff = le32(z, e + 16)
+    let loff = le32(z, cdoff + 42)
+    let nlen = le16(z, loff + 26)
+    let elen = le16(z, loff + 28)
+    let sz = le32(z, loff + 22)
+    assert_eq(sz, payload.len())
+    assert_streq(z.slice(loff + 30 + nlen + elen, loff + 30 + nlen + elen + sz), payload)
+}
+
+// Two entries, added one at a time. The second call must move nothing and break nothing: the first
+// entry keeps its bytes and its central-directory pointer still lands on its local header.
+fn test_offsets_stay_correct_across_adds() {
+    let z1 = ar::zip_add_stored(empty_zip(), "one.txt", "first")
+    let z2 = ar::zip_add_stored(z1, "two.txt", "second")
+    let names = ar::zip_names(z2)
+    assert_eq(names.len(), 2)
+    assert_streq(names[0], "one.txt")
+    assert_streq(names[1], "two.txt")
+    let e = find_eocd(z2)
+    let cdoff = le32(z2, e + 16)
+    // walk both central-directory entries and confirm each points at a real local header
+    var p = cdoff
+    var i = 0
+    while i < 2 {
+        assert_eq(le32(z2, p), 33639248)                 // 0x02014B50
+        let loff = le32(z2, p + 42)
+        assert_eq(le32(z2, loff), 67324752)              // and it lands on a local header
+        let nlen = le16(z2, p + 28)
+        p = p + 46 + nlen + le16(z2, p + 30) + le16(z2, p + 32)
+        i = i + 1
+    }
+    // the directory's own size and start, as recorded, describe where it actually is
+    assert_eq(le32(z2, e + 12), p - cdoff)
+    assert_eq(le16(z2, e + 8), 2)
+}
+
+fn test_rejects_a_non_zip() {
+    assert_eq(ar::zip_add_stored("not a zip at all", "x", "y").len(), 0)
+    assert_eq(ar::zip_names("not a zip at all").len(), 0)
+}
+
+fn test_empty_payload() {
+    let z = ar::zip_add_stored(empty_zip(), "empty", "")
+    assert_eq(ar::zip_names(z).len(), 1)
+    let e = find_eocd(z)
+    let loff = le32(z, le32(z, e + 16) + 42)
+    assert_eq(le32(z, loff + 22), 0)                     // size 0
+    assert_eq(le32(z, loff + 14), 0)                     // and the CRC of nothing is 0
+}

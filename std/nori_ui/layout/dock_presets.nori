@@ -1,0 +1,196 @@
+use core::*
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// named layout builders (pure parts; file I/O
+// lives with persist). The "valid tab ids" set is a Vec<Str>.
+// ===========================================================================
+
+/// true if `x` is in the Vec<Str> `v`.
+pub fn str_vec_contains(v: Vec<Str>, x: Str) -> Bool {
+    var i = 0
+    while i < v.len() { if (v[i] == x) { return true }  i = i + 1 }
+    return false
+}
+
+/// the elements of `candidates` that are present in `valid`, in candidate order.
+pub fn prefer_tabs(valid: Vec<Str>, candidates: Vec<Str>) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var i = 0
+    while i < candidates.len() { if str_vec_contains(valid, candidates[i]) { out.push(copy candidates[i]) }  i = i + 1 }
+    return out
+}
+
+/// a DockState with a horizontal split: left/right tab groups (filtered to `valid_tab_ids`),
+/// first child weighted by `left_ratio`. Falls back to a single leaf when a side is empty.
+pub fn build_horizontal_split(valid_tab_ids: Vec<Str>, left_candidates: Vec<Str>, right_candidates: Vec<Str>, left_ratio: Float) -> DockState {
+    var left = prefer_tabs(valid_tab_ids, left_candidates)
+    var right = prefer_tabs(valid_tab_ids, right_candidates)
+    var tree: Tree = tree_empty()
+    if left.len() > 0 && right.len() > 0 {
+        tree = tree_split(SplitDirection::DirHorizontal, left_ratio, tree_leaf(sink left, 0), tree_leaf(sink right, 0))
+    } else if left.len() > 0 {
+        tree = tree_leaf(sink left, 0)
+    } else if right.len() > 0 {
+        tree = tree_leaf(sink right, 0)
+    } else {
+        tree = tree_leaf(path_copy_str(valid_tab_ids), 0)
+    }
+    var surfaces: Vec<Surface> = vec()
+    surfaces.push(Surface { tree: tree })
+    var fp: Vec<Int> = vec()
+    var ti: Vec<Str> = vec()
+    var tt: Vec<Str> = vec()
+    return DockState { surfaces: surfaces, has_focus_surface: true, focused_surface_index: 0, has_focus_leaf: false, focused_leaf_path: fp, title_ids: ti, title_texts: tt }
+}
+
+/// a fresh copy of a Vec<Str> (so callers don't share the backing handle).
+pub fn path_copy_str(v: Vec<Str>) -> Vec<Str> { var r: Vec<Str> = vec()  var i = 0  while i < v.len() { r.push(copy v[i])  i = i + 1 }  return r }
+
+/// collect every tab id in `tree` into `out` (deduplicated).
+pub fn collect_dock_tab_ids(tree: Tree, inout out: Vec<Str>) {
+    match tree.node {
+        Node::NLeaf(l) => {
+            var tabs = ld_tabs(l)
+            var i = 0
+            while i < tabs.len() { if !str_vec_contains(out, tabs[i]) { out.push(copy tabs[i]) }  i = i + 1 }
+        }
+        Node::NSplit(s) => { collect_dock_tab_ids(sd_first(s), out)  collect_dock_tab_ids(sd_second(s), out) }
+        Node::NEmpty => {}
+    }
+}
+
+/// every tab id present across all surfaces of `state` (deduplicated).
+pub fn collect_dock_tab_ids_from_state(state: DockState) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var i = 0
+    while i < state.surfaces.len() { collect_dock_tab_ids(state.surfaces[i].tree, out)  i = i + 1 }
+    return out
+}
+
+/// true if any leaf in `tree` has at least one tab.
+pub fn tree_has_any_tabs(tree: Tree) -> Bool {
+    match tree.node {
+        Node::NLeaf(l) => { return ld_tabs(l).len() > 0 }
+        Node::NSplit(s) => { return tree_has_any_tabs(sd_first(s)) || tree_has_any_tabs(sd_second(s)) }
+        Node::NEmpty => { return false }
+    }
+}
+
+/// strip tabs not in `valid_tab_ids` from every leaf of `tree`, clamping each leaf's active index.
+pub fn normalize_tree_tabs(tree: Tree, valid_tab_ids: Vec<Str>) {
+    match tree.node {
+        Node::NLeaf(l) => {
+            var kept: Vec<Str> = vec()
+            var tabs = ld_tabs(l)
+            var i = 0
+            while i < tabs.len() { if str_vec_contains(valid_tab_ids, tabs[i]) { kept.push(copy tabs[i]) }  i = i + 1 }
+            let nkept = kept.len()
+            l.tabs = kept
+            ld_set_active(l, imin_i(ld_active(l), imax_i(nkept - 1, 0)))
+        }
+        Node::NSplit(s) => { normalize_tree_tabs(sd_first(s), valid_tab_ids)  normalize_tree_tabs(sd_second(s), valid_tab_ids) }
+        Node::NEmpty => {}
+    }
+}
+
+/// strip unknown tabs from every surface of `dock` (in place), keeping only `valid_tab_ids`.
+pub fn normalize_dock_strip_unknown(dock: DockState, valid_tab_ids: Vec<Str>) {
+    var i = 0
+    while i < dock.surfaces.len() { normalize_tree_tabs(dock.surfaces[i].tree, valid_tab_ids)  i = i + 1 }
+}
+/// wrap a single tree in a one-surface DockState.
+pub fn dock_state_from_tree(sink tree: Tree) -> DockState {
+    var surfaces: Vec<Surface> = vec()
+    surfaces.push(Surface { tree: tree })
+    var fp: Vec<Int> = vec()
+    var ti: Vec<Str> = vec()
+    var tt: Vec<Str> = vec()
+    return DockState { surfaces: surfaces, has_focus_surface: true, focused_surface_index: 0, has_focus_leaf: false, focused_leaf_path: fp, title_ids: ti, title_texts: tt }
+}
+
+/// a vertical split: top/bottom tab groups (filtered to `valid`), first weighted by `top_ratio`.
+pub fn build_vertical_split(valid: Vec<Str>, top_candidates: Vec<Str>, bottom_candidates: Vec<Str>, top_ratio: Float) -> DockState {
+    var top = prefer_tabs(valid, top_candidates)
+    var bottom = prefer_tabs(valid, bottom_candidates)
+    var tree: Tree = tree_empty()
+    if top.len() > 0 && bottom.len() > 0 { tree = tree_split(SplitDirection::DirVertical, top_ratio, tree_leaf(sink top, 0), tree_leaf(sink bottom, 0)) }
+    else if top.len() > 0 { tree = tree_leaf(sink top, 0) }
+    else if bottom.len() > 0 { tree = tree_leaf(sink bottom, 0) }
+    else { tree = tree_leaf(path_copy_str(valid), 0) }
+    return dock_state_from_tree(tree)
+}
+
+/// three side-by-side columns: left | center | right. `left_ratio` = left's fraction of the whole;
+/// `center_ratio` = center's fraction of the remainder. Empty groups are dropped (2- or 1-pane fallback).
+pub fn build_three_pane(valid: Vec<Str>, left_c: Vec<Str>, center_c: Vec<Str>, right_c: Vec<Str>, left_ratio: Float, center_ratio: Float) -> DockState {
+    var left = prefer_tabs(valid, left_c)
+    var center = prefer_tabs(valid, center_c)
+    var right = prefer_tabs(valid, right_c)
+    var nL = left.len() > 0
+    var nC = center.len() > 0
+    var nR = right.len() > 0
+    var tree: Tree = tree_empty()
+    if nL && nC && nR {
+        tree = tree_split(SplitDirection::DirHorizontal, left_ratio, tree_leaf(sink left, 0), tree_split(SplitDirection::DirHorizontal, center_ratio, tree_leaf(sink center, 0), tree_leaf(sink right, 0)))
+    } else if nL && nC { tree = tree_split(SplitDirection::DirHorizontal, left_ratio, tree_leaf(sink left, 0), tree_leaf(sink center, 0)) }
+    else if nL && nR { tree = tree_split(SplitDirection::DirHorizontal, left_ratio, tree_leaf(sink left, 0), tree_leaf(sink right, 0)) }
+    else if nC && nR { tree = tree_split(SplitDirection::DirHorizontal, center_ratio, tree_leaf(sink center, 0), tree_leaf(sink right, 0)) }
+    else if nL { tree = tree_leaf(sink left, 0) }
+    else if nC { tree = tree_leaf(sink center, 0) }
+    else if nR { tree = tree_leaf(sink right, 0) }
+    else { tree = tree_leaf(path_copy_str(valid), 0) }
+    return dock_state_from_tree(tree)
+}
+
+/// classic IDE layout: a left sidebar | a right column split into a main area (top) and a bottom
+/// panel. `sidebar_ratio` = sidebar's fraction of the width; `main_ratio` = main's fraction of the height.
+pub fn build_ide(valid: Vec<Str>, sidebar_c: Vec<Str>, main_c: Vec<Str>, bottom_c: Vec<Str>, sidebar_ratio: Float, main_ratio: Float) -> DockState {
+    var side = prefer_tabs(valid, sidebar_c)
+    var main = prefer_tabs(valid, main_c)
+    var bottom = prefer_tabs(valid, bottom_c)
+    var nS = side.len() > 0
+    var nM = main.len() > 0
+    var nB = bottom.len() > 0
+    var rightt: Tree = tree_empty()
+    if nM && nB { rightt = tree_split(SplitDirection::DirVertical, main_ratio, tree_leaf(sink main, 0), tree_leaf(sink bottom, 0)) }
+    else if nM { rightt = tree_leaf(sink main, 0) }
+    else if nB { rightt = tree_leaf(sink bottom, 0) }
+    var tree: Tree = tree_empty()
+    if nS && (nM || nB) { tree = tree_split(SplitDirection::DirHorizontal, sidebar_ratio, tree_leaf(sink side, 0), sink rightt) }
+    else if nS { tree = tree_leaf(sink side, 0) }
+    else if nM || nB { tree = sink rightt }
+    else { tree = tree_leaf(path_copy_str(valid), 0) }
+    return dock_state_from_tree(tree)
+}
+
+/// a column built by preset_col: `tree` is owned; ok=false when both groups were empty.
+struct PresetCol { ok: Bool, tree: Tree }
+
+// a vertical column (top over bottom); ok=false if both groups are empty.
+fn preset_col(sink top: Vec<Str>, sink bottom: Vec<Str>, ratio: Float) -> PresetCol {
+    var nT = top.len() > 0
+    var nB = bottom.len() > 0
+    if nT && nB { return PresetCol { ok: true, tree: tree_split(SplitDirection::DirVertical, ratio, tree_leaf(sink top, 0), tree_leaf(sink bottom, 0)) } }
+    if nT { return PresetCol { ok: true, tree: tree_leaf(sink top, 0) } }
+    if nB { return PresetCol { ok: true, tree: tree_leaf(sink bottom, 0) } }
+    return PresetCol { ok: false, tree: tree_empty() }
+}
+
+/// a 2x2 grid: top-left / top-right / bottom-left / bottom-right. `col_ratio` = left column's width
+/// fraction; `row_ratio` = top row's height fraction. Empty cells collapse gracefully.
+pub fn build_grid_2x2(valid: Vec<Str>, tl_c: Vec<Str>, tr_c: Vec<Str>, bl_c: Vec<Str>, br_c: Vec<Str>, col_ratio: Float, row_ratio: Float) -> DockState {
+    var tl = prefer_tabs(valid, tl_c)
+    var tr = prefer_tabs(valid, tr_c)
+    var bl = prefer_tabs(valid, bl_c)
+    var br = prefer_tabs(valid, br_c)
+    var leftc = preset_col(tl, bl, row_ratio)
+    var rightc = preset_col(tr, br, row_ratio)
+    var tree: Tree = tree_empty()
+    if leftc.ok && rightc.ok { tree = tree_split(SplitDirection::DirHorizontal, col_ratio, sink leftc.tree, sink rightc.tree) }
+    else if leftc.ok { tree = sink leftc.tree }
+    else if rightc.ok { tree = sink rightc.tree }
+    else { tree = tree_leaf(path_copy_str(valid), 0) }
+    return dock_state_from_tree(tree)
+}

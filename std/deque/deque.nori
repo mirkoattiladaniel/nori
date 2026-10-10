@@ -1,0 +1,73 @@
+//! std/deque: a double-ended queue of `Int` (i64-uniform, so it also holds any handle/Bool/Char).
+//! Backed by a Vec with a moving head index: push/pop at both ends, peek, size. O(1) amortized at the
+//! back and for pop-front; push-front is O(1) when there's slack, else O(n) to make room.
+//!   import "std/deque" as deque
+//!   var d = deque::new()
+//!   deque::push_back(d, 1)  deque::push_front(d, 0)
+//!   deque::pop_front(d)     // 0
+
+pub struct Deque {
+    items: Vec<Int>,
+    head: Int
+}
+
+/// a new empty deque.
+pub fn new() -> Deque {
+    var v: Vec<Int> = vec()
+    return Deque { items: v, head: 0 }
+}
+/// number of live elements.
+pub fn size(d: Deque) -> Int {
+    return d.items.len() - d.head
+}
+/// is the deque empty?
+pub fn is_empty(d: Deque) -> Bool {
+    return d.items.len() - d.head == 0
+}
+
+/// append `x` at the back.
+pub fn push_back(inout d: Deque, x: Int) {
+    d.items.push(x)
+}
+/// prepend `x` at the front.
+pub fn push_front(inout d: Deque, x: Int) {
+    if d.head > 0 {
+        d.head = d.head - 1
+        d.items[d.head] = x
+    }
+    else {
+        var nw: Vec<Int> = vec()
+        nw.push(x)
+        var i = 0
+        while i < d.items.len() {
+            nw.push(d.items[i])
+            i = i + 1
+        }
+        d.items = nw
+        d.head = 0
+    }
+}
+
+/// the front element (call only when non-empty).
+pub fn peek_front(d: Deque) -> Int {
+    return d.items[d.head]
+}
+/// the back element (call only when non-empty).
+pub fn peek_back(d: Deque) -> Int {
+    return d.items[d.items.len() - 1]
+}
+
+/// remove and return the front element (call only when non-empty; it traps on an empty deque, the
+/// same as `peek_front`, so guard with `is_empty`).
+pub fn pop_front(inout d: Deque) -> Int {
+    let x = d.items[d.head]
+    d.head = d.head + 1
+    return x
+}
+/// remove and return the back element (call only when non-empty; it traps on an empty deque, the
+/// same as `peek_back`, so guard with `is_empty`).
+pub fn pop_back(inout d: Deque) -> Int {
+    let x = d.items[d.items.len() - 1]
+    d.items.pop()
+    return x
+}

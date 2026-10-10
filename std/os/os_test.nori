@@ -1,0 +1,120 @@
+// .nori tests for std/os: only safe, deterministic behavior.
+// Filesystem ops use a unique temp path under /tmp and clean up after themselves.
+import "std/os" as os
+
+// a temp path unlikely to collide.
+fn tmp_dir() -> Str { return "/tmp/nori_os_test_dir_9f3a7" }
+
+fn test_make_and_remove_dir() {
+    let d = tmp_dir()
+    os::remove_tree(d)                 // pre-clean in case a prior run left it
+    assert_false(os::path_exists(d))
+    assert_eq(os::make_dir(d), 0)
+    assert_true(os::path_exists(d))
+    assert_eq(os::remove_tree(d), 0)
+    assert_false(os::path_exists(d))
+}
+
+fn test_make_dir_p_and_list() {
+    let base = tmp_dir()
+    os::remove_tree(base)
+    let nested = base + "/a/b/c"
+    assert_eq(os::make_dir_p(nested), 0)
+    assert_true(os::path_exists(nested))
+    os::remove_tree(base)
+    assert_false(os::path_exists(base))
+}
+
+fn test_env_set_get() {
+    let name = "NORI_OS_TEST_VAR_9f3a7"
+    assert_eq(os::set_env(name, "hello"), 0)
+    assert_streq(os::env(name), "hello")
+    assert_eq(os::set_env(name, "world"), 0)
+    assert_streq(os::env(name), "world")
+}
+
+fn test_env_or_default() {
+    let missing = "NORI_OS_TEST_UNSET_9f3a7"
+    assert_streq(os::env(missing), "")
+    assert_streq(os::env_or(missing, "fallback"), "fallback")
+}
+
+fn test_cwd_nonempty() {
+    assert_true((os::cwd()).len() > 0)
+}
+
+fn test_move_path() {
+    let base = tmp_dir()
+    os::remove_tree(base)
+    assert_eq(os::make_dir(base), 0)
+    let from = base + "/from"
+    let to = base + "/to"
+    assert_eq(os::make_dir(from), 0)
+    assert_true(os::path_exists(from))
+    assert_eq(os::move_path(from, to), 0)
+    assert_false(os::path_exists(from))
+    assert_true(os::path_exists(to))
+    os::remove_tree(base)
+    assert_false(os::path_exists(base))
+}
+
+fn test_open_file_create() {
+    let p = "/tmp/nori_os_test_open_9f3a7.txt"
+    os::remove_tree(p)
+    // create a fresh file from safe code (O_CREAT) with mode 0644
+    let fd = os::open_file(p, os::O_WRONLY() | os::O_CREAT() | os::O_TRUNC(), 420)
+    assert_true(fd >= 0)
+    // write via the fd helper
+    let c = os::os_cstr("hi")
+    assert_eq(os::write_fd(fd, c, 2), 2)
+    free_ptr(c)
+    assert_eq(os::close_fd(fd), 0)
+    assert_true(os::path_exists(p))
+    assert_streq(read_file(p), "hi")
+    os::remove_tree(p)
+}
+fn free_ptr(p: Int) { unsafe { cfree(p) } }
+
+// temp_dir trims its separator, and does so without reading past the end of the string.
+//
+// The case that matters is a directory that does not end in a separator. That is the normal case,
+// reached as soon as TMPDIR is set (always on Windows, where TEMP is), and the trim must handle it
+// without indexing past the end of the string and trapping. So the point is not that the slash goes
+// away but that asking at all is survivable.
+fn test_temp_dir_trims_separator() {
+    let saved = os::env_or("TMPDIR", "")
+
+    let _a = os::set_env("TMPDIR", "/var/scratch")      // no trailing separator: the case that must not trap
+    assert_streq(os::temp_dir(), "/var/scratch")
+    assert_streq(os::temp_path("d.diag"), "/var/scratch/d.diag")
+
+    let _b = os::set_env("TMPDIR", "/var/scratch/")     // one to trim
+    assert_streq(os::temp_dir(), "/var/scratch")
+
+    let _c = os::set_env("TMPDIR", "/var/scratch///")   // several
+    assert_streq(os::temp_dir(), "/var/scratch")
+
+    let _d = os::set_env("TMPDIR", "C:\\Temp\\")        // Windows spells it the other way
+    assert_streq(os::temp_dir(), "C:\\Temp")
+
+    // A root stays a root. Trimming to "" would make every temp path relative, and nothing would trap:
+    // files would just appear in whatever directory the process happened to be in.
+    let _e = os::set_env("TMPDIR", "/")
+    assert_streq(os::temp_dir(), "/")
+
+    let _f = os::set_env("TMPDIR", saved)
+}
+
+// State belongs to the user, not to the install directory. XDG_STATE_HOME wins everywhere; without
+// it, Linux answers under HOME.
+fn test_state_dir() {
+    let sx = os::env_or("XDG_STATE_HOME", "")
+    let sh = os::env_or("HOME", "")
+    let _a = os::set_env("XDG_STATE_HOME", "/var/st/")
+    assert_streq(os::state_dir("app"), "/var/st/app")
+    let _b = os::set_env("XDG_STATE_HOME", "")
+    let _c = os::set_env("HOME", "/home/u")
+    assert_streq(os::state_dir("app"), "/home/u/.local/state/app")
+    let _d = os::set_env("XDG_STATE_HOME", sx)
+    let _e = os::set_env("HOME", sh)
+}

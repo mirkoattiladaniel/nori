@@ -1,0 +1,781 @@
+// std/window/__native_xkb.nori: turns the XKB keymap a Wayland compositor sends into keysyms, for
+// __native_wayland.nori. The compositor hands over its keymap as text (xkb_keymap_get_as_string's
+// output, already compiled: every include resolved), and these parts of it are read:
+//
+//   xkb_keycodes       <NAME> = code;  alias <A> = <B>;
+//   xkb_types          type "NAME" { modifiers= ...; map[mods]= level; preserve[mods]= mods; }
+//   xkb_compatibility  interpret SYM+Cond { repeat= ...; }   (only what decides key repeat)
+//   xkb_symbols        key <NAME> { type= "T", repeat= R, symbols[1]= [ lvl1, lvl2, ... ] };
+//                      modifier_map Mod { <A>, <B> };
+//
+// A key's level is its type's map entry for the active modifiers, as xkbcommon chooses it; a
+// key with no explicit type gets the type xkbcommon infers from its symbols, and a Lock its type does
+// not consume capitalises the result. Up to four groups (layouts): a key's `symbols[N]` and `type[N]`
+// are group N's (a bare `[ … ]` the first's, an unindexed `type=` every group's), and the group in use
+// — wl_keyboard.modifiers' `group`, which the compositor moves (a layout switch) — picks among them; a
+// key with fewer groups than that wraps (the group modulo its count), as xkbcommon's default
+// out-of-range action does. What is not modelled: actions. The compositor applies those and reports
+// the modifier state they produce. Virtual modifiers are resolved to the real ones the standard keymaps
+// bind them to.
+
+import "__native_keysyms.nori"
+
+// the decoded keymap. Per keycode (0..1023) and group (0..3), at slot code * 4 + group: eight level
+// keysyms (u32), the level count, the type index (255 = none); per keycode: how many groups it has,
+// whether it repeats, and whether any modifier_map names it. Per type: its modifier mask and up to 32
+// map entries of (modifiers, level, preserved modifiers), 24 bytes each.
+cstruct NxkbMap { syms: Int, nlv: Int, ktype: Int, rep: Int, modmap: Int, explrep: Int, ntypes: Int, tmask: Int, tmaps: Int, tnmaps: Int, thash: Int, ngrp: Int }
+
+fn NXKB_KEYS() -> Int { return 1024 }
+fn NXKB_GROUPS() -> Int { return 4 }
+fn NXKB_TYPES() -> Int { return 64 }
+fn NXKB_MAPS() -> Int { return 32 }
+
+// ---- scanning ----------------------------------------------------------------------------------------
+
+fn nxkb_hash(p: Int, n: Int) -> Int {
+    var h = 2166136261
+    var i = 0
+    while i < n { h = ((h ^ peek8(p + i)) * 16777619) & 4294967295  i = i + 1 }
+    return h
+}
+fn nxkb_hash_lit(s: Str) -> Int { return nxkb_hash(nori_str_ptr(s), s.len()) }
+
+fn nxkb_is_space(ch: Int) -> Int { if ch == 32 || ch == 9 || ch == 10 || ch == 13 { return 1 }  return 0 }
+fn nxkb_is_ident(ch: Int) -> Int {
+    if (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95 { return 1 }
+    return 0
+}
+
+fn nxkb_skip_ws(p: Int, n: Int, at: Int) -> Int {
+    var i = at
+    var going = 1
+    while going == 1 && i < n {
+        let ch = peek8(p + i)
+        if nxkb_is_space(ch) == 1 { i = i + 1 }
+        else if ch == 47 && i + 1 < n && peek8(p + i + 1) == 47 {                 // a // comment
+            while i < n && peek8(p + i) != 10 { i = i + 1 }
+        } else { going = 0 }
+    }
+    return i
+}
+
+// the end of an identifier-like token starting at `at`
+fn nxkb_word_end(p: Int, n: Int, at: Int) -> Int {
+    var i = at
+    while i < n && nxkb_is_ident(peek8(p + i)) == 1 { i = i + 1 }
+    return i
+}
+
+// the index of `lit` in p[at..end), or -1
+fn nxkb_find(p: Int, at: Int, end: Int, lit: Str) -> Int {
+    let q = nori_str_ptr(lit)
+    let m = lit.len()
+    var i = at
+    while i + m <= end {
+        if peek8(p + i) == peek8(q) {
+            var j = 1
+            while j < m && peek8(p + i + j) == peek8(q + j) { j = j + 1 }
+            if j == m { return i }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// the index just past the brace that closes the one at `open` (quoted strings are skipped)
+fn nxkb_close_brace(p: Int, end: Int, open: Int) -> Int {
+    var depth = 0
+    var i = open
+    while i < end {
+        let ch = peek8(p + i)
+        if ch == 34 {
+            i = i + 1
+            while i < end && peek8(p + i) != 34 { i = i + 1 }
+        } else if ch == 123 { depth = depth + 1 }
+        else if ch == 125 {
+            depth = depth - 1
+            if depth == 0 { return i + 1 }
+        }
+        i = i + 1
+    }
+    return end
+}
+
+// the index just past the `;` ending the statement at `at` (a braced body is skipped whole)
+fn nxkb_skip_stmt(p: Int, end: Int, at: Int) -> Int {
+    var i = at
+    while i < end {
+        let ch = peek8(p + i)
+        if ch == 59 { return i + 1 }
+        if ch == 34 {
+            i = i + 1
+            while i < end && peek8(p + i) != 34 { i = i + 1 }
+        }
+        if ch == 123 { i = nxkb_close_brace(p, end, i) - 1 }
+        i = i + 1
+    }
+    return end
+}
+
+// a section's body: the index after its `{` into outs[0] and of its `}` into outs[8]; 0 if absent
+fn nxkb_section(p: Int, n: Int, name: Str, outs: Int) -> Int {
+    let at = nxkb_find(p, 0, n, name)
+    if at < 0 { return 0 }
+    var i = at
+    while i < n && peek8(p + i) != 123 { i = i + 1 }
+    if i >= n { return 0 }
+    poke(outs, i + 1)
+    poke(outs + 8, nxkb_close_brace(p, n, i) - 1)
+    return 1
+}
+
+fn nxkb_number(p: Int, end: Int, at: Int) -> Int {
+    var v = 0
+    var i = at
+    if i + 1 < end && peek8(p + i) == 48 && (peek8(p + i + 1) == 120 || peek8(p + i + 1) == 88) {
+        i = i + 2
+        var going = 1
+        while going == 1 && i < end {
+            let d = nxkb_hexval(peek8(p + i))
+            if d < 0 { going = 0 } else { v = v * 16 + d  i = i + 1 }
+        }
+        return v
+    }
+    while i < end && peek8(p + i) >= 48 && peek8(p + i) <= 57 { v = v * 10 + peek8(p + i) - 48  i = i + 1 }
+    return v
+}
+fn nxkb_hexval(ch: Int) -> Int {
+    if ch >= 48 && ch <= 57 { return ch - 48 }
+    if ch >= 97 && ch <= 102 { return ch - 87 }
+    if ch >= 65 && ch <= 70 { return ch - 55 }
+    return 0 - 1
+}
+
+// ---- tables ------------------------------------------------------------------------------------------
+
+// an open-addressed table of (hash, value) pairs, `cap` a power of two; value -1 means absent
+fn nxkb_tab_new(cap: Int) -> Int {
+    let t = malloc(8 + cap * 16)
+    poke(t, cap)
+    var i = 0
+    while i < cap { poke(t + 8 + i * 16, 0 - 1)  poke(t + 16 + i * 16, 0 - 1)  i = i + 1 }
+    return t
+}
+fn nxkb_tab_put(t: Int, hk: Int, v: Int) {
+    let cap = peek(t)
+    var i = hk & (cap - 1)
+    var tries = 0
+    while tries < cap {
+        let e = t + 8 + i * 16
+        if peek(e) == 0 - 1 || peek(e) == hk { poke(e, hk)  poke(e + 8, v)  return }
+        i = (i + 1) & (cap - 1)
+        tries = tries + 1
+    }
+}
+fn nxkb_tab_get(t: Int, hk: Int) -> Int {
+    let cap = peek(t)
+    var i = hk & (cap - 1)
+    var tries = 0
+    while tries < cap {
+        let e = t + 8 + i * 16
+        if peek(e) == 0 - 1 { return 0 - 1 }
+        if peek(e) == hk { return peek(e + 8) }
+        i = (i + 1) & (cap - 1)
+        tries = tries + 1
+    }
+    return 0 - 1
+}
+
+global g_nxkb_names: Int = 0
+
+// the keysym-name table, decoded once: name hash -> keysym
+fn nxkb_name_table() -> Int {
+    if g_nxkb_names != 0 { return g_nxkb_names }
+    let src = nxkb_names()
+    let p = nori_str_ptr(src)
+    let n = src.len()
+    let t = nxkb_tab_new(4096)
+    var i = 0
+    while i < n {
+        i = nxkb_skip_ws(p, n, i)
+        let ns = i
+        while i < n && peek8(p + i) != 32 { i = i + 1 }
+        let ne = i
+        i = nxkb_skip_ws(p, n, i)
+        var v = 0
+        var going = 1
+        while going == 1 && i < n {
+            let d = nxkb_hexval(peek8(p + i))
+            if d < 0 { going = 0 } else { v = v * 16 + d  i = i + 1 }
+        }
+        if ne > ns && nxkb_tab_get(t, nxkb_hash(p + ns, ne - ns)) < 0 { nxkb_tab_put(t, nxkb_hash(p + ns, ne - ns), v) }
+    }
+    g_nxkb_names = t
+    return t
+}
+
+// the keysym a name in a keymap stands for (0 = NoSymbol, or a name this table does not know)
+fn nxkb_sym(p: Int, n: Int) -> Int {
+    if n <= 0 { return 0 }
+    if n == 1 { return peek8(p) }
+    if n > 2 && peek8(p) == 48 && (peek8(p + 1) == 120 || peek8(p + 1) == 88) { return nxkb_number(p, n, 0) }
+    if n >= 5 && peek8(p) == 85 {                                                 // U+hex
+        var cp = 0
+        var i = 1
+        var ok = 1
+        while i < n {
+            let d = nxkb_hexval(peek8(p + i))
+            if d < 0 { ok = 0 }
+            cp = cp * 16 + d
+            i = i + 1
+        }
+        if ok == 1 {
+            if (cp >= 32 && cp <= 126) || (cp >= 160 && cp <= 255) { return cp }
+            return 16777216 + cp
+        }
+    }
+    let v = nxkb_tab_get(nxkb_name_table(), nxkb_hash(p, n))
+    if v < 0 { return 0 }
+    return v
+}
+
+// ---- case ------------------------------------------------------------------------------------------
+
+// Keysym case, for the sets a layout's letters come from: whether a key is alphabetic depends on its
+// first two levels being a lower/upper pair, and a Lock the key's type leaves unconsumed capitalises.
+// Each entry below is a run "lower upper count step": `count` letters whose lower-case keysyms start at
+// `lower` and upper-case ones at `upper`, `step` apart. Every number is hexadecimal.
+fn nxkb_case_table() -> Str {
+    return "61 41 1a 1 e0 c0 17 1 f8 d8 7 1 df 1001e9e 1 1 ff 13be 1 1 " +
+        "1b1 1a1 1 1 1b3 1a3 1 1 1b5 1a5 2 1 1b9 1a9 4 1 1be 1ae 2 1 1e0 1c0 17 1 1f8 1d8 7 1 " +
+        "2b1 2a1 1 1 2b6 2a6 1 1 2b9 49 1 1 2bb 2ab 2 1 2e5 2c5 2 1 2f5 2d5 1 1 2f8 2d8 1 1 2fd 2dd 2 1 " +
+        "3b3 3a3 1 1 3b5 3a5 2 1 3ba 3aa 3 1 3bf 3bd 1 1 3e0 3c0 1 1 3e7 3c7 1 1 3ec 3cc 1 1 3ef 3cf 1 1 " +
+        "3f1 3d1 3 1 3f9 3d9 1 1 3fd 3dd 2 1 13bd 13bc 1 1 " +
+        "6a1 6b1 f 1 6c0 6e0 20 1 7b1 7a1 5 1 7b7 7a7 3 1 7e1 7c1 12 1 7f3 7d2 1 1 7f4 7d4 6 1 " +
+        "1000101 1000100 18 2 1000133 1000132 3 2 100013a 1000139 8 2 100014b 100014a 17 2 " +
+        "100017a 1000179 3 2 1000259 100018f 1 1 1000292 10001b7 1 1 1001e01 1001e00 4b 2 1001ea1 1001ea0 30 2 " +
+        "10003b1 1000391 11 1 10003c3 10003a3 7 1 10003c2 10003a3 1 1 10003ac 1000386 1 1 10003ad 1000388 3 1 " +
+        "10003cc 100038c 1 1 10003cd 100038e 2 1 10003d7 10003cf 1 1 10003d9 10003d8 c 2 10003f0 100039a 1 1 " +
+        "10003f1 10003a1 1 1 10003f2 10003f9 1 1 10003f3 100037f 1 1 10003f5 1000395 1 1 10003f8 10003f7 1 1 " +
+        "10003fb 10003fa 1 1 100037b 10003fd 3 1 10003d0 1000392 1 1 10003d1 1000398 1 1 10003d5 10003a6 1 1 " +
+        "10003d6 10003a0 1 1 10003b8 10003f4 1 1 " +
+        "1000430 1000410 20 1 1000450 1000400 10 1 1000461 1000460 11 2 100048b 100048a 1b 2 " +
+        "10004d1 10004d0 30 2 1000561 1000531 26 1 "
+}
+
+global g_nxkb_case: Int = 0
+
+// the case table decoded once into (lower, upper, count, step) records, 32 bytes each; the count of
+// records is the first word
+fn nxkb_cases() -> Int {
+    if g_nxkb_case != 0 { return g_nxkb_case }
+    let src = nxkb_case_table()
+    let p = nori_str_ptr(src)
+    let n = src.len()
+    let t = malloc(8 + 256 * 32)
+    var cnt = 0
+    var i = 0
+    while i < n && cnt < 256 {
+        var f = 0
+        while f < 4 {
+            i = nxkb_skip_ws(p, n, i)
+            var v = 0
+            var going = 1
+            while going == 1 && i < n {
+                let d = nxkb_hexval(peek8(p + i))
+                if d < 0 { going = 0 } else { v = v * 16 + d  i = i + 1 }
+            }
+            poke(t + 8 + cnt * 32 + f * 8, v)
+            f = f + 1
+        }
+        cnt = cnt + 1
+        i = nxkb_skip_ws(p, n, i)
+    }
+    poke(t, cnt)
+    g_nxkb_case = t
+    return t
+}
+
+// the other case of keysym `s`: `up` = 1 gives the upper case of a lower-case letter, 0 the lower case
+// of an upper-case one; anything else comes back unchanged
+fn nxkb_case(s: Int, up: Int) -> Int {
+    let t = nxkb_cases()
+    let cnt = peek(t)
+    var r = 0
+    while r < cnt {
+        let e = t + 8 + r * 32
+        let lo = peek(e)
+        let hi = peek(e + 8)
+        let count = peek(e + 16)
+        let step = peek(e + 24)
+        var from = hi
+        var to = lo
+        if up == 1 { from = lo  to = hi }
+        if s >= from && s < from + count * step && (s - from) % step == 0 { return to + (s - from) }
+        r = r + 1
+    }
+    return s
+}
+// micro sign and long s capitalise into another script's letter, which does not lower back to them
+fn nxkb_upper(s: Int) -> Int {
+    if s == 181 { return 1996 }                                                   // µ -> Greek MU
+    if s == 16777599 { return 83 }                                                // ſ -> S
+    return nxkb_case(s, 1)
+}
+fn nxkb_is_lower(s: Int) -> Int { if nxkb_upper(s) != s { return 1 }  return 0 }
+fn nxkb_is_upper(s: Int) -> Int { if nxkb_case(s, 0) != s { return 1 }  return 0 }
+fn nxkb_is_keypad(s: Int) -> Int { if s >= 65408 && s <= 65469 { return 1 }  return 0 }
+
+// ---- modifiers ---------------------------------------------------------------------------------------
+
+// a `+`-joined modifier expression as a real-modifier mask; -1 when it names only modifiers that are
+// bound to no real one (such a map entry can never match)
+fn nxkb_mods(p: Int, at: Int, end: Int) -> Int {
+    var mask = 0
+    var unbound = 0
+    var i = at
+    while i < end {
+        i = nxkb_skip_ws(p, end, i)
+        let ws = i
+        let we = nxkb_word_end(p, end, i)
+        let wl = we - ws
+        let q = p + ws
+        if wl > 0 {
+            if nwu_mem_eq(q, wl, "Shift") == 1 { mask = mask | 1 }
+            else if nwu_mem_eq(q, wl, "Lock") == 1 { mask = mask | 2 }
+            else if nwu_mem_eq(q, wl, "Control") == 1 { mask = mask | 4 }
+            else if nwu_mem_eq(q, wl, "Mod1") == 1 || nwu_mem_eq(q, wl, "Alt") == 1 || nwu_mem_eq(q, wl, "Meta") == 1 { mask = mask | 8 }
+            else if nwu_mem_eq(q, wl, "Mod2") == 1 || nwu_mem_eq(q, wl, "NumLock") == 1 { mask = mask | 16 }
+            else if nwu_mem_eq(q, wl, "Mod3") == 1 || nwu_mem_eq(q, wl, "LevelFive") == 1 { mask = mask | 32 }
+            else if nwu_mem_eq(q, wl, "Mod4") == 1 || nwu_mem_eq(q, wl, "Super") == 1 { mask = mask | 64 }
+            else if nwu_mem_eq(q, wl, "Mod5") == 1 || nwu_mem_eq(q, wl, "LevelThree") == 1 { mask = mask | 128 }
+            else if nwu_mem_eq(q, wl, "all") == 1 { mask = mask | 255 }
+            else if nwu_mem_eq(q, wl, "none") == 1 || nwu_mem_eq(q, wl, "None") == 1 { }
+            else { unbound = 1 }
+        }
+        i = we
+        while i < end && peek8(p + i) != 43 { i = i + 1 }                         // to the next '+'
+        i = i + 1
+    }
+    if mask == 0 && unbound == 1 { return 0 - 1 }
+    return mask
+}
+
+// ---- sections ----------------------------------------------------------------------------------------
+
+// the code a `<NAME>` at `at` names (its '<'), via the keycodes table; -1 if unknown
+fn nxkb_keyname(p: Int, end: Int, at: Int, codes: Int) -> Int {
+    var i = at + 1
+    while i < end && peek8(p + i) != 62 { i = i + 1 }
+    return nxkb_tab_get(codes, nxkb_hash(p + at + 1, i - at - 1))
+}
+
+fn nxkb_parse_keycodes(p: Int, at: Int, end: Int, codes: Int) {
+    var i = at
+    while i < end {
+        i = nxkb_skip_ws(p, end, i)
+        if i >= end { return }
+        let ch = peek8(p + i)
+        if ch == 60 {                                                             // <NAME> = code;
+            var j = i + 1
+            while j < end && peek8(p + j) != 62 { j = j + 1 }
+            let hk = nxkb_hash(p + i + 1, j - i - 1)
+            var e = j + 1
+            while e < end && peek8(p + e) != 61 && peek8(p + e) != 59 { e = e + 1 }
+            if e < end && peek8(p + e) == 61 {
+                let vs = nxkb_skip_ws(p, end, e + 1)
+                nxkb_tab_put(codes, hk, nxkb_number(p, end, vs))
+            }
+            i = nxkb_skip_stmt(p, end, i)
+        } else if nwu_mem_starts(p + i, end - i, "alias") == 1 {               // alias <A> = <B>;
+            let stop = nxkb_skip_stmt(p, end, i)
+            let a1 = nxkb_find(p, i, stop, "<")
+            let b1 = nxkb_find(p, i, stop, "=")
+            if a1 >= 0 && b1 > a1 {
+                let t1 = nxkb_find(p, b1, stop, "<")
+                if t1 >= 0 {
+                    let code = nxkb_keyname(p, stop, t1, codes)
+                    var ae = a1 + 1
+                    while ae < stop && peek8(p + ae) != 62 { ae = ae + 1 }
+                    if code >= 0 { nxkb_tab_put(codes, nxkb_hash(p + a1 + 1, ae - a1 - 1), code) }
+                }
+            }
+            i = stop
+        } else { i = nxkb_skip_stmt(p, end, i) }
+    }
+}
+
+fn nxkb_parse_types(km: NxkbMap, p: Int, at: Int, end: Int) {
+    var i = at
+    while i < end {
+        i = nxkb_skip_ws(p, end, i)
+        if i >= end { return }
+        if nwu_mem_starts(p + i, end - i, "type") == 1 && km.ntypes < NXKB_TYPES() {
+            let q1 = nxkb_find(p, i, end, "\"")
+            let ob = nxkb_find(p, i, end, "{")
+            if q1 < 0 || ob < 0 || q1 > ob { i = nxkb_skip_stmt(p, end, i) } else {
+                var q2 = q1 + 1
+                while q2 < end && peek8(p + q2) != 34 { q2 = q2 + 1 }
+                let t = km.ntypes
+                km.ntypes = t + 1
+                poke(km.thash + t * 8, nxkb_hash(p + q1 + 1, q2 - q1 - 1))
+                poke(km.tmask + t * 8, 0)
+                poke8(km.tnmaps + t, 0)
+                let cb = nxkb_close_brace(p, end, ob)
+                var s = ob + 1
+                while s < cb - 1 {
+                    s = nxkb_skip_ws(p, cb - 1, s)
+                    let se = nxkb_skip_stmt(p, cb - 1, s)
+                    if nwu_mem_starts(p + s, se - s, "modifiers") == 1 {
+                        let eq = nxkb_find(p, s, se, "=")
+                        if eq >= 0 {
+                            var mm = nxkb_mods(p, eq + 1, se - 1)
+                            if mm < 0 { mm = 0 }
+                            poke(km.tmask + t * 8, mm)
+                        }
+                    } else if nwu_mem_starts(p + s, se - s, "map[") == 1 {
+                        let rb = nxkb_find(p, s, se, "]")
+                        let eq2 = nxkb_find(p, s, se, "=")
+                        if rb > 0 && eq2 > rb {
+                            let mods = nxkb_mods(p, s + 4, rb)
+                            var ls = nxkb_skip_ws(p, se, eq2 + 1)
+                            if nwu_mem_starts(p + ls, se - ls, "Level") == 1 || nwu_mem_starts(p + ls, se - ls, "level") == 1 { ls = ls + 5 }
+                            let lvl = nxkb_number(p, se, ls)
+                            let nm = peek8(km.tnmaps + t)
+                            if nm < NXKB_MAPS() {
+                                let e = km.tmaps + (t * NXKB_MAPS() + nm) * 24
+                                poke(e, mods)
+                                poke(e + 8, lvl)
+                                poke(e + 16, 0)
+                                poke8(km.tnmaps + t, nm + 1)
+                            }
+                        }
+                    } else if nwu_mem_starts(p + s, se - s, "preserve[") == 1 {
+                        let prb = nxkb_find(p, s, se, "]")
+                        let peq = nxkb_find(p, s, se, "=")
+                        if prb > 0 && peq > prb {
+                            let pmods = nxkb_mods(p, s + 9, prb)
+                            var pm = nxkb_mods(p, peq + 1, se - 1)
+                            if pm < 0 { pm = 0 }
+                            var pj = 0
+                            while pj < peek8(km.tnmaps + t) {
+                                let pe = km.tmaps + (t * NXKB_MAPS() + pj) * 24
+                                if peek(pe) == pmods { poke(pe + 16, pm) }
+                                pj = pj + 1
+                            }
+                        }
+                    }
+                    s = se
+                }
+                i = cb
+                i = nxkb_skip_ws(p, end, i)
+                if i < end && peek8(p + i) == 59 { i = i + 1 }
+            }
+        } else { i = nxkb_skip_stmt(p, end, i) }
+    }
+}
+
+fn nxkb_type_index(km: NxkbMap, hk: Int) -> Int {
+    var t = 0
+    while t < km.ntypes { if peek(km.thash + t * 8) == hk { return t }  t = t + 1 }
+    return 255
+}
+
+// `interpret SYM+Cond { repeat= X; }`: (keysym or -1 for Any, needs a modifier_map, repeats) triples
+// into `out`, 24 bytes each; returns the count
+fn nxkb_parse_compat(p: Int, at: Int, end: Int, out: Int, cap: Int) -> Int {
+    var cnt = 0
+    var dflt = 0
+    var i = at
+    while i < end {
+        i = nxkb_skip_ws(p, end, i)
+        if i >= end { return cnt }
+        let se = nxkb_skip_stmt(p, end, i)
+        if nwu_mem_starts(p + i, se - i, "interpret.repeat") == 1 {
+            let tr = nxkb_find(p, i, se, "True")
+            if tr >= 0 { dflt = 1 } else { dflt = 0 }
+        } else if nwu_mem_starts(p + i, se - i, "interpret ") == 1 && cnt < cap {
+            let ss = nxkb_skip_ws(p, se, i + 10)
+            var sn = ss
+            while sn < se && peek8(p + sn) != 43 && peek8(p + sn) != 123 && nxkb_is_space(peek8(p + sn)) == 0 { sn = sn + 1 }
+            var sym = 0 - 1
+            if nwu_mem_eq(p + ss, sn - ss, "Any") == 0 { sym = nxkb_sym(p + ss, sn - ss) }
+            var needmm = 0
+            if sn < se && peek8(p + sn) == 43 {
+                if nwu_mem_starts(p + sn + 1, se - sn - 1, "AnyOfOrNone") == 1 { needmm = 0 }
+                else if nwu_mem_starts(p + sn + 1, se - sn - 1, "AnyOf") == 1 || nwu_mem_starts(p + sn + 1, se - sn - 1, "AllOf") == 1 { needmm = 1 }
+            }
+            var rp = dflt
+            let rk = nxkb_find(p, sn, se, "repeat")
+            if rk >= 0 {
+                let rs = nxkb_skip_ws(p, se, rk + 7)
+                if peek8(p + rs) == 84 || peek8(p + rs) == 116 || peek8(p + rs) == 89 || peek8(p + rs) == 121 { rp = 1 } else { rp = 0 }
+            }
+            poke(out + cnt * 24, sym)
+            poke(out + cnt * 24 + 8, needmm)
+            poke(out + cnt * 24 + 16, rp)
+            cnt = cnt + 1
+        }
+        i = se
+    }
+    return cnt
+}
+
+// the symbol list `[ a, b, ... ]` starting at the '[' at `lb`: level keysyms into the key's slots in group `g`
+fn nxkb_parse_levels(km: NxkbMap, p: Int, lb: Int, end: Int, code: Int, g: Int) {
+    let slot = code * NXKB_GROUPS() + g
+    var i = lb + 1
+    var lvl = 0
+    var going = 1
+    while going == 1 && i < end {
+        i = nxkb_skip_ws(p, end, i)
+        if i >= end || peek8(p + i) == 93 { going = 0 } else {
+            if peek8(p + i) == 123 { i = nxkb_skip_ws(p, end, i + 1) }             // { a, b }: its first keysym
+            let ws = i
+            while i < end && peek8(p + i) != 44 && peek8(p + i) != 93 && peek8(p + i) != 125 && nxkb_is_space(peek8(p + i)) == 0 { i = i + 1 }
+            if lvl < 8 { poke32(km.syms + slot * 32 + lvl * 4, nxkb_sym(p + ws, i - ws)) }
+            lvl = lvl + 1
+            if i < end && peek8(p + i) == 125 {                                   // close a { } level
+                while i < end && peek8(p + i) != 44 && peek8(p + i) != 93 { i = i + 1 }
+            }
+            while i < end && peek8(p + i) != 44 && peek8(p + i) != 93 { i = i + 1 }
+            if i < end && peek8(p + i) == 44 { i = i + 1 }
+        }
+    }
+    poke8(km.nlv + slot, lvl)
+}
+
+// the type xkbcommon gives a key's group that names none, from what its levels hold
+fn nxkb_auto_type(km: NxkbMap, code: Int, g: Int) -> Int {
+    let slot = code * NXKB_GROUPS() + g
+    let nl = peek8(km.nlv + slot)
+    let s0 = peek32(km.syms + slot * 32)
+    let s1 = peek32(km.syms + slot * 32 + 4)
+    let s2 = peek32(km.syms + slot * 32 + 8)
+    let s3 = peek32(km.syms + slot * 32 + 12)
+    var name = "ONE_LEVEL"
+    if nl == 2 {
+        if nxkb_is_lower(s0) == 1 && nxkb_is_upper(s1) == 1 { name = "ALPHABETIC" }
+        else if nxkb_is_keypad(s0) == 1 || nxkb_is_keypad(s1) == 1 { name = "KEYPAD" }
+        else { name = "TWO_LEVEL" }
+    } else if nl >= 3 {
+        if nxkb_is_lower(s0) == 1 && nxkb_is_upper(s1) == 1 {
+            if nxkb_is_lower(s2) == 1 && nxkb_is_upper(s3) == 1 { name = "FOUR_LEVEL_ALPHABETIC" } else { name = "FOUR_LEVEL_SEMIALPHABETIC" }
+        } else if nxkb_is_keypad(s0) == 1 || nxkb_is_keypad(s1) == 1 { name = "FOUR_LEVEL_KEYPAD" }
+        else { name = "FOUR_LEVEL" }
+    }
+    return nxkb_type_index(km, nxkb_hash_lit(name))
+}
+
+fn nxkb_parse_symbols(km: NxkbMap, p: Int, at: Int, end: Int, codes: Int) {
+    var i = at
+    while i < end {
+        i = nxkb_skip_ws(p, end, i)
+        if i >= end { return }
+        let se = nxkb_skip_stmt(p, end, i)
+        if nwu_mem_starts(p + i, se - i, "key") == 1 && nxkb_is_ident(peek8(p + i + 3)) == 0 {
+            let nb = nxkb_find(p, i, se, "<")
+            var code = 0 - 1
+            if nb >= 0 { code = nxkb_keyname(p, se, nb, codes) }
+            let ob = nxkb_find(p, i, se, "{")
+            if code >= 0 && code < NXKB_KEYS() && ob >= 0 {
+                let cb = nxkb_close_brace(p, se, ob)
+                // the groups' symbols: `symbols[N]= [ … ]`, or a bare `[ … ]` (not part of name[..]) the first's
+                var ng = 0
+                var g = 0
+                while g < NXKB_GROUPS() {
+                    let sk = nxkb_find(p, ob, cb, "symbols[" + to_str(g + 1) + "]")
+                    if sk >= 0 {
+                        let lb = nxkb_find(p, sk + 10, cb, "[")
+                        if lb >= 0 { nxkb_parse_levels(km, p, lb, cb, code, g)  ng = g + 1 }
+                    }
+                    g = g + 1
+                }
+                if ng == 0 && nxkb_find(p, ob, cb, "symbols[") < 0 {
+                    var k = ob + 1
+                    var lb2 = 0 - 1
+                    while k < cb && lb2 < 0 {
+                        if peek8(p + k) == 91 && nxkb_is_ident(peek8(p + k - 1)) == 0 { lb2 = k }
+                        k = k + 1
+                    }
+                    if lb2 >= 0 { nxkb_parse_levels(km, p, lb2, cb, code, 0)  ng = 1 }
+                }
+                poke8(km.ngrp + code, ng)
+                // the types: an unindexed `type= "T"` is every group's, `type[N]= "T"` group N's, in the order written;
+                // a group with none gets the type its symbols imply
+                var named = 0                                                     // bit g: group g's type was named
+                var tk = nxkb_find(p, ob, cb, "type")
+                while tk >= 0 {
+                    var after = tk + 4
+                    let whole = nxkb_is_ident(peek8(p + tk - 1)) == 0 && nxkb_is_ident(peek8(p + after)) == 0
+                    if whole {
+                        after = nxkb_skip_ws(p, cb, after)
+                        var tg = 0 - 1                                            // -1: every group
+                        if peek8(p + after) == 91 { tg = nxkb_number(p, cb, after + 1) - 1 }
+                        let tq = nxkb_find(p, after, cb, "\"")
+                        if tq >= 0 {
+                            var tq2 = tq + 1
+                            while tq2 < cb && peek8(p + tq2) != 34 { tq2 = tq2 + 1 }
+                            let ti = nxkb_type_index(km, nxkb_hash(p + tq + 1, tq2 - tq - 1))
+                            var g2 = 0
+                            while g2 < NXKB_GROUPS() {
+                                if tg < 0 || tg == g2 { poke8(km.ktype + code * NXKB_GROUPS() + g2, ti)  named = named | (1 << g2) }
+                                g2 = g2 + 1
+                            }
+                            after = tq2 + 1
+                        }
+                    }
+                    tk = nxkb_find(p, after, cb, "type")
+                }
+                var g3 = 0
+                while g3 < ng {
+                    if (named & (1 << g3)) == 0 { poke8(km.ktype + code * NXKB_GROUPS() + g3, nxkb_auto_type(km, code, g3)) }
+                    g3 = g3 + 1
+                }
+                let rk = nxkb_find(p, ob, cb, "repeat")
+                if rk >= 0 {
+                    let rs = nxkb_skip_ws(p, cb, nxkb_find(p, rk, cb, "=") + 1)
+                    let rc = peek8(p + rs)
+                    if rc == 84 || rc == 116 || rc == 89 || rc == 121 { poke8(km.explrep + code, 2) } else { poke8(km.explrep + code, 1) }
+                }
+            }
+        } else if nwu_mem_starts(p + i, se - i, "modifier_map") == 1 {
+            var k2 = i
+            while k2 < se {
+                if peek8(p + k2) == 60 {
+                    let mc = nxkb_keyname(p, se, k2, codes)
+                    if mc >= 0 && mc < NXKB_KEYS() { poke8(km.modmap + mc, 1) }
+                }
+                k2 = k2 + 1
+            }
+        }
+        i = se
+    }
+}
+
+// ---- the keymap --------------------------------------------------------------------------------------
+
+fn nxkb_parse(p: Int, size: Int) -> Int {
+    var n = size
+    while n > 0 && peek8(p + n - 1) == 0 { n = n - 1 }                            // the text is NUL-terminated
+    let span = malloc(16)
+    let km: NxkbMap = calloc(1, sizeof(NxkbMap))
+    km.syms = calloc(NXKB_KEYS() * NXKB_GROUPS() * 32, 1)
+    km.nlv = calloc(NXKB_KEYS() * NXKB_GROUPS(), 1)
+    km.ktype = malloc(NXKB_KEYS() * NXKB_GROUPS())
+    km.ngrp = calloc(NXKB_KEYS(), 1)
+    km.rep = calloc(NXKB_KEYS(), 1)
+    km.modmap = calloc(NXKB_KEYS(), 1)
+    km.explrep = calloc(NXKB_KEYS(), 1)
+    km.tmask = calloc(NXKB_TYPES() * 8, 1)
+    km.tmaps = calloc(NXKB_TYPES() * NXKB_MAPS() * 24, 1)
+    km.tnmaps = calloc(NXKB_TYPES(), 1)
+    km.thash = calloc(NXKB_TYPES() * 8, 1)
+    var i = 0
+    while i < NXKB_KEYS() * NXKB_GROUPS() { poke8(km.ktype + i, 255)  i = i + 1 }
+    let codes = nxkb_tab_new(4096)
+    var ok = 0
+    if nxkb_section(p, n, "xkb_keycodes", span) == 1 {
+        nxkb_parse_keycodes(p, peek(span), peek(span + 8), codes)
+        if nxkb_section(p, n, "xkb_types", span) == 1 { nxkb_parse_types(km, p, peek(span), peek(span + 8)) }
+        let interps = malloc(512 * 24)
+        var ninterp = 0
+        if nxkb_section(p, n, "xkb_compat", span) == 1 { ninterp = nxkb_parse_compat(p, peek(span), peek(span + 8), interps, 512) }
+        if nxkb_section(p, n, "xkb_symbols", span) == 1 {
+            nxkb_parse_symbols(km, p, peek(span), peek(span + 8), codes)
+            ok = 1
+        }
+        nxkb_resolve_repeat(km, interps, ninterp)
+        free(interps)
+    }
+    free(codes)
+    free(span)
+    if ok == 0 { nxkb_free(km)  return 0 }
+    return km
+}
+
+// Whether each key repeats, as xkbcommon settles it: an explicit `repeat=` wins, and a key with nothing
+// on its first level does not; otherwise the
+// interpret for its first-level keysym decides (one whose condition needs a modifier_map applies only
+// to a key that has one), then an `Any` interpret for a key with a modifier_map; otherwise it repeats.
+fn nxkb_resolve_repeat(km: NxkbMap, interps: Int, cnt: Int) {
+    var code = 0
+    while code < NXKB_KEYS() {
+        var r = 1
+        let ex = peek8(km.explrep + code)
+        if ex != 0 { r = ex - 1 } else if peek32(km.syms + code * NXKB_GROUPS() * 32) == 0 { r = 0 } else {
+            let s0 = peek32(km.syms + code * NXKB_GROUPS() * 32)
+            let hasmm = peek8(km.modmap + code)
+            var found = 0
+            var j = 0
+            while j < cnt && found == 0 {
+                let e = interps + j * 24
+                if peek(e) == s0 && s0 != 0 && (peek(e + 8) == 0 || hasmm == 1) { r = peek(e + 16)  found = 1 }
+                j = j + 1
+            }
+            if found == 0 && hasmm == 1 {
+                j = 0
+                while j < cnt && found == 0 {
+                    let e2 = interps + j * 24
+                    if peek(e2) == 0 - 1 { r = peek(e2 + 16)  found = 1 }
+                    j = j + 1
+                }
+            }
+        }
+        poke8(km.rep + code, r)
+        code = code + 1
+    }
+}
+
+fn nxkb_free(h: Int) {
+    let km: NxkbMap = h
+    free(km.syms)  free(km.nlv)  free(km.ktype)  free(km.ngrp)  free(km.rep)  free(km.modmap)  free(km.explrep)
+    free(km.tmask)  free(km.tmaps)  free(km.tnmaps)  free(km.thash)
+    free(km)
+}
+
+// the keysym keycode `code` produces under the real-modifier state `mods` in the first group (0 = NoSymbol)
+fn nxkb_keysym(h: Int, code: Int, mods: Int) -> Int { return nxkb_keysym_group(h, code, mods, 0) }
+
+// the same in group `group` (the layout in use; a key with fewer groups wraps)
+fn nxkb_keysym_group(h: Int, code: Int, mods: Int, group: Int) -> Int {
+    let km: NxkbMap = h
+    if code < 0 || code >= NXKB_KEYS() { return 0 }
+    let ng = peek8(km.ngrp + code)
+    if ng == 0 { return 0 }
+    var g = group
+    if g < 0 { g = 0 }
+    g = g % ng
+    let slot = code * NXKB_GROUPS() + g
+    let nl = peek8(km.nlv + slot)
+    if nl == 0 { return 0 }
+    let t = peek8(km.ktype + slot)
+    var level = 1
+    var consumed = 0
+    if t != 255 {
+        let tm = peek(km.tmask + t * 8)
+        let masked = mods & tm
+        consumed = tm
+        let nm = peek8(km.tnmaps + t)
+        var j = 0
+        while j < nm {
+            let e = km.tmaps + (t * NXKB_MAPS() + j) * 24
+            if peek(e) == masked {
+                level = peek(e + 8)
+                consumed = tm & (255 - (peek(e + 16) & 255))
+            }
+            j = j + 1
+        }
+    }
+    if level < 1 || level > nl || level > 8 { return 0 }
+    let sym = peek32(km.syms + slot * 32 + (level - 1) * 4)
+    if (mods & 2) != 0 && (consumed & 2) == 0 { return nxkb_upper(sym) }             // an unconsumed Lock
+    return sym
+}
+
+fn nxkb_repeats(h: Int, code: Int) -> Int {
+    let km: NxkbMap = h
+    if code < 0 || code >= NXKB_KEYS() { return 0 }
+    return peek8(km.rep + code)
+}

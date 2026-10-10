@@ -1,0 +1,35 @@
+column { padding: 8 gap: 4 bg: #202020 text { text: "title" size_px: 18 } row { gap: 6 button { label: "One" on_click: one } button { label: "Two" on_click: two } spacer { } text { text: "right" } } rect { w: 50% h: 20 color: #ff0000 radius: 4 } }
+=====
+row { padding: 2 gap: 2 cross_align: center main_align: space_between column { fill_w: true bg: #111111 text { text: "a" } } column { fill_w: true flex_weight: 2 bg: #222222 text { text: "b" } } column { w: 40 text { text: "c" } } }
+=====
+column { main_align: center cross_align: center padding: 10 text { text: "centered" } text { text: "also" text_align: center } }
+=====
+column { main_align: end cross_align: end text { text: "end" } rect { w: 10 h: 10 color: #00ff00 } }
+=====
+column { padding: 4 text { text: "a long line of text that wraps around a narrow column of width" wrap: true max_width: 120 } text { text: "clamped text clamped text clamped text" line_clamp: 1 text_overflow: ellipsis max_width: 80 } }
+=====
+column { padding: 6 rect { w: 100 h: 60 color: #333333 } rect { w: 20 h: 20 color: #ff00ff position: absolute top: 4 left: 8 z_index: 2 } rect { w: 30 h: 30 color: #00ffff position: absolute right: 2 bottom: 2 z_index: -1 } text { text: "after" } }
+=====
+column { h: 50 overflow_y: hidden padding: 3 bg: #101010 rect { w: 30 h: 30 color: #ff0000 } rect { w: 30 h: 30 color: #00ff00 } text { text: "cut" } }
+=====
+scroll_column { id: list min_height: 80 padding: 4 gap: 2 text { text: "row 1" } text { text: "row 2" } text { text: "row 3" } text { text: "row 4" } text { text: "row 5" } text { text: "row 6" } text { text: "row 7" } text { text: "row 8" } text { text: "row 9" } }
+=====
+scroll_row { id: strip min_width: 100 gap: 4 rect { w: 40 h: 20 color: #ff0000 } rect { w: 40 h: 20 color: #00ff00 } rect { w: 40 h: 20 color: #0000ff } rect { w: 40 h: 20 color: #ffff00 } }
+=====
+column { padding: 4 scroll_column { id: outer min_height: 100 column { gap: 2 text { text: "x" } scroll_column { id: inner min_height: 30 text { text: "i1" } text { text: "i2" } text { text: "i3" } } text { text: "y" } } } }
+=====
+column { padding: 4 gap: 4 checkbox { id: c1 label: "Agree" checked: true } slider { id: s1 value: 0.3 } dropdown { id: dd options: [alpha, beta, gamma] selected: 1 open: true } text_input { id: name label: "Name" value: "Ann" } number { id: n label: "N" value: 3 min: 0 max: 9 } }
+=====
+column { padding: 4 scroll_column { id: sc min_height: 40 dropdown { id: dd2 options: [a, b] open: true } text { text: "below" } } }
+=====
+row { gap: 4 text { text: "visible" } text { text: "hidden" bind_visible: never } rect { w: 5 h: 5 color: #ffffff } }
+=====
+stylesheet { class btn { bg: #3b82f6 radius: 6 hover_bg: #60a5fa active_bg: #1d4ed8 } class lbl { text_color: #eeeeee hover_text_color: #ffff00 } tag text { size_px: 13 } } row { padding: 4 gap: 4 column { class: btn padding: 6 on_click: go text { class: lbl text: "Go" } } column { class: btn padding: 6 on_click: stop text { class: lbl text: "Stop" } } }
+=====
+column { padding: 0 gap: 0 row { h: 30 bg: #000000 text { text: "status" fill_w: true } text { text: "12:00" } } column { fill_h: true bg: #111111 } }
+=====
+column { gap: 3 padding: 2 border_color: #ffffff border_w: 1 radius: 5 text { text: "bold" bold: true } text { text: "under" text_decoration: underline } text { text: "shadow" text_shadow_color: [0, 0, 0, 200] } }
+=====
+row { overflow_x: scroll id: hs w: 80 rect { w: 60 h: 10 color: #ff0000 } rect { w: 60 h: 10 color: #00ff00 } }
+=====
+column { overflow_y: auto h: 40 rect { w: 10 h: 30 color: #ff0000 } rect { w: 10 h: 30 color: #00ff00 } }

@@ -1,0 +1,963 @@
+// std/window/__native_x11.nori: the X11 backend of __native_linux.nori: the core protocol spoken over the
+// server's Unix socket, answering what window_x11.c answers through Xlib: a window with WM_NAME and
+// WM_DELETE_WINDOW, key/button/motion/configure/client-message events, PutImage presentation, the
+// CLIPBOARD selection both ways, font cursors, and the pointer lock by grab and warp.
+//
+// The wire. A request is an opcode byte, a byte of data, its length in 4-byte units, then its fields,
+// all little-endian (the setup names byte order 'l'). The server answers with 32-byte events and
+// errors, and replies of 32 bytes plus 4 * their length word; every reply and error carries the low 16
+// bits of the sequence number of the request it answers, which is how a reply is matched. Events that
+// arrive while a reply is awaited are kept, in order, for the next poll.
+//
+// Event codes returned to window.nori are window_x11.c's: 1 closed, 2 resized(w, h), 3/4 key
+// down/up(keysym, mods), 6 scroll(delta), 7/8 mouse down/up(button, x, y). Drag-and-drop (XDND) is not
+// spoken, as it is not in window_x11.c.
+
+cstruct NxWin {
+    fd: Int, dead: Int, seq: Int,
+    out: Int, olen: Int, mstart: Int,
+    inb: Int, ihead: Int, ilen: Int,
+    evq: Int, eqhead: Int, eqtail: Int,
+    rid_base: Int, rid_mask: Int, rid_next: Int, maxreq: Int,
+    root: Int, depth: Int, black: Int, minkc: Int, maxkc: Int, kpk: Int, kmap: Int,
+    win: Int, gc: Int, w: Int, h: Int, closed: Int,
+    px: Int, py: Int, btn: Int, mid: Int, lx: Int, ly: Int, tap_latch: Int, pending_scroll: Int,
+    wmdel: Int, clipboard: Int, utf8: Int, targets: Int, incr: Int, clip_own: Int,
+    locked: Int, warp_x: Int, warp_y: Int, rel_dx: Int, rel_dy: Int, blank: Int,
+    cfont: Int, shapes: Int, shape_cur: Int, scale120: Int
+}
+
+fn NX_BUFCAP() -> Int { return 65536 }
+fn NX_EVQ() -> Int { return 256 }
+
+// ---- requests ----------------------------------------------------------------------------------------
+
+fn nx_begin(x: NxWin, op: Int, data: Int) {
+    if x.olen > 49152 { nx_flush(x) }
+    x.mstart = x.olen
+    poke8(x.out + x.olen, op)
+    poke8(x.out + x.olen + 1, data)
+    poke16(x.out + x.olen + 2, 0)
+    x.olen = x.olen + 4
+}
+fn nx_u8(x: NxWin, v: Int) { poke8(x.out + x.olen, v & 255)  x.olen = x.olen + 1 }
+fn nx_u16(x: NxWin, v: Int) { poke16(x.out + x.olen, v & 65535)  x.olen = x.olen + 2 }
+fn nx_u32(x: NxWin, v: Int) { poke32(x.out + x.olen, v & 4294967295)  x.olen = x.olen + 4 }
+fn nx_bytes(x: NxWin, p: Int, n: Int) {
+    if n > 0 { memcpy(x.out + x.olen, p, n) }
+    x.olen = x.olen + n
+    while (x.olen & 3) != 0 { poke8(x.out + x.olen, 0)  x.olen = x.olen + 1 }
+}
+// close the request: pad it to a 4-byte boundary, write its length, and count its sequence number
+fn nx_end(x: NxWin) -> Int {
+    while (x.olen & 3) != 0 { poke8(x.out + x.olen, 0)  x.olen = x.olen + 1 }
+    poke16(x.out + x.mstart + 2, (x.olen - x.mstart) / 4)
+    x.seq = x.seq + 1
+    return x.seq
+}
+
+fn nx_write_raw(x: NxWin, p: Int, n: Int) {
+    var off = 0
+    while off < n && x.dead == 0 {
+        let k = write(x.fd, p + off, n - off)
+        if k > 0 { off = off + k } else {
+            if k == 0 - 11 || k == 0 - 4 { usleep(1000) } else { x.dead = 1 }
+        }
+    }
+}
+fn nx_flush(x: NxWin) {
+    if x.olen > 0 { nx_write_raw(x, x.out, x.olen) }
+    x.olen = 0
+}
+
+// a fresh resource id from the range the server assigned this connection
+fn nx_newid(x: NxWin) -> Int {
+    let step = x.rid_mask & (0 - x.rid_mask)
+    x.rid_next = x.rid_next + step
+    return x.rid_base | (x.rid_next & x.rid_mask)
+}
+
+// ---- replies and events ------------------------------------------------------------------------------
+
+fn nx_read(x: NxWin, ms: Int) -> Int {
+    if x.dead == 1 { return 0 }
+    if nwu_readable(x.fd, ms) == 0 { return 0 }
+    if x.ihead > 0 {
+        memmove(x.inb, x.inb + x.ihead, x.ilen - x.ihead)
+        x.ilen = x.ilen - x.ihead
+        x.ihead = 0
+    }
+    if x.ilen >= NX_BUFCAP() { return 0 }
+    let r = read(x.fd, x.inb + x.ilen, NX_BUFCAP() - x.ilen)
+    if r == 0 { x.dead = 1  x.closed = 1 }
+    if r <= 0 { return 0 }
+    x.ilen = x.ilen + r
+    return r
+}
+
+// the length of the complete message at the head of the input, or 0 if it has not all arrived
+fn nx_msg_len(x: NxWin) -> Int {
+    let avail = x.ilen - x.ihead
+    if avail < 32 { return 0 }
+    let p = x.inb + x.ihead
+    var len = 32
+    if peek8(p) == 1 { len = 32 + peek32(p + 4) * 4 }
+    if avail < len { return 0 }
+    return len
+}
+
+fn nx_queue_event(x: NxWin, p: Int) {
+    let n = (x.eqtail + 1) % NX_EVQ()
+    if n == x.eqhead { return }
+    memcpy(x.evq + x.eqtail * 32, p, 32)
+    x.eqtail = n
+}
+
+// read until the reply to request `seq` arrives: a malloc'd copy of it, or 0 for an error or silence.
+// A reply whose body does not fit the buffer is assembled with further reads.
+fn nx_reply(x: NxWin, seq: Int) -> Int {
+    nx_flush(x)
+    var quiet = 0
+    while x.dead == 0 && quiet < 50 {
+        var going = 1
+        while going == 1 {
+            let avail = x.ilen - x.ihead
+            if avail < 32 { going = 0 } else {
+                let p = x.inb + x.ihead
+                let kind = peek8(p)
+                if kind == 1 {
+                    let total = 32 + peek32(p + 4) * 4
+                    let rs = peek16(p + 2)
+                    if total > NX_BUFCAP() {
+                        let big = malloc(total)
+                        memcpy(big, p, avail)
+                        var got = avail
+                        x.ihead = 0
+                        x.ilen = 0
+                        while got < total && x.dead == 0 {
+                            let k = read(x.fd, big + got, total - got)
+                            if k > 0 { got = got + k } else { if k == 0 - 11 || k == 0 - 4 { nwu_readable(x.fd, 100) } else { x.dead = 1 } }
+                        }
+                        if rs == (seq & 65535) && got == total { return big }
+                        free(big)
+                    } else {
+                        if avail < total { going = 0 } else {
+                            x.ihead = x.ihead + total
+                            if rs == (seq & 65535) {
+                                let cp = malloc(total)
+                                memcpy(cp, p, total)
+                                return cp
+                            }
+                        }
+                    }
+                } else {
+                    x.ihead = x.ihead + 32
+                    if kind == 0 {
+                        if peek16(p + 2) == (seq & 65535) { return 0 }
+                        nx_report_error(p)
+                    } else { nx_queue_event(x, p) }
+                }
+            }
+        }
+        if nx_read(x, 100) > 0 { quiet = 0 } else { quiet = quiet + 1 }
+    }
+    return 0
+}
+
+// An X error that no request is waiting on is reported on stderr, and the program goes on.
+fn nx_report_error(p: Int) {
+    nwu_stderr("std/window: X11 protocol error ")
+    nx_write_num(peek8(p + 1))
+    nwu_stderr(" on request ")
+    nx_write_num(peek8(p + 10))
+    nwu_stderr("\n")
+}
+fn nx_write_num(v: Int) {
+    let b = malloc(24)
+    var n = 0
+    var t = v
+    if t == 0 { poke8(b, 48)  n = 1 }
+    while t > 0 { poke8(b + 23 - n, 48 + t % 10)  t = t / 10  n = n + 1 }
+    if v == 0 { write(2, b, 1) } else { write(2, b + 24 - n, n) }
+    free(b)
+}
+
+fn nx_intern(x: NxWin, name: Str) -> Int {
+    nx_begin(x, 16, 0)
+    nx_u16(x, name.len())
+    nx_u16(x, 0)
+    nx_bytes(x, nori_str_ptr(name), name.len())
+    let r = nx_reply(x, nx_end(x))
+    if r == 0 { return 0 }
+    let atom = peek32(r + 8)
+    free(r)
+    return atom
+}
+
+// ---- connecting --------------------------------------------------------------------------------------
+
+// the display number and screen from $DISPLAY (":N", ":N.S", "unix:N"): outs[0] = N, outs[8] = S.
+// 0 when DISPLAY is unset or names a TCP host, which this backend does not reach.
+fn nx_parse_display(outs: Int) -> Int {
+    let d = nwu_getenv("DISPLAY")
+    if d == 0 { return 0 }
+    var i = 0
+    if nwu_mem_starts(d, strlen(d), "unix:") == 1 { i = 4 }
+    if peek8(d + i) != 58 { return 0 }
+    i = i + 1
+    if peek8(d + i) < 48 || peek8(d + i) > 57 { return 0 }
+    var num = 0
+    while peek8(d + i) >= 48 && peek8(d + i) <= 57 { num = num * 10 + peek8(d + i) - 48  i = i + 1 }
+    var scr = 0
+    if peek8(d + i) == 46 {
+        i = i + 1
+        while peek8(d + i) >= 48 && peek8(d + i) <= 57 { scr = scr * 10 + peek8(d + i) - 48  i = i + 1 }
+    }
+    poke(outs, num)
+    poke(outs + 8, scr)
+    return 1
+}
+
+// the decimal digits of `v` into `p`, returning how many
+fn nx_itoa(p: Int, v: Int) -> Int {
+    let tmp = malloc(24)
+    var n = 0
+    var t = v
+    if t == 0 { poke8(tmp, 48)  n = 1 }
+    while t > 0 { poke8(tmp + n, 48 + t % 10)  t = t / 10  n = n + 1 }
+    var i = 0
+    while i < n { poke8(p + i, peek8(tmp + n - 1 - i))  i = i + 1 }
+    free(tmp)
+    return n
+}
+
+// a whole file read into a malloc'd buffer; outs[0] = its length. 0 if it cannot be opened.
+fn nx_slurp(path: Int, outs: Int) -> Int {
+    let fd = open(path, 524288)                                                   // O_RDONLY | O_CLOEXEC
+    if fd < 0 { return 0 }
+    var cap = 4096
+    var len = 0
+    var buf = malloc(cap)
+    var going = 1
+    while going == 1 {
+        if len == cap { cap = cap * 2  buf = realloc(buf, cap) }
+        let k = read(fd, buf + len, cap - len)
+        if k > 0 { len = len + k } else { going = 0 }
+    }
+    close(fd)
+    poke(outs, len)
+    return buf
+}
+
+// The MIT-MAGIC-COOKIE-1 for display `num` from $XAUTHORITY or ~/.Xauthority: records of (family,
+// address, number, name, data), each field a big-endian 16-bit length and its bytes. A record matches
+// when it is for this host (FamilyLocal with the node name, or FamilyWild) and this display number (or
+// any). The 16-byte cookie goes into `cookie`; returns its length, 0 when there is none.
+fn nx_find_cookie(num: Int, cookie: Int) -> Int {
+    var path = 0
+    let xa = nwu_getenv("XAUTHORITY")
+    if xa != 0 && peek8(xa) != 0 {
+        path = nwu_strdup(xa)
+    } else {
+        let home = nwu_getenv("HOME")
+        if home == 0 { return 0 }
+        let hl = strlen(home)
+        let suffix = "/.Xauthority"
+        path = malloc(hl + suffix.len() + 1)
+        memcpy(path, home, hl)
+        memcpy(path + hl, nori_str_ptr(suffix), suffix.len())
+        poke8(path + hl + suffix.len(), 0)
+    }
+    let lenout = malloc(8)
+    let data = nx_slurp(path, lenout)
+    free(path)
+    if data == 0 { free(lenout)  return 0 }
+    let n = peek(lenout)
+    free(lenout)
+    let uts = malloc(390)
+    uname(uts)
+    let host = uts + 65
+    let hostlen = strlen(host)
+    let numstr = malloc(24)
+    let numlen = nx_itoa(numstr, num)
+    var found = 0
+    var i = 0
+    while found == 0 && i + 2 <= n {
+        let family = peek8(data + i) * 256 + peek8(data + i + 1)
+        i = i + 2
+        var fields = 0
+        var ok = 1
+        let starts = malloc(32)
+        let lens = malloc(32)
+        while fields < 4 && ok == 1 {
+            if i + 2 > n { ok = 0 } else {
+                let fl = peek8(data + i) * 256 + peek8(data + i + 1)
+                i = i + 2
+                if i + fl > n { ok = 0 } else {
+                    poke(starts + fields * 8, i)
+                    poke(lens + fields * 8, fl)
+                    i = i + fl
+                    fields = fields + 1
+                }
+            }
+        }
+        if ok == 1 {
+            var hostok = 0
+            if family == 65535 { hostok = 1 }
+            if family == 256 && peek(lens) == hostlen && memcmp(data + peek(starts), host, hostlen) == 0 { hostok = 1 }
+            var numok = 0
+            if peek(lens + 8) == 0 { numok = 1 }
+            if peek(lens + 8) == numlen && memcmp(data + peek(starts + 8), numstr, numlen) == 0 { numok = 1 }
+            let nameok = nwu_mem_eq(data + peek(starts + 16), peek(lens + 16), "MIT-MAGIC-COOKIE-1")
+            if hostok == 1 && numok == 1 && nameok == 1 && peek(lens + 24) == 16 {
+                memcpy(cookie, data + peek(starts + 24), 16)
+                found = 16
+            }
+        } else { i = n }
+        free(starts)
+        free(lens)
+    }
+    free(numstr)
+    free(uts)
+    free(data)
+    return found
+}
+
+// connect to display `num`: the abstract socket first, then the file in /tmp/.X11-unix, as Xlib does
+fn nx_connect(num: Int) -> Int {
+    let path = malloc(64)
+    let base = "/tmp/.X11-unix/X"
+    memcpy(path, nori_str_ptr(base), base.len())
+    let n = base.len() + nx_itoa(path + base.len(), num)
+    var fd = nwu_unix_connect(path, n, 1)
+    if fd < 0 { fd = nwu_unix_connect(path, n, 0) }
+    free(path)
+    return fd
+}
+
+// the connection setup: returns 1 once the server accepts, filling the screen's root, depth and
+// black pixel, the resource id range, the maximum request length and the keycode range
+fn nx_setup(x: NxWin, num: Int, scr: Int) -> Int {
+    let cookie = malloc(16)
+    let clen = nx_find_cookie(num, cookie)
+    let aname = "MIT-MAGIC-COOKIE-1"
+    nx_u8(x, 108)  nx_u8(x, 0)  nx_u16(x, 11)  nx_u16(x, 0)                     // 'l', protocol 11.0
+    if clen > 0 { nx_u16(x, aname.len())  nx_u16(x, 16) } else { nx_u16(x, 0)  nx_u16(x, 0) }
+    nx_u16(x, 0)
+    if clen > 0 {
+        nx_bytes(x, nori_str_ptr(aname), aname.len())
+        nx_bytes(x, cookie, 16)
+    }
+    free(cookie)
+    nx_flush(x)
+    var quiet = 0
+    while x.ilen < 8 && x.dead == 0 && quiet < 50 { if nx_read(x, 100) == 0 { quiet = quiet + 1 } }
+    if x.ilen < 8 { return 0 }
+    let total = 8 + peek16(x.inb + 6) * 4
+    quiet = 0
+    while x.ilen < total && x.dead == 0 && quiet < 50 { if nx_read(x, 100) == 0 { quiet = quiet + 1 } }
+    if x.ilen < total || peek8(x.inb) != 1 { return 0 }
+    let d = x.inb + 8
+    x.rid_base = peek32(d + 4)
+    x.rid_mask = peek32(d + 8)
+    let vlen = peek16(d + 16)
+    x.maxreq = peek16(d + 18) * 4
+    let nscreens = peek8(d + 20)
+    let nformats = peek8(d + 21)
+    x.minkc = peek8(d + 26)
+    x.maxkc = peek8(d + 27)
+    var sp = d + 32 + ((vlen + 3) & (0 - 4)) + nformats * 8
+    var si = 0
+    var want = scr
+    if want >= nscreens { want = 0 }
+    while si < want {                                                             // step over the screens before ours
+        let ndepths = peek8(sp + 39)
+        var dp = sp + 40
+        var di = 0
+        while di < ndepths { dp = dp + 8 + peek16(dp + 2) * 24  di = di + 1 }
+        sp = dp
+        si = si + 1
+    }
+    x.root = peek32(sp)
+    x.black = peek32(sp + 12)
+    x.depth = peek8(sp + 38)
+    x.ihead = total
+    return 1
+}
+
+// the core keyboard mapping: keysyms_per_keycode keysyms for every keycode in [minkc, maxkc]
+fn nx_load_keymap(x: NxWin) {
+    let count = x.maxkc - x.minkc + 1
+    nx_begin(x, 101, 0)  nx_u8(x, x.minkc)  nx_u8(x, count)  nx_u16(x, 0)
+    let r = nx_reply(x, nx_end(x))
+    if r == 0 { return }
+    let per = peek8(r + 1)
+    if x.kmap != 0 { free(x.kmap) }
+    x.kmap = malloc(count * per * 4 + 4)
+    memcpy(x.kmap, r + 32, count * per * 4)
+    x.kpk = per
+    free(r)
+}
+
+// Xft.dpi from the root window's RESOURCE_MANAGER property, as 120ths of 96 dpi (120 when unset)
+fn nx_read_scale(x: NxWin) -> Int {
+    nx_begin(x, 20, 0)  nx_u32(x, x.root)  nx_u32(x, 23)  nx_u32(x, 31)  nx_u32(x, 0)  nx_u32(x, 100000)
+    let r = nx_reply(x, nx_end(x))
+    if r == 0 { return 120 }
+    let n = peek32(r + 16)
+    let p = r + 32
+    let key = "Xft.dpi:"
+    var result = 120
+    var i = 0
+    var found = 0 - 1
+    while i + key.len() <= n && found < 0 {
+        if nwu_mem_eq(p + i, key.len(), key) == 1 { found = i + key.len() }
+        i = i + 1
+    }
+    if found >= 0 {
+        var j = found
+        while j < n && (peek8(p + j) == 32 || peek8(p + j) == 9) { j = j + 1 }
+        var milli = 0
+        while j < n && peek8(p + j) >= 48 && peek8(p + j) <= 57 { milli = milli * 10 + (peek8(p + j) - 48) * 1000  j = j + 1 }
+        if j < n && peek8(p + j) == 46 {
+            j = j + 1
+            var scale = 100
+            while j < n && peek8(p + j) >= 48 && peek8(p + j) <= 57 && scale > 0 { milli = milli + (peek8(p + j) - 48) * scale  scale = scale / 10  j = j + 1 }
+        }
+        if milli > 0 {
+            let s = (milli * 120 / 96 + 500) / 1000
+            if s < 120 { result = 120 } else { result = s }
+        }
+    }
+    free(r)
+    return result
+}
+
+fn nx_open(title: Int, width: Int, height: Int) -> Int {
+    let dn = malloc(16)
+    if nx_parse_display(dn) == 0 { free(dn)  return 0 }
+    let num = peek(dn)
+    let scr = peek(dn + 8)
+    free(dn)
+    let fd = nx_connect(num)
+    if fd < 0 { return 0 }
+    let x: NxWin = calloc(1, sizeof(NxWin))
+    x.fd = fd
+    x.out = malloc(NX_BUFCAP())
+    x.inb = malloc(NX_BUFCAP())
+    x.evq = malloc(NX_EVQ() * 32)
+    x.shapes = calloc(6, 8)
+    x.shape_cur = 0
+    if nx_setup(x, num, scr) == 0 {
+        nx_free(x)
+        return 0
+    }
+    x.w = width
+    x.h = height
+    x.px = 0 - 1
+    x.py = 0 - 1
+    // a window with no background, whose content stays put on a resize: the server does not clear it
+    // to white on every step of a drag
+    x.win = nx_newid(x)
+    nx_begin(x, 1, 0)
+    nx_u32(x, x.win)  nx_u32(x, x.root)
+    nx_u16(x, 0)  nx_u16(x, 0)  nx_u16(x, width)  nx_u16(x, height)  nx_u16(x, 1)  nx_u16(x, 1)
+    nx_u32(x, 0)
+    nx_u32(x, 1 | 8 | 16 | 2048)                                                 // BackPixmap, BorderPixel, BitGravity, EventMask
+    nx_u32(x, 0)                                                                  // background: None
+    nx_u32(x, x.black)
+    nx_u32(x, 1)                                                                  // NorthWestGravity
+    nx_u32(x, 1 | 2 | 4 | 8 | 64 | 131072)                                       // key, button, motion, structure
+    nx_end(x)
+    if title != 0 {
+        let tl = strlen(title)
+        nx_begin(x, 18, 0)  nx_u32(x, x.win)  nx_u32(x, 39)  nx_u32(x, 31)  nx_u8(x, 8)  nx_u8(x, 0)  nx_u16(x, 0)  nx_u32(x, tl)
+        nx_bytes(x, title, tl)
+        nx_end(x)
+    }
+    x.wmdel = nx_intern(x, "WM_DELETE_WINDOW")
+    x.clipboard = nx_intern(x, "CLIPBOARD")
+    x.utf8 = nx_intern(x, "UTF8_STRING")
+    x.targets = nx_intern(x, "TARGETS")
+    x.incr = nx_intern(x, "INCR")
+    let wmprot = nx_intern(x, "WM_PROTOCOLS")
+    nx_begin(x, 18, 0)  nx_u32(x, x.win)  nx_u32(x, wmprot)  nx_u32(x, 4)  nx_u8(x, 32)  nx_u8(x, 0)  nx_u16(x, 0)  nx_u32(x, 1)  nx_u32(x, x.wmdel)
+    nx_end(x)
+    nx_begin(x, 8, 0)  nx_u32(x, x.win)  nx_end(x)                              // MapWindow
+    x.gc = nx_newid(x)
+    nx_begin(x, 55, 0)  nx_u32(x, x.gc)  nx_u32(x, x.root)  nx_u32(x, 0)  nx_end(x)
+    nx_load_keymap(x)
+    x.scale120 = nx_read_scale(x)
+    nx_flush(x)
+    if x.dead == 1 { nx_free(x)  return 0 }
+    return x
+}
+
+fn nx_free(x: NxWin) {
+    if x.fd >= 0 { close(x.fd) }
+    if x.clip_own != 0 { free(x.clip_own) }
+    if x.kmap != 0 { free(x.kmap) }
+    free(x.out)  free(x.inb)  free(x.evq)  free(x.shapes)
+    free(x)
+}
+
+// ---- keysyms -----------------------------------------------------------------------------------------
+
+// XLookupKeysym as Xlib answers it on a server with XKB: column 0 or 1 of the keycode's row in the
+// first group, where a row holding a single keysym (a ONE_LEVEL key, Shift_L) gives that keysym for
+// column 1 as well
+fn nx_keysym(x: NxWin, code: Int, col: Int) -> Int {
+    if x.kmap == 0 || code < x.minkc || code > x.maxkc || x.kpk == 0 { return 0 }
+    let row = x.kmap + (code - x.minkc) * x.kpk * 4
+    if col == 0 || x.kpk <= 1 { return peek32(row) }
+    let s1 = peek32(row + 4)
+    if s1 == 0 { return peek32(row) }
+    return s1
+}
+
+// ---- events ------------------------------------------------------------------------------------------
+
+// A property of the window replaced with `n` bytes of 8-bit data of type `ty` (ChangeProperty, mode Replace).
+// Text longer than one request takes is cut at what one request carries.
+fn nx_put_prop8(x: NxWin, prop: Int, ty: Int, data: Int, n0: Int) {
+    var n = n0
+    if 24 + n > x.maxreq { n = x.maxreq - 24 }
+    if n < 0 { n = 0 }
+    nx_begin(x, 18, 0)  nx_u32(x, x.win)  nx_u32(x, prop)  nx_u32(x, ty)  nx_u8(x, 8)  nx_u8(x, 0)  nx_u16(x, 0)  nx_u32(x, n)
+    nx_bytes(x, data, n)
+    nx_end(x)
+}
+// the title: WM_NAME (STRING, as nx_open sets it) and _NET_WM_NAME (UTF8_STRING, what a window manager prefers)
+fn nx_set_title(h: Int, title: Int) {
+    let x: NxWin = h
+    if x.dead == 1 || x.win == 0 { return }
+    var n = 0
+    if title != 0 { n = strlen(title) }
+    nx_put_prop8(x, 39, 31, title, n)
+    nx_put_prop8(x, nx_intern(x, "_NET_WM_NAME"), x.utf8, title, n)
+    nx_flush(x)
+}
+// the application: WM_CLASS, "instance\0class\0", both the id
+fn nx_set_app_id(h: Int, id: Int) {
+    let x: NxWin = h
+    if x.dead == 1 || x.win == 0 || id == 0 { return }
+    let n = strlen(id)
+    let buf = calloc(1, 2 * n + 2)
+    memcpy(buf, id, n)
+    memcpy(buf + n + 1, id, n)
+    nx_put_prop8(x, 67, 31, buf, 2 * n + 2)
+    free(buf)
+    nx_flush(x)
+}
+
+// The CLIPBOARD owner answering another client: TARGETS lists what is offered, UTF8_STRING and STRING
+// get the text, anything else is refused with property None.
+fn nx_serve_selection(x: NxWin, e: Int) {
+    let tm = peek32(e + 4)
+    let requestor = peek32(e + 12)
+    let selection = peek32(e + 16)
+    let target = peek32(e + 20)
+    let property = peek32(e + 24)
+    var answered = 0
+    if x.clip_own != 0 {
+        if target == x.targets {
+            nx_begin(x, 18, 0)  nx_u32(x, requestor)  nx_u32(x, property)  nx_u32(x, 4)  nx_u8(x, 32)  nx_u8(x, 0)  nx_u16(x, 0)
+            nx_u32(x, 2)  nx_u32(x, x.targets)  nx_u32(x, x.utf8)
+            nx_end(x)
+            answered = property
+        } else if target == x.utf8 || target == 31 {
+            let tl = strlen(x.clip_own)
+            if 24 + tl <= x.maxreq {                                              // one ChangeProperty; longer text would need INCR
+                nx_flush(x)
+                let hdr = calloc(1, 28)
+                poke8(hdr, 18)  poke16(hdr + 2, (24 + tl + 3) / 4)
+                poke32(hdr + 4, requestor)  poke32(hdr + 8, property)  poke32(hdr + 12, target)
+                poke8(hdr + 16, 8)  poke32(hdr + 20, tl)
+                nx_write_raw(x, hdr, 24)
+                nx_write_raw(x, x.clip_own, tl)
+                nx_write_raw(x, hdr + 24, ((tl + 3) & (0 - 4)) - tl)                // zero padding
+                free(hdr)
+                x.seq = x.seq + 1
+                answered = property
+            }
+        }
+    }
+    nx_begin(x, 25, 0)  nx_u32(x, requestor)  nx_u32(x, 0)
+    nx_u8(x, 31)  nx_u8(x, 0)  nx_u16(x, 0)
+    nx_u32(x, tm)  nx_u32(x, requestor)  nx_u32(x, selection)  nx_u32(x, target)  nx_u32(x, answered)
+    nx_u32(x, 0)  nx_u32(x, 0)
+    nx_end(x)
+    nx_flush(x)
+}
+
+fn nx_button_id(b: Int) -> Int { if b == 1 { return 1 }  if b == 2 { return 2 }  return 3 }
+
+// one event: returns the code to report (0 = keep draining), with its payload written to `out`
+fn nx_event(x: NxWin, e: Int, out: Int) -> Int {
+    let code = peek8(e) & 127
+    if code == 33 {                                                               // ClientMessage
+        if peek32(e + 12) == x.wmdel { x.closed = 1  return 1 }
+        return 0
+    }
+    if code == 22 {                                                               // ConfigureNotify
+        let cw = peek16(e + 20)
+        let ch = peek16(e + 22)
+        if cw != x.w || ch != x.h {
+            x.w = cw
+            x.h = ch
+            poke32(out, cw)  poke32(out + 4, ch)
+            return 2
+        }
+        return 0
+    }
+    if code == 2 || code == 3 {                                                   // KeyPress / KeyRelease
+        let state = peek16(e + 28)
+        var col = 0
+        if (state & 1) != 0 { col = 1 }
+        let ks = nx_keysym(x, peek8(e + 1), col)
+        var mods = 0
+        if (state & 1) != 0 { mods = mods | 1 }
+        if (state & 4) != 0 { mods = mods | 2 }
+        if (state & 8) != 0 { mods = mods | 4 }
+        if (state & 64) != 0 { mods = mods | 8 }
+        poke32(out, ks)  poke32(out + 4, mods)
+        if code == 2 { return 3 }
+        return 4
+    }
+    if code == 4 {                                                                // ButtonPress
+        let b = peek8(e + 1)
+        x.px = nx_s16(peek16(e + 24))
+        x.py = nx_s16(peek16(e + 26))
+        if b == 4 { x.pending_scroll = x.pending_scroll - 48  return 0 }         // a wheel notch, in logical pixels
+        if b == 5 { x.pending_scroll = x.pending_scroll + 48  return 0 }
+        if b == 1 { x.btn = 1  x.lx = x.px  x.ly = x.py  x.tap_latch = 1 }
+        else if b == 2 { x.mid = 1 }
+        else if b != 3 { return 0 }                                               // buttons 6/7 (tilt) are not reported
+        poke32(out, nx_button_id(b))  poke32(out + 4, x.px & 4294967295)  poke32(out + 8, x.py & 4294967295)
+        return 7
+    }
+    if code == 5 {                                                                // ButtonRelease
+        let rb = peek8(e + 1)
+        if rb == 4 || rb == 5 { return 0 }                                        // only the press of a notch counts
+        x.px = nx_s16(peek16(e + 24))
+        x.py = nx_s16(peek16(e + 26))
+        if rb == 1 { x.btn = 0 }
+        else if rb == 2 { x.mid = 0 }
+        else if rb != 3 { return 0 }
+        poke32(out, nx_button_id(rb))  poke32(out + 4, x.px & 4294967295)  poke32(out + 8, x.py & 4294967295)
+        return 8
+    }
+    if code == 6 {                                                                // MotionNotify
+        x.px = nx_s16(peek16(e + 24))
+        x.py = nx_s16(peek16(e + 26))
+        return 0
+    }
+    if code == 30 { nx_serve_selection(x, e)  return 0 }                         // SelectionRequest
+    if code == 29 {                                                               // SelectionClear
+        if x.clip_own != 0 { free(x.clip_own)  x.clip_own = 0 }
+        return 0
+    }
+    if code == 34 {                                                               // MappingNotify
+        if peek8(e + 4) == 1 { nx_load_keymap(x) }
+        return 0
+    }
+    return 0
+}
+
+fn nx_s16(v: Int) -> Int { if v >= 32768 { return v - 65536 }  return v }
+
+// Take what the server has sent without waiting; stop at the first event worth reporting. Wheel
+// notches are coalesced, so a flick reports one scroll rather than lagging a notch per poll.
+fn nx_poll_event(h: Int, out: Int) -> Int {
+    let x: NxWin = h
+    poke32(out, 0)  poke32(out + 4, 0)  poke32(out + 8, 0)
+    if x.pending_scroll != 0 {
+        poke32(out, x.pending_scroll & 4294967295)
+        x.pending_scroll = 0
+        return 6
+    }
+    nx_flush(x)
+    var going = 1
+    while going == 1 {
+        if x.eqhead != x.eqtail {
+            let e = x.evq + x.eqhead * 32
+            x.eqhead = (x.eqhead + 1) % NX_EVQ()
+            let r = nx_event(x, e, out)
+            if r != 0 { return r }
+        } else {
+            let len = nx_msg_len(x)
+            if len == 0 {
+                if nx_read(x, 0) == 0 { going = 0 }
+            } else {
+                let p = x.inb + x.ihead
+                x.ihead = x.ihead + len
+                let kind = peek8(p)
+                if kind == 0 { nx_report_error(p) }
+                else if kind != 1 {
+                    let ev = malloc(32)
+                    memcpy(ev, p, 32)
+                    let r2 = nx_event(x, ev, out)
+                    free(ev)
+                    if r2 != 0 { return r2 }
+                }
+            }
+        }
+    }
+    if x.dead == 1 && x.closed == 1 { return 0 }
+    if x.pending_scroll != 0 {
+        poke32(out, x.pending_scroll & 4294967295)
+        x.pending_scroll = 0
+        return 6
+    }
+    return 0
+}
+
+// A press no polled read has seen yet is latched, as on the other backends.
+fn nx_take_down(x: NxWin) -> Int {
+    if x.btn == 1 { x.tap_latch = 0  return 1 }
+    if x.tap_latch == 1 { x.tap_latch = 0  return 1 }
+    return 0
+}
+fn nx_mouse_x(h: Int) -> Int { let x: NxWin = h  if x.tap_latch == 1 { return x.lx }  return x.px }
+fn nx_mouse_y(h: Int) -> Int { let x: NxWin = h  if x.tap_latch == 1 { return x.ly }  return x.py }
+fn nx_mouse(h: Int, out: Int) -> Int {
+    poke32(out, nx_mouse_x(h) & 4294967295)
+    poke32(out + 4, nx_mouse_y(h) & 4294967295)
+    return nx_take_down(h)
+}
+fn nx_mouse_down(h: Int) -> Int { return nx_take_down(h) }
+fn nx_pointer_held(h: Int) -> Int { let x: NxWin = h  return x.btn }
+fn nx_mouse_middle(h: Int) -> Int { let x: NxWin = h  return x.mid }
+fn nx_closed(h: Int) -> Int { let x: NxWin = h  return x.closed }
+fn nx_fd(h: Int) -> Int { let x: NxWin = h  if x.dead == 1 { return 0 - 1 }  return x.fd }
+// flush, read what is readable without waiting: how many things poll has to look at (-1: gone). The X
+// events are decoded by poll itself, so a complete message still in the input buffer counts as one.
+fn nx_dispatch(h: Int) -> Int {
+    let x: NxWin = h
+    nx_flush(x)
+    while x.dead == 0 && nx_read(x, 0) > 0 { }
+    var n = (x.eqtail - x.eqhead + NX_EVQ()) % NX_EVQ()
+    if nx_msg_len(x) > 0 { n = n + 1 }
+    if x.pending_scroll != 0 { n = n + 1 }
+    if n == 0 && x.dead == 1 { return 0 - 1 }
+    return n
+}
+fn nx_w(h: Int) -> Int { let x: NxWin = h  return x.w }
+fn nx_h(h: Int) -> Int { let x: NxWin = h  return x.h }
+fn nx_scale120(h: Int) -> Int { let x: NxWin = h  return x.scale120 }
+fn nx_display(h: Int) -> Int { return h }
+fn nx_surface(h: Int) -> Int { let x: NxWin = h  return x.win }
+
+// ---- presenting --------------------------------------------------------------------------------------
+
+// 0x00RRGGBB pixels as a ZPixmap: on a little-endian server with a 32-bit-per-pixel format for the
+// depth, those are the bytes the image already holds. The image goes up in strips of rows, each strip
+// one PutImage request under the server's maximum request length.
+fn nx_shm_present(h: Int, pixels: Int, ww: Int, hh: Int) {
+    let x: NxWin = h
+    if pixels == 0 || ww <= 0 || hh <= 0 || x.dead == 1 { return }
+    let rowbytes = ww * 4
+    let room = x.maxreq - 24
+    if rowbytes > room { return }
+    var rows = room / rowbytes
+    nx_flush(x)
+    let hdr = malloc(24)
+    var y = 0
+    while y < hh && x.dead == 0 {
+        var n = rows
+        if y + n > hh { n = hh - y }
+        let bytes = n * rowbytes
+        poke8(hdr, 72)  poke8(hdr + 1, 2)  poke16(hdr + 2, (24 + bytes) / 4)
+        poke32(hdr + 4, x.win)  poke32(hdr + 8, x.gc)
+        poke16(hdr + 12, ww)  poke16(hdr + 14, n)  poke16(hdr + 16, 0)  poke16(hdr + 18, y)
+        poke8(hdr + 20, 0)  poke8(hdr + 21, x.depth)  poke16(hdr + 22, 0)
+        nx_write_raw(x, hdr, 24)
+        nx_write_raw(x, pixels + y * rowbytes, bytes)
+        x.seq = x.seq + 1
+        y = y + n
+    }
+    free(hdr)
+}
+
+// X has no frame callback: sync with the server, and if nothing is waiting, sleep out the budget.
+fn nx_frame_wait(h: Int, timeout_ms: Int) {
+    let x: NxWin = h
+    nx_begin(x, 43, 0)                                                            // GetInputFocus: a round trip
+    let r = nx_reply(x, nx_end(x))
+    if r != 0 { free(r) }
+    if x.eqhead != x.eqtail || x.ilen > x.ihead || timeout_ms <= 0 { return }
+    if nwu_readable(x.fd, 0) == 1 { return }
+    usleep(timeout_ms * 1000)
+}
+
+// ---- clipboard ---------------------------------------------------------------------------------------
+
+fn nx_clipboard_set(h: Int, text: Int) {
+    let x: NxWin = h
+    if text == 0 { return }
+    if x.clip_own != 0 { free(x.clip_own) }
+    x.clip_own = nwu_strdup(text)
+    nx_begin(x, 22, 0)  nx_u32(x, x.win)  nx_u32(x, x.clipboard)  nx_u32(x, 0)  nx_end(x)
+    nx_flush(x)
+}
+
+// Reading the selection is a round trip through its owner, bounded at about 200ms so a gone or wedged
+// owner cannot hang the frame loop. Other events that arrive meanwhile stay queued for poll.
+fn nx_clipboard_get(h: Int) -> Int {
+    let x: NxWin = h
+    if x.clip_own != 0 { return nwu_strdup(x.clip_own) }
+    nx_begin(x, 23, 0)  nx_u32(x, x.clipboard)
+    let ro = nx_reply(x, nx_end(x))
+    if ro == 0 { return 0 }
+    let owner = peek32(ro + 8)
+    free(ro)
+    if owner == 0 { return 0 }
+    let prop = nx_intern(x, "NORI_CLIP")
+    nx_begin(x, 24, 0)  nx_u32(x, x.win)  nx_u32(x, x.clipboard)  nx_u32(x, x.utf8)  nx_u32(x, prop)  nx_u32(x, 0)
+    nx_end(x)
+    nx_flush(x)
+    var spin = 0
+    while spin < 200 && x.dead == 0 {
+        var notified = 0 - 1
+        var going = 1
+        while going == 1 {
+            let len = nx_msg_len(x)
+            if len == 0 { going = 0 } else {
+                let p = x.inb + x.ihead
+                x.ihead = x.ihead + len
+                let kind = peek8(p) & 127
+                if kind == 31 && peek32(p + 8) == x.win {
+                    notified = peek32(p + 20)
+                    going = 0
+                } else if kind != 1 && kind != 0 { nx_queue_event(x, p) }
+            }
+        }
+        if notified == 0 { return 0 }
+        if notified > 0 {
+            nx_begin(x, 20, 1)  nx_u32(x, x.win)  nx_u32(x, prop)  nx_u32(x, 0)  nx_u32(x, 0)  nx_u32(x, 4000000)
+            let rp = nx_reply(x, nx_end(x))
+            if rp == 0 { return 0 }
+            if peek32(rp + 8) == x.incr { free(rp)  return 0 }                    // huge transfers are not taken
+            let fmt = peek8(rp + 1)
+            let n = peek32(rp + 16) * (fmt / 8)
+            let txt = malloc(n + 1)
+            if n > 0 { memcpy(txt, rp + 32, n) }
+            poke8(txt + n, 0)
+            free(rp)
+            return txt
+        }
+        nx_read(x, 1)
+        spin = spin + 1
+    }
+    return 0
+}
+
+// ---- cursors and the pointer lock --------------------------------------------------------------------
+
+// a 1x1-looking empty cursor: an 8x8 depth-1 pixmap cleared to 0 is both its image and its mask
+fn nx_blank_cursor(x: NxWin) -> Int {
+    let pm = nx_newid(x)
+    nx_begin(x, 53, 1)  nx_u32(x, pm)  nx_u32(x, x.win)  nx_u16(x, 8)  nx_u16(x, 8)  nx_end(x)
+    let g = nx_newid(x)
+    nx_begin(x, 55, 0)  nx_u32(x, g)  nx_u32(x, pm)  nx_u32(x, 4)  nx_u32(x, 0)  nx_end(x)   // foreground 0
+    nx_begin(x, 70, 0)  nx_u32(x, pm)  nx_u32(x, g)  nx_u16(x, 0)  nx_u16(x, 0)  nx_u16(x, 8)  nx_u16(x, 8)  nx_end(x)
+    let cur = nx_newid(x)
+    nx_begin(x, 93, 0)  nx_u32(x, cur)  nx_u32(x, pm)  nx_u32(x, pm)
+    nx_u16(x, 0)  nx_u16(x, 0)  nx_u16(x, 0)  nx_u16(x, 0)  nx_u16(x, 0)  nx_u16(x, 0)  nx_u16(x, 0)  nx_u16(x, 0)
+    nx_end(x)
+    nx_begin(x, 60, 0)  nx_u32(x, g)  nx_end(x)
+    nx_begin(x, 54, 0)  nx_u32(x, pm)  nx_end(x)
+    return cur
+}
+
+fn nx_define_cursor(x: NxWin, cur: Int) {
+    nx_begin(x, 2, 0)  nx_u32(x, x.win)  nx_u32(x, 16384)  nx_u32(x, cur)  nx_end(x)       // CWCursor
+}
+
+// Pointer shapes from the standard cursor font: left_ptr, xterm, hand2, sb_h_double_arrow,
+// sb_v_double_arrow, fleur. Each is created on first use and kept for the window's life.
+fn nx_set_cursor(h: Int, shape: Int) -> Int {
+    let x: NxWin = h
+    if x.dead == 1 { return 0 }
+    if x.locked == 1 { return 0 }
+    var sh = shape
+    if sh < 0 || sh > 5 { sh = 0 }
+    if x.shape_cur == sh { return 1 }
+    var cur = peek(x.shapes + sh * 8)
+    if cur == 0 {
+        if x.cfont == 0 {
+            x.cfont = nx_newid(x)
+            let fname = "cursor"
+            nx_begin(x, 45, 0)  nx_u32(x, x.cfont)  nx_u16(x, fname.len())  nx_u16(x, 0)  nx_bytes(x, nori_str_ptr(fname), fname.len())  nx_end(x)
+        }
+        var glyph = 68
+        if sh == 1 { glyph = 152 }
+        if sh == 2 { glyph = 60 }
+        if sh == 3 { glyph = 108 }
+        if sh == 4 { glyph = 116 }
+        if sh == 5 { glyph = 52 }
+        cur = nx_newid(x)
+        nx_begin(x, 94, 0)  nx_u32(x, cur)  nx_u32(x, x.cfont)  nx_u32(x, x.cfont)  nx_u16(x, glyph)  nx_u16(x, glyph + 1)
+        nx_u16(x, 0)  nx_u16(x, 0)  nx_u16(x, 0)  nx_u16(x, 65535)  nx_u16(x, 65535)  nx_u16(x, 65535)
+        nx_end(x)
+        poke(x.shapes + sh * 8, cur)
+    }
+    nx_define_cursor(x, cur)
+    x.shape_cur = sh
+    return 1
+}
+
+fn nx_warp_centre(x: NxWin) {
+    x.warp_x = x.w / 2
+    x.warp_y = x.h / 2
+    nx_begin(x, 41, 0)  nx_u32(x, 0)  nx_u32(x, x.win)  nx_u16(x, 0)  nx_u16(x, 0)  nx_u16(x, 0)  nx_u16(x, 0)
+    nx_u16(x, x.warp_x)  nx_u16(x, x.warp_y)
+    nx_end(x)
+    nx_flush(x)
+}
+
+// X11 has no pointer lock, so this grabs the pointer, hides it, and warps it back to the centre after
+// every read of the delta: it can never reach an edge.
+fn nx_lock_pointer(h: Int, on: Int) -> Int {
+    let x: NxWin = h
+    if x.dead == 1 { return 0 }
+    if on != 0 {
+        if x.blank == 0 { x.blank = nx_blank_cursor(x) }
+        nx_define_cursor(x, x.blank)
+        nx_begin(x, 26, 1)  nx_u32(x, x.win)  nx_u16(x, 4 | 8 | 64)  nx_u8(x, 1)  nx_u8(x, 1)
+        nx_u32(x, x.win)  nx_u32(x, x.blank)  nx_u32(x, 0)
+        let r = nx_reply(x, nx_end(x))
+        if r != 0 { free(r) }
+        nx_warp_centre(x)
+        x.locked = 1
+        return 1
+    }
+    if x.locked == 1 {
+        nx_begin(x, 27, 0)  nx_u32(x, 0)  nx_end(x)
+        nx_define_cursor(x, 0)
+        nx_flush(x)
+        x.locked = 0
+        x.shape_cur = 0
+    }
+    return 1
+}
+fn nx_pointer_locked(h: Int) -> Int { let x: NxWin = h  return x.locked }
+
+// the distance the pointer moved from the centre since the last read, in 1/256 px, then re-centred
+fn nx_pointer_delta(h: Int, out: Int) -> Int {
+    let x: NxWin = h
+    if x.locked == 0 { poke32(out, 0)  poke32(out + 4, 0)  return 0 }
+    poke32(out, ((x.px - x.warp_x) * 256) & 4294967295)
+    poke32(out + 4, ((x.py - x.warp_y) * 256) & 4294967295)
+    nx_warp_centre(x)
+    x.px = x.warp_x
+    x.py = x.warp_y
+    return 1
+}
+
+fn nx_close(h: Int) {
+    let x: NxWin = h
+    nx_begin(x, 4, 0)  nx_u32(x, x.win)  nx_end(x)                              // DestroyWindow
+    nx_flush(x)
+    nx_free(x)
+}

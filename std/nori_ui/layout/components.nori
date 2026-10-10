@@ -1,0 +1,296 @@
+use core::*
+import "std/os" as os
+import "std/path" as path
+import "std/parse" as parse
+
+// ===========================================================================
+// layout/components: `.ui` files that use other `.ui` and `.style` files.
+//
+//   import "taskbar_button.ui"        // the components (and styles) it defines
+//   import "theme.style"              // a stylesheet, cascading before this file's own
+//
+//   component taskbar_button(title, icon = "", state = "") {
+//       row { classes: [tb, $state] gap: 6
+//             image { path: $icon w: 16 h: 16 }
+//             text { text: $title }
+//             slot { } }               // whatever the use puts inside it goes here
+//   }
+//
+//   row { taskbar_button { id: files title: "Files" icon: "files.png" }
+//         taskbar_button { title: "Terminal" state: urgent  text { text: "3" } } }
+//
+// A component is an element: its name is used like `row`, its parameters are
+// set like attributes, and `$name` anywhere in its body is replaced by the
+// value the use gave (or the default). The use may also give the root an `id`
+// and `class` / `classes`, and the root always carries the component's name as
+// a class, so `.taskbar_button:hover { … }` styles every one of them. An empty
+// class name (`state: ""`) is dropped, which is how a parameter switches a
+// class off.
+//
+// A body is parsed again for every use, from its own file, with the use's
+// values: an error in it is reported at its own file, line and column, and an
+// error in a use at the use's. There is no expansion step that could lose a
+// position.
+//
+// Imports are relative to the importing file. A file imported twice is read
+// once; one that imports itself (through any chain) is an error. Every file a
+// parse reads is reported (`deps`), which is what hot reload watches: a change
+// to an imported file reloads the documents that import it.
+// ===========================================================================
+
+/// a component definition: its parameters (with defaults where given), and where its body is.
+pub struct UiComp { name: Str, params: Vec<Str>, defaults: Vec<DslValue>, has_def: Vec<Bool>, file: Str, text: Str, body_off: Int }
+/// what a parse carries from file to file: the components it knows, the files it has read (`deps`,
+/// in the order it read them), the files imported so far, and the chain being imported now.
+pub struct DslCtx { lib: Vec<UiComp>, deps: Vec<Str>, imported: Vec<Str>, importing: Vec<Str> }
+pub fn dsl_ctx_new() -> DslCtx { return DslCtx { lib: vec(), deps: vec(), imported: vec(), importing: vec() } }
+
+/// node kind: a fragment, the children a component's use put in its `slot`. Only the parser sees
+/// one: a container that is handed a fragment takes its children instead (dsl_push_child).
+pub fn nk_fragment() -> Int { return 99 }
+
+/// the component `name` in `cx`, or -1.
+pub fn dsl_comp_find(cx: DslCtx, name: Str) -> Int {
+    var i = 0
+    while i < cx.lib.len() { if cx.lib[i].name == name { return i }  i = i + 1 }
+    return 0 - 1
+}
+
+/// push a parsed child into `node`: a fragment's children one by one, anything else whole.
+fn dsl_push_child(inout node: UiNode, sink child: UiNode) {
+    if child.kind == nk_fragment() {
+        var ks = sink child.children
+        var i = 0
+        while i < ks.len() { node.children.push(sink ks[i])  i = i + 1 }
+        return
+    }
+    node.children.push(sink child)
+}
+
+/// skip a `{ … }` body whose `{` has been consumed, to just past its matching `}`: strings and
+/// comments are skipped as the lexer skips them, so a brace inside either does not count.
+fn dsl_skip_block(inout p: DslP) {
+    var depth = 1
+    while depth > 0 {
+        dsl_skip(p)
+        let c = dsl_peek(p)
+        if c < 0 { dsl_fail(p, "unterminated component body")  return }
+        if c == 123 { depth = depth + 1  dsl_bump(p) }
+        else if c == 125 { depth = depth - 1  dsl_bump(p) }
+        else if c == 34 { let _s = dsl_string(p) }
+        else { dsl_bump(p) }
+        if p.failed[0] == 1 { return }
+    }
+}
+
+/// `component NAME(PARAM [= DEFAULT], ...) { ELEMENT }`: the keyword has been read.
+fn dsl_component_def(inout p: DslP) {
+    let name = dsl_ident(p)
+    if p.failed[0] == 1 { return }
+    if up_kind(name) >= 0 || name == "slot" { dsl_fail(p, ("`" + (name + "` is an element of its own; a component needs another name")))  return }
+    if dsl_comp_find(p.cx, name) >= 0 { dsl_fail(p, ("component `" + (name + "` is defined twice")))  return }
+    var comp = UiComp { name: copy name, params: vec(), defaults: vec(), has_def: vec(), file: copy p.file, text: "", body_off: 0 }
+    dsl_expect(p, 40, ("`(` after the component name (write `component " + (name + "() { … }` for none)")))
+    if p.failed[0] == 1 { return }
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 41 { dsl_bump(p)  break }
+        let pn = dsl_ident(p)
+        if p.failed[0] == 1 { return }
+        if strs_has(comp.params, pn) { dsl_fail(p, ("parameter `" + (pn + "` is named twice")))  return }
+        if pn == "id" || pn == "class" || pn == "classes" { dsl_fail(p, ("`" + (pn + "` is set on a component's root by every use; it cannot be a parameter")))  return }
+        comp.params.push(copy pn)
+        dsl_skip(p)
+        if dsl_peek(p) == 61 {
+            dsl_bump(p)
+            comp.defaults.push(dsl_value(p))
+            comp.has_def.push(true)
+            if p.failed[0] == 1 { return }
+        } else {
+            comp.defaults.push(dval(0))
+            comp.has_def.push(false)
+        }
+        dsl_skip(p)
+        if dsl_peek(p) == 44 { dsl_bump(p) }
+        else if dsl_peek(p) != 41 { dsl_fail(p, "expected `,` or `)` in the parameter list")  return }
+    }
+    dsl_expect(p, 123, "`{` before the component's body")
+    if p.failed[0] == 1 { return }
+    comp.body_off = p.s.at()
+    dsl_skip_block(p)
+    if p.failed[0] == 1 { return }
+    comp.text = copy p.src
+    p.cx.lib.push(sink comp)
+}
+
+/// `slot { }` inside a component's body: the children this use of the component was given.
+fn dsl_slot(inout p: DslP) -> UiNode {
+    var frag = ui_node_blank(nk_fragment())
+    if !p.in_comp { dsl_fail(p, "`slot` is only used inside a component's body")  return frag }
+    dsl_skip(p)
+    if dsl_peek(p) != 125 { dsl_fail(p, "a slot is empty: `slot { }`")  return frag }
+    dsl_bump(p)
+    frag.children = nodes_dup(p.slot)
+    p.slot_used = true
+    return frag
+}
+
+/// a use of component `ci` (its name and `{` consumed): read the use, then parse the body from its
+/// own file with the use's values bound.
+fn dsl_instantiate(inout p: DslP, ci: Int) -> UiNode {
+    let cname = copy p.cx.lib[ci].name
+    let pnames = path_copy_str(p.cx.lib[ci].params)
+    var blank = ui_node_blank(nk_column())
+    var names: Vec<Str> = vec()
+    var vals: Vec<DslValue> = vec()
+    var kids = ui_node_blank(nk_column())
+    var use_id = ""
+    var use_classes: Vec<Str> = vec()
+    while true {
+        dsl_skip(p)
+        if dsl_peek(p) == 125 { dsl_bump(p)  break }
+        if dsl_peek(p) < 0 { dsl_fail(p, ("unterminated " + cname))  return blank }
+        let an = dw_ident(p)
+        if p.failed[0] == 1 { return blank }
+        dsl_skip(p)
+        if dsl_peek(p) == 58 {
+            dsl_bump(p)
+            var v = dsl_value(p)
+            if p.failed[0] == 1 { return blank }
+            if strs_has(pnames, an) {
+                if strs_has(names, an) { dsl_fail(p, ("`" + (an + ("` is given twice to " + cname))))  return blank }
+                names.push(copy an)
+                vals.push(sink v)
+            }
+            else if an == "id" { use_id = dw_str_of(p, v, "id") }
+            else if an == "class" { use_classes.push(dw_str_of(p, v, "class")) }
+            else if an == "classes" { let cl = dw_classes(p, v)  var q = 0  while q < cl.len() { use_classes.push(copy cl[q])  q = q + 1 } }
+            else { dsl_fail(p, ("unknown " + (cname + (" parameter " + dw_dq(an)))))  return blank }
+            if p.failed[0] == 1 { return blank }
+        } else if dsl_peek(p) == 123 {
+            dsl_bump(p)
+            var ch = dsl_node_body(p, an)
+            if p.failed[0] == 1 { return blank }
+            dsl_push_child(kids, sink ch)
+        } else { dsl_fail(p, ("expected `:` or `{` after " + dw_dq(an)))  return blank }
+    }
+    var args: Vec<DslValue> = vec()
+    var k = 0
+    while k < pnames.len() {
+        var at = 0 - 1
+        var j = 0
+        while j < names.len() { if names[j] == pnames[k] { at = j }  j = j + 1 }
+        if at >= 0 { args.push(dval_dup(vals[at])) }
+        else if p.cx.lib[ci].has_def[k] { args.push(dval_dup(p.cx.lib[ci].defaults[k])) }
+        else { dsl_fail(p, (cname + (" needs `" + (pnames[k] + "`"))))  return blank }
+        k = k + 1
+    }
+    if p.depth >= 32 { dsl_fail(p, ("components nest more than 32 deep (does " + (cname + " use itself?)")))  return blank }
+    let text = copy p.cx.lib[ci].text
+    let off = p.cx.lib[ci].body_off
+    var sub = dsl_new(text)
+    sub.file = copy p.cx.lib[ci].file
+    sub.params = path_copy_str(pnames)
+    sub.args = sink args
+    sub.slot = sink kids.children
+    sub.in_comp = true
+    sub.depth = p.depth + 1
+    sub.cx = sink p.cx
+    sub.s.seek(off)
+    var node = ui_node_blank(nk_column())
+    let rname = dw_ident(sub)
+    if sub.failed[0] == 0 {
+        dsl_expect(sub, 123, "`{` after the element name")
+        if sub.failed[0] == 0 { node = dsl_node_body(sub, rname) }
+        if sub.failed[0] == 0 && node.kind == nk_fragment() { dsl_fail(sub, "a component's root cannot be its slot") }
+        if sub.failed[0] == 0 {
+            dsl_skip(sub)
+            if dsl_peek(sub) != 125 { dsl_fail(sub, "a component's body is ONE element (wrap several in a row or a column)") }
+        }
+        if sub.failed[0] == 0 && sub.slot.len() > 0 && !sub.slot_used { dsl_fail(sub, (cname + " takes no children: its body has no `slot { }`")) }
+    }
+    p.cx = dsl_take_cx(sub)
+    if sub.failed[0] == 1 { dsl_fail_from(p, sub)  return node }
+    if use_id.len() > 0 { node.id = copy use_id }
+    var cls: Vec<Str> = vec()
+    var c = 0
+    while c < node.classes.len() { if node.classes[c].len() > 0 { cls.push(copy node.classes[c]) }  c = c + 1 }
+    if !strs_has(cls, cname) { cls.push(copy cname) }
+    var u = 0
+    while u < use_classes.len() { if use_classes[u].len() > 0 && !strs_has(cls, use_classes[u]) { cls.push(copy use_classes[u]) }  u = u + 1 }
+    node.classes = sink cls
+    return node
+}
+
+// ---- imports ------------------------------------------------------------------------------------------
+
+/// `import "REL"` in the file `p` reads: a `.ui` file's components and styles, or a `.style` file.
+fn dsl_import(inout p: DslP, inout doc: UiDocument, rel: Str) {
+    if p.failed[0] == 1 { return }
+    if p.file.len() == 0 { dsl_fail(p, "`import` needs the document to be a file: its imports are read relative to it")  return }
+    dsl_import_at(p, doc, p.file, rel)
+}
+fn dsl_import_at(inout p: DslP, inout doc: UiDocument, from_file: Str, rel: Str) {
+    let full = path::join(path::dirname(from_file), rel)
+    if strs_has(p.cx.importing, full) || full == from_file { dsl_fail(p, ("import cycle: " + (dw_dq(rel) + " is already being imported")))  return }
+    if strs_has(p.cx.imported, full) { return }
+    let st = os::stat_path(full)
+    if !st.ok || st.is_dir { dsl_fail(p, ("cannot import " + (dw_dq(rel) + (": no file at " + full))))  return }
+    if !strs_has(p.cx.deps, full) { p.cx.deps.push(copy full) }
+    p.cx.imported.push(copy full)
+    let text = read_file(full)
+    if nui_ends_with(full, ".style") { dsl_import_style(p, doc, full, text) }
+    else if nui_ends_with(full, ".ui") { dsl_import_ui(p, doc, full, text) }
+    else { dsl_fail(p, ("import a .ui or a .style file, not " + dw_dq(rel))) }
+}
+/// a `.style` file: the files it imports first (CSS's order: an import cascades before the file
+/// that imports it), then its own rules.
+fn dsl_import_style(inout p: DslP, inout doc: UiDocument, full: Str, text: Str) {
+    var sp = style_parse(text, full)
+    if !sp.ok { dsl_fail_ui(p, sp.err)  return }
+    p.cx.importing.push(copy full)
+    var i = 0
+    while i < sp.styles.imports.len() && p.failed[0] == 0 {
+        let rel = copy sp.styles.imports[i].path
+        if !nui_ends_with(rel, ".style") {
+            let lc = parse::line_col(text, sp.styles.imports[i].off)
+            dsl_fail_ui(p, UiError { file: copy full, line: lc.line, col: lc.col, msg: ("a .style file imports .style files, not " + dw_dq(rel)) })
+        } else { dsl_import_at(p, doc, full, rel) }
+        i = i + 1
+    }
+    let _done = p.cx.importing.pop()
+    if p.failed[0] == 1 { return }
+    var none: Vec<StyleImport> = vec()
+    sp.styles.imports = sink none
+    style_set_append(doc.rich, sp.styles)
+}
+/// a `.ui` file: its imports, components and stylesheet blocks, and no root, since a document has
+/// one and it is the importer's.
+fn dsl_import_ui(inout p: DslP, inout doc: UiDocument, full: Str, text: Str) {
+    var sub = dsl_new(text)
+    sub.file = copy full
+    sub.cx = sink p.cx
+    sub.cx.importing.push(copy full)
+    var ldoc = UiDocument { has_sheet: false, sheet: stylesheet_new(), tree: ui_node_blank(nk_column()), style: "", rich: style_set_new() }
+    var hr: Vec<Int> = vec()
+    hr.push(0)
+    dsl_skip(sub)
+    if dsl_peek(sub) >= 0 { dsl_document_fields(sub, ldoc, false, hr) }
+    if sub.failed[0] == 0 && hr[0] == 1 { dsl_fail(sub, "an imported .ui file holds components and styles, not a root element") }
+    let _done = sub.cx.importing.pop()
+    p.cx = dsl_take_cx(sub)
+    if sub.failed[0] == 1 { dsl_fail_from(p, sub)  return }
+    style_set_append(doc.rich, ldoc.rich)
+}
+/// move a parser's context out (a sub-parser's, back to the one that lent it).
+fn dsl_take_cx(inout q: DslP) -> DslCtx { return sink q.cx }
+/// fail with an error that already knows its file, line and column.
+fn dsl_fail_ui(inout p: DslP, e: UiError) {
+    if p.failed[0] == 1 { return }
+    p.failed[0] = 1
+    p.err[0] = ui_error_text(e)
+    p.eline[0] = e.line
+    p.ecol[0] = e.col
+    p.emsg[0] = copy e.msg
+    p.efile[0] = copy e.file
+}

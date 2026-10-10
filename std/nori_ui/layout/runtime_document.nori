@@ -1,0 +1,2577 @@
+use core::*
+import "std/math" as math
+import "std/result" as result
+
+// ===========================================================================
+// layout/runtime_document: overlay .ui layout (core subset).
+//
+// The core that delivers a working flex overlay: UiLength, alignment, a
+// tagged-union UiNode, the flex math, a layout pass producing positioned paint
+// primitives + hit regions, and a minimal .ui parser. Text wrapping, animation,
+// scroll, editors, stylesheets, templates and syntax highlighting build on it
+// in sibling files of this directory.
+// ===========================================================================
+
+// --- UiLength: a CSS-like length (unit tag + value) ---
+/// length unit: 0 px, 1 percent (of parent inner), 2 vw, 3 vh, 4 ui (scale multiplier).
+pub struct UiLength { unit: Int, value: Float }
+
+/// a pixel length.
+pub fn ui_px(v: Float) -> UiLength { return UiLength { unit: 0, value: v } }
+/// a percent-of-parent length.
+pub fn ui_percent(v: Float) -> UiLength { return UiLength { unit: 1, value: v } }
+/// a viewport-width-percent length.
+pub fn ui_vw(v: Float) -> UiLength { return UiLength { unit: 2, value: v } }
+/// a viewport-height-percent length.
+pub fn ui_vh(v: Float) -> UiLength { return UiLength { unit: 3, value: v } }
+/// a ui-scale-multiplier length.
+pub fn ui_scale_len(v: Float) -> UiLength { return UiLength { unit: 4, value: v } }
+
+/// length axis: 0 width, 1 height.
+pub struct LayoutLengthContext { viewport_w: Float, viewport_h: Float, ui_scale: Float, parent_inner_w: Float, parent_inner_h: Float }
+
+/// default UI scale: fit a 1280x720 reference, clamped to [0.5, 2.0].
+pub fn default_ui_scale(viewport_w: Float, viewport_h: Float) -> Float {
+    return math::fclamp(math::fmin(viewport_w / 1280.0, viewport_h / 720.0), 0.5, 2.0)
+}
+
+/// a root length context for a viewport (ui_scale auto-derived).
+pub fn length_context_root(viewport_w: Float, viewport_h: Float) -> LayoutLengthContext {
+    var vw = math::fmax(viewport_w, 0.0)
+    var vh = math::fmax(viewport_h, 0.0)
+    return LayoutLengthContext { viewport_w: vw, viewport_h: vh, ui_scale: default_ui_scale(vw, vh), parent_inner_w: vw, parent_inner_h: vh }
+}
+
+/// a copy of `ctx` with a new parent inner size (for resolving percent lengths of children).
+pub fn length_context_with_parent(ctx: LayoutLengthContext, inner_w: Float, inner_h: Float) -> LayoutLengthContext {
+    return LayoutLengthContext { viewport_w: ctx.viewport_w, viewport_h: ctx.viewport_h, ui_scale: ctx.ui_scale, parent_inner_w: math::fmax(inner_w, 0.0), parent_inner_h: math::fmax(inner_h, 0.0) }
+}
+
+/// resolve a UiLength to pixels on `axis` (0 width, 1 height) within `ctx`.
+pub fn ui_length_resolve(l: UiLength, ctx: LayoutLengthContext, axis: Int) -> Float {
+    if l.unit == 0 { return l.value }
+    if l.unit == 1 { var base = ctx.parent_inner_w  if axis == 1 { base = ctx.parent_inner_h }  return base * l.value / 100.0 }
+    if l.unit == 2 { return ctx.viewport_w * l.value / 100.0 }
+    if l.unit == 3 { return ctx.viewport_h * l.value / 100.0 }
+    return ctx.ui_scale * l.value
+}
+
+/// a present flag + UiLength.
+pub struct UiLengthOpt { ok: Bool, len: UiLength }
+
+/// parse a length string ("50%", "10vh", "25vw", "300ui", "ui", "42"); ok=false if invalid.
+pub fn ui_length_parse(s: Str) -> UiLengthOpt {
+    var t = nui_trim(s)
+    if t.len() == 0 { return UiLengthOpt { ok: false, len: ui_px(0.0) } }
+    if (nui_lower(t) == "ui") { return UiLengthOpt { ok: true, len: ui_scale_len(1.0) } }
+    if nui_ends_with(t, "%") { return parse_unit_num(t.slice(0, t.len() - 1), 1) }
+    if nui_ends_with(t, "vw") { return parse_unit_num(t.slice(0, t.len() - 2), 2) }
+    if nui_ends_with(t, "vh") { return parse_unit_num(t.slice(0, t.len() - 2), 3) }
+    if nui_ends_with(t, "ui") {
+        var num = nui_trim(t.slice(0, t.len() - 2))
+        if num.len() == 0 { return UiLengthOpt { ok: true, len: ui_scale_len(1.0) } }
+        return parse_unit_num(num, 4)
+    }
+    return parse_unit_num(t, 0)
+}
+
+/// parse a trimmed numeric string with a unit tag into a UiLengthOpt (internal helper).
+pub fn parse_unit_num(s: Str, unit: Int) -> UiLengthOpt {
+    var t = nui_trim(s)
+    if t.len() == 0 { return UiLengthOpt { ok: false, len: ui_px(0.0) } }
+    // Refuse anything that is not a number: accepting any non-empty text, with parse_float_sub's
+    // best-effort 0.0 as the value, would make `rect { w: bogus }` silently become Px(0) instead
+    // of the error `invalid w: "bogus"`. Node families check this locally as well.
+    if !is_number(t) { return UiLengthOpt { ok: false, len: ui_px(0.0) } }
+    return UiLengthOpt { ok: true, len: UiLength { unit: unit, value: parse_float_sub(t, 0, t.len()) } }
+}
+
+/// lowercase ASCII (inline helper).
+pub fn nui_lower(s: Str) -> Str {
+    var out = ""
+    var i = 0
+    while i < s.len() { var c = ord(s.at(i))  if c >= 65 && c <= 90 { c = c + 32 }  out = out + chr(c)  i = i + 1 }
+    return out
+}
+/// suffix test (inline helper).
+pub fn nui_ends_with(s: Str, suf: Str) -> Bool { if suf.len() > s.len() { return false }  return (s.slice(s.len() - suf.len(), s.len()) == suf) }
+
+// --- alignment ---
+/// cross-axis alignment: 0 start, 1 center, 2 end, 3 stretch.
+pub fn cross_start() -> Int { return 0 }
+/// cross-axis alignment: center.
+pub fn cross_center() -> Int { return 1 }
+/// cross-axis alignment: end.
+pub fn cross_end() -> Int { return 2 }
+/// cross-axis alignment: stretch to fill.
+pub fn cross_stretch() -> Int { return 3 }
+/// main-axis alignment: 0 start, 1 center, 2 end, 3 space-between.
+pub fn main_start() -> Int { return 0 }
+/// main-axis alignment: center.
+pub fn main_center() -> Int { return 1 }
+/// main-axis alignment: end.
+pub fn main_end() -> Int { return 2 }
+/// main-axis alignment: space-between.
+pub fn main_space_between() -> Int { return 3 }
+
+// --- flex math ---
+/// a flex grow/shrink slot: which child index, its grow weight, and shrink factor.
+pub struct FlexGrowSlot { index: Int, weight: Float, shrink: Float }
+
+/// distribute `remaining` extra main-axis space across `slots` into `sizes` (by weight; equal if weightless).
+pub fn distribute_flex_grow(inout sizes: Vec<Float>, slots: Vec<FlexGrowSlot>, remaining: Float) {
+    if remaining <= 0.0 || slots.len() == 0 { return }
+    var total_weight = 0.0
+    var i = 0
+    while i < slots.len() { total_weight = total_weight + slots[i].weight  i = i + 1 }
+    if total_weight <= 0.0 {
+        var share = remaining / to_float(slots.len())
+        var j = 0
+        while j < slots.len() { var idx = slots[j].index  sizes[idx] = sizes[idx] + share  j = j + 1 }
+        return
+    }
+    var k = 0
+    while k < slots.len() { var idx = slots[k].index  sizes[idx] = sizes[idx] + remaining * (slots[k].weight / total_weight)  k = k + 1 }
+}
+
+/// shrink `sizes` by up to `deficit` across `slots` weighted by size*shrink.
+pub fn apply_flex_shrink(inout sizes: Vec<Float>, slots: Vec<FlexGrowSlot>, deficit: Float) {
+    if deficit <= 0.0 || slots.len() == 0 { return }
+    var budget = 0.0
+    var i = 0
+    while i < slots.len() { if slots[i].shrink > 0.0 { budget = budget + math::fmax(sizes[slots[i].index], 0.0) * slots[i].shrink }  i = i + 1 }
+    if budget <= 0.0 { return }
+    var factor = math::fmin(deficit, budget) / budget
+    var j = 0
+    while j < slots.len() {
+        if slots[j].shrink > 0.0 {
+            var idx = slots[j].index
+            var take = math::fmax(sizes[idx], 0.0) * slots[j].shrink * factor
+            sizes[idx] = math::fmax(sizes[idx] - take, 0.0)
+        }
+        j = j + 1
+    }
+}
+
+/// grow or shrink `sizes` to fit `inner_main` given fixed sizes + gaps.
+pub fn apply_flex_main_axis(inout sizes: Vec<Float>, slots: Vec<FlexGrowSlot>, inner_main: Float, fixed_sum: Float, gap_count: Int, gap: Float) {
+    var total = fixed_sum + gap * to_float(gap_count)
+    var remaining = inner_main - total
+    if remaining > 0.0 { distribute_flex_grow(sizes, slots, remaining) }
+    else if remaining < -0.01 { apply_flex_shrink(sizes, slots, 0.0 - remaining) }
+}
+
+// --- UiNode: a tagged-union overlay node ---
+/// node kind: vertical flex container.
+pub fn nk_column() -> Int { return 0 }
+/// node kind: horizontal flex container.
+pub fn nk_row() -> Int { return 1 }
+/// node kind: text leaf.
+pub fn nk_text() -> Int { return 2 }
+/// node kind: button leaf.
+pub fn nk_button() -> Int { return 3 }
+/// node kind: colored rectangle leaf.
+pub fn nk_rect() -> Int { return 4 }
+/// node kind: empty spacer leaf.
+pub fn nk_spacer() -> Int { return 5 }
+/// node kind: reserved surface rectangle (host-drawn).
+pub fn nk_surface() -> Int { return 6 }
+/// a vertically-scrolling column (children flow at natural height; clipped to the viewport).
+pub fn nk_scroll_column() -> Int { return 7 }
+/// a horizontally-scrolling row.
+pub fn nk_scroll_row() -> Int { return 8 }
+/// node kind: image leaf (a resolved path blitted into the node rect).
+pub fn nk_image() -> Int { return 9 }
+/// node kind: checkbox leaf.
+pub fn nk_checkbox() -> Int { return 10 }
+/// node kind: slider leaf (horizontal track + thumb).
+pub fn nk_slider() -> Int { return 11 }
+/// node kind: dropdown leaf (closed trigger; the popup is host-drawn).
+pub fn nk_dropdown() -> Int { return 12 }
+/// node kind: numeric drag field, the `number` / `drag_value` element.
+pub fn nk_number() -> Int { return 13 }
+/// node kind: single-line text field.
+pub fn nk_text_input() -> Int { return 14 }
+/// node kind: multi-line text field.
+pub fn nk_text_area() -> Int { return 15 }
+/// node kind: value picker (a label + a "Browse..." field the host fills in).
+pub fn nk_picker() -> Int { return 16 }
+/// node kind: syntax-highlighted code editor, `text_area`'s gutter-and-colours sibling.
+///
+/// Distinct from `text_area` on purpose. `text_area` is a plain multiline
+/// field: no gutter, no colours, and its state rebuilt from `value:` on every layout.
+/// `code_editor` turns the gutter and current-line highlight on, takes a `language:` to colour by,
+/// and accepts `caret:`/`sel_anchor:`/`scroll_y:` so the caller can own the editing state across
+/// frames, which is what makes it usable from a plugin that re-emits its document every frame.
+pub fn nk_code_editor() -> Int { return 17 }
+/// node kind: a scrollbar for content the plugin scrolls itself.
+///
+/// The other kind of scrolling is `overflow_y: scroll`, where this library owns the flow: it
+/// measures the children, shifts them by an offset the host keeps, clips them, and reports the
+/// region so the host can draw a bar over it. That is right for a settings page and wrong for a
+/// transcript with ten thousand lines in it, where emitting every row into a document rebuilt each
+/// frame is the expensive part and drawing a window of them is the whole design.
+///
+/// So this is the bar for the other case: the plugin says how much content there is, how much of it
+/// is showing and where it is, and gets told when someone moves it. The three numbers are in the
+/// plugin's own units (lines, rows, items, pixels) because the only arithmetic done with them is
+/// a ratio, and the offset comes back in whatever they were.
+pub fn nk_scrollbar() -> Int { return 18 }
+
+/// an overlay node: a `kind` tag plus the union of layout-relevant fields and children.
+pub struct UiNode {
+    kind: Int,
+    id: Str,
+    text: Str,
+    on_click: Str,
+    gap: Float,
+    padding: Float,
+    has_padding_x: Bool,
+    padding_x: Float,
+    has_padding_y: Bool,
+    padding_y: Float,
+    cross_align: Int,
+    main_align: Int,
+    has_bg: Bool,
+    bg: Int,
+    radius: Float,
+    has_border: Bool,
+    border_color: Int,
+    border_w: Float,
+    fill_w: Bool,
+    fill_h: Bool,
+    has_flex_weight: Bool,
+    flex_weight: Float,
+    has_flex_shrink: Bool,
+    flex_shrink: Float,
+    w: UiLength,
+    h: UiLength,
+    has_color: Bool,
+    color: Int,
+    size_px: Float,
+    min_height: Float,
+    tag: Str,
+    classes: Vec<Str>,
+    wrap: Bool,
+    wrap_hard_break: Bool,
+    line_clamp: Int,
+    text_overflow: Int,
+    text_transform: Int,
+    has_max_width: Bool,
+    max_width_px: Float,
+    line_height_mult: Float,
+    overflow_x: Int,
+    overflow_y: Int,
+    hidden: Bool,
+    disabled: Bool,
+    bind_visible: Str,
+    bind_disabled: Str,
+    position: Int,
+    z_index: Int,
+    has_tab_index: Bool,
+    tab_index: Int,
+    spans: Vec<TextSpanRun>,
+    has_hover_bg: Bool,
+    hover_bg: Int,
+    has_hover_border_color: Bool,
+    hover_border_color: Int,
+    has_hover_text_color: Bool,
+    hover_text_color: Int,
+    has_active_bg: Bool,
+    active_bg: Int,
+    has_top: Bool,
+    top: Float,
+    has_right: Bool,
+    right: Float,
+    has_bottom: Bool,
+    bottom: Float,
+    has_left: Bool,
+    left: Float,
+    has_align_self: Bool,
+    align_self: Int,
+    flex_wrap: Bool,
+    has_min_width: Bool,
+    min_width: Float,
+    bind: Str,
+    src: Str,
+    checked: Bool,
+    value_f: Float,
+    value_s: Str,
+    vmin: Float,
+    vmax: Float,
+    has_step: Bool,
+    step: Float,
+    has_precision: Bool,
+    precision: Int,
+    suffix: Str,
+    options: Vec<Str>,
+    selected: Int,
+    open: Bool,
+    has_item_height: Bool,
+    item_height: Float,
+    has_track_h: Bool,
+    track_h: Float,
+    has_knob_r: Bool,
+    knob_r: Float,
+    has_track_color: Bool,
+    track_color: Int,
+    has_fill_color: Bool,
+    fill_color: Int,
+    has_knob_color: Bool,
+    knob_color: Int,
+    read_only: Bool,
+    /// code_editor: whether to draw the line-number gutter. On for source, off for anything whose
+    /// lines are not numbered in the first place: a build transcript's third line is not "line 3"
+    /// of anything, and a gutter counting it invites a click on a number that means nothing.
+    line_numbers: Bool,
+    /// `L:text` pairs, `|`-separated: a glyph for the gutter rail and a note after the line. Written
+    /// as one string because that is what a plugin can hand across the ABI: only scalars and C
+    /// strings cross, so a Vec per line is not something a panel could send.
+    gutter_marks: Str,
+    line_notes: Str,
+    /// `LINE:COL:LEN:SEV|...`: what the checker said, and the span each thing is about.
+    diags: Str,
+    focus_from: Int,
+    focus_to: Int,
+    /// code_editor: whether to band the caret's line. On for source, where it says where the next
+    /// keystroke lands. Off is right for anything you cannot type into: a full-width band across a
+    /// line you merely clicked reads as a selection you did not make.
+    highlight_line: Bool,
+    /// code_editor: the line whose links are drawn as hovered, or -1 for none.
+    ///
+    /// The caller's, because only the caller knows where the pointer is inside a widget it does not
+    /// own: one `code_editor` is one hit region however many lines are in it, so a hover cannot be
+    /// noticed here.
+    hot_line: Int,
+    tab_size: Int,
+    hard_tabs: Bool,
+    word_wrap: Bool,
+    /// code_editor: the lexer to colour with ("nori", or "" for plain text).
+    language: Str,
+    /// text_area: the fewest rows it is ever drawn at. Three is the default, which is what an editor
+    /// surface wants; an input bar wants one and grows from there.
+    min_rows: Int,
+    /// text_area / code_editor: how many rows it may grow to before it scrolls its content instead.
+    /// 0 is no cap, which is what an editor filling a pane wants; an input bar wants a small number,
+    /// so that a pasted file does not push the rest of the panel off the screen.
+    max_rows: Int,
+    /// code_editor: caret offset, selection anchor, and vertical scroll, all owned by the caller.
+    caret: Int,
+    /// text_input: whether `caret` was given at all. Without it the caret sits after the last
+    /// character, which is where a field that nobody positions wants it.
+    has_caret: Bool,
+    sel_anchor: Int,
+    scroll_y: Float,
+    scroll_x: Float,
+    anchor_x: Float,
+    anchor_y: Float,
+    has_anchor: Bool,
+    font_bold: Bool,
+    font_italic: Bool,
+    has_letter_spacing: Bool,
+    letter_spacing: Float,
+    has_word_spacing: Bool,
+    word_spacing: Float,
+    // ---- text effects; all optional, so each has a has_ gate ----
+    has_text_outline: Bool,
+    text_outline_color: Int,
+    text_outline_width_px: Float,
+    has_text_gradient_from: Bool,
+    text_gradient_from: Int,
+    has_text_gradient_to: Bool,
+    text_gradient_to: Int,
+    text_gradient_horizontal: Bool,
+    has_text_shadow: Bool,
+    text_shadow_color: Int,
+    shadow_blur: Float,
+    shadow_spread: Float,
+    shadow_offset_x: Float,
+    shadow_offset_y: Float,
+    text_decoration: Int,
+    has_text_decoration_color: Bool,
+    text_decoration_color: Int,
+    text_decoration_width_px: Float,
+    // ---- whole-subtree paint effects: the node and everything under it is drawn at `opacity`,
+    //      moved by (translate_x, translate_y) and scaled by (scale_x, scale_y) about the centre of
+    //      the node's rect. Applied to the laid-out primitives (layout is untouched, as in CSS), so
+    //      neither painter needs to know about them. `.style` sets them; retained documents animate
+    //      them (a start menu sliding up is translate_y + opacity). ----
+    opacity: Float = 1.0,
+    translate_x: Float = 0.0,
+    translate_y: Float = 0.0,
+    scale_x: Float = 1.0,
+    scale_y: Float = 1.0,
+    // ---- text in every script: the paragraph direction (dir_ltr / dir_rtl / dir_auto, where auto is
+    //      the first strong character's), the language (BCP 47; it picks a font's localized forms),
+    //      and line alignment (ta_*: start and end follow each line's direction) ----
+    text_dir: Int = 2,
+    lang: Str = "",
+    text_align: Int = 0,
+    // ---- the face: a family list ("Noto Sans, Noto Sans Arabic, sans-serif"), a weight (100-900,
+    //      0 = unset) and a slant (0 unset, 1 normal, 2 italic), resolved by the text engine to a
+    //      font stack. `bold` / `italic` do not change the face ----
+    font_family: Str = "",
+    font_weight: Int = 0,
+    font_slant: Int = 0,
+    // ---- a gradient background: `bg` to `bg_to` across the node (down it when `bg_vertical`) ----
+    has_bg_to: Bool = false,
+    bg_to: Int = 0,
+    bg_vertical: Bool = false,
+    children: Vec<UiNode>
+}
+
+/// a blank node of `kind` with default layout fields (internal builder base).
+pub fn ui_node_blank(kind: Int) -> UiNode {
+    var kids: Vec<UiNode> = vec()
+    var cls: Vec<Str> = vec()
+    var nospans: Vec<TextSpanRun> = vec()
+    var opts: Vec<Str> = vec()
+    return UiNode {
+        kind: kind, id: "", text: "", on_click: "",
+        gap: 8.0, padding: 8.0, has_padding_x: false, padding_x: 0.0, has_padding_y: false, padding_y: 0.0,
+        cross_align: cross_start(), main_align: main_start(),
+        has_bg: false, bg: rgba_transparent(), radius: 0.0,
+        has_border: false, border_color: rgba_transparent(), border_w: 0.0,
+        fill_w: false, fill_h: false, has_flex_weight: false, flex_weight: 1.0, has_flex_shrink: false, flex_shrink: 1.0,
+        w: ui_px(0.0), h: ui_px(0.0), has_color: false, color: rgba_white(), size_px: 14.0, min_height: 0.0,
+        tag: "", classes: cls, wrap: false, wrap_hard_break: false, line_clamp: 0, text_overflow: 0, text_transform: 0,
+        has_max_width: false, max_width_px: 0.0, line_height_mult: 1.2,
+        overflow_x: 0, overflow_y: 0,
+        hidden: false, disabled: false, bind_visible: "", bind_disabled: "",
+        position: 0, z_index: 0, has_tab_index: false, tab_index: 0, spans: nospans,
+        has_hover_bg: false, hover_bg: rgba_transparent(),
+        has_hover_border_color: false, hover_border_color: rgba_transparent(),
+        has_hover_text_color: false, hover_text_color: rgba_transparent(),
+        has_active_bg: false, active_bg: rgba_transparent(),
+        has_top: false, top: 0.0, has_right: false, right: 0.0,
+        has_bottom: false, bottom: 0.0, has_left: false, left: 0.0,
+        has_align_self: false, align_self: cross_start(), flex_wrap: false, has_min_width: false, min_width: 0.0,
+        bind: "", src: "", checked: false, value_f: 0.0, value_s: "", vmin: 0.0, vmax: 1.0,
+        has_step: false, step: 0.0, has_precision: false, precision: 0, suffix: "",
+        options: opts, selected: 0, open: false, has_item_height: false, item_height: 0.0,
+        has_track_h: false, track_h: 0.0, has_knob_r: false, knob_r: 0.0,
+        has_track_color: false, track_color: rgba_transparent(),
+        has_fill_color: false, fill_color: rgba_transparent(),
+        has_knob_color: false, knob_color: rgba_transparent(),
+        read_only: false, line_numbers: true, gutter_marks: "", line_notes: "", diags: "", focus_from: 0, focus_to: 0, highlight_line: true, hot_line: 0 - 1, tab_size: 4, hard_tabs: false, word_wrap: true,
+        language: "", min_rows: 0, max_rows: 0, caret: 0, has_caret: false, sel_anchor: 0, scroll_y: 0.0, scroll_x: 0.0,
+        anchor_x: 0.0, anchor_y: 0.0, has_anchor: false, font_bold: false, font_italic: false,
+        has_letter_spacing: false, letter_spacing: 0.0, has_word_spacing: false, word_spacing: 0.0,
+        has_text_outline: false, text_outline_color: rgba_transparent(), text_outline_width_px: 0.0,
+        has_text_gradient_from: false, text_gradient_from: rgba_transparent(),
+        has_text_gradient_to: false, text_gradient_to: rgba_transparent(), text_gradient_horizontal: true,
+        has_text_shadow: false, text_shadow_color: rgba_transparent(),
+        shadow_blur: 0.0, shadow_spread: 0.0, shadow_offset_x: 0.0, shadow_offset_y: 0.0,
+        text_decoration: 0, has_text_decoration_color: false, text_decoration_color: rgba_transparent(),
+        text_decoration_width_px: 0.0,
+        children: kids
+    }
+}
+/// tag `node` for stylesheet resolution: an explicit `tag` (empty = use the element kind) + `classes`.
+pub fn ui_tagged(sink node: UiNode, tag: Str, classes: Vec<Str>) -> UiNode { node.tag = copy tag  node.classes = path_copy_str(classes)  return node }
+/// the canonical stylesheet tag for a node kind (column/row/text/button/rect/spacer/surface).
+pub fn ui_kind_tag(kind: Int) -> Str {
+    if kind == nk_row() { return "row" }
+    if kind == nk_text() { return "text" }
+    if kind == nk_button() { return "button" }
+    if kind == nk_rect() { return "rect" }
+    if kind == nk_spacer() { return "spacer" }
+    if kind == nk_surface() { return "surface" }
+    if kind == nk_scroll_column() { return "scroll_column" }
+    if kind == nk_scroll_row() { return "scroll_row" }
+    if kind == nk_image() { return "image" }
+    if kind == nk_checkbox() { return "checkbox" }
+    if kind == nk_slider() { return "slider" }
+    if kind == nk_dropdown() { return "dropdown" }
+    if kind == nk_number() { return "number" }
+    if kind == nk_text_input() { return "text_input" }
+    if kind == nk_text_area() { return "text_area" }
+    if kind == nk_scrollbar() { return "scrollbar" }
+    if kind == nk_picker() { return "picker" }
+    if kind == nk_code_editor() { return "code_editor" }
+    return "column"
+}
+
+/// apply a resolved NodeStyle's set fields onto `node`'s visual + text-layout fields (in place).
+pub fn apply_style_to_node(inout node: UiNode, style: NodeStyle) {
+    if style.has_bg { node.has_bg = true  node.bg = style.bg }
+    if style.has_color { node.has_color = true  node.color = style.color }
+    if node.kind == nk_text() && style.has_text_color { node.has_color = true  node.color = style.text_color }
+    if style.has_radius { node.radius = style.radius }
+    if style.has_padding { node.padding = style.padding }
+    if style.has_border_color { node.has_border = true  node.border_color = style.border_color }
+    if style.has_border_w { node.border_w = style.border_w  if style.border_w > 0.0 { node.has_border = true } }
+    if style.has_min_height { node.min_height = style.min_height }
+    if style.has_size_px { node.size_px = style.size_px }
+    if style.has_line_height_mult { node.line_height_mult = style.line_height_mult }
+    if style.has_font_bold { node.font_bold = style.font_bold }
+    if style.has_font_italic { node.font_italic = style.font_italic }
+    if style.has_letter_spacing { node.has_letter_spacing = true  node.letter_spacing = style.letter_spacing }
+    if style.has_word_spacing { node.has_word_spacing = true  node.word_spacing = style.word_spacing }
+    if style.has_wrap { node.wrap = style.wrap }
+    if style.has_wrap_hard_break { node.wrap_hard_break = style.wrap_hard_break }
+    if style.has_line_clamp { node.line_clamp = style.line_clamp }
+    if style.has_text_overflow { node.text_overflow = style.text_overflow }
+    if style.has_text_transform { node.text_transform = style.text_transform }
+    if style.has_max_width { node.has_max_width = true  node.max_width_px = style.max_width }
+    if style.has_overflow_x { node.overflow_x = style.overflow_x }
+    if style.has_overflow_y { node.overflow_y = style.overflow_y }
+    if style.has_position { node.position = style.position }
+    if style.has_z_index { node.z_index = style.z_index }
+    if style.has_top { node.has_top = true  node.top = style.top }
+    if style.has_right { node.has_right = true  node.right = style.right }
+    if style.has_bottom { node.has_bottom = true  node.bottom = style.bottom }
+    if style.has_left { node.has_left = true  node.left = style.left }
+    if style.has_hover_bg { node.has_hover_bg = true  node.hover_bg = style.hover_bg }
+    if style.has_hover_border_color { node.has_hover_border_color = true  node.hover_border_color = style.hover_border_color }
+    if style.has_hover_text_color { node.has_hover_text_color = true  node.hover_text_color = style.hover_text_color }
+    if style.has_active_bg { node.has_active_bg = true  node.active_bg = style.active_bg }
+    if style.has_opacity { node.opacity = style.opacity }
+    if style.has_translate_x { node.translate_x = style.translate_x }
+    if style.has_translate_y { node.translate_y = style.translate_y }
+    if style.has_scale_x { node.scale_x = style.scale_x }
+    if style.has_scale_y { node.scale_y = style.scale_y }
+    if style.has_w { node.w = UiLength { unit: style.w_unit, value: style.w_val } }
+    if style.has_h { node.h = UiLength { unit: style.h_unit, value: style.h_val } }
+    if style.has_gap { node.gap = style.gap }
+    if style.has_text_dir { node.text_dir = style.text_dir }
+    if style.has_lang { node.lang = copy style.lang }
+    if style.has_text_align { node.text_align = style.text_align  node.has_anchor = true  node.anchor_x = style.align_x }
+    if style.has_font_family { node.font_family = copy style.font_family }
+    if style.has_bg_to { node.has_bg_to = true  node.bg_to = style.bg_to }
+    if style.has_bg_vertical { node.bg_vertical = style.bg_vertical }
+    if style.has_font_weight { node.font_weight = style.font_weight }
+    if style.has_font_slant { node.font_slant = style.font_slant }
+    if style.has_shadow_color { node.has_text_shadow = true  node.text_shadow_color = style.shadow_color }
+    if style.has_shadow_blur { node.shadow_blur = style.shadow_blur }
+    if style.has_shadow_spread { node.shadow_spread = style.shadow_spread }
+    if style.has_shadow_x { node.shadow_offset_x = style.shadow_x }
+    if style.has_shadow_y { node.shadow_offset_y = style.shadow_y }
+}
+
+/// apply a resolved NodeStyle onto one styled span (in place). A span's
+/// `classes` layer over the parent text node's resolved style, and
+/// only the four properties a TextSpanRun can carry are taken: size, colour, bold, italic.
+/// `text_color` wins over `color`, matching apply_style_to_node's rule for a `text` node.
+pub fn apply_style_to_span(inout sp: TextSpanRun, style: NodeStyle) {
+    if style.has_size_px { sp.has_size = true  sp.size_px = style.size_px }
+    if style.has_color { sp.has_color = true  sp.color = rgba_color(style.color) }
+    if style.has_text_color { sp.has_color = true  sp.color = rgba_color(style.text_color) }
+    if style.has_font_bold { sp.bold = style.font_bold }
+    if style.has_font_italic { sp.italic = style.font_italic }
+}
+/// cascade `sheet` over the whole tree: for each node resolve its style from (tag or kind) + classes,
+/// then apply it, recursing into children.
+pub fn apply_stylesheet(inout node: UiNode, sheet: OverlayStyleSheet) {
+    var tag = node.tag
+    if tag.len() == 0 { tag = ui_kind_tag(node.kind) }
+    apply_style_to_node(node, resolve_node_style(sheet, tag, node.classes))
+    // a span's `classes:` resolve class rules only; span resolution never consults a tag
+    // rule for a span, because the span's base is the already-tag-resolved text node.
+    var si = 0
+    while si < node.spans.len() {
+        if node.spans[si].classes.len() > 0 { apply_style_to_span(node.spans[si], resolve_node_style(sheet, "", node.spans[si].classes)) }
+        si = si + 1
+    }
+    var i = 0
+    while i < node.children.len() { apply_stylesheet(node.children[i], sheet)  i = i + 1 }
+}
+
+// ---- per-node runtime state + declarative binds ----
+/// a runtime overlay for one node id, applied without re-parsing: optionally replace `classes`,
+/// merge `add_classes`, and force disabled/hidden.
+pub struct NodeRuntimeState { has_classes: Bool, classes: Vec<Str>, add_classes: Vec<Str>, disabled: Bool, hidden: Bool }
+/// a NodeRuntimeState of its own.
+pub fn node_runtime_state_dup(s: NodeRuntimeState) -> NodeRuntimeState { return NodeRuntimeState { has_classes: s.has_classes, classes: path_copy_str(s.classes), add_classes: path_copy_str(s.add_classes), disabled: s.disabled, hidden: s.hidden } }
+pub fn node_runtime_state_new() -> NodeRuntimeState {
+    var c: Vec<Str> = vec()
+    var a: Vec<Str> = vec()
+    return NodeRuntimeState { has_classes: false, classes: c, add_classes: a, disabled: false, hidden: false }
+}
+/// id -> NodeRuntimeState (parallel vecs).
+pub struct OverlayRuntimeState { ids: Vec<Str>, states: Vec<NodeRuntimeState> }
+pub fn runtime_state_new() -> OverlayRuntimeState {
+    var ids: Vec<Str> = vec()
+    var st: Vec<NodeRuntimeState> = vec()
+    return OverlayRuntimeState { ids: ids, states: st }
+}
+/// set (replace) the runtime state for `id`; a later set for the same id wins.
+pub fn rs_set(inout state: OverlayRuntimeState, id: Str, ns: NodeRuntimeState) {
+    var i = 0
+    while i < state.ids.len() { if (state.ids[i] == id) { var sts = inout state.states  sts[i] = node_runtime_state_dup(ns)  return }  i = i + 1 }
+    state.ids.push(copy id)
+    state.states.push(node_runtime_state_dup(ns))
+}
+/// remove the runtime state for `id`.
+pub fn rs_clear(inout state: OverlayRuntimeState, id: Str) {
+    var kept_ids: Vec<Str> = vec()
+    var kept_st: Vec<NodeRuntimeState> = vec()
+    var i = 0
+    while i < state.ids.len() { if (state.ids[i] == id) { } else { kept_ids.push(sink state.ids[i])  kept_st.push(sink state.states[i]) }  i = i + 1 }
+    state.ids = kept_ids
+    state.states = kept_st
+}
+/// apply the runtime overlay to the tree: for each node whose id has an entry, replace classes when
+/// has_classes, merge add_classes, and set hidden/disabled. Recursive; call before apply_stylesheet.
+pub fn apply_runtime_state(inout node: UiNode, state: OverlayRuntimeState) {
+    if node.id.len() > 0 {
+        var i = 0
+        while i < state.ids.len() {
+            if (state.ids[i] == node.id) {
+                var ns = state.states[i]
+                if ns.has_classes { node.classes = path_copy_str(ns.classes) }
+                var a = 0
+                while a < ns.add_classes.len() {
+                    // dedup: add only when not already present
+                    var dup = false
+                    var d = 0
+                    while d < node.classes.len() { if (node.classes[d] == ns.add_classes[a]) { dup = true }  d = d + 1 }
+                    if !dup { node.classes.push(copy ns.add_classes[a]) }
+                    a = a + 1
+                }
+                node.hidden = ns.hidden
+                node.disabled = ns.disabled
+            }
+            i = i + 1
+        }
+    }
+    var c = 0
+    while c < node.children.len() { apply_runtime_state(node.children[c], state)  c = c + 1 }
+}
+/// truthiness of a bind var value: "", "false" and "0" are false; anything else is true.
+pub fn bind_truthy(v: Str) -> Bool {
+    if v.len() == 0 { return false }
+    if (v == "false") { return false }
+    if (v == "0") { return false }
+    return true
+}
+/// the value of var `name` in the parallel (ids, vals) bind environment ("" when absent).
+pub fn bind_get(var_ids: Vec<Str>, var_vals: Vec<Str>, name: Str) -> Str {
+    var i = 0
+    while i < var_ids.len() { if (var_ids[i] == name) { return copy var_vals[i] }  i = i + 1 }
+    return ""
+}
+/// evaluate `bind_visible` / `bind_disabled` on the whole tree against a var environment
+/// bind_visible hides the node when its var is falsy; bind_disabled disables when its var is falsy or
+/// absent: the var expresses the enabled condition, so a node is disabled when `bind_disabled` is set
+/// and the var is false.
+pub fn apply_binds(inout node: UiNode, var_ids: Vec<Str>, var_vals: Vec<Str>) {
+    if node.bind_visible.len() > 0 { node.hidden = !bind_truthy(bind_get(var_ids, var_vals, node.bind_visible)) }
+    if node.bind_disabled.len() > 0 { node.disabled = !bind_truthy(bind_get(var_ids, var_vals, node.bind_disabled)) }
+    var c = 0
+    while c < node.children.len() { apply_binds(node.children[c], var_ids, var_vals)  c = c + 1 }
+}
+
+// ---- overlay keyboard focus (tab order, cycling, the `focused` class) ----
+/// one tab stop: the node id (falls back to on_click when the id is empty), its explicit tab_index
+/// (has_tab_index=false sorts after all explicit indices), document tree order, and the action.
+pub struct OverlayFocusable { id: Str, has_tab_index: Bool, tab_index: Int, tree_order: Int, on_click: Str }
+/// an OverlayFocusable of its own.
+pub fn focusable_dup(f: OverlayFocusable) -> OverlayFocusable { return OverlayFocusable { id: copy f.id, has_tab_index: f.has_tab_index, tab_index: f.tab_index, tree_order: f.tree_order, on_click: copy f.on_click } }
+fn focus_key_lt(a: OverlayFocusable, b: OverlayFocusable) -> Bool {
+    var ai = 2147483647
+    if a.has_tab_index { ai = a.tab_index }
+    var bi = 2147483647
+    if b.has_tab_index { bi = b.tab_index }
+    if ai != bi { return ai < bi }
+    return a.tree_order < b.tree_order
+}
+/// true when this kind is focusable in its own right, independent of `on_click`. Focus is keyed
+/// on the node kind: Number, Dropdown, Picker, TextInput, TextArea and Checkbox are focusable, and Slider is
+/// not (its variant carries no tab_index field at all).
+fn ui_kind_focusable(kind: Int) -> Bool {
+    return kind == nk_checkbox() || kind == nk_dropdown() || kind == nk_number() || kind == nk_text_input() || kind == nk_text_area() || kind == nk_picker() || kind == nk_code_editor()
+}
+fn collect_focusables_walk(node: UiNode, inout out: Vec<OverlayFocusable>) {
+    if node.hidden || node.disabled { return }
+    if ui_kind_focusable(node.kind) && node.id.len() > 0 {
+        out.push(OverlayFocusable { id: copy node.id, has_tab_index: node.has_tab_index, tab_index: node.tab_index, tree_order: out.len(), on_click: copy node.on_click })
+        return                                        // a focusable is a leaf for the walk
+    }
+    if node.on_click.len() > 0 {
+        var fid = node.id
+        if fid.len() == 0 { fid = node.on_click }
+        out.push(OverlayFocusable { id: copy fid, has_tab_index: node.has_tab_index, tab_index: node.tab_index, tree_order: out.len(), on_click: copy node.on_click })
+        return                                        // a focusable is a leaf for the walk
+    }
+    var i = 0
+    while i < node.children.len() { collect_focusables_walk(node.children[i], out)  i = i + 1 }
+}
+/// collect focusable controls in tab order: explicit tab_index first (ascending), then tree order;
+/// hidden/disabled nodes (runtime state or binds; apply those first) are skipped.
+pub fn collect_overlay_focusables(root: UiNode) -> Vec<OverlayFocusable> {
+    var raw: Vec<OverlayFocusable> = vec()
+    collect_focusables_walk(root, raw)
+    // insertion sort by (tab_index | MAX, tree_order); stable, small n
+    var sorted: Vec<OverlayFocusable> = vec()
+    var i = 0
+    while i < raw.len() {
+        var item = sink raw[i]
+        var pos = sorted.len()
+        var j = 0
+        var found = false
+        while j < sorted.len() && !found { if focus_key_lt(item, sorted[j]) { pos = j  found = true }  j = j + 1 }
+        sorted.push(focusable_dup(item))             // grow by one, then shift down into place
+        var k = sorted.len() - 1
+        while k > pos { sorted[k] = sink sorted[k - 1]  k = k - 1 }
+        sorted[pos] = item
+        i = i + 1
+    }
+    return sorted
+}
+/// the next (or previous, when `reverse`) focus id after `current`; wraps; the first stop when
+/// `current` is empty/unknown; "" when there are no focusables.
+pub fn cycle_overlay_focus(focusables: Vec<OverlayFocusable>, current: Str, reverse: Bool) -> Str {
+    if focusables.len() == 0 { return "" }
+    var cur = 0 - 1
+    var i = 0
+    while i < focusables.len() { if (focusables[i].id == current) { cur = i }  i = i + 1 }
+    var nxt = 0
+    if cur >= 0 {
+        if reverse { nxt = (cur + focusables.len() - 1) % focusables.len() } else { nxt = (cur + 1) % focusables.len() }
+    }
+    return copy focusables[nxt].id
+}
+/// merge the `focused` class for `focused_id` into a runtime state:
+/// apply_runtime_state afterwards gives the node the class so a
+/// stylesheet `.focused` rule can style the focus ring.
+pub fn rs_add_focus(inout state: OverlayRuntimeState, focused_id: Str) {
+    if focused_id.len() == 0 { return }
+    var i = 0
+    while i < state.ids.len() {
+        if (state.ids[i] == focused_id) { state.states[i].add_classes.push("focused")  return }
+        i = i + 1
+    }
+    var ns = node_runtime_state_new()
+    ns.add_classes.push("focused")
+    state.ids.push(copy focused_id)
+    state.states.push(ns)
+}
+
+/// the rendered content + box for a text `node`, honoring its wrap/clamp/transform/overflow style
+/// within `avail_w`. Uses text_render_content_and_metrics.
+pub fn ui_text_layout(node: UiNode, avail_w: Float) -> TextLayout {
+    var maxw = 0.0
+    if node.has_max_width { maxw = node.max_width_px }
+    var ellipsis = node.text_overflow == 1
+    return text_render_st(node.text, avail_w, maxw, node.wrap, node.wrap_hard_break, node.line_clamp, ellipsis, node.text_transform, node.line_height_mult, node.min_height, node_measure_style(node))
+}
+/// how a node's text is measured: its size and spacings, and the font stack, direction and
+/// language the text engine shapes it with.
+pub fn node_measure_style(node: UiNode) -> TextMeasureStyle {
+    var st = text_measure_style_sp(node.size_px, node_letter_spacing(node), node_word_spacing(node))
+    st.dir = node.text_dir
+    st.lang = copy node.lang
+    st.stack = node_font_stack(node)
+    return st
+}
+/// the width of a node's one-line label (a button's), shaped in the label's own direction.
+pub fn node_label_width(node: UiNode) -> Float {
+    return text_measure_width(node.text, text_style_dir(node_measure_style(node), text_para_dir(node.text, node.text_dir) == 1))
+}
+/// the font stack a node's text is shaped with: its `font_family` / `font_weight` / `font_style`
+/// resolved by the text engine, or 0 (the default stack) when it names none.
+pub fn node_font_stack(node: UiNode) -> Int {
+    if node.font_family.len() == 0 && node.font_weight == 0 && node.font_slant == 0 { return 0 }
+    return text_engine_family_stack(node.font_family, node.font_weight, node.font_slant == 2)
+}
+/// the node's letter spacing in px (0 when unset). A negative value is
+/// clamped to 0, so it is a no-op rather than a squeeze.
+pub fn node_letter_spacing(node: UiNode) -> Float { if !node.has_letter_spacing { return 0.0 }  return math::fmax(node.letter_spacing, 0.0) }
+/// the node's word spacing in px (0 when unset), clamped the same way.
+pub fn node_word_spacing(node: UiNode) -> Float { if !node.has_word_spacing { return 0.0 }  return math::fmax(node.word_spacing, 0.0) }
+/// a vertical container with `gap`, `padding`, and children.
+/// the horizontal padding: padding_x when set, else padding.
+pub fn node_pad_x(node: UiNode) -> Float { if node.has_padding_x { return node.padding_x }  return node.padding }
+/// the vertical padding: padding_y when set, else padding.
+pub fn node_pad_y(node: UiNode) -> Float { if node.has_padding_y { return node.padding_y }  return node.padding }
+
+pub fn ui_column(gap: Float, padding: Float, children: Vec<UiNode>) -> UiNode { var n = ui_node_blank(nk_column())  n.gap = gap  n.padding = padding  n.children = nodes_dup(children)  return n }
+/// a horizontal container with `gap`, `padding`, and children.
+pub fn ui_row(gap: Float, padding: Float, children: Vec<UiNode>) -> UiNode { var n = ui_node_blank(nk_row())  n.gap = gap  n.padding = padding  n.children = nodes_dup(children)  return n }
+/// a text node.
+pub fn ui_text(text: Str, size_px: Float) -> UiNode { var n = ui_node_blank(nk_text())  n.text = copy text  n.size_px = size_px  return n }
+/// a button node with a label and click action id.
+pub fn ui_button(label: Str, on_click: Str) -> UiNode { var n = ui_node_blank(nk_button())  n.text = copy label  n.on_click = copy on_click  n.h = ui_px(32.0)  return n }
+/// a colored rectangle of size (w, h).
+pub fn ui_rect(w: UiLength, h: UiLength, color: Color) -> UiNode { var n = ui_node_blank(nk_rect())  n.w = copy w  n.h = copy h  n.has_color = true  n.color = rgba_pack(color)  return n }
+/// an empty spacer of size (w, h).
+pub fn ui_spacer(w: UiLength, h: UiLength) -> UiNode { var n = ui_node_blank(nk_spacer())  n.w = copy w  n.h = copy h  return n }
+/// a reserved surface rectangle (host draws content) with an id and size.
+pub fn ui_surface(id: Str, w: UiLength, h: UiLength) -> UiNode { var n = ui_node_blank(nk_surface())  n.id = copy id  n.w = copy w  n.h = copy h  return n }
+/// a rich text node: styled spans flowed inline (wrap via node.wrap / max_width, like plain text).
+pub fn ui_text_spans(spans: Vec<TextSpanRun>, size_px: Float) -> UiNode {
+    var n = ui_node_blank(nk_text())  n.spans = spans_dup(spans)  n.size_px = size_px  n.has_color = false  return n
+}
+/// a vertically-scrolling column: fixed viewport (min_height, default 120), children flow at natural
+/// height, clipped; the host feeds offsets via layout_overlay_scrolled using `id`.
+pub fn ui_scroll_column(id: Str, gap: Float, padding: Float, min_height: Float, children: Vec<UiNode>) -> UiNode {
+    var n = ui_node_blank(nk_scroll_column())  n.id = copy id  n.gap = gap  n.padding = padding  n.min_height = min_height  n.children = nodes_dup(children)  return n
+}
+/// a horizontally-scrolling row. The fixed viewport width is `min_width`; a scroll row
+/// has no `min_height`.
+pub fn ui_scroll_row(id: Str, gap: Float, padding: Float, min_width: Float, children: Vec<UiNode>) -> UiNode {
+    var n = ui_node_blank(nk_scroll_row())  n.id = copy id  n.gap = gap  n.padding = padding  n.has_min_width = true  n.min_width = min_width  n.children = nodes_dup(children)  return n
+}
+
+// --- paint primitives + computed overlay ---
+/// paint primitive kind: 0 fill rect, 1 border rect, 2 text, 3 image.
+///
+/// Text effects (kind 2 only), optional fields:
+///   `outline_w > 0`  -> draw an outline of `outline_color` around every glyph (clamped to 0.5..16
+///                       by the layout pass).
+///   `has_grad`       -> fill the glyphs with a linear ramp from `color` (the gradient's from colour)
+///                       to `grad_to`, over the axis span [grad_a, grad_a + grad_b), x when
+///                       `grad_horizontal`, else y.
+/// Both are painted by paint_cpu and paint_gpu; no other kind reads them.
+///
+/// These live on the struct and not in a side table indexed by a `has_fx` flag: a
+/// `Vec<PaintPrimitive>` is produced in places that have no ComputedOverlay to hang a side
+/// table off (`layout_multiline_edit` returns a bare vector, and
+/// `SurfacePainter` accumulates one), so an index would make a primitive vector
+/// no longer self-describing and would force those modules to thread a second value everywhere.
+/// The cost is bounded by reusing what is already there: the gradient's from colour is `color`, its
+/// bounds collapse to two floats, and "no outline" is `outline_w == 0` rather than a flag, which
+/// makes seven fields instead of twelve.
+pub struct PaintPrimitive { kind: Int, rect: Rect, color: Color, radius: Float, border_w: Float, text: Str, pos: Vec2, size_px: Float, has_clip: Bool, clip: Rect, font_bold: Bool, font_italic: Bool, outline_color: Color, outline_w: Float, has_grad: Bool, grad_to: Color, grad_a: Float, grad_b: Float, grad_horizontal: Bool, letter_spacing: Float, word_spacing: Float,
+    // text: the font stack (0 = the painter's own faces), the language, and per line (lines are split
+    // on '\n') its direction ('L'/'R'; "" = each line finds its own) and its x offset from `pos`
+    // (empty = every line at `pos.x`); alignment is layout's, the painters only place
+    font: Int = 0, lang: Str = "", line_dir: Str = "", line_x: Vec<Float> = vec() }
+/// a filled-rect paint primitive.
+pub fn pp_rect(rect: Rect, copy color: Color, radius: Float) -> PaintPrimitive { return PaintPrimitive { kind: 0, rect: rect_dup(rect), color: color, radius: radius, border_w: 0.0, text: "", pos: vec2_zero(), size_px: 0.0, has_clip: false, clip: rect_min_max(vec2_zero(), vec2_zero()), font_bold: false, font_italic: false, outline_color: color_transparent(), outline_w: 0.0, has_grad: false, grad_to: color_transparent(), grad_a: 0.0, grad_b: 1.0, grad_horizontal: true, letter_spacing: 0.0, word_spacing: 0.0 } }
+/// a border-rect paint primitive.
+pub fn pp_border(rect: Rect, copy color: Color, border_w: Float) -> PaintPrimitive { return PaintPrimitive { kind: 1, rect: rect_dup(rect), color: color, radius: 0.0, border_w: border_w, text: "", pos: vec2_zero(), size_px: 0.0, has_clip: false, clip: rect_min_max(vec2_zero(), vec2_zero()), font_bold: false, font_italic: false, outline_color: color_transparent(), outline_w: 0.0, has_grad: false, grad_to: color_transparent(), grad_a: 0.0, grad_b: 1.0, grad_horizontal: true, letter_spacing: 0.0, word_spacing: 0.0 } }
+/// a border-rect paint primitive that follows a corner radius.
+pub fn pp_border_round(rect: Rect, copy color: Color, border_w: Float, radius: Float) -> PaintPrimitive {
+    var p = pp_border(rect, color, border_w)
+    p.radius = radius
+    return p
+}
+
+/// a box shadow (kind 4): a soft shadow outside a box, as CSS `box-shadow` draws one: the box `rect`
+/// with corner `radius`, grown by `spread`, moved by (dx, dy) and blurred over `blur` px, in `color`.
+/// Stored: `rect` the grown box (unmoved), `radius` its corners, `border_w` the spread (the box itself is
+/// `rect` shrunk by it: no shadow is drawn inside that), `outline_w` the blur, (`letter_spacing`,
+/// `word_spacing`) the offset, the fields a transform scales, so a scaled box's shadow scales with it.
+pub fn pp_box_shadow(rect: Rect, copy color: Color, radius: Float, blur: Float, spread: Float, dx: Float, dy: Float) -> PaintPrimitive {
+    var p = pp_rect(rect_min_max(vec2(rect.min.x - spread, rect.min.y - spread), vec2(rect.max.x + spread, rect.max.y + spread)), color, math::fmax(radius + spread, 0.0))
+    p.kind = 4
+    p.border_w = spread
+    p.outline_w = math::fmax(blur, 0.0)
+    p.letter_spacing = dx
+    p.word_spacing = dy
+    return p
+}
+
+/// a text paint primitive.
+///
+/// Contract for `pos` on a kind-2 (text) primitive:
+/// `pos` is the text box top-left in the same logical space as `rect`, not a baseline.
+/// `pos.y` is the top edge of the first line box; line `n` starts at `pos.y + n * line_height`.
+///
+/// Every producer computes a top (this file's nk_text/button/rich-span branches centre a
+/// box top inside the node rect; multiline_edit.nori walks line tops; dsl_widgets/dsl_input centre
+/// a line box; dock_ui's `TextLabel.top` is the same quantity), so the top is what layout can state
+/// without knowing anything about a font. Turning it into a baseline needs the font's ascent, which
+/// only a painter has, so the conversion lives in the painters, once each:
+/// `paint_cpu::cpu_text_baseline_offset` and `paint_gpu::gpu_text_baseline_offset`, both
+/// `font_v_metrics_px(font, size_px).ascent`. Anything that draws a kind-2 `pos` straight into a
+/// rasterizer's baseline argument paints one ascent too high.
+pub fn pp_text(copy pos: Vec2, text: Str, copy color: Color, size_px: Float) -> PaintPrimitive { return PaintPrimitive { kind: 2, rect: rect_min_max(vec2_zero(), vec2_zero()), color: color, radius: 0.0, border_w: 0.0, text: copy text, pos: pos, size_px: size_px, has_clip: false, clip: rect_min_max(vec2_zero(), vec2_zero()), font_bold: false, font_italic: false, outline_color: color_transparent(), outline_w: 0.0, has_grad: false, grad_to: color_transparent(), grad_a: 0.0, grad_b: 1.0, grad_horizontal: true, letter_spacing: 0.0, word_spacing: 0.0 } }
+
+/// a click target: id, action string, and screen rect.
+/// a Rect of its own, sharing nothing with `r`: the spelling for storing a rect that was read
+/// from a value which goes on living (or dying) independently of the store.
+pub fn rect_dup(r: Rect) -> Rect { return rect_min_max(vec2(r.min.x, r.min.y), vec2(r.max.x, r.max.y)) }
+/// a PaintPrimitive of its own (every rect, colour and string fresh).
+pub fn pp_dup(p: PaintPrimitive) -> PaintPrimitive {
+    return PaintPrimitive { kind: p.kind, rect: rect_dup(p.rect), color: color_dup(p.color), radius: p.radius, border_w: p.border_w, text: copy p.text, pos: copy p.pos, size_px: p.size_px, has_clip: p.has_clip, clip: rect_dup(p.clip), font_bold: p.font_bold, font_italic: p.font_italic, outline_color: color_dup(p.outline_color), outline_w: p.outline_w, has_grad: p.has_grad, grad_to: color_dup(p.grad_to), grad_a: p.grad_a, grad_b: p.grad_b, grad_horizontal: p.grad_horizontal, letter_spacing: p.letter_spacing, word_spacing: p.word_spacing, font: p.font, lang: copy p.lang, line_dir: copy p.line_dir, line_x: floats_dup(p.line_x) }
+}
+/// a Vec<Float> of its own.
+pub fn floats_dup(v: Vec<Float>) -> Vec<Float> { var o: Vec<Float> = vec()  var i = 0  while i < v.len() { o.push(v[i])  i = i + 1 }  return o }
+/// a Color of its own: a fresh record, whatever `c` was read from.
+pub fn color_dup(c: Color) -> Color { return color_rgba(c.r, c.g, c.b, c.a) }
+/// a HitRegion of its own (strings and rect all fresh).
+pub fn hit_region_dup(h: HitRegion) -> HitRegion { return HitRegion { id: copy h.id, on_click: copy h.on_click, rect: rect_dup(h.rect) } }
+pub struct HitRegion { id: Str, on_click: Str, rect: Rect }
+/// a reserved surface region: id and screen rect.
+pub struct SurfaceRegion { id: Str, rect: Rect }
+/// the result of laying out an overlay: paint primitives, hit regions, and surface regions.
+/// one scroll region the host must manage: clamp its offset to [0, content_extent - viewport size]
+/// and feed it back via layout_overlay_scrolled. `axis`: 1 = vertical (column), 0 = horizontal (row).
+pub struct ScrollRegionMeta { id: Str, viewport: Rect, content_extent: Float, axis: Int }
+pub struct ComputedOverlay {
+    prims: Vec<PaintPrimitive>, hits: Vec<HitRegion>, surfaces: Vec<SurfaceRegion>,
+    scrolls: Vec<ScrollRegionMeta>,
+    // The popup layer. Content a widget wants drawn above everything and outside every clip: a
+    // dropdown's option list, a picker's colour popup. It is a separate pair of vectors rather than
+    // `position: absolute` + `z_index` because those two are not enough on their own: an absolute
+    // child escapes its parent's flow but still lays into the same
+    // overlay, so a scroll/overflow ancestor's merge_clipped_overlay intersects it away, and
+    // z_index (z_sort_absolute) only orders absolute siblings within that same normal layer, so it
+    // cannot lift anything out of an ancestor's clip. Popup content is collected here,
+    // carried through merge_clipped_overlay unchanged (no intersect, no drop), and appended to
+    // prims/hits at the very end by overlay_flush_popups: last painted, so it draws on top, and
+    // last in `hits`, so overlay_hit_test's backwards walk lets it win.
+    pop_prims: Vec<PaintPrimitive>, pop_hits: Vec<HitRegion>,
+    // scroll input state (the interaction-state substitute): parallel id -> offset, host-provided.
+    scroll_in_ids: Vec<Str>, scroll_in_offs: Vec<Float>,
+    // pointer input state: hover/active styling reads these (has_mouse=false = no pointer).
+    in_has_mouse: Bool, in_mouse: Vec2, in_mouse_down: Bool
+}
+/// true when the pointer is over `rect` (hover styling).
+pub fn overlay_hovered(out: ComputedOverlay, rect: Rect) -> Bool {
+    if !out.in_has_mouse { return false }
+    return rect.contains(out.in_mouse)
+}
+/// a fresh empty overlay carrying the given scroll-offset input state.
+pub fn overlay_new(inout in_ids: Vec<Str>, inout in_offs: Vec<Float>) -> ComputedOverlay {
+    var prims: Vec<PaintPrimitive> = vec()
+    var hits: Vec<HitRegion> = vec()
+    var surfaces: Vec<SurfaceRegion> = vec()
+    var scrolls: Vec<ScrollRegionMeta> = vec()
+    var pprims: Vec<PaintPrimitive> = vec()
+    var phits: Vec<HitRegion> = vec()
+    return ComputedOverlay { prims: prims, hits: hits, surfaces: surfaces, scrolls: scrolls, pop_prims: pprims, pop_hits: phits, scroll_in_ids: path_copy_str(in_ids), scroll_in_offs: copy in_offs, in_has_mouse: false, in_mouse: vec2_zero(), in_mouse_down: false }
+}
+/// a fresh child overlay inheriting all of `out`'s input state (scroll offsets + pointer).
+pub fn overlay_child(inout out: ComputedOverlay) -> ComputedOverlay {
+    var c = overlay_new(out.scroll_in_ids, out.scroll_in_offs)
+    c.in_has_mouse = out.in_has_mouse
+    c.in_mouse = copy out.in_mouse
+    c.in_mouse_down = out.in_mouse_down
+    return c
+}
+/// the input scroll offset for region `rid` (0 when the host has not set one).
+pub fn overlay_scroll_off(out: ComputedOverlay, rid: Str) -> Float {
+    var i = 0
+    while i < out.scroll_in_ids.len() { if (out.scroll_in_ids[i] == rid) { return out.scroll_in_offs[i] }  i = i + 1 }
+    return 0.0
+}
+
+/// approximate intrinsic width of `text` at `size_px` (half the size per char).
+pub fn overlay_text_width(text: Str, size_px: Float) -> Float { return text_measure_width(text, text_measure_style(size_px)) }
+/// the line height of text at `size_px`.
+pub fn overlay_line_height(size_px: Float) -> Float { return text_line_height(size_px) }
+
+// ---- text wrapping ----
+/// split `s` on newlines (every '\n' starts a new piece; a trailing '\n' yields a final "").
+fn wt_split_nl(s: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var start = 0
+    var i = 0
+    let n = s.len()
+    while i <= n {
+        if i == n || ord(s.at(i)) == 10 { out.push(s.slice(start, i))  start = i + 1 }
+        i = i + 1
+    }
+    return out
+}
+/// split `s` on runs of whitespace (space/tab/CR/LF), dropping empty tokens.
+fn wt_split_ws(s: Str) -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    var start = 0 - 1
+    var i = 0
+    let n = s.len()
+    while i < n {
+        let c = ord(s.at(i))
+        if c == 32 || c == 9 || c == 13 || c == 10 { if start >= 0 { out.push(s.slice(start, i))  start = 0 - 1 } }
+        else { if start < 0 { start = i } }
+        i = i + 1
+    }
+    if start >= 0 { out.push(s.slice(start, n)) }
+    return out
+}
+/// word-wrap `text` to `max_w` at font `size_px`, inserting '\n' between wrapped lines (existing '\n's
+/// are preserved as hard breaks). When `hard_break`, a single word wider than `max_w` is split mid-word.
+pub fn wrap_text(text: Str, max_w: Float, size_px: Float, hard_break: Bool) -> Str { return wrap_text_st(text, max_w, text_measure_style(size_px), hard_break) }
+/// wrap_text against a full measure style, the form that carries letter_spacing / word_spacing, so
+/// a spaced-out string wraps at the width it will actually be drawn at.
+pub fn wrap_text_st(text: Str, max_w: Float, style: TextMeasureStyle, hard_break: Bool) -> Str {
+    if max_w <= 1.0 { return copy text }
+    let lines = text_wrap_lines(text, max_w, style, hard_break)
+    var out = ""
+    var i = 0
+    while i < lines.len() { if i > 0 { out = out + "\n" }  out = out + lines[i]  i = i + 1 }
+    return out
+}
+/// truncate `text` to fit `max_w` at `size_px`, appending "..." when it overflows (no-wrap ellipsis).
+pub fn truncate_with_ellipsis(text: Str, max_w: Float, size_px: Float) -> Str { return truncate_with_ellipsis_st(text, max_w, text_measure_style(size_px)) }
+/// truncate_with_ellipsis against a full measure style (carries letter_spacing / word_spacing).
+pub fn truncate_with_ellipsis_st(text: Str, max_w: Float, style: TextMeasureStyle) -> Str { return text_truncate_ellipsis(text, max_w, style) }
+/// clamp `text` to at most `max_lines` lines; if `ellipsis`, the last kept line is truncated with "...".
+pub fn apply_line_clamp(text: Str, max_lines: Int, max_w: Float, size_px: Float, ellipsis: Bool) -> Str { return apply_line_clamp_st(text, max_lines, max_w, text_measure_style(size_px), ellipsis) }
+/// apply_line_clamp against a full measure style (carries letter_spacing / word_spacing).
+pub fn apply_line_clamp_st(text: Str, max_lines: Int, max_w: Float, style: TextMeasureStyle, ellipsis: Bool) -> Str {
+    var ml = max_lines
+    if ml < 1 { ml = 1 }
+    let lines = wt_split_nl(text)
+    if lines.len() <= ml { return copy text }
+    var out = ""
+    var i = 0
+    while i < ml {
+        if i > 0 { out = out + "\n" }
+        if i == ml - 1 {
+            if ellipsis { out = out + truncate_with_ellipsis_st(lines[i], max_w, style) }
+            else { out = out + lines[i] }
+        } else { out = out + lines[i] }
+        i = i + 1
+    }
+    return out
+}
+// ---- text transform (CSS text-transform) ----
+pub fn tt_none() -> Int { return 0 }
+pub fn tt_uppercase() -> Int { return 1 }
+pub fn tt_lowercase() -> Int { return 2 }
+pub fn tt_capitalize() -> Int { return 3 }
+fn ascii_upper_byte(c: Int) -> Int { if c >= 97 && c <= 122 { return c - 32 }  return c }
+fn ascii_lower_byte(c: Int) -> Int { if c >= 65 && c <= 90 { return c + 32 }  return c }
+fn tt_is_ws(c: Int) -> Bool { return c == 32 || c == 9 || c == 13 || c == 10 }
+fn tt_is_alpha(c: Int) -> Bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) }
+/// apply a CSS-like text-transform (0 none / 1 uppercase / 2 lowercase / 3 capitalize) over ASCII.
+pub fn apply_text_transform(text: Str, transform: Int) -> Str {
+    if transform == 0 { return copy text }
+    var out = ""
+    var i = 0
+    let n = text.len()
+    var cap_next = true
+    while i < n {
+        let c = ord(text.at(i))
+        if transform == 1 { out = out + chr(ascii_upper_byte(c)) }
+        else if transform == 2 { out = out + chr(ascii_lower_byte(c)) }
+        else {
+            if cap_next && tt_is_alpha(c) { out = out + chr(ascii_upper_byte(c))  cap_next = false }
+            else { cap_next = tt_is_ws(c)  out = out + chr(c) }
+        }
+        i = i + 1
+    }
+    return out
+}
+/// resolved per-line height: size_px * max(line_height_mult, 0.25), floored at 1.
+pub fn text_line_height_px(size_px: Float, line_height_mult: Float) -> Float {
+    var m = line_height_mult
+    if m < 0.25 { m = 0.25 }
+    let h = size_px * m
+    if h < 1.0 { return 1.0 }
+    return h
+}
+
+/// the rendered text + its intrinsic box.
+pub struct TextLayout {
+    content: Str
+    width: Float
+    height: Float
+    lines: Int
+    // each line's width and direction ('L'/'R'), in content order (text_render_st fills them)
+    line_w: Vec<Float> = vec()
+    line_dir: Str = ""
+}
+/// resolve a text node's rendered content and box: apply transform, optionally wrap (when `wrap` or
+/// `line_clamp>0`), then clamp or single-line ellipsis, and measure. `max_width<=0` means "no cap"
+/// (use `available_w`).
+pub fn text_render_content_and_metrics(text: Str, available_w: Float, max_width: Float, size_px: Float, wrap: Bool, hard_break: Bool, line_clamp: Int, ellipsis: Bool, transform: Int, line_height_mult: Float, min_height: Float) -> TextLayout { return text_render_content_and_metrics_sp(text, available_w, max_width, size_px, wrap, hard_break, line_clamp, ellipsis, transform, line_height_mult, min_height, 0.0, 0.0) }
+/// text_render_content_and_metrics plus `letter_spacing` / `word_spacing` (px), which widen every
+/// line and therefore change where it wraps and where it is cut. They are the same values the painters space
+/// the glyphs by, so the box a document reserves is the box the glyphs land in.
+pub fn text_render_content_and_metrics_sp(text: Str, available_w: Float, max_width: Float, size_px: Float, wrap: Bool, hard_break: Bool, line_clamp: Int, ellipsis: Bool, transform: Int, line_height_mult: Float, min_height: Float, letter_spacing: Float, word_spacing: Float) -> TextLayout {
+    return text_render_st(text, available_w, max_width, wrap, hard_break, line_clamp, ellipsis, transform, line_height_mult, min_height, text_measure_style_sp(size_px, letter_spacing, word_spacing))
+}
+
+// ---- text decorations (underline / strikethrough / overline) ----
+pub fn td_none() -> Int { return 0 }
+pub fn td_underline() -> Int { return 1 }
+pub fn td_strikethrough() -> Int { return 2 }
+pub fn td_overline() -> Int { return 3 }
+/// build the decoration rects for `text` laid out at `rect` (one per non-empty line). `decoration`:
+/// 0 none / 1 underline / 2 strikethrough / 3 overline; `width_px` is the rule thickness (>= 0.5).
+pub fn push_text_decorations(rect: Rect, text: Str, size_px: Float, line_height_mult: Float, decoration: Int, color: Color, width_px: Float) -> Vec<PaintPrimitive> { return push_text_decorations_sp(rect, text, size_px, line_height_mult, decoration, color, width_px, 0.0, 0.0) }
+/// push_text_decorations measuring with letter/word spacing, so the rule spans the whole spaced-out
+/// line instead of stopping where the unspaced one would have ended.
+pub fn push_text_decorations_sp(rect: Rect, text: Str, size_px: Float, line_height_mult: Float, decoration: Int, color: Color, width_px: Float, letter_spacing: Float, word_spacing: Float) -> Vec<PaintPrimitive> {
+    var out: Vec<PaintPrimitive> = vec()
+    if decoration == 0 { return out }
+    if color.a <= 0 { return out }                       // fully transparent: emit nothing
+    let lh = text_line_height_px(size_px, line_height_mult)
+    var thickness = width_px
+    if thickness < 0.5 { thickness = 0.5 }
+    let style = text_measure_style_sp(size_px, letter_spacing, word_spacing)
+    let lines = wt_split_nl(text)
+    var i = 0
+    while i < lines.len() {
+        let line = lines[i]
+        if line.len() > 0 {
+            var line_w = text_measure_width(line, style)
+            if line_w > rect.width() { line_w = rect.width() }
+            if line_w < 1.0 { line_w = 1.0 }
+            let line_y = rect.min.y + to_float(i) * lh
+            var y = line_y + size_px * 0.88
+            if decoration == 2 { y = line_y + size_px * 0.55 }
+            else if decoration == 3 { y = line_y + size_px * 0.15 }
+            out.push(pp_rect(rect_min_size(vec2(rect.min.x, y), vec2(line_w, thickness)), color, 0.0))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// push_text_decorations for lines already measured: line `i` of `text` is `widths[i]` wide and starts
+/// `offs[i]` right of the box (offs empty = every line at the box's left), so the rule sits under the
+/// line where it was placed, at the right for a right-aligned line of Arabic.
+pub fn push_text_decorations_lines(rect: Rect, text: Str, widths: Vec<Float>, offs: Vec<Float>, size_px: Float, line_height_mult: Float, decoration: Int, color: Color, width_px: Float) -> Vec<PaintPrimitive> {
+    var out: Vec<PaintPrimitive> = vec()
+    if decoration == 0 { return out }
+    if color.a <= 0 { return out }
+    let lh = text_line_height_px(size_px, line_height_mult)
+    var thickness = width_px
+    if thickness < 0.5 { thickness = 0.5 }
+    let lines = wt_split_nl(text)
+    var i = 0
+    while i < lines.len() {
+        if lines[i].len() > 0 && i < widths.len() {
+            var line_w = widths[i]
+            if line_w > rect.width() { line_w = rect.width() }
+            if line_w < 1.0 { line_w = 1.0 }
+            var x = rect.min.x
+            if i < offs.len() { x = x + offs[i] }
+            let line_y = rect.min.y + to_float(i) * lh
+            var y = line_y + size_px * 0.88
+            if decoration == 2 { y = line_y + size_px * 0.55 }
+            else if decoration == 3 { y = line_y + size_px * 0.15 }
+            out.push(pp_rect(rect_min_size(vec2(x, y), vec2(line_w, thickness)), color, 0.0))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// stamp a text primitive with how its lines are drawn: the font stack, the language, each line's
+/// direction and x offset (see PaintPrimitive).
+pub fn pp_text_set_lines(inout pr: PaintPrimitive, stack: Int, lang: Str, line_dir: Str, line_x: Vec<Float>) {
+    pr.font = stack
+    pr.lang = copy lang
+    pr.line_dir = copy line_dir
+    pr.line_x = floats_dup(line_x)
+}
+
+/// scale a colour's alpha by `scale` (clamped to 0..1).
+pub fn color_scale_alpha(copy c: Color, scale: Float) -> Color {
+    var sc = scale
+    if sc < 0.0 { sc = 0.0 }
+    if sc > 1.0 { sc = 1.0 }
+    var a = to_int(to_float(c.a) * sc)
+    if a < 0 { a = 0 }
+    if a > 255 { a = 255 }
+    return color_rgba(c.r, c.g, c.b, a)
+}
+/// how many stacked, fading copies a text shadow of `blur` over `rect` uses, at most 12.
+pub fn text_shadow_steps(rect: Rect, blur: Float) -> Int {
+    let area = math::fmax(rect.width(), 1.0) * math::fmax(rect.height(), 1.0)
+    var area_scale = sqrt(area) / 128.0
+    if area_scale < 0.5 { area_scale = 0.5 }
+    if area_scale > 1.5 { area_scale = 1.5 }
+    var base = to_int(math::ceil(blur / 2.5))
+    if base < 4 { base = 4 }
+    if base > 12 { base = 12 }
+    var steps = to_int(math::round(to_float(base) * area_scale))
+    if steps < 4 { steps = 4 }
+    if steps > 12 { steps = 12 }
+    return steps
+}
+/// build a text drop shadow as stacked, offset, fading copies of the glyph run, which needs no blur
+/// capability in either painter because every copy is an ordinary text primitive. `rect` is the
+/// laid-out text box. A text shadow has no `spread`; only a rect shadow does.
+pub fn push_text_shadow(rect: Rect, text: Str, size_px: Float, copy scolor: Color, blur: Float, offset_x: Float, offset_y: Float, font_bold: Bool, font_italic: Bool) -> Vec<PaintPrimitive> { return push_text_shadow_sp(rect, text, size_px, scolor, blur, offset_x, offset_y, font_bold, font_italic, 0.0, 0.0) }
+/// push_text_shadow with the node's letter/word spacing stamped on every copy. The shadow is the
+/// glyph run drawn again, so it has to be spaced identically or it slides out from under the text.
+pub fn push_text_shadow_sp(rect: Rect, text: Str, size_px: Float, copy scolor: Color, blur: Float, offset_x: Float, offset_y: Float, font_bold: Bool, font_italic: Bool, letter_spacing: Float, word_spacing: Float) -> Vec<PaintPrimitive> {
+    var out: Vec<PaintPrimitive> = vec()
+    if scolor.a <= 0 { return out }
+    let steps = text_shadow_steps(rect, blur)
+    var i = steps - 1
+    while i >= 0 {
+        let t = to_float(i + 1) / to_float(steps)
+        let off = blur * t * 0.22
+        let col = color_scale_alpha(scolor, math::pow(1.0 - t, 1.35) * 0.55 / to_float(steps) * 4.0)
+        if col.a > 0 {
+            var pr = pp_text(vec2(rect.min.x + offset_x + off, rect.min.y + offset_y + off), text, col, size_px)
+            pr.font_bold = font_bold
+            pr.font_italic = font_italic
+            pr.letter_spacing = letter_spacing
+            pr.word_spacing = word_spacing
+            out.push(pr)
+        }
+        i = i - 1
+    }
+    return out
+}
+/// the outline width actually drawn with: clamped to 0.5..16. Shared by
+/// the plain-text node path and the per-span path, which apply the same clamp to the same field.
+pub fn text_outline_width_clamped(w: Float) -> Float {
+    if w < 0.5 { return 0.5 }
+    if w > 16.0 { return 16.0 }
+    return w
+}
+/// stamp a text node's outline / gradient effect data onto a text primitive.
+/// The outline width is clamped to 0.5..16 and is
+/// 0 when there is no outline colour, and a gradient's from colour replaces the prim colour.
+pub fn pp_text_apply_fx(inout pr: PaintPrimitive, node: UiNode, bounds: Rect) {
+    pr.letter_spacing = node_letter_spacing(node)
+    pr.word_spacing = node_word_spacing(node)
+    if node.has_text_outline {
+        pr.outline_color = rgba_color(node.text_outline_color)
+        pr.outline_w = text_outline_width_clamped(node.text_outline_width_px)
+    }
+    if node.has_text_gradient_from && node.has_text_gradient_to {
+        pr.color = rgba_color(node.text_gradient_from)
+        pr.has_grad = true
+        pr.grad_to = rgba_color(node.text_gradient_to)
+        pr.grad_horizontal = node.text_gradient_horizontal
+        if node.text_gradient_horizontal { pr.grad_a = bounds.min.x  pr.grad_b = math::fmax(bounds.width(), 1.0) }
+        else { pr.grad_a = bounds.min.y  pr.grad_b = math::fmax(bounds.height(), 1.0) }
+    }
+}
+
+/// format `value` with up to `precision` decimals (default 3, capped at 6), trimming trailing zeros
+/// and a bare ".", then append `suffix` (what `number` and `drag_value` show).
+pub fn number_value_text(value: Float, precision: Int, suffix: Str) -> Str {
+    var decimals = precision
+    if decimals < 0 { decimals = 3 }
+    if decimals > 6 { decimals = 6 }
+    var neg = value < 0.0
+    var v = value
+    if neg { v = 0.0 - v }
+    var scale = 1.0
+    var k = 0
+    while k < decimals { scale = scale * 10.0  k = k + 1 }
+    let scaled = math::round(v * scale)
+    let ip_f = math::floor(scaled / scale + 0.0000001)
+    var out = to_str(to_int(ip_f))
+    if decimals > 0 {
+        var fs = to_str(to_int(scaled - ip_f * scale))
+        while fs.len() < decimals { fs = "0" + fs }
+        var end = fs.len()
+        while end > 0 && fs.at(end - 1) == '0' { end = end - 1 }
+        if end > 0 { out = out + ("." + fs.slice(0, end)) }
+    }
+    if neg && to_int(scaled) != 0 { out = "-" + out }
+    return out + suffix
+}
+
+/// the wrapped lines of `text`, as a vector.
+///
+/// `wrap_text` answers with one string and newlines in it, which is what a text node wants and the
+/// wrong shape for a panel that has to page through the result: a transcript that scrolls needs to
+/// take a window out of the middle of the lines, and drawing a scrollbar needs to know how many
+/// there are. Splitting the joined string back apart would be the first thing every such caller
+/// wrote, and a caller wrapping by character count gets a proportional font wrong.
+pub fn wrap_text_lines(text: Str, max_w: Float, size_px: Float, hard_break: Bool) -> Vec<Str> {
+    return wrap_text_lines_st(text, max_w, text_measure_style(size_px), hard_break)
+}
+
+/// wrap_text_lines against a full measure style; see `wrap_text_st`.
+pub fn wrap_text_lines_st(text: Str, max_w: Float, style: TextMeasureStyle, hard_break: Bool) -> Vec<Str> {
+    return wt_split_nl(wrap_text_st(text, max_w, style, hard_break))
+}
+
+/// the number of lines `wrap_text` would produce (= wrapped newline count + 1).
+pub fn wrap_line_count(text: Str, max_w: Float, size_px: Float, hard_break: Bool) -> Int {
+    let w = wrap_text(text, max_w, size_px, hard_break)
+    var n = 1
+    var i = 0
+    while i < w.len() { if ord(w.at(i)) == 10 { n = n + 1 }  i = i + 1 }
+    return n
+}
+
+/// intrinsic (natural) size of `node` within `ctx` (recursive).
+pub fn ui_measure(node: UiNode, ctx: LayoutLengthContext) -> Vec2 {
+    if node.hidden { return vec2_zero() }            // hidden nodes take no space
+    var k = node.kind
+    if k == nk_text() {
+        // intrinsic: wrap only when a max_width is set (else unbounded single line)
+        var avail = 100000.0
+        if node.has_max_width { avail = node.max_width_px }
+        if node.spans.len() > 0 {
+            var rl = layout_rich_node(node, avail)
+            return vec2(rl.width, math::fmax(rl.height, node.min_height))
+        }
+        var tl = ui_text_layout(node, avail)
+        return vec2(tl.width, math::fmax(tl.height, node.min_height))
+    }
+    if k == nk_button() {
+        var bw = node_label_width(node) + 24.0
+        var bh = ui_length_resolve(node.h, ctx, 1)
+        if bh <= 0.0 { bh = 32.0 }
+        return vec2(bw, bh)
+    }
+    if k == nk_spacer() {
+        // an unset spacer extent is 8px, not 0 (and the resolved extent is floored at 1)
+        var sw = ui_length_resolve(node.w, ctx, 0)
+        var sh = ui_length_resolve(node.h, ctx, 1)
+        if node.w.unit == 0 && node.w.value == 0.0 { sw = 8.0 }
+        if node.h.unit == 0 && node.h.value == 0.0 { sh = 8.0 }
+        return vec2(sw, sh)
+    }
+    if k == nk_rect() || k == nk_surface() {
+        return vec2(ui_length_resolve(node.w, ctx, 0), ui_length_resolve(node.h, ctx, 1))
+    }
+    if k == nk_scroll_column() || k == nk_scroll_row() {
+        // a scroll container's intrinsic size is its fixed viewport, not its content (that is the point):
+        var vh = node.min_height
+        if k == nk_scroll_row() { vh = node.min_width }   // scroll_row's fixed extent is min_width
+        if vh <= 0.0 { vh = 120.0 }
+        if k == nk_scroll_column() { vh = vh + node_pad_y(node) * 2.0 } else { vh = vh + node_pad_x(node) * 2.0 }
+        var cw = 0.0
+        var mi = 0
+        while mi < node.children.len() {
+            var ms = ui_measure(node.children[mi], ctx)
+            if k == nk_scroll_column() { cw = math::fmax(cw, ms.x) } else { cw = math::fmax(cw, ms.y) }
+            mi = mi + 1
+        }
+        if k == nk_scroll_column() { cw = cw + node_pad_x(node) * 2.0 } else { cw = cw + node_pad_y(node) * 2.0 }
+        if k == nk_scroll_column() { return vec2(cw, vh) }
+        return vec2(vh, cw)   // row: fixed width viewport, measured height
+    }
+    // The widget / input / media kinds measure in their own family file. This must stay above the
+    // container fallthrough below: an unhandled kind falls into container measure and silently
+    // returns a padding-only size, which is the easiest bug in this file to introduce.
+    if ui_kind_is_ext(k) { return ui_measure_ext(node, ctx) }
+    // container: measure children
+    var is_row = k == nk_row()
+    var inner_w = 0.0
+    var inner_h = 0.0
+    var n = node.children.len()
+    var i = 0
+    var count = 0
+    while i < n {
+        var cs = ui_measure(node.children[i], ctx)
+        if is_row {
+            inner_w = inner_w + cs.x
+            inner_h = math::fmax(inner_h, cs.y)
+        } else {
+            inner_h = inner_h + cs.y
+            inner_w = math::fmax(inner_w, cs.x)
+        }
+        count = count + 1
+        i = i + 1
+    }
+    var gaps = 0.0
+    if count > 1 { gaps = node.gap * to_float(count - 1) }
+    var total_w = inner_w + node_pad_x(node) * 2.0
+    var total_h = inner_h + node_pad_y(node) * 2.0
+    if is_row { total_w = total_w + gaps } else { total_h = total_h + gaps }
+    total_h = math::fmax(total_h, node.min_height)
+    return container_fixed_size(node, ctx, vec2(total_w, total_h))
+}
+
+/// A container's `w` / `h` (from its style: `.pool { h: 30 }`), where it has them, in place of what its
+/// children measure: a box of a given size, its children placed in it as its alignment says. Unset (a
+/// zero length in px) leaves the measured size.
+pub fn container_fixed_size(node: UiNode, ctx: LayoutLengthContext, measured: Vec2) -> Vec2 {
+    var w = measured.x
+    var h = measured.y
+    if !(node.w.unit == 0 && node.w.value == 0.0) { w = ui_length_resolve(node.w, ctx, 0) }
+    if !(node.h.unit == 0 && node.h.value == 0.0) { h = ui_length_resolve(node.h, ctx, 1) }
+    return vec2(w, h)
+}
+
+/// emit the background fill and border of a container/leaf `node` covering `rect` (internal).
+pub fn ui_emit_chrome(node: UiNode, rect: Rect, inout out: ComputedOverlay) {
+    // a box's shadow, under everything it draws (a text's shadow is behind its glyphs instead)
+    if node.has_text_shadow && !(node.kind == nk_text()) && rgba_color(node.text_shadow_color).a > 0 {
+        out.prims.push(pp_box_shadow(rect, rgba_color(node.text_shadow_color), node.radius, node.shadow_blur, node.shadow_spread, node.shadow_offset_x, node.shadow_offset_y))
+    }
+    var hovered = overlay_hovered(out, rect)
+    var bgc = rgba_color(node.bg)
+    var has_bgc = node.has_bg
+    if hovered {
+        if out.in_mouse_down {
+            // the active state replaces hover styling: no active_bg -> the base bg, not hover
+            if node.has_active_bg { bgc = rgba_color(node.active_bg)  has_bgc = true }
+        } else if node.has_hover_bg { bgc = rgba_color(node.hover_bg)  has_bgc = true }
+    }
+    if has_bgc {
+        var bp = pp_rect(rect, bgc, node.radius)
+        // a gradient background (`bg_to`): the painters' two-colour ramp across the node, not
+        // under a hover colour, which replaces it
+        if node.has_bg_to && !(hovered && (node.has_hover_bg || (out.in_mouse_down && node.has_active_bg))) {
+            bp.has_grad = true
+            bp.grad_to = rgba_color(node.bg_to)
+            bp.grad_horizontal = !node.bg_vertical
+            if node.bg_vertical { bp.grad_a = rect.min.y  bp.grad_b = rect.height() } else { bp.grad_a = rect.min.x  bp.grad_b = rect.width() }
+        }
+        out.prims.push(sink bp)
+    }
+    if node.kind == nk_rect() && node.has_color { out.prims.push(pp_rect(rect, rgba_color(node.color), node.radius)) }
+    var bc = rgba_color(node.border_color)
+    var has_bc = node.has_border
+    if hovered && !out.in_mouse_down && node.has_hover_border_color { bc = rgba_color(node.hover_border_color)  has_bc = true }   // active replaces hover
+    // the border follows the corners the background has (a square stroke around a rounded fill
+    // showed its corners outside the fill)
+    if has_bc && node.border_w > 0.0 {
+        if node.radius > 0.0 { out.prims.push(pp_border_round(rect, bc, node.border_w, node.radius)) } else { out.prims.push(pp_border(rect, bc, node.border_w)) }
+    }
+}
+
+// ---- scroll containers (core subset) ----
+/// total flowed height of `children` stacked vertically at natural size (Spacers skipped).
+pub fn measure_flow_column_h(children: Vec<UiNode>, ctx: LayoutLengthContext, gap: Float) -> Float {
+    var total = 0.0
+    var count = 0
+    var i = 0
+    while i < children.len() {
+        if children[i].kind == nk_spacer() || children[i].hidden { } else { total = total + ui_measure(children[i], ctx).y  count = count + 1 }
+        i = i + 1
+    }
+    if count > 1 { total = total + gap * to_float(count - 1) }
+    return total
+}
+/// total flowed width of `children` laid horizontally at natural size (Spacers skipped).
+pub fn measure_flow_row_w(children: Vec<UiNode>, ctx: LayoutLengthContext, gap: Float) -> Float {
+    var total = 0.0
+    var count = 0
+    var i = 0
+    while i < children.len() {
+        if children[i].kind == nk_spacer() || children[i].hidden { } else { total = total + ui_measure(children[i], ctx).x  count = count + 1 }
+        i = i + 1
+    }
+    if count > 1 { total = total + gap * to_float(count - 1) }
+    return total
+}
+/// merge a scrolled child overlay into `out`, clipped to `viewport`: rect/border prims are intersected
+/// (dropped when fully outside), text prims keep their position but carry the clip rect for the host to
+/// scissor (dropped when their anchor is outside), hits/surfaces outside the viewport are dropped.
+/// Is everything under `node` something merge_clipped_overlay will clip to the viewport?
+///
+/// Primitives, hit regions and surfaces are all clipped there, so a child the viewport cannot show
+/// contributes nothing to what is drawn or clicked. Two channels are carried through uncut, on
+/// purpose: a nested scroll region, because the host needs every id to clamp offsets against, and
+/// the popup layer, because a dropdown opens past its pane's edge. A subtree holding either has to
+/// be laid out wherever it sits.
+///
+/// The test is a whitelist of the plain flow kinds. A kind added later is "not clippable" until
+/// someone says otherwise, so a new widget can cost a frame some time, never a missing popup.
+fn scroll_content_is_clippable(node: UiNode) -> Bool {
+    let k = node.kind
+    if k == nk_scroll_column() || k == nk_scroll_row() { return false }
+    if k > nk_image() { return false }                       // a widget or an input: may open a popup
+    if node.overflow_x >= 2 || node.overflow_y >= 2 { return false }   // an overflow container is a scroll region
+    if node.position == 1 { return false }                   // absolute: it does not sit in this band
+    var i = 0
+    while i < node.children.len() {
+        if !scroll_content_is_clippable(node.children[i]) { return false }
+        i = i + 1
+    }
+    return true
+}
+/// ...and the same question for a whole child list, asked once per scroll container per layout.
+fn scroll_children_clippable(children: Vec<UiNode>) -> Bool {
+    var i = 0
+    while i < children.len() {
+        if !scroll_content_is_clippable(children[i]) { return false }
+        i = i + 1
+    }
+    return true
+}
+pub fn merge_clipped_overlay(inout out: ComputedOverlay, sink child: ComputedOverlay, viewport: Rect) {
+    var i = 0
+    while i < child.prims.len() {
+        var prim = sink child.prims[i]
+        // A clip already on a primitive is narrowed, never replaced.
+        //
+        // Assigning `viewport` outright would silently widen any clip a child had already
+        // set. A code editor clips its rows to the text area (it paints a few beyond the viewport
+        // on purpose, so that scrolling has something to reveal) and merging that into a panel
+        // would hand those rows the whole panel to draw in. They would appear over the toolbar and the tab
+        // strip above them, and only while scrolled, which is when nobody suspects the
+        // clipping.
+        //
+        // An empty intersection means the two clips share nothing, so the primitive is not drawn.
+        var keep = true
+        var cl = rect_dup(viewport)
+        if prim.has_clip {
+            if let Option::Some(both) = prim.clip.intersect(viewport) { cl = sink both } else { keep = false }
+        }
+        if keep {
+            if prim.kind == 2 {
+                // A run of text is not its origin.
+                //
+                // Dropping any run whose starting point has left the viewport would drop every
+                // run on the line as soon as you scroll sideways, though most of each one is still
+                // on screen. Text grows rightward from its origin, so a run that begins to the left
+                // of the view can still fill it.
+                //
+                // A comment is one long run, so it would vanish whole; code is a
+                // run per token, so it would go in pieces; a file with no syntax spans is one run per
+                // line, so the line would go dark all at once. The vertical direction never shows it
+                // because a row's origin leaves the viewport at the same moment the row does.
+                //
+                // Kept and clipped instead, on a bounding box: it starts left of the right edge, and
+                // its line overlaps the clip vertically. The renderer scissors the rest.
+                let ty0 = prim.pos.y - prim.size_px
+                let ty1 = prim.pos.y + prim.size_px + prim.size_px
+                if prim.pos.x <= cl.max.x && ty1 >= cl.min.y && ty0 <= cl.max.y {
+                    prim.has_clip = true
+                    prim.clip = sink cl
+                    out.prims.push(sink prim)
+                }
+            } else if prim.kind == 4 {
+                // a box shadow keeps its shape (cutting the box would move its edges): clipped instead
+                if pp_bounds(prim).overlaps(cl) {
+                    prim.has_clip = true
+                    prim.clip = sink cl
+                    out.prims.push(sink prim)
+                }
+            } else {
+                if let Option::Some(clipped) = prim.rect.intersect(cl) {
+                    prim.rect = clipped
+                    prim.has_clip = true
+                    prim.clip = sink cl
+                    out.prims.push(sink prim)
+                }
+            }
+        }
+        i = i + 1
+    }
+    var h = 0
+    while h < child.hits.len() {
+        if child.hits[h].rect.overlaps(viewport) { out.hits.push(sink child.hits[h]) }
+        h = h + 1
+    }
+    var sf = 0
+    while sf < child.surfaces.len() {
+        if let Option::Some(sr) = child.surfaces[sf].rect.intersect(viewport) {
+            out.surfaces.push(SurfaceRegion { id: sink child.surfaces[sf].id, rect: sr })
+        }
+        sf = sf + 1
+    }
+    var sc = 0
+    while sc < child.scrolls.len() { out.scrolls.push(sink child.scrolls[sc])  sc = sc + 1 }
+    // The popup layer is not clipped. This is the point of it: a dropdown three levels deep
+    // inside a scroll viewport must be able to drop its option list past the viewport's edge.
+    var pp = 0
+    while pp < child.pop_prims.len() { out.pop_prims.push(sink child.pop_prims[pp])  pp = pp + 1 }
+    var ph = 0
+    while ph < child.pop_hits.len() { out.pop_hits.push(sink child.pop_hits[ph])  ph = ph + 1 }
+}
+
+/// append the popup layer to `prims`/`hits` and empty it. Called once, by the top-level entry
+/// points, after the whole tree has been laid out, so popup content is the last thing painted and
+/// the last thing in `hits`.
+pub fn overlay_flush_popups(inout out: ComputedOverlay) {
+    var i = 0
+    while i < out.pop_prims.len() { out.prims.push(sink out.pop_prims[i])  i = i + 1 }
+    var h = 0
+    while h < out.pop_hits.len() { out.hits.push(sink out.pop_hits[h])  h = h + 1 }
+    var eprims: Vec<PaintPrimitive> = vec()
+    var ehits: Vec<HitRegion> = vec()
+    out.pop_prims = eprims
+    out.pop_hits = ehits
+}
+
+/// lay `node` into `rect`, emitting paint primitives, hit regions, and surface regions (recursive).
+/// place an absolutely-positioned node inside `inner` at its natural size using top/right/bottom/left
+/// (missing side -> the min edge).
+pub fn resolve_absolute_rect(inner: Rect, size: Vec2, node: UiNode) -> Rect {
+    var w = math::fmax(size.x, 0.0)
+    var h = math::fmax(size.y, 0.0)
+    var x = inner.min.x
+    if node.has_left { x = inner.min.x + node.left }
+    else if node.has_right { x = inner.max.x - w - node.right }
+    var y = inner.min.y
+    if node.has_top { y = inner.min.y + node.top }
+    else if node.has_bottom { y = inner.max.y - h - node.bottom }
+    return rect_min_size(vec2(x, y), vec2(w, h))
+}
+/// true if any direct child is positioned out of flow (absolute/overlay).
+pub fn has_absolute_child(node: UiNode) -> Bool {
+    var i = 0
+    while i < node.children.len() { if node.children[i].position == 1 { return true }  i = i + 1 }
+    return false
+}
+/// order out-of-flow siblings by ascending `z_index`, stably: equal `z_index` keeps document order,
+/// so a document with no `z_index` at all lays out in document order.
+/// Insertion sort with a `>` (never `>=`) comparison is the stability guarantee: swapping equals
+/// would make paint order depend on the sort's internals, which is the non-determinism a
+/// layout pass must not have. n is the number of absolute children of one container, so O(n^2) is
+/// the cheap choice as well as the simple one.
+pub fn z_sort_absolute(kids: Vec<UiNode>) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    var i = 0
+    while i < kids.len() {
+        out.push(i)
+        var j = out.len() - 1
+        while j > 0 && kids[out[j - 1]].z_index > kids[i].z_index {
+            out[j] = out[j - 1]
+            out[j - 1] = i
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return out
+}
+pub fn ui_layout_node(inout node: UiNode, rect: Rect, ctx: LayoutLengthContext, inout out: ComputedOverlay) {
+    if node.hidden { return }                        // runtime_state / bind_visible: removed from layout
+    if node_has_fx(node) {
+        // opacity / translate / scale cover the whole subtree's output (layout/fx.nori), so the
+        // subtree is laid into a scratch overlay of its own and transformed there. The pointer goes
+        // in through the inverse transform, so hover styling inside it tests what is drawn. The
+        // effects are cleared for the recursive call and restored; UiNode is a reference struct,
+        // the same reason the overflow branch below restores what it clears.
+        let fxx = node_fx_xf(node, rect)
+        let fop = fx_opacity(node.opacity)
+        var fxs = overlay_child(out)
+        fxs.in_mouse = xf_unpoint(fxx, out.in_mouse)
+        let s_op = node.opacity
+        let s_tx = node.translate_x
+        let s_ty = node.translate_y
+        let s_sx = node.scale_x
+        let s_sy = node.scale_y
+        node.opacity = 1.0  node.translate_x = 0.0  node.translate_y = 0.0  node.scale_x = 1.0  node.scale_y = 1.0
+        ui_layout_node(node, rect, ctx, fxs)
+        node.opacity = s_op  node.translate_x = s_tx  node.translate_y = s_ty  node.scale_x = s_sx  node.scale_y = s_sy
+        overlay_apply_fx(fxs, fxx, fop)
+        overlay_append(out, sink fxs)
+        return
+    }
+    ui_layout_node_body(node, rect, ctx, out)
+}
+/// ui_layout_node past the hidden check and the paint effects: what the node draws itself, and its
+/// children. A retained document calls this for a leaf, because it applies the effects itself
+/// (layout/retained.nori composes them with its ancestors' and its scroll offsets).
+pub fn ui_layout_node_body(inout node: UiNode, rect: Rect, ctx: LayoutLengthContext, inout out: ComputedOverlay) {
+    if has_absolute_child(node) {
+        // absolute/overlay children leave the flow. The children are taken out of the node and
+        // split into the in-flow list and the absolute list; the node is laid out holding only the
+        // in-flow children, then every absolute child is placed against the padded bounds at its
+        // natural size, and the two lists are put back in document order. Absolute children paint
+        // after the flow (on top), in ascending `z_index`, ties keeping document order
+        // (z_sort_absolute). This is not the popup layer: pop_prims/pop_hits are appended after the
+        // whole tree and are clipped by nothing, so they always win; z_index only orders within the
+        // normal layer.
+        var allkids = sink node.children
+        var flow: Vec<UiNode> = vec()
+        var absk: Vec<UiNode> = vec()
+        var abs_at: Vec<Int> = vec()                  // document index of each absolute child
+        let nkids = allkids.len()
+        var pi = 0
+        while pi < nkids {
+            if allkids[pi].position == 1 { absk.push(sink allkids[pi])  abs_at.push(pi) } else { flow.push(sink allkids[pi]) }
+            pi = pi + 1
+        }
+        var order = z_sort_absolute(absk)
+        node.children = sink flow
+        ui_layout_node(node, rect, ctx, out)
+        var inner = rect_min_max(vec2(rect.min.x + node_pad_x(node), rect.min.y + node_pad_y(node)), vec2(rect.max.x - node_pad_x(node), rect.max.y - node_pad_y(node)))
+        var ai = 0
+        while ai < order.len() {
+            var an = inout absk[order[ai]]
+            var arect = resolve_absolute_rect(inner, ui_measure(an, ctx), an)
+            var oldpos = an.position
+            an.position = 0                          // clear so the recursive call flows normally; restore after
+            ui_layout_node(an, arect, ctx, out)
+            an.position = oldpos
+            ai = ai + 1
+        }
+        var laid = sink node.children
+        var back: Vec<UiNode> = vec()
+        var fi = 0
+        var bi = 0
+        var qi = 0
+        while qi < nkids {
+            if bi < abs_at.len() && abs_at[bi] == qi { back.push(sink absk[bi])  bi = bi + 1 } else { back.push(sink laid[fi])  fi = fi + 1 }
+            qi = qi + 1
+        }
+        node.children = sink back
+        return
+    }
+    var k = node.kind
+    ui_emit_chrome(node, rect, out)
+    if node.on_click.len() > 0 && k != nk_button() && !node.disabled { out.hits.push(HitRegion { id: copy node.id, on_click: copy node.on_click, rect: rect_dup(rect) }) }
+
+    if k == nk_text() {
+        if node.spans.len() > 0 {
+            // rich text: one prim per styled segment, per line
+            var rmw = rect.width()
+            if node.has_max_width { rmw = math::fmin(rmw, node.max_width_px) }
+            var rl = layout_rich_node(node, rmw)
+            var basecol = color_white()
+            if node.has_color { basecol = rgba_color(node.color) }
+            var rh = math::fmax(rl.height, node.min_height)    // center on the min_height-clamped box
+            var y = rect.min.y + (rect.height() - rh) / 2.0
+            var li = 0
+            while li < rl.lines.len() {
+                var segs = rl.lines[li].segments
+                var si = 0
+                while si < segs.len() {
+                    var sg = segs[si]
+                    var scol = basecol
+                    if sg.has_color { scol = sg.color }
+                    var prim = pp_text(vec2(rect.min.x + sg.x, y), sg.text, scol, sg.size_px)
+                    prim.font_bold = sg.bold
+                    prim.font_italic = sg.italic
+                    prim.font = sg.stack                          // a bold or italic span's own face
+                    prim.letter_spacing = node_letter_spacing(node)
+                    prim.word_spacing = node_word_spacing(node)
+                    // a span's own outline replaces the node's for that segment; an unset one
+                    // falls back to the node's.
+                    if sg.has_outline { prim.outline_color = color_dup(sg.outline_color)  prim.outline_w = text_outline_width_clamped(sg.outline_width_px) }
+                    else if node.has_text_outline { prim.outline_color = rgba_color(node.text_outline_color)  prim.outline_w = text_outline_width_clamped(node.text_outline_width_px) }
+                    out.prims.push(prim)
+                    si = si + 1
+                }
+                y = y + rl.lines[li].height
+                li = li + 1
+            }
+            return
+        }
+        var tl = ui_text_layout(node, rect.width())
+        // default placement: at the paragraph's start (left, or right when its first line runs right
+        // to left), vertically centred. `pos` is the text box top-left (pp_text's contract); the
+        // painters add the font ascent to reach the baseline.
+        // An explicit `anchor` / `text_align` / `vertical_align` replaces both components (the
+        // anchor is one [x, y] pair); `text_align: start/end` follow the direction.
+        var pos = vec2(rect.min.x, rect.min.y + (rect.height() - tl.height) / 2.0)
+        if node.has_anchor {
+            pos = vec2(rect.min.x + (rect.width() - tl.width) * node.anchor_x, rect.min.y + (rect.height() - tl.height) * node.anchor_y)
+        }
+        let first_rtl = tl.line_dir.len() > 0 && ord(tl.line_dir.at(0)) == 82
+        var lalign = node.text_align
+        if lalign == ta_auto() && node.has_anchor { lalign = ta_physical() }
+        if lalign == ta_auto() || lalign == ta_start() || lalign == ta_end() {
+            var a = 0.0
+            if (lalign == ta_end()) != first_rtl { a = 1.0 }
+            pos = vec2(rect.min.x + (rect.width() - tl.width) * a, pos.y)
+        }
+        let line_x = text_line_offsets(tl.line_w, tl.line_dir, tl.width, lalign, node.anchor_x)
+        var col = color_white()
+        if node.has_color { col = rgba_color(node.color) }
+        if node.has_hover_text_color && overlay_hovered(out, rect) { col = rgba_color(node.hover_text_color) }
+        // the laid-out text box: where the gradient ramp, the shadow copies and the decoration
+        // rules are all measured from.
+        let tbox = rect_min_size(pos, vec2(math::fmax(tl.width, 1.0), tl.height))
+        let stack = node_font_stack(node)
+        // shadow first (behind the glyphs): push_styled_text calls push_text_shadow before the
+        // text primitive.
+        if node.has_text_shadow {
+            var shad = push_text_shadow_sp(tbox, tl.content, node.size_px, rgba_color(node.text_shadow_color), math::fmax(node.shadow_blur, 0.0), node.shadow_offset_x, node.shadow_offset_y, node.font_bold, node.font_italic, node_letter_spacing(node), node_word_spacing(node))
+            var shi = 0
+            while shi < shad.len() {
+                pp_text_set_lines(shad[shi], stack, node.lang, tl.line_dir, line_x)
+                out.prims.push(sink shad[shi])
+                shi = shi + 1
+            }
+        }
+        var tprim = pp_text(pos, tl.content, col, node.size_px)
+        tprim.font_bold = node.font_bold
+        tprim.font_italic = node.font_italic
+        pp_text_apply_fx(tprim, node, tbox)
+        pp_text_set_lines(tprim, stack, node.lang, tl.line_dir, line_x)
+        out.prims.push(tprim)
+        // decorations last, over the glyphs
+        if node.text_decoration != 0 {
+            var dcol = col
+            if node.has_text_decoration_color { dcol = rgba_color(node.text_decoration_color) }
+            let decs = push_text_decorations_lines(tbox, tl.content, tl.line_w, line_x, node.size_px, node.line_height_mult, node.text_decoration, dcol, node.text_decoration_width_px)
+            var di = 0
+            while di < decs.len() { out.prims.push(sink decs[di])  di = di + 1 }
+        }
+        return
+    }
+    if k == nk_button() {
+        var bg = color_rgb(60, 60, 70)
+        if node.has_bg { bg = rgba_color(node.bg) }
+        out.prims.push(pp_rect(rect, bg, node.radius))
+        var tcol = color_white()
+        if node.has_color { tcol = rgba_color(node.color) }
+        // the label, centred, shaped in its own direction (a button's label is one paragraph)
+        let bst = node_measure_style(node)
+        let brtl = text_para_dir(node.text, node.text_dir) == 1
+        var tx = rect.min.x + (rect.width() - node_label_width(node)) / 2.0
+        var ty = rect.min.y + (rect.height() - overlay_line_height(node.size_px)) / 2.0
+        var bprim = pp_text(vec2(tx, ty), node.text, tcol, node.size_px)
+        bprim.font_bold = node.font_bold                  // label_bold / label_italic
+        bprim.font_italic = node.font_italic
+        var bdir = "L"
+        if brtl { bdir = "R" }
+        let nox: Vec<Float> = vec()
+        pp_text_set_lines(bprim, bst.stack, node.lang, bdir, nox)
+        out.prims.push(bprim)
+        if !node.disabled { out.hits.push(HitRegion { id: copy node.id, on_click: copy node.on_click, rect: rect_dup(rect) }) }
+        return
+    }
+    if k == nk_surface() {
+        out.surfaces.push(SurfaceRegion { id: copy node.id, rect: rect_dup(rect) })
+        return
+    }
+    // CSS-like overflow on plain containers:
+    // overflow >= om_auto scrolls (routes into the scroll path with the container's axis);
+    // om_hidden clips children to the padded bounds without a scroll region.
+    var ovf = 0
+    if k == nk_column() { ovf = node.overflow_y }
+    if k == nk_row() { ovf = node.overflow_x }
+    if k == nk_scroll_column() || k == nk_scroll_row() || ovf >= 2 {
+        // layout_scroll_column_node / layout_scroll_row_node (core subset): chrome, then flow the
+        // children at natural size from an origin shifted by the host scroll offset, clipped to the
+        // padded viewport; report the region so the host can clamp offsets + draw scrollbars.
+        var rid = node.id
+        if rid.len() == 0 { rid = ("_scroll_" + to_str(out.scrolls.len())) }
+        var offs = overlay_scroll_off(out, rid)
+        var inner = rect_min_max(vec2(rect.min.x + node_pad_x(node), rect.min.y + node_pad_y(node)), vec2(rect.max.x - node_pad_x(node), rect.max.y - node_pad_y(node)))
+        var cctx = length_context_with_parent(ctx, inner.width(), inner.height())
+        var scratch = overlay_child(out)
+        if k == nk_scroll_column() || k == nk_column() {
+            // The bar gets a gutter of its own, the way `overflow-y: scroll` does. The host draws the
+            // scrollbar down the right edge of the viewport reported here; children flowed at the
+            // full width run underneath it, and the last dozen pixels of every row (which is where
+            // a settings panel keeps its `reset` and a list keeps its counts) are covered by it.
+            //
+            // Measured twice, and only when it overflows: whether there is a bar depends on the
+            // content height, and the content height depends on the width, which depends on whether
+            // there is a bar. Measure at the full width, and if that overflows, narrow and measure
+            // again: one extra pass for a container that is scrolling, none for one that is not.
+            var svp = rect_dup(inner)
+            var fctx = length_context_with_parent(ctx, svp.width(), svp.height())
+            var raw_h = measure_flow_column_h(node.children, fctx, node.gap)
+            if raw_h > inner.height() {
+                svp = rect_min_max(vec2(inner.min.x, inner.min.y), vec2(inner.max.x - scrollbar_track_width(), inner.max.y))
+                fctx = length_context_with_parent(ctx, svp.width(), svp.height())
+                raw_h = measure_flow_column_h(node.children, fctx, node.gap)
+            }
+            var content_h = math::fmax(raw_h, inner.height())
+            // ...and the viewport is the full one, gutter included, so the bar the host draws from it
+            // lands in the space just reserved rather than a track-width to the left of it.
+            out.scrolls.push(ScrollRegionMeta { id: copy rid, viewport: rect_dup(inner), content_extent: content_h, axis: 1 })
+            // A row the viewport cannot show is laid out and then discarded by the merge below, which
+            // would cost the whole document on every frame of a list that shows twenty of a thousand rows.
+            // Its extent is still needed to place the rows after it, so it is measured either way.
+            let cull = scroll_children_clippable(node.children)
+            var y = inner.min.y - offs
+            var ci = 0
+            while ci < node.children.len() {
+                var chn = node.children[ci]
+                if chn.kind == nk_spacer() || chn.hidden { } else {   // spacers/hidden contribute nothing in scroll flow (matches the measure)
+                    var chh = ui_measure(chn, fctx).y
+                    if cull && ((y + chh) < inner.min.y || y > inner.max.y) { } else {
+                        ui_layout_node(chn, rect_min_size(vec2(svp.min.x, y), vec2(svp.width(), chh)), fctx, scratch)
+                    }
+                    y = y + chh + node.gap
+                }
+                ci = ci + 1
+            }
+        } else {
+            var content_w = math::fmax(measure_flow_row_w(node.children, cctx, node.gap), inner.width())
+            out.scrolls.push(ScrollRegionMeta { id: copy rid, viewport: rect_dup(inner), content_extent: content_w, axis: 0 })
+            // ...and the same along the row axis: a column scrolled off the side is discarded too.
+            let cullx = scroll_children_clippable(node.children)
+            var x = inner.min.x - offs
+            var cj = 0
+            while cj < node.children.len() {
+                var chn = node.children[cj]
+                if chn.kind == nk_spacer() || chn.hidden { } else {
+                    var chw = ui_measure(chn, cctx).x
+                    if cullx && ((x + chw) < inner.min.x || x > inner.max.x) { } else {
+                        ui_layout_node(chn, rect_min_size(vec2(x, inner.min.y), vec2(chw, inner.height())), cctx, scratch)
+                    }
+                    x = x + chw + node.gap
+                }
+                cj = cj + 1
+            }
+        }
+        merge_clipped_overlay(out, sink scratch, inner)
+        return
+    }
+    if ovf == 1 {
+        // overflow: hidden: normal container layout, the children clipped to the padded bounds.
+        //
+        // The box itself (its background, border and click target) is not clipped, as in CSS:
+        // overflow clips what overflows the box, and it has already been emitted above. Laying the
+        // whole node out again into the scratch overlay would emit the background and the hit
+        // region twice, once unclipped and once clipped, which a translucent
+        // background would show as a darker inner panel and a hit test would answer twice.
+        var hinner = rect_min_max(vec2(rect.min.x + node_pad_x(node), rect.min.y + node_pad_y(node)), vec2(rect.max.x - node_pad_x(node), rect.max.y - node_pad_y(node)))
+        var hscratch = overlay_child(out)
+        ui_layout_flex_children(node, rect, ctx, hscratch)
+        merge_clipped_overlay(out, sink hscratch, hinner)
+        return
+    }
+    if k == nk_rect() || k == nk_spacer() { return }
+    // ...and the widget / input / media leaves, each painted by its own family file. Like every other
+    // leaf this must return before the container flex below, or the node is treated as a container
+    // and recursed into.
+    if ui_kind_is_ext(k) { ui_layout_ext(node, rect, ctx, out)  return }
+
+    ui_layout_flex_children(node, rect, ctx, out)
+}
+
+/// a row / column's children: measured against the padded box, placed by the flex pass, laid out.
+pub fn ui_layout_flex_children(inout node: UiNode, rect: Rect, ctx: LayoutLengthContext, inout out: ComputedOverlay) {
+    var inner = container_inner(node, rect)
+    var cctx = length_context_with_parent(ctx, inner.width(), inner.height())
+    var items: Vec<Float> = vec()
+    var i = 0
+    while i < node.children.len() { let cs = ui_measure(node.children[i], cctx)  flex_item_push(items, node.children[i], cs.x, cs.y)  i = i + 1 }
+    let crects = container_flex_rects(node, inner, items)
+    var m = 0
+    while m < node.children.len() {
+        ui_layout_node(node.children[m], flex_rect_at(crects, m), cctx, out)
+        m = m + 1
+    }
+}
+
+/// one child as the flex pass sees it: its measured size and the flex properties it carries,
+/// pushed as FLEX_STRIDE floats onto `items`: w, h, fill_w, fill_h (0/1), weight, shrink,
+/// has_align_self (0/1), align_self.
+///
+/// The pass itself (`container_flex_rects`) takes these rather than the children, so the
+/// immediate layout above and a retained document, whose children are not a `Vec<UiNode>` and
+/// whose sizes come from a cache, run the same arithmetic and cannot drift apart. Flat floats and
+/// not a record per child because this runs for every child of every container on every frame of
+/// the immediate path, where a record each is a measurable share of the layout.
+pub fn flex_stride() -> Int { return 8 }
+pub fn flex_item_push(inout items: Vec<Float>, child: UiNode, w: Float, h: Float) {
+    items.push(w)
+    items.push(h)
+    if child.fill_w { items.push(1.0) } else { items.push(0.0) }
+    if child.fill_h { items.push(1.0) } else { items.push(0.0) }
+    if child.has_flex_weight { items.push(child.flex_weight) } else { items.push(1.0) }
+    if child.has_flex_shrink { items.push(child.flex_shrink) } else { items.push(1.0) }
+    if child.has_align_self { items.push(1.0) } else { items.push(0.0) }
+    items.push(to_float(child.align_self))
+}
+/// the padded box a row / column flows its children into.
+pub fn container_inner(node: UiNode, rect: Rect) -> Rect { return rect.inset(node_pad_x(node), node_pad_x(node), node_pad_y(node), node_pad_y(node)) }
+/// the flex pass of a row / column: the rect of each child inside `inner`, in child order.
+/// Reads the container's kind, gap and alignment; everything about the children is in `items`.
+pub fn container_flex_rects(node: UiNode, inner: Rect, items: Vec<Float>) -> Vec<Float> {
+    var is_row = node.kind == nk_row()
+    var inner_main = inner.width()
+    var inner_cross = inner.height()
+    if !is_row { inner_main = inner.height()  inner_cross = inner.width() }
+    let st = flex_stride()
+    var n = items.len() / st
+    // main sizes + flex slots
+    var sizes: Vec<Float> = vec()
+    var cross_sizes: Vec<Float> = vec()
+    var slots: Vec<FlexGrowSlot> = vec()
+    var fixed_sum = 0.0
+    var i = 0
+    while i < n {
+        let b = i * st
+        var main_sz = items[b]
+        var cross_sz = items[b + 1]
+        if !is_row { main_sz = items[b + 1]  cross_sz = items[b] }
+        var grows = false
+        if is_row && items[b + 2] != 0.0 { grows = true }
+        if !is_row && items[b + 3] != 0.0 { grows = true }
+        if grows {
+            slots.push(FlexGrowSlot { index: i, weight: items[b + 4], shrink: items[b + 5] })
+            main_sz = 0.0
+        } else {
+            fixed_sum = fixed_sum + main_sz
+        }
+        sizes.push(main_sz)
+        cross_sizes.push(cross_sz)
+        i = i + 1
+    }
+    var gap_count = 0
+    if n > 1 { gap_count = n - 1 }
+    apply_flex_main_axis(sizes, slots, inner_main, fixed_sum, gap_count, node.gap)
+
+    // main-axis start offset for alignment
+    var used = 0.0
+    var j = 0
+    while j < n { used = used + sizes[j]  j = j + 1 }
+    used = used + node.gap * to_float(gap_count)
+    var extra = inner_main - used
+    var cursor = 0.0
+    var gap_eff = node.gap
+    if node.main_align == main_center() { cursor = math::fmax(extra, 0.0) / 2.0 }
+    else if node.main_align == main_end() { cursor = math::fmax(extra, 0.0) }
+    else if node.main_align == main_space_between() && n > 1 && extra > 0.0 { gap_eff = node.gap + extra / to_float(gap_count) }
+
+    // x, y, w, h per child
+    var out: Vec<Float> = vec()
+    var m = 0
+    while m < n {
+        var main_sz = sizes[m]
+        var cross_sz = cross_sizes[m]
+        // cross placement: a child's own `align_self` overrides the container's `cross_align`
+        var ca = node.cross_align
+        if items[m * st + 6] != 0.0 { ca = to_int(items[m * st + 7]) }
+        var cross_pos = 0.0
+        if ca == cross_stretch() { cross_sz = inner_cross }
+        else if ca == cross_center() { cross_pos = math::fmax(inner_cross - cross_sz, 0.0) / 2.0 }
+        else if ca == cross_end() { cross_pos = math::fmax(inner_cross - cross_sz, 0.0) }
+        if is_row {
+            out.push(inner.min.x + cursor)  out.push(inner.min.y + cross_pos)  out.push(main_sz)  out.push(cross_sz)
+        } else {
+            out.push(inner.min.x + cross_pos)  out.push(inner.min.y + cursor)  out.push(cross_sz)  out.push(main_sz)
+        }
+        cursor = cursor + main_sz + gap_eff
+        m = m + 1
+    }
+    return out
+}
+/// child `i`'s rect from container_flex_rects' answer.
+pub fn flex_rect_at(rs: Vec<Float>, i: Int) -> Rect { return rect_min_size(vec2(rs[i * 4], rs[i * 4 + 1]), vec2(rs[i * 4 + 2], rs[i * 4 + 3])) }
+
+/// lay out an overlay `root` into a viewport rect, returning paint primitives, hits, and surfaces.
+pub fn layout_overlay(inout root: UiNode, viewport: Rect) -> ComputedOverlay {
+    var nid: Vec<Str> = vec()
+    var noff: Vec<Float> = vec()
+    return layout_overlay_scrolled(root, viewport, nid, noff)
+}
+
+/// like layout_overlay, with host-provided scroll offsets (parallel region-id -> offset vectors; get the
+/// region ids + extents from the returned `scrolls`). The frame loop: layout -> read scrolls -> clamp/
+/// update offsets from input -> layout again next frame.
+pub fn layout_overlay_scrolled(inout root: UiNode, viewport: Rect, inout scroll_ids: Vec<Str>, inout scroll_offs: Vec<Float>) -> ComputedOverlay {
+    var out = overlay_new(scroll_ids, scroll_offs)
+    var ctx = length_context_root(viewport.width(), viewport.height())
+    ui_layout_node(root, viewport, ctx, out)
+    overlay_flush_popups(out)
+    return out
+}
+
+/// full interactive layout: scroll offsets + the pointer (position, button state) for hover/active
+/// styling (`hover_bg`/`hover_border_color`/`hover_text_color`/`active_bg` from the cascade).
+pub fn layout_overlay_interactive(inout root: UiNode, viewport: Rect, inout scroll_ids: Vec<Str>, inout scroll_offs: Vec<Float>, mouse: Vec2, mouse_down: Bool) -> ComputedOverlay {
+    var out = overlay_new(scroll_ids, scroll_offs)
+    out.in_has_mouse = true
+    out.in_mouse = copy mouse
+    out.in_mouse_down = mouse_down
+    var ctx = length_context_root(viewport.width(), viewport.height())
+    ui_layout_node(root, viewport, ctx, out)
+    overlay_flush_popups(out)
+    return out
+}
+
+/// hit-test an overlay at `point`; returns the front-most hit region (id empty if none).
+pub fn overlay_hit_test(overlay: ComputedOverlay, point: Vec2) -> HitRegion {
+    var i = overlay.hits.len() - 1
+    while i >= 0 {
+        if overlay.hits[i].rect.contains(point) { return hit_region_dup(overlay.hits[i]) }
+        i = i - 1
+    }
+    return HitRegion { id: "", on_click: "", rect: rect_min_max(vec2_zero(), vec2_zero()) }
+}
+
+// --- minimal .ui DSL parser ---
+// Grammar (subset): node := IDENT '{' (field | node)* '}'
+//   field := IDENT ':' value ;  value := STRING | NUMBER | BOOL | IDENT | '[' num,* ']'
+// Supported nodes: column/panel, row, text, button, rect, spacer, surface.
+// Supported fields: gap, padding, text, label, on_click, id, size_px, fill_w,
+//   fill_h, w, h, radius, bg, color, cross_align, main_align.
+
+/// skip whitespace and `// line comments` at the cursor (internal helper).
+pub fn up_ws(s: Str, inout pos: Vec<Int>) {
+    var go = true
+    while go {
+        var c = dp_peek(s, pos)
+        if c == 32 || c == 9 || c == 10 || c == 13 { dp_adv(pos) }
+        else if c == 47 && pos[0] + 1 < s.len() && ord(s.at(pos[0] + 1)) == 47 {
+            while dp_peek(s, pos) != 10 && dp_peek(s, pos) >= 0 { dp_adv(pos) }
+        } else { go = false }
+    }
+}
+/// true if byte `c` can start/continue an identifier (internal helper).
+pub fn up_is_ident(c: Int) -> Bool { return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 }
+/// read an identifier at the cursor (internal helper).
+pub fn up_ident(s: Str, inout pos: Vec<Int>) -> Str {
+    up_ws(s, pos)
+    var out = ""
+    while up_is_ident(dp_peek(s, pos)) { out = out + chr(dp_peek(s, pos))  dp_adv(pos) }
+    return out
+}
+/// read a bare value token (string / number / ident) into a string (internal helper).
+pub fn up_value_str(s: Str, inout pos: Vec<Int>) -> Str {
+    up_ws(s, pos)
+    var c = dp_peek(s, pos)
+    if c == 34 { return dp_string(s, pos) }
+    if (c >= 48 && c <= 57) || c == 45 || c == 46 { return up_number_str(s, pos) }
+    return up_ident(s, pos)
+}
+/// read a numeric token as is into a string (internal helper).
+pub fn up_number_str(s: Str, inout pos: Vec<Int>) -> Str {
+    up_ws(s, pos)
+    var out = ""
+    var go = true
+    while go {
+        var c = dp_peek(s, pos)
+        if (c >= 48 && c <= 57) || c == 45 || c == 43 || c == 46 || c == 101 || c == 69 || c == 37 || c == 118 || c == 104 || c == 105 || c == 117 || c == 119 { out = out + chr(c)  dp_adv(pos) } else { go = false }
+    }
+    return out
+}
+/// parse a `[r, g, b(, a)]` color array at the cursor (internal helper).
+pub fn up_color(s: Str, inout pos: Vec<Int>) -> Color {
+    up_ws(s, pos)
+    var nums: Vec<Int> = vec()
+    if dp_peek(s, pos) == 91 {
+        dp_adv(pos)
+        var go = true
+        up_ws(s, pos)
+        if dp_peek(s, pos) == 93 { dp_adv(pos)  go = false }
+        while go {
+            nums.push(to_int(dp_number(s, pos)))
+            up_ws(s, pos)
+            if dp_peek(s, pos) == 44 { dp_adv(pos) } else { go = false }
+        }
+        dp_eat(s, pos, 93)
+    }
+    var r = 0  var g = 0  var b = 0  var a = 255
+    if nums.len() > 0 { r = nums[0] }
+    if nums.len() > 1 { g = nums[1] }
+    if nums.len() > 2 { b = nums[2] }
+    if nums.len() > 3 { a = nums[3] }
+    return color_rgba(r, g, b, a)
+}
+/// map a node-name string to a node kind tag (-1 if unknown) (internal helper).
+pub fn up_kind(name: Str) -> Int {
+    if (name == "column") || (name == "panel") { return nk_column() }
+    if (name == "row") { return nk_row() }
+    if (name == "text") { return nk_text() }
+    if (name == "button") { return nk_button() }
+    if (name == "rect") { return nk_rect() }
+    if (name == "spacer") { return nk_spacer() }
+    if (name == "surface") { return nk_surface() }
+    if (name == "scroll_column") || (name == "scroll") { return nk_scroll_column() }
+    if (name == "scroll_row") { return nk_scroll_row() }
+    if (name == "image") { return nk_image() }
+    if (name == "checkbox") { return nk_checkbox() }
+    if (name == "slider") { return nk_slider() }
+    if (name == "dropdown") { return nk_dropdown() }
+    if (name == "number") || (name == "drag_value") { return nk_number() }
+    if (name == "text_input") { return nk_text_input() }
+    if (name == "text_area") { return nk_text_area() }
+    if (name == "scrollbar") { return nk_scrollbar() }
+    if (name == "picker") { return nk_picker() }
+    if (name == "code_editor") { return nk_code_editor() }
+    // `divider` is sugar for a full-width rect carrying an implicit `divider` class; it has no kind
+    // of its own. The parser rewrites it.
+    if (name == "divider") { return nk_rect() }
+    return -1
+}
+/// map an alignment word to its int (cross/main share start/center/end; stretch/space_between extra).
+pub fn up_align(word: Str) -> Int {
+    if (word == "center") { return 1 }
+    if (word == "end") { return 2 }
+    if (word == "stretch") { return 3 }
+    if (word == "space_between") { return 3 }
+    return 0
+}
+
+/// parse one node (and its children) at the cursor; returns the node (kind -1 placeholder on failure).
+pub fn up_node(s: Str, inout pos: Vec<Int>) -> UiNode {
+    var name = up_ident(s, pos)
+    var kind = up_kind(name)
+    if kind < 0 { kind = nk_column() }
+    var node = ui_node_blank(kind)
+    if kind == nk_button() { node.h = ui_px(32.0) }
+    if kind == nk_text() { node.has_color = false }
+    up_ws(s, pos)
+    dp_eat(s, pos, 123)            // '{'
+    var go = true
+    while go {
+        up_ws(s, pos)
+        var c = dp_peek(s, pos)
+        if c == 125 { dp_adv(pos)  go = false }       // '}'
+        else if c < 0 { go = false }
+        else {
+            // lookahead: ident then ':' = field, ident then '{' = child node
+            var save = pos[0]
+            var word = up_ident(s, pos)
+            up_ws(s, pos)
+            var nx = dp_peek(s, pos)
+            if nx == 58 {                              // ':'
+                dp_adv(pos)
+                up_apply_field(s, pos, node, word)
+            } else if nx == 123 {                       // child node '{'
+                pos[0] = save
+                node.children.push(up_node(s, pos))
+            } else {
+                // unknown token; skip one char to avoid infinite loop
+                if word.len() == 0 { dp_adv(pos) }
+            }
+        }
+    }
+    return node
+}
+
+/// apply field `key` (value at the cursor) to `node` (internal helper).
+pub fn up_apply_field(s: Str, inout pos: Vec<Int>, inout node: UiNode, key: Str) {
+    up_ws(s, pos)
+    if (key == "bg") { node.has_bg = true  node.bg = rgba_pack(up_color(s, pos))  return }
+    if (key == "color") { node.has_color = true  node.color = rgba_pack(up_color(s, pos))  return }
+    if (key == "border_color") { node.has_border = true  node.border_color = rgba_pack(up_color(s, pos))  return }
+    var v = up_value_str(s, pos)
+    if (key == "gap") { node.gap = parse_float_sub(v, 0, v.len()) }
+    else if (key == "padding") { node.padding = parse_float_sub(v, 0, v.len()) }
+    else if (key == "padding_x") || (key == "pad_x") { node.has_padding_x = true  node.padding_x = parse_float_sub(v, 0, v.len()) }
+    else if (key == "padding_y") || (key == "pad_y") { node.has_padding_y = true  node.padding_y = parse_float_sub(v, 0, v.len()) }
+    else if (key == "size_px") { node.size_px = parse_float_sub(v, 0, v.len()) }
+    else if (key == "radius") { node.radius = parse_float_sub(v, 0, v.len()) }
+    else if (key == "border_w") { node.border_w = parse_float_sub(v, 0, v.len()) }
+    else if (key == "min_height") { node.min_height = parse_float_sub(v, 0, v.len()) }
+    else if (key == "text") { node.text = v }
+    else if (key == "label") { node.text = v }
+    else if (key == "on_click") { node.on_click = v }
+    else if (key == "id") { node.id = v }
+    else if (key == "fill_w") { node.fill_w = (v == "true") }
+    else if (key == "fill_h") { node.fill_h = (v == "true") }
+    else if (key == "cross_align") { node.cross_align = up_align(v) }
+    else if (key == "align_self") { node.has_align_self = true  node.align_self = up_align(v) }
+    else if (key == "flex_wrap") || (key == "flex-wrap") { node.flex_wrap = (v == "true") || (v == "wrap") }
+    else if (key == "min_width") { node.has_min_width = true  node.min_width = parse_float_sub(v, 0, v.len()) }
+    else if (key == "wrap_text") { node.wrap = (v == "true") }
+    else if (key == "nowrap") { if (v == "true") { node.wrap = false } }
+    else if (key == "bold") { node.font_bold = (v == "true") }
+    else if (key == "italic") { node.font_italic = (v == "true") }
+    else if (key == "line_height_mult") { node.line_height_mult = parse_float_sub(v, 0, v.len()) }
+    else if (key == "letter_spacing") { node.has_letter_spacing = true  node.letter_spacing = parse_float_sub(v, 0, v.len()) }
+    else if (key == "word_spacing") { node.has_word_spacing = true  node.word_spacing = parse_float_sub(v, 0, v.len()) }
+    else if (key == "text_align") || (key == "horizontal_align") {
+        node.has_anchor = true  node.anchor_x = up_anchor_x(v)
+        if v == "start" { node.text_align = ta_start() } else if v == "end" { node.text_align = ta_end() } else { node.text_align = ta_physical() }
+    }
+    else if (key == "dir") || (key == "direction") { if v == "ltr" { node.text_dir = 0 } else if v == "rtl" { node.text_dir = 1 } else { node.text_dir = 2 } }
+    else if (key == "lang") { node.lang = v }
+    else if (key == "vertical_align") { node.has_anchor = true  node.anchor_y = up_anchor_y(v) }
+    else if (key == "main_align") { node.main_align = up_align(v) }
+    else if (key == "w") { var p = ui_length_parse(v)  if p.ok { node.w = sink p.len } }
+    else if (key == "h") { var p = ui_length_parse(v)  if p.ok { node.h = sink p.len } }
+    else if (key == "flex_weight") { node.has_flex_weight = true  node.flex_weight = parse_float_sub(v, 0, v.len()) }
+    else if (key == "tag") { node.tag = v }
+    else if (key == "class") { node.classes = wt_split_ws(v) }         // space-separated class names
+    else if (key == "wrap") { node.wrap = (v == "true") }
+    else if (key == "wrap_hard_break") { node.wrap_hard_break = (v == "true") }
+    else if (key == "line_clamp") { node.line_clamp = to_int(parse_float_sub(v, 0, v.len())) }
+    else if (key == "max_width") { node.has_max_width = true  node.max_width_px = parse_float_sub(v, 0, v.len()) }
+    else if (key == "line_height") { node.line_height_mult = parse_float_sub(v, 0, v.len()) }
+    else if (key == "text_overflow") { if (v == "ellipsis") { node.text_overflow = 1 } else { node.text_overflow = 0 } }
+    else if (key == "overflow_y") { node.overflow_y = up_overflow(v) }
+    else if (key == "overflow_x") { node.overflow_x = up_overflow(v) }
+    else if (key == "bind_visible") { node.bind_visible = v }
+    else if (key == "bind_disabled") { node.bind_disabled = v }
+    else if (key == "position") { if (v == "absolute") { node.position = 1 } else if (v == "overlay") { node.position = 2 } else { node.position = 0 } }
+    else if (key == "z_index") { node.z_index = to_int(parse_float_sub(v, 0, v.len())) }
+    else if (key == "tab_index") { node.has_tab_index = true  node.tab_index = to_int(parse_float_sub(v, 0, v.len())) }
+    else if (key == "top") { node.has_top = true  node.top = parse_float_sub(v, 0, v.len()) }
+    else if (key == "right") { node.has_right = true  node.right = parse_float_sub(v, 0, v.len()) }
+    else if (key == "bottom") { node.has_bottom = true  node.bottom = parse_float_sub(v, 0, v.len()) }
+    else if (key == "left") { node.has_left = true  node.left = parse_float_sub(v, 0, v.len()) }
+    else if (key == "text_transform") {
+        if (v == "uppercase") { node.text_transform = tt_uppercase() }
+        else if (v == "lowercase") { node.text_transform = tt_lowercase() }
+        else if (v == "capitalize") { node.text_transform = tt_capitalize() }
+        else { node.text_transform = tt_none() }
+    }
+}
+
+/// a horizontal text-alignment word -> anchor x (start/left 0, center/middle 0.5, end/right 1).
+pub fn up_anchor_x(v: Str) -> Float {
+    if (v == "center") || (v == "middle") { return 0.5 }
+    if (v == "end") || (v == "right") { return 1.0 }
+    return 0.0
+}
+/// a vertical text-alignment word -> anchor y (start/top 0, center/middle 0.5, end/bottom 1).
+pub fn up_anchor_y(v: Str) -> Float {
+    if (v == "center") || (v == "middle") { return 0.5 }
+    if (v == "end") || (v == "bottom") { return 1.0 }
+    return 0.0
+}
+/// overflow attribute word -> om_* value (visible/hidden/auto/scroll).
+pub fn up_overflow(v: Str) -> Int {
+    if (v == "hidden") { return 1 }
+    if (v == "auto") { return 2 }
+    if (v == "scroll") { return 3 }
+    return 0
+}
+// ---- rich text: styled spans inside one text node ----
+/// one styled run inside a text node (core subset).
+pub struct TextSpanRun { text: Str, classes: Vec<Str>, has_size: Bool, size_px: Float, has_color: Bool, color: Color, bold: Bool, italic: Bool, transform: Int, has_outline: Bool, outline_color: Color, outline_width_px: Float }
+/// a UiLength of its own.
+pub fn ui_length_dup(l: UiLength) -> UiLength { return UiLength { unit: l.unit, value: l.value } }
+/// a TextSpanRun of its own (text, classes and colours all fresh).
+pub fn span_dup(r: TextSpanRun) -> TextSpanRun {
+    return TextSpanRun { text: copy r.text, classes: path_copy_str(r.classes), has_size: r.has_size, size_px: r.size_px, has_color: r.has_color, color: color_dup(r.color), bold: r.bold, italic: r.italic, transform: r.transform, has_outline: r.has_outline, outline_color: color_dup(r.outline_color), outline_width_px: r.outline_width_px }
+}
+/// a fresh list of span copies.
+pub fn spans_dup(v: Vec<TextSpanRun>) -> Vec<TextSpanRun> {
+    var out: Vec<TextSpanRun> = vec()
+    var i = 0
+    while i < v.len() { out.push(span_dup(v[i]))  i = i + 1 }
+    return out
+}
+/// a fresh list of node copies (deep: every subtree is copied too).
+pub fn nodes_dup(v: Vec<UiNode>) -> Vec<UiNode> {
+    var out: Vec<UiNode> = vec()
+    var i = 0
+    while i < v.len() { out.push(ui_node_dup(v[i]))  i = i + 1 }
+    return out
+}
+/// a UiNode of its own: a deep copy, sharing nothing with `n` (children and spans included).
+pub fn ui_node_dup(n: UiNode) -> UiNode {
+    var out = ui_node_dup_shallow(n)
+    out.children = nodes_dup(n.children)
+    return out
+}
+/// every field of `n` but its children, which come back empty: the node on its own. A retained
+/// document keeps a tree of these (each node's children live beside it, not inside it).
+pub fn ui_node_dup_shallow(n: UiNode) -> UiNode {
+    var nokids: Vec<UiNode> = vec()
+    return UiNode { kind: n.kind, id: copy n.id, text: copy n.text, on_click: copy n.on_click, gap: n.gap, padding: n.padding, has_padding_x: n.has_padding_x, padding_x: n.padding_x, has_padding_y: n.has_padding_y, padding_y: n.padding_y, cross_align: n.cross_align, main_align: n.main_align, has_bg: n.has_bg, bg: n.bg, radius: n.radius, has_border: n.has_border, border_color: n.border_color, border_w: n.border_w, fill_w: n.fill_w, fill_h: n.fill_h, has_flex_weight: n.has_flex_weight, flex_weight: n.flex_weight, has_flex_shrink: n.has_flex_shrink, flex_shrink: n.flex_shrink, w: ui_length_dup(n.w), h: ui_length_dup(n.h), has_color: n.has_color, color: n.color, size_px: n.size_px, min_height: n.min_height, tag: copy n.tag, classes: path_copy_str(n.classes), wrap: n.wrap, wrap_hard_break: n.wrap_hard_break, line_clamp: n.line_clamp, text_overflow: n.text_overflow, text_transform: n.text_transform, has_max_width: n.has_max_width, max_width_px: n.max_width_px, line_height_mult: n.line_height_mult, overflow_x: n.overflow_x, overflow_y: n.overflow_y, hidden: n.hidden, disabled: n.disabled, bind_visible: copy n.bind_visible, bind_disabled: copy n.bind_disabled, position: n.position, z_index: n.z_index, has_tab_index: n.has_tab_index, tab_index: n.tab_index, spans: spans_dup(n.spans), has_hover_bg: n.has_hover_bg, hover_bg: n.hover_bg, has_hover_border_color: n.has_hover_border_color, hover_border_color: n.hover_border_color, has_hover_text_color: n.has_hover_text_color, hover_text_color: n.hover_text_color, has_active_bg: n.has_active_bg, active_bg: n.active_bg, has_top: n.has_top, top: n.top, has_right: n.has_right, right: n.right, has_bottom: n.has_bottom, bottom: n.bottom, has_left: n.has_left, left: n.left, has_align_self: n.has_align_self, align_self: n.align_self, flex_wrap: n.flex_wrap, has_min_width: n.has_min_width, min_width: n.min_width, bind: copy n.bind, src: copy n.src, checked: n.checked, value_f: n.value_f, value_s: copy n.value_s, vmin: n.vmin, vmax: n.vmax, has_step: n.has_step, step: n.step, has_precision: n.has_precision, precision: n.precision, suffix: copy n.suffix, options: path_copy_str(n.options), selected: n.selected, open: n.open, has_item_height: n.has_item_height, item_height: n.item_height, has_track_h: n.has_track_h, track_h: n.track_h, has_knob_r: n.has_knob_r, knob_r: n.knob_r, has_track_color: n.has_track_color, track_color: n.track_color, has_fill_color: n.has_fill_color, fill_color: n.fill_color, has_knob_color: n.has_knob_color, knob_color: n.knob_color, read_only: n.read_only, line_numbers: n.line_numbers, gutter_marks: copy n.gutter_marks, line_notes: copy n.line_notes, diags: copy n.diags, focus_from: n.focus_from, focus_to: n.focus_to, highlight_line: n.highlight_line, hot_line: n.hot_line, tab_size: n.tab_size, hard_tabs: n.hard_tabs, word_wrap: n.word_wrap, language: copy n.language, min_rows: n.min_rows, max_rows: n.max_rows, caret: n.caret, has_caret: n.has_caret, sel_anchor: n.sel_anchor, scroll_y: n.scroll_y, scroll_x: n.scroll_x, anchor_x: n.anchor_x, anchor_y: n.anchor_y, has_anchor: n.has_anchor, font_bold: n.font_bold, font_italic: n.font_italic, has_letter_spacing: n.has_letter_spacing, letter_spacing: n.letter_spacing, has_word_spacing: n.has_word_spacing, word_spacing: n.word_spacing, has_text_outline: n.has_text_outline, text_outline_color: n.text_outline_color, text_outline_width_px: n.text_outline_width_px, has_text_gradient_from: n.has_text_gradient_from, text_gradient_from: n.text_gradient_from, has_text_gradient_to: n.has_text_gradient_to, text_gradient_to: n.text_gradient_to, text_gradient_horizontal: n.text_gradient_horizontal, has_text_shadow: n.has_text_shadow, text_shadow_color: n.text_shadow_color, shadow_blur: n.shadow_blur, shadow_spread: n.shadow_spread, shadow_offset_x: n.shadow_offset_x, shadow_offset_y: n.shadow_offset_y, text_decoration: n.text_decoration, has_text_decoration_color: n.has_text_decoration_color, text_decoration_color: n.text_decoration_color, text_decoration_width_px: n.text_decoration_width_px, opacity: n.opacity, translate_x: n.translate_x, translate_y: n.translate_y, scale_x: n.scale_x, scale_y: n.scale_y, text_dir: n.text_dir, lang: copy n.lang, text_align: n.text_align, font_family: copy n.font_family, font_weight: n.font_weight, font_slant: n.font_slant, has_bg_to: n.has_bg_to, bg_to: n.bg_to, bg_vertical: n.bg_vertical, children: nokids }
+}
+/// a plain span at the parent's size/color.
+pub fn span(text: Str) -> TextSpanRun {
+    var cls: Vec<Str> = vec()
+    return TextSpanRun { text: copy text, classes: cls, has_size: false, size_px: 0.0, has_color: false, color: color_white(), bold: false, italic: false, transform: 0, has_outline: false, outline_color: color_transparent(), outline_width_px: 0.0 }
+}
+/// a positioned styled segment on one laid-out line (x is relative to the line start).
+pub struct RichSegment { text: Str, x: Float, size_px: Float, has_color: Bool, color: Color, bold: Bool, italic: Bool, has_outline: Bool, outline_color: Color, outline_width_px: Float, stack: Int = 0 }
+/// one laid-out line of rich segments.
+pub struct RichLine { segments: Vec<RichSegment>, height: Float }
+/// the rich layout result box.
+pub struct RichLayout { lines: Vec<RichLine>, width: Float, height: Float }
+
+fn rich_seg_of(text: Str, x: Float, size: Float, run: TextSpanRun, stack: Int) -> RichSegment {
+    return RichSegment { text: copy text, x: x, size_px: size, has_color: run.has_color, color: color_dup(run.color), bold: run.bold, italic: run.italic, has_outline: run.has_outline, outline_color: color_dup(run.outline_color), outline_width_px: run.outline_width_px, stack: stack }
+}
+/// The face a rich text node's run is shaped and painted with: the node's own (its font_family, font_weight and
+/// font_style; 0, the default stack, when it names none), made bold (weight 700) or italic by the span. A span's
+/// `bold`/`italic` select this face; they are not only flags on the primitive, which the painter does not read.
+pub struct RichFace { family: Str, weight: Int, slant: Int }
+fn rich_face_none() -> RichFace { return RichFace { family: "", weight: 0, slant: 0 } }
+fn rich_run_stack(face: RichFace, run: TextSpanRun) -> Int {
+    var weight = face.weight
+    if run.bold && weight < 700 { weight = 700 }
+    let italic = run.italic || face.slant == 2
+    if face.family.len() == 0 && weight == 0 && !italic { return 0 }
+    return text_engine_family_stack(face.family, weight, italic)
+}
+fn rich_style(size: Float, letter_spacing: Float, word_spacing: Float, stack: Int) -> TextMeasureStyle {
+    var st = text_measure_style_sp(size, letter_spacing, word_spacing)
+    st.stack = stack
+    return st
+}
+/// a rich text node laid out within `max_w`, the same for measuring it and painting it: its spans, size, line
+/// height, wrapping, spacing and face
+pub fn layout_rich_node(node: UiNode, max_w: Float) -> RichLayout {
+    return layout_rich_spans_face(node.spans, node.size_px, node.line_height_mult, node.wrap || node.line_clamp > 0, max_w, node_letter_spacing(node), node_word_spacing(node),
+                                  RichFace { family: copy node.font_family, weight: node.font_weight, slant: node.font_slant })
+}
+fn rich_line_height(segs: Vec<RichSegment>, lh_mult: Float, fallback_size: Float) -> Float {
+    if segs.len() == 0 { return text_line_height_px(fallback_size, lh_mult) }
+    var h = 1.0                                       // segment heights fold from 1.0 (a small-span line is short)
+    var i = 0
+    while i < segs.len() { h = math::fmax(h, text_line_height_px(segs[i].size_px, lh_mult))  i = i + 1 }
+    return h
+}
+/// flow styled runs into wrapped lines (core subset): char-by-char with a word
+/// buffer flushed at whitespace (when wrapping), at newlines, and at the wrap boundary; each segment
+/// carries its run's style; a line's height is its tallest segment's line height.
+pub fn layout_rich_spans(spans: Vec<TextSpanRun>, base_size: Float, lh_mult: Float, wrap: Bool, max_w0: Float) -> RichLayout { return layout_rich_spans_sp(spans, base_size, lh_mult, wrap, max_w0, 0.0, 0.0) }
+/// layout_rich_spans with the text node's letter/word spacing applied to every segment. A `span`
+/// cannot carry its own (the parser rejects `letter_spacing` there), so the node's
+/// value is the only one there is, and it spaces each segment's own glyph run, which is
+/// what the per-segment text primitives are then painted with.
+pub fn layout_rich_spans_sp(spans: Vec<TextSpanRun>, base_size: Float, lh_mult: Float, wrap: Bool, max_w0: Float, letter_spacing: Float, word_spacing: Float) -> RichLayout {
+    return layout_rich_spans_face(spans, base_size, lh_mult, wrap, max_w0, letter_spacing, word_spacing, rich_face_none())
+}
+/// layout_rich_spans_sp with each run measured in the face it is painted with (RichFace: the node's, bold or italic
+/// by the span)
+pub fn layout_rich_spans_face(spans: Vec<TextSpanRun>, base_size: Float, lh_mult: Float, wrap: Bool, max_w0: Float, letter_spacing: Float, word_spacing: Float, face: RichFace) -> RichLayout {
+    var max_w = math::fmax(max_w0, 1.0)
+    var lines: Vec<RichLine> = vec()
+    var cur: Vec<RichSegment> = vec()
+    var line_x = 0.0
+    var ri = 0
+    while ri < spans.len() {
+        var run = spans[ri]
+        var size = base_size
+        if run.has_size { size = run.size_px }
+        let stack = rich_run_stack(face, run)
+        let st = rich_style(size, letter_spacing, word_spacing, stack)
+        var source = apply_text_transform(run.text, run.transform)
+        var buf = ""
+        var ci = 0
+        var n = source.len()
+        while ci < n {
+            var c = ord(source.at(ci))
+            if c == 10 {
+                if buf.len() > 0 {
+                    cur.push(rich_seg_of(buf, line_x, size, run, stack))
+                    line_x = line_x + text_measure_width(buf, st)
+                    buf = ""
+                }
+                if cur.len() > 0 {
+                    let lh = rich_line_height(cur, lh_mult, base_size)
+                    lines.push(RichLine { segments: sink cur, height: lh })
+                    var fresh: Vec<RichSegment> = vec()
+                    cur = sink fresh
+                    line_x = 0.0
+                }
+            } else {
+                var chw = fallback_char_advance(c, size)
+                if wrap && line_x + text_measure_width(buf, st) + chw > max_w && cur.len() > 0 {
+                    // The word buffer goes to the next line, which is the reason it exists.
+                    //
+                    // Pushing it onto the line being closed would split a word when a boundary is
+                    // reached in the middle of one: "...is its value, an" / "d the branches...".
+                    // The plain-text wrapper beside this one makes hard
+                    // breaking an explicit opt-in (`wrap_hard_break`, off unless set) and this path
+                    // has no such flag, so word wrapping is the only behaviour it can have.
+                    // A single word longer than the whole line still overflows rather than looping:
+                    // `cur.len() > 0` refuses to close a line that has nothing on it yet.
+                    let lh2 = rich_line_height(cur, lh_mult, base_size)
+                    lines.push(RichLine { segments: sink cur, height: lh2 })
+                    var fresh2: Vec<RichSegment> = vec()
+                    cur = sink fresh2
+                    line_x = 0.0
+                }
+                buf = (buf + source.slice(ci, ci + 1))
+                if wrap && (c == 32 || c == 9 || c == 13) {
+                    cur.push(rich_seg_of(buf, line_x, size, run, stack))
+                    line_x = line_x + text_measure_width(buf, st)
+                    buf = ""
+                }
+            }
+            ci = ci + 1
+        }
+        if buf.len() > 0 {
+            cur.push(rich_seg_of(buf, line_x, size, run, stack))
+            line_x = line_x + text_measure_width(buf, st)
+        }
+        ri = ri + 1
+    }
+    if cur.len() > 0 { let lh3 = rich_line_height(cur, lh_mult, base_size)  lines.push(RichLine { segments: sink cur, height: lh3 }) }
+    if lines.len() == 0 {
+        var none: Vec<RichSegment> = vec()
+        lines.push(RichLine { segments: none, height: text_line_height_px(base_size, lh_mult) })
+    }
+    var width = 1.0
+    var height = 0.0
+    var li = 0
+    while li < lines.len() {
+        height = height + lines[li].height
+        var lw = 0.0
+        var sgs = lines[li].segments
+        var si = 0
+        while si < sgs.len() { lw = lw + text_measure_width(sgs[si].text, rich_style(sgs[si].size_px, letter_spacing, word_spacing, sgs[si].stack))  si = si + 1 }
+        width = math::fmax(width, lw)
+        li = li + 1
+    }
+    width = math::fmax(math::fmin(width, max_w), 1.0)
+    height = math::fmax(height, text_line_height_px(base_size, lh_mult))
+    return RichLayout { lines: lines, width: width, height: height }
+}
+
+// ---- the document wrapper ----
+/// a parsed `.ui` tree + its (optional) stylesheet. `doc_layout` runs the full pipeline.
+/// `rich`: everything the document's `stylesheet { }` block says (selectors, tokens, transitions,
+/// keyframes; layout/sheet.nori); `sheet` is the tag/class part of it the immediate path uses.
+pub struct UiDocument { has_sheet: Bool, sheet: OverlayStyleSheet, tree: UiNode, style: Str, rich: StyleSet }
+/// parse a `.ui` source into a document (no stylesheet attached yet).
+pub fn ui_document_parse(source: Str) -> UiDocument {
+    // Parse strictly first, and keep the stylesheet.
+    //
+    // `doc_layout` only cascades when has_sheet is set, so the document's `stylesheet { }` block has
+    // to be kept: a document shipping one would otherwise parse fine and then lay out completely
+    // unstyled, silently. The strict parser keeps it.
+    //
+    // The lenient parse survives only as the fallback for a source the strict parser rejects, because
+    // this function has no error channel and must stay total. A caller that wants the diagnostic
+    // should use `dsl_parse_document` directly.
+    let r = dsl_parse_document(source)
+    if r.ok { return sink r.doc }
+    return UiDocument { has_sheet: false, sheet: stylesheet_new(), tree: parse_ui(source), style: "", rich: style_set_new() }
+}
+/// merge `extra`'s rules into the document's stylesheet (field-level; creates one when absent).
+pub fn doc_merge_stylesheet(inout doc: UiDocument, extra: OverlayStyleSheet) {
+    doc.has_sheet = true
+    stylesheet_merge_over(doc.sheet, extra)
+}
+/// lay the document out: cascade the stylesheet onto the tree (idempotent for an unchanged sheet),
+/// then layout.
+pub fn doc_layout(inout doc: UiDocument, viewport: Rect) -> ComputedOverlay {
+    if doc.has_sheet { apply_stylesheet(doc.tree, doc.sheet) }
+    return layout_overlay(doc.tree, viewport)
+}
+/// like doc_layout with host scroll offsets (see layout_overlay_scrolled).
+pub fn doc_layout_scrolled(inout doc: UiDocument, viewport: Rect, inout scroll_ids: Vec<Str>, inout scroll_offs: Vec<Float>) -> ComputedOverlay {
+    if doc.has_sheet { apply_stylesheet(doc.tree, doc.sheet) }
+    return layout_overlay_scrolled(doc.tree, viewport, scroll_ids, scroll_offs)
+}
+/// like `doc_layout_scrolled`, with the pointer as well, so `hover_bg` / `hover_text_color` /
+/// `active_bg` from the cascade actually fire.
+///
+/// The three exist in the stylesheet, in the cascade and in `ui_emit_chrome`, and a host that lays a
+/// document out through `doc_layout_scrolled` gets an overlay whose `in_has_mouse` is false: every
+/// one of them is then dead, silently, and a panel full of `class row { hover_bg: ... }` rows never
+/// lights up under the pointer. This is the same call with the pointer in it.
+pub fn doc_layout_interactive(inout doc: UiDocument, viewport: Rect, inout scroll_ids: Vec<Str>, inout scroll_offs: Vec<Float>, mouse: Vec2, mouse_down: Bool) -> ComputedOverlay {
+    if doc.has_sheet { apply_stylesheet(doc.tree, doc.sheet) }
+    return layout_overlay_interactive(doc.tree, viewport, scroll_ids, scroll_offs, mouse, mouse_down)
+}
+
+fn patch_text_walk(inout node: UiNode, id: Str, new_text: Str) -> Bool {
+    if node.kind == nk_text() && node.id.len() > 0 && (node.id == id) { node.text = copy new_text  return true }
+    // patch_text_node descends only Column | Row children; other containers are not searched
+    if node.kind == nk_column() || node.kind == nk_row() {
+        var i = 0
+        while i < node.children.len() { if patch_text_walk(node.children[i], id, new_text) { return true }  i = i + 1 }
+    }
+    return false
+}
+/// replace the text of the text node with `id`; false when no such node.
+pub fn doc_patch_text(inout doc: UiDocument, id: Str, new_text: Str) -> Bool {
+    return patch_text_walk(doc.tree, id, new_text)
+}
+
+// ---- overlay parse cache (the layout cache is host-domain: layout_overlay is a pure function of
+// (tree, viewport, offsets), so hosts memoize at their layer) ----
+/// a capped parse cache keyed by the exact source string; when full, the oldest entry is evicted.
+pub struct OverlayParseCache { sources: Vec<Str>, docs: Vec<UiNode>, cap: Int }
+pub fn parse_cache_new(cap: Int) -> OverlayParseCache {
+    var srcs: Vec<Str> = vec()
+    var docs: Vec<UiNode> = vec()
+    var c = cap
+    if c < 1 { c = 1 }
+    return OverlayParseCache { sources: srcs, docs: docs, cap: c }
+}
+pub fn parse_cache_clear(inout cache: OverlayParseCache) {
+    var srcs: Vec<Str> = vec()
+    var docs: Vec<UiNode> = vec()
+    cache.sources = srcs
+    cache.docs = docs
+}
+/// the parsed tree for `source`, reusing a cached document when the source is identical. Note the
+/// returned tree is a view of the cache's own document: treat it as immutable, or take
+/// `ui_node_dup` of it when the caller mutates trees (apply_stylesheet/apply_binds mutate!). For
+/// mutated flows, parse fresh and keep the cache for static chrome panels.
+pub fn parse_cache_get(inout cache: OverlayParseCache, source: Str) -> view UiNode {
+    var i = 0
+    while i < cache.sources.len() {
+        if (cache.sources[i] == source) { return cache.docs[i] }
+        i = i + 1
+    }
+    var doc = parse_ui(source)
+    if cache.sources.len() >= cache.cap {
+        // evict the oldest (index 0), FIFO
+        var ns: Vec<Str> = vec()
+        var nd: Vec<UiNode> = vec()
+        var k = 1
+        while k < cache.sources.len() { ns.push(sink cache.sources[k])  nd.push(sink cache.docs[k])  k = k + 1 }
+        cache.sources = ns
+        cache.docs = nd
+    }
+    cache.sources.push(copy source)
+    cache.docs.push(sink doc)
+    return cache.docs[cache.docs.len() - 1]
+}
+
+/// parse a `.ui` document string into a UiNode tree (root node).
+pub fn parse_ui(src: Str) -> UiNode {
+    var pos: Vec<Int> = vec()  pos.push(0)
+    return up_node(src, pos)
+}

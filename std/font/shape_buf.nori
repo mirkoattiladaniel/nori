@@ -1,0 +1,317 @@
+// std/font: the shaping buffer: HarfBuzz's buffer model, glyph for glyph.
+//
+// A buffer holds one record of K Ints per glyph (codepoint-then-glyph id, mask, cluster, the
+// Unicode and glyph property words, ligature props, syllable, two shaper words, and the glyph index
+// normalization looks up), in one flat Vec. Substitution that changes the glyph count reads `info`
+// and writes `out`: the in/out model HarfBuzz's GSUB uses, with `idx` the read position and
+// `out_len` the write position, then swaps them (`sync`). Positions are a second flat Vec of
+// P Ints per glyph, made when positioning starts.
+//
+// Cluster merging follows HarfBuzz exactly (merge_clusters, delete_glyph, the ligature and
+// normalization rules), because a cluster is what a caret, a selection and a line break are built
+// from, and the tests compare them to HarfBuzz's.
+
+fn K() -> Int { return 12 }
+fn F_CP() -> Int { return 0 }
+fn F_MASK() -> Int { return 1 }
+fn F_CL() -> Int { return 2 }
+fn F_UP() -> Int { return 3 }        // unicode props: gc (bits 0-4) | UP_* flags | modified ccc << 16
+fn F_GP() -> Int { return 4 }        // glyph props (GP_*) | mark attachment class << 8
+fn F_LIG() -> Int { return 5 }       // lig_id << 5 | IS_LIG_BASE (16) | comp (0-15)
+fn F_SYL() -> Int { return 6 }       // syllable serial (per-syllable matching)
+fn F_SH1() -> Int { return 7 }       // shaper word: arabic action, indic category
+fn F_SH2() -> Int { return 8 }       // shaper word: indic position
+fn F_GI() -> Int { return 9 }        // glyph index while normalizing
+fn F_SPC() -> Int { return 10 }      // space fallback type
+fn F_ORIG() -> Int { return 11 }     // the original code point (kept for the caller)
+
+fn P() -> Int { return 6 }
+fn P_XA() -> Int { return 0 }
+fn P_YA() -> Int { return 1 }
+fn P_XO() -> Int { return 2 }
+fn P_YO() -> Int { return 3 }
+fn P_CHAIN() -> Int { return 4 }
+fn P_ATYPE() -> Int { return 5 }
+
+// unicode props flags
+fn UP_IGNORABLE() -> Int { return 32 }
+fn UP_HIDDEN() -> Int { return 64 }
+fn UP_CONTINUATION() -> Int { return 128 }
+fn UP_ZWNJ() -> Int { return 256 }
+fn UP_ZWJ() -> Int { return 512 }
+
+// buffer scratch flags
+fn SF_HAS_NON_ASCII() -> Int { return 1 }
+fn SF_HAS_DEFAULT_IGNORABLES() -> Int { return 2 }
+fn SF_HAS_SPACE_FALLBACK() -> Int { return 4 }
+fn SF_HAS_GPOS_ATTACHMENT() -> Int { return 8 }
+fn SF_HAS_CGJ() -> Int { return 16 }
+fn SF_HAS_CONTINUATIONS() -> Int { return 32 }
+
+struct Buf {
+    info: Vec<Int>,
+    out: Vec<Int>,
+    pos: Vec<Int>,
+    len: Int,
+    out_len: Int,
+    idx: Int,
+    have_output: Bool,
+    rtl: Bool,                 // the run's direction
+    serial: Int,
+    scratch: Int
+}
+
+fn buf_new() -> Buf {
+    var a: Vec<Int> = vec()
+    var b: Vec<Int> = vec()
+    var c: Vec<Int> = vec()
+    return Buf { info: a, out: b, pos: c, len: 0, out_len: 0, idx: 0, have_output: false, rtl: false, serial: 0, scratch: 0 }
+}
+
+// store x at v[i], growing v as needed
+fn vput(inout v: Vec<Int>, i: Int, x: Int) {
+    while v.len() <= i { v.push(0) }
+    v[i] = x
+}
+
+// ── field access ─────────────────────────────────────────────────────────────────────────────────
+fn bi(b: Buf, i: Int, f: Int) -> Int { return b.info[i * K() + f] }
+fn bset(inout b: Buf, i: Int, f: Int, v: Int) { b.info[i * K() + f] = v }
+fn bo(b: Buf, i: Int, f: Int) -> Int { return b.out[i * K() + f] }
+fn boset(inout b: Buf, i: Int, f: Int, v: Int) { b.out[i * K() + f] = v }
+// the "previous" glyph record a backtrack reads: out when there is an output, else info
+fn bprev(b: Buf, i: Int, f: Int) -> Int { if b.have_output { return b.out[i * K() + f] }  return b.info[i * K() + f] }
+fn bp(b: Buf, i: Int, f: Int) -> Int { return b.pos[i * P() + f] }
+fn bpset(inout b: Buf, i: Int, f: Int, v: Int) { b.pos[i * P() + f] = v }
+fn bpadd(inout b: Buf, i: Int, f: Int, v: Int) { b.pos[i * P() + f] = b.pos[i * P() + f] + v }
+fn cur(b: Buf, f: Int) -> Int { return b.info[b.idx * K() + f] }
+fn cur_set(inout b: Buf, f: Int, v: Int) { b.info[b.idx * K() + f] = v }
+
+// append a fresh glyph for code point `cp` with cluster `cl`
+fn buf_add(inout b: Buf, cp: Int, cl: Int) {
+    let base = b.len * K()
+    var k = 0
+    while k < K() { vput(b.info, base + k, 0)  k = k + 1 }
+    b.info[base + F_CP()] = cp
+    b.info[base + F_CL()] = cl
+    b.info[base + F_ORIG()] = cp
+    b.len = b.len + 1
+}
+
+// ── the in/out machinery ─────────────────────────────────────────────────────────────────────────
+
+fn buf_clear_output(inout b: Buf) {
+    b.have_output = true
+    b.out_len = 0
+}
+// copy info record `i` to out slot `o`
+fn copy_to_out(inout b: Buf, i: Int, o: Int) {
+    let si = i * K()
+    let so = o * K()
+    var k = 0
+    while k < K() { vput(b.out, so + k, b.info[si + k])  k = k + 1 }
+}
+fn buf_sync(inout b: Buf) {
+    if b.have_output {
+        let t = sink b.info
+        b.info = sink b.out
+        b.out = sink t
+        b.len = b.out_len
+    }
+    b.have_output = false
+    b.out_len = 0
+    b.idx = 0
+}
+fn next_glyph(inout b: Buf) {
+    if b.have_output { copy_to_out(b, b.idx, b.out_len)  b.out_len = b.out_len + 1 }
+    b.idx = b.idx + 1
+}
+fn next_glyphs(inout b: Buf, n: Int) {
+    var k = 0
+    while k < n { next_glyph(b)  k = k + 1 }
+}
+fn skip_glyph(inout b: Buf) { b.idx = b.idx + 1 }
+// output a copy of the current glyph with glyph/code point `g` (does not advance idx)
+fn output_glyph(inout b: Buf, g: Int) {
+    copy_to_out(b, b.idx, b.out_len)
+    boset(b, b.out_len, F_CP(), g)
+    b.out_len = b.out_len + 1
+}
+fn replace_glyph(inout b: Buf, g: Int) {
+    if b.have_output {
+        copy_to_out(b, b.idx, b.out_len)
+        boset(b, b.out_len, F_CP(), g)
+        b.out_len = b.out_len + 1
+    } else {
+        cur_set(b, F_CP(), g)
+    }
+    b.idx = b.idx + 1
+}
+// the last output record (out_info[out_len-1])
+fn prev_f(b: Buf, f: Int) -> Int { return bprev(b, b.out_len - 1, f) }
+
+// ── clusters ─────────────────────────────────────────────────────────────────────────────────────
+fn set_cluster_info(inout b: Buf, i: Int, cl: Int) { bset(b, i, F_CL(), cl) }
+
+fn merge_clusters(inout b: Buf, start0: Int, end0: Int) {
+    if end0 - start0 < 2 { return }
+    var start = start0
+    var end = end0
+    var cl = bi(b, start, F_CL())
+    var i = start + 1
+    while i < end { let c = bi(b, i, F_CL())  if c < cl { cl = c }  i = i + 1 }
+    // extend end
+    if cl != bi(b, end - 1, F_CL()) {
+        while end < b.len && bi(b, end - 1, F_CL()) == bi(b, end, F_CL()) { end = end + 1 }
+    }
+    // extend start
+    if cl != bi(b, start, F_CL()) {
+        while b.idx < start && bi(b, start - 1, F_CL()) == bi(b, start, F_CL()) { start = start - 1 }
+    }
+    // if we hit the start of buffer, continue in out-buffer
+    if b.idx == start && bi(b, start, F_CL()) != cl && b.have_output {
+        let old = bi(b, start, F_CL())
+        var j = b.out_len
+        while j > 0 && bo(b, j - 1, F_CL()) == old { boset(b, j - 1, F_CL(), cl)  j = j - 1 }
+    }
+    i = start
+    while i < end { bset(b, i, F_CL(), cl)  i = i + 1 }
+}
+fn merge_out_clusters(inout b: Buf, start0: Int, end0: Int) {
+    if end0 - start0 < 2 { return }
+    var start = start0
+    var end = end0
+    var cl = bo(b, start, F_CL())
+    var i = start + 1
+    while i < end { let c = bo(b, i, F_CL())  if c < cl { cl = c }  i = i + 1 }
+    // extend start
+    while start > 0 && bo(b, start - 1, F_CL()) == bo(b, start, F_CL()) { start = start - 1 }
+    // extend end
+    while end < b.out_len && bo(b, end - 1, F_CL()) == bo(b, end, F_CL()) { end = end + 1 }
+    // if we hit the end of out-buffer, continue in buffer
+    if end == b.out_len {
+        let old = bo(b, end - 1, F_CL())
+        var j = b.idx
+        while j < b.len && bi(b, j, F_CL()) == old { bset(b, j, F_CL(), cl)  j = j + 1 }
+    }
+    i = start
+    while i < end { boset(b, i, F_CL(), cl)  i = i + 1 }
+}
+
+// delete the current glyph, keeping its cluster alive in a neighbour (HarfBuzz's delete_glyph)
+fn delete_glyph(inout b: Buf) {
+    let cl = cur(b, F_CL())
+    var done = false
+    if (b.idx + 1 < b.len && cl == bi(b, b.idx + 1, F_CL())) || (b.out_len > 0 && cl == bo(b, b.out_len - 1, F_CL())) {
+        done = true                                                       // cluster survives
+    }
+    if !done && b.out_len > 0 {
+        if cl < bo(b, b.out_len - 1, F_CL()) {
+            let old = bo(b, b.out_len - 1, F_CL())
+            var i = b.out_len
+            while i > 0 && bo(b, i - 1, F_CL()) == old { boset(b, i - 1, F_CL(), cl)  i = i - 1 }
+        }
+        done = true
+    }
+    if !done && b.idx + 1 < b.len { merge_clusters(b, b.idx, b.idx + 2) }
+    skip_glyph(b)
+}
+
+// move the boundary between out and info so that out holds `i` glyphs (HarfBuzz's move_to)
+fn buf_move_to(inout b: Buf, i: Int) {
+    if !b.have_output { b.idx = i  return }
+    if b.out_len < i {
+        let count = i - b.out_len
+        var k = 0
+        while k < count { copy_to_out(b, b.idx + k, b.out_len + k)  k = k + 1 }
+        b.idx = b.idx + count
+        b.out_len = b.out_len + count
+    } else if b.out_len > i {
+        let count = b.out_len - i
+        if b.idx < count {
+            // shift info forward to make room in front of idx
+            let shift = count - b.idx
+            let n = b.len
+            var k = 0
+            while k < shift * K() { b.info.push(0)  k = k + 1 }
+            var j = n * K() - 1
+            while j >= b.idx * K() { b.info[j + shift * K()] = b.info[j]  j = j - 1 }
+            b.len = b.len + shift
+            b.idx = b.idx + shift
+        }
+        b.idx = b.idx - count
+        b.out_len = b.out_len - count
+        var k = 0
+        while k < count {
+            let so = (b.out_len + k) * K()
+            let si = (b.idx + k) * K()
+            var f = 0
+            while f < K() { b.info[si + f] = b.out[so + f]  f = f + 1 }
+            k = k + 1
+        }
+    }
+}
+
+// reverse glyphs [start, end) in place (info, and pos when positioned)
+fn buf_reverse_range(inout b: Buf, start: Int, end: Int) {
+    var i = start
+    var j = end - 1
+    while i < j {
+        var f = 0
+        while f < K() { let t = bi(b, i, f)  bset(b, i, f, bi(b, j, f))  bset(b, j, f, t)  f = f + 1 }
+        if b.pos.len() >= b.len * P() {
+            f = 0
+            while f < P() { let t = bp(b, i, f)  bpset(b, i, f, bp(b, j, f))  bpset(b, j, f, t)  f = f + 1 }
+        }
+        i = i + 1
+        j = j - 1
+    }
+}
+fn buf_reverse(inout b: Buf) { buf_reverse_range(b, 0, b.len) }
+
+// swap records i and j of info
+fn buf_swap(inout b: Buf, i: Int, j: Int) {
+    var f = 0
+    while f < K() { let t = bi(b, i, f)  bset(b, i, f, bi(b, j, f))  bset(b, j, f, t)  f = f + 1 }
+}
+// move record i to position j (j < i), shifting [j, i) up by one
+fn buf_move_back(inout b: Buf, i: Int, j: Int) {
+    var t: Vec<Int> = vec()
+    var f = 0
+    while f < K() { t.push(bi(b, i, f))  f = f + 1 }
+    var k = i
+    while k > j {
+        f = 0
+        while f < K() { bset(b, k, f, bi(b, k - 1, f))  f = f + 1 }
+        k = k - 1
+    }
+    f = 0
+    while f < K() { bset(b, j, f, t[f])  f = f + 1 }
+}
+
+// ── lig props ────────────────────────────────────────────────────────────────────────────────────
+fn lig_id_of(lp: Int) -> Int { return lp >> 5 }
+fn lig_comp_of(lp: Int) -> Int { if (lp & 16) != 0 { return 0 }  return lp & 15 }
+fn lig_num_comps(gp: Int, lp: Int) -> Int {
+    if (gp & GP_LIGATURE()) != 0 && (lp & 16) != 0 { return lp & 15 }
+    return 1
+}
+fn lig_props_for_ligature(id: Int, n: Int) -> Int { return (id << 5) | 16 | (n & 15) }
+fn lig_props_for_mark(id: Int, comp: Int) -> Int { return (id << 5) | (comp & 15) }
+fn alloc_lig_id(inout b: Buf) -> Int {
+    b.serial = b.serial + 1
+    var id = b.serial & 7
+    if id == 0 { b.serial = b.serial + 1  id = b.serial & 7 }
+    return id
+}
+
+// ── unicode props accessors ──────────────────────────────────────────────────────────────────────
+fn up_gc(up: Int) -> Int { return up & 31 }
+fn up_mcc(up: Int) -> Int { return (up >> 16) & 255 }
+fn up_is_mark(up: Int) -> Bool { return gc_is_mark(up & 31) }
+fn info_is_default_ignorable(b: Buf, i: Int) -> Bool {
+    return (bi(b, i, F_UP()) & UP_IGNORABLE()) != 0 && (bi(b, i, F_GP()) & GP_SUBSTITUTED()) == 0
+}
+fn gp_is_mark(gp: Int) -> Bool { return (gp & GP_MARK()) != 0 }
+fn gp_is_ligature(gp: Int) -> Bool { return (gp & GP_LIGATURE()) != 0 }
+fn gp_is_base(gp: Int) -> Bool { return (gp & GP_BASE()) != 0 }

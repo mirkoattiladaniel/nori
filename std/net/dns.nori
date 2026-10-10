@@ -1,0 +1,460 @@
+// A DNS resolver (RFC 1035): enough of one to turn a hostname into an address.
+//
+// Every socket call takes an address, so without this a program can only reach hosts someone
+// already resolved for it.
+//
+// What this is not: a caching resolver, a validating one, or a general DNS library. It asks the
+// system's configured servers for A and AAAA records over UDP and reads the answer. There is no
+// DNSSEC: a resolver on an untrusted network can lie, and the defence against that is TLS
+// certificate validation rather than anything here, which is why the answer is only ever used to
+// open a connection whose identity is then checked independently.
+//
+// The parser is the part that matters. A response comes from whoever answered the datagram, so
+// every length and every offset in it is hostile input: name compression lets a pointer jump
+// backwards, and a pointer that jumps to itself is an infinite loop in a naive reader. The walk
+// below bounds both the jumps and the total work.
+
+import "std/strutil" as strutil
+import "std/os" as os
+import "std/time" as time
+
+/// One resolved address: 4 bytes for IPv4, 16 for IPv6.
+pub struct DnsAddr { bytes: Str }
+
+/// What a lookup produced. `err` is "" on success; `addrs` is empty when it is not.
+pub struct DnsResult { addrs: Vec<DnsAddr>, err: Str }
+
+/// DNS record type A: a 4-byte IPv4 address.
+pub fn dns_type_a() -> Int { return 1 }
+/// DNS record type AAAA: a 16-byte IPv6 address.
+pub fn dns_type_aaaa() -> Int { return 28 }
+
+/// How long to wait for one server before trying the next.
+pub fn dns_timeout_ms() -> Int { return 3000 }
+
+fn u16be(n: Int) -> Str { return (("" + chr(((n >> 8) & 0xff))) + chr((n & 0xff))) }
+fn rd16(s: Str, at: Int) -> Int {
+    if (at + 2) > s.len() { return 0 - 1 }
+    return ((ord(s.at(at)) << 8) | ord(s.at(at + 1)))
+}
+
+/// Encode a hostname as a DNS QNAME: each label length-prefixed, terminated by a zero byte.
+/// "" if any label is empty or over 63 bytes, or the name is over 255: the wire format cannot
+/// represent those, and a resolver that truncates instead would query a different name.
+pub fn dns_encode_name(host: Str) -> Str {
+    if host.len() == 0 { return "" }
+    if host.len() > 253 { return "" }
+    let labels = strutil::split(host, ".")
+    var out = ""
+    var i = 0
+    while i < labels.len() {
+        let l = labels[i]
+        // a trailing dot gives an empty final label, which is the root and is already implied
+        if l.len() == 0 {
+            if i == (labels.len() - 1) { i = i + 1  continue }
+            return ""
+        }
+        if l.len() > 63 { return "" }
+        out = ((out + chr(l.len())) + l)
+        i = i + 1
+    }
+    return (out + chr(0))
+}
+
+/// Build a query for `host` of type `qtype`, with the given 16-bit id.
+pub fn dns_build_query(id: Int, host: Str, qtype: Int) -> Str {
+    let qname = dns_encode_name(host)
+    if qname.len() == 0 { return "" }
+    var m = u16be(id)
+    m = (m + u16be(0x0100))          // standard query, recursion desired
+    m = (m + u16be(1))               // one question
+    m = (m + u16be(0))               // no answers
+    m = (m + u16be(0))               // no authority records
+    m = (m + u16be(0))               // no additional records
+    m = ((m + qname) + u16be(qtype))
+    return (m + u16be(1))            // class IN
+}
+
+// Skip over a name at `at`, returning the offset just past it, or -1.
+//
+// A name ends either at a zero byte or at a compression pointer, which is two bytes with the top
+// two bits set. The pointer is not followed here (skipping only needs to know the name stopped),
+// and that is what makes this loop terminate regardless of where the pointer aims.
+fn skip_name(msg: Str, at: Int) -> Int {
+    var p = at
+    var steps = 0
+    while steps < 128 {
+        if p >= msg.len() { return 0 - 1 }
+        let len = ord(msg.at(p))
+        if len == 0 { return (p + 1) }
+        if (len & 0xc0) == 0xc0 {
+            if (p + 2) > msg.len() { return 0 - 1 }
+            return (p + 2)
+        }
+        if (len & 0xc0) != 0 { return 0 - 1 }        // reserved label type
+        p = ((p + 1) + len)
+        steps = steps + 1
+    }
+    return 0 - 1
+}
+
+/// Read the addresses out of a DNS response, checking it answers `id`.
+///
+/// Records of a type that was not asked for are skipped rather than refused: a response legitimately
+/// carries CNAMEs alongside the addresses, and refusing the whole answer because of one would mean
+/// failing on most of the web.
+pub fn dns_parse_response(msg: Str, id: Int, qtype: Int) -> DnsResult {
+    var out: Vec<DnsAddr> = vec()
+    if msg.len() < 12 { return DnsResult { addrs: out, err: "short DNS response" } }
+    if rd16(msg, 0) != id { return DnsResult { addrs: out, err: "DNS response id does not match the query" } }
+    let flags = rd16(msg, 2)
+    if (flags & 0x8000) == 0 { return DnsResult { addrs: out, err: "not a DNS response" } }
+    let rcode = (flags & 0x0f)
+    if rcode == 3 { return DnsResult { addrs: out, err: "no such host" } }
+    if rcode != 0 { return DnsResult { addrs: out, err: ("DNS server returned error " + to_str(rcode)) } }
+
+    let qdcount = rd16(msg, 4)
+    let ancount = rd16(msg, 6)
+    var p = 12
+    var i = 0
+    while i < qdcount {
+        p = skip_name(msg, p)
+        if p < 0 { return DnsResult { addrs: out, err: "malformed DNS question" } }
+        p = (p + 4)                                   // qtype and qclass
+        if p > msg.len() { return DnsResult { addrs: out, err: "truncated DNS question" } }
+        i = i + 1
+    }
+
+    i = 0
+    while i < ancount {
+        p = skip_name(msg, p)
+        if p < 0 { return DnsResult { addrs: out, err: "malformed DNS answer" } }
+        let rtype = rd16(msg, p)
+        let rdlen = rd16(msg, (p + 8))
+        if rtype < 0 { return DnsResult { addrs: out, err: "truncated DNS answer" } }
+        if rdlen < 0 { return DnsResult { addrs: out, err: "truncated DNS answer" } }
+        let rdata = (p + 10)
+        if (rdata + rdlen) > msg.len() { return DnsResult { addrs: out, err: "DNS record runs past the message" } }
+        if rtype == qtype {
+            // The length must match the address family exactly. A 5-byte "A record" is not an
+            // address to be trimmed, it is a malformed answer.
+            if qtype == dns_type_a() { if rdlen == 4 { out.push(DnsAddr { bytes: msg.slice(rdata, (rdata + 4)) }) } }
+            if qtype == dns_type_aaaa() { if rdlen == 16 { out.push(DnsAddr { bytes: msg.slice(rdata, (rdata + 16)) }) } }
+        }
+        p = (rdata + rdlen)
+        i = i + 1
+    }
+    if out.len() == 0 { return DnsResult { addrs: out, err: "no address records in the DNS response" } }
+    return DnsResult { addrs: out, err: "" }
+}
+
+/// The nameservers from /etc/resolv.conf, in order. Empty when there are none.
+pub fn dns_servers() -> Vec<Str> {
+    var out: Vec<Str> = vec()
+    let path = os::env_or("NORI_RESOLV_CONF", "/etc/resolv.conf")
+    if !os::path_exists(path) { return out }
+    let lines = strutil::split(read_file(path), "\n")
+    var i = 0
+    while i < lines.len() {
+        let l = strutil::trim(lines[i])
+        if l.len() > 10 {
+            if l.slice(0, 10) == "nameserver" {
+                let rest = strutil::trim(l.slice(10, l.len()))
+                // IPv4 only: the socket layer here connects over IPv4, so an IPv6 server would be
+                // an address this cannot send to.
+                if rest.len() > 0 { if !strutil::contains(rest, ":") { out.push(rest) } }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn ip4_of_addr(a: DnsAddr) -> Ip4 {
+    if a.bytes.len() != 4 { return ipv4_bad() }
+    return ipv4(ord(a.bytes.at(0)), ord(a.bytes.at(1)), ord(a.bytes.at(2)), ord(a.bytes.at(3)))
+}
+
+/// Ask one server for `host`, returning what it said.
+///
+/// The query id is drawn from the clock and the port is whatever the OS gives an unbound socket.
+/// Neither is a security measure (an attacker on the path sees both), and the real defence against
+/// a forged answer is that the address is only used to open a connection whose certificate is then
+/// checked. Matching the id at least rejects a stale datagram from a previous query.
+pub fn dns_query_server(server: Str, host: Str, qtype: Int, id: Int) -> DnsResult {
+    var empty: Vec<DnsAddr> = vec()
+    let sip = parse_ipv4(server)
+    if sip.ok == 0 { return DnsResult { addrs: empty, err: "bad nameserver address" } }
+    let q = dns_build_query(id, host, qtype)
+    if q.len() == 0 { return DnsResult { addrs: empty, err: "hostname cannot be encoded as a DNS name" } }
+    let fd = udp_open4()
+    if fd < 0 { return DnsResult { addrs: empty, err: "could not open a UDP socket" } }
+    if udp_send_to4(fd, sip, 53, q) < 0 {
+        udp_close(fd)
+        return DnsResult { addrs: empty, err: "could not send the DNS query" }
+    }
+    var waited = 0
+    while waited < dns_timeout_ms() {
+        let ready = poll_read(fd, 200)
+        if ready < 0 { udp_close(fd)  return DnsResult { addrs: empty, err: "DNS socket error" } }
+        if ready > 0 {
+            // 512 bytes is the classic UDP limit; 4096 covers the EDNS-sized replies real
+            // resolvers send. A reply larger than this is truncated, and the TC flag would tell
+            // us to retry over TCP, which this does not do, and says so rather than guessing.
+            let r = udp_recv(fd, 4096)
+            udp_close(fd)
+            if r.n <= 0 { return DnsResult { addrs: empty, err: "empty DNS response" } }
+            return dns_parse_response(r.data, id, qtype)
+        }
+        waited = (waited + 200)
+    }
+    udp_close(fd)
+    return DnsResult { addrs: empty, err: "the nameserver did not answer" }
+}
+
+// ---- Android ------------------------------------------------------------------------------------
+//
+// Android has no /etc/resolv.conf and no net.dns properties. Resolution goes through netd, and the
+// only supported route from an app is the platform resolver, which also means per-network DNS,
+// VPN routes and Private DNS keep working, none of which a hand-rolled UDP client would honour.
+//
+// So on Android this asks bionic. Bionic is already linked into every Android program, and this
+// is a name lookup rather than a TLS stack. The certificate check that decides whether to trust
+// the answer is still entirely this library's.
+cfg(android) {
+    extern fn getaddrinfo(Int, Int, Int, Int) -> Int
+    extern fn freeaddrinfo(Int)
+    extern fn malloc(Int) -> Int
+    extern fn free(Int)
+
+    // struct addrinfo on bionic, verified on a device rather than assumed: 48 bytes, with
+    // ai_canonname at 24 and ai_addr at 32. glibc has those two the other way round, so a layout
+    // copied from a Linux header reads the name where the address should be.
+    fn ai_size() -> Int { return 48 }
+    fn ai_family_off() -> Int { return 4 }
+    fn ai_addr_off() -> Int { return 32 }
+    fn ai_next_off() -> Int { return 40 }
+    fn af_inet() -> Int { return 2 }
+
+    fn read_ptr(at: Int) -> Int {
+        var v = 0
+        var i = 7
+        unsafe { while i >= 0 { v = ((v << 8) | peek8(at + i))  i = i - 1 } }
+        return v
+    }
+    fn read_i32(at: Int) -> Int {
+        var v = 0
+        unsafe { v = (((peek8(at) | (peek8(at + 1) << 8)) | (peek8(at + 2) << 16)) | (peek8(at + 3) << 24)) }
+        return v
+    }
+    fn cstr_of(s: Str) -> Int {
+        let n = s.len()
+        var b = 0
+        unsafe {
+            b = malloc(n + 1)
+            var i = 0
+            while i < n { poke8(b + i, ord(s.at(i)))  i = i + 1 }
+            poke8(b + n, 0)
+        }
+        return b
+    }
+
+    fn android_resolve4(host: Str) -> DnsResult {
+        var out: Vec<DnsAddr> = vec()
+        let hp = cstr_of(host)
+        var hints = 0
+        var resp = 0
+        var rc = 0
+        unsafe {
+            hints = malloc(ai_size())
+            var i = 0
+            while i < ai_size() { poke8(hints + i, 0)  i = i + 1 }
+            poke8(hints + ai_family_off(), af_inet())        // ai_family = AF_INET
+            poke8(hints + 8, 1)                              // ai_socktype = SOCK_STREAM
+            resp = malloc(8)
+            i = 0
+            while i < 8 { poke8(resp + i, 0)  i = i + 1 }
+            rc = getaddrinfo(hp, 0, hints, resp)
+        }
+        if rc != 0 {
+            unsafe { free(hp)  free(hints)  free(resp) }
+            // bionic uses the BSD error numbers, not glibc's: EAI_NODATA is 7 and EAI_NONAME is 8,
+            // where glibc has EAI_NONAME as -2. Checking for glibc's value here makes every
+            // "no such host" arrive as an unexplained numeric failure instead.
+            if rc == 7 { return DnsResult { addrs: out, err: "no such host" } }
+            if rc == 8 { return DnsResult { addrs: out, err: "no such host" } }
+            return DnsResult { addrs: out, err: ("the platform resolver failed (" + to_str(rc) + ")") }
+        }
+        let head = read_ptr(resp)
+        var node = head
+        var guard = 0
+        while node != 0 {
+            if guard > 64 { node = 0 }
+            else {
+                if read_i32(node + ai_family_off()) == af_inet() {
+                    let sa = read_ptr(node + ai_addr_off())
+                    if sa != 0 {
+                        var b = ""
+                        unsafe {
+                            var k = 0
+                            while k < 4 { b = (b + chr(peek8(sa + 4 + k)))  k = k + 1 }   // sin_addr
+                        }
+                        out.push(DnsAddr { bytes: b })
+                    }
+                }
+                node = read_ptr(node + ai_next_off())
+                guard = guard + 1
+            }
+        }
+        unsafe { freeaddrinfo(head)  free(hp)  free(hints)  free(resp) }
+        if out.len() == 0 { return DnsResult { addrs: out, err: "the platform resolver returned no IPv4 address" } }
+        return DnsResult { addrs: out, err: "" }
+    }
+}
+// Windows has no /etc/resolv.conf. The nameservers live in the registry, per adapter, and a VPN or a
+// DNS-over-HTTPS setting can move them, so this asks the platform resolver (ws2_32's getaddrinfo,
+// already linked for the sockets) instead of reading a list and speaking UDP to it. As on Android,
+// only the name lookup is the platform's; the certificate check that decides whether to believe the
+// answer is still this library's.
+cfg(windows) {
+    extern fn getaddrinfo(Int, Int, Int, Int) -> Int
+    extern fn freeaddrinfo(Int)
+    extern fn malloc(Int) -> Int
+    extern fn free(Int)
+
+    // Winsock's ADDRINFOA has bionic's field order rather than glibc's: ai_canonname at 24 and
+    // ai_addr at 32, so the offsets below are the ones the Android block uses, and a layout copied
+    // from a Linux header would read the name where the address should be.
+    fn ai_size() -> Int { return 48 }
+    fn ai_family_off() -> Int { return 4 }
+    fn ai_addr_off() -> Int { return 32 }
+    fn ai_next_off() -> Int { return 40 }
+    fn af_inet() -> Int { return 2 }
+
+    fn read_ptr(at: Int) -> Int {
+        var v = 0
+        var i = 7
+        unsafe { while i >= 0 { v = ((v << 8) | peek8(at + i))  i = i - 1 } }
+        return v
+    }
+    fn read_i32(at: Int) -> Int {
+        var v = 0
+        unsafe { v = (((peek8(at) | (peek8(at + 1) << 8)) | (peek8(at + 2) << 16)) | (peek8(at + 3) << 24)) }
+        return v
+    }
+    fn cstr_of(s: Str) -> Int {
+        let n = s.len()
+        var b = 0
+        unsafe {
+            b = malloc(n + 1)
+            var i = 0
+            while i < n { poke8(b + i, ord(s.at(i)))  i = i + 1 }
+            poke8(b + n, 0)
+        }
+        return b
+    }
+
+    fn windows_resolve4(host: Str) -> DnsResult {
+        var out: Vec<DnsAddr> = vec()
+        let hp = cstr_of(host)
+        var hints = 0
+        var resp = 0
+        var rc = 0
+        unsafe {
+            hints = malloc(ai_size())
+            var i = 0
+            while i < ai_size() { poke8(hints + i, 0)  i = i + 1 }
+            poke8(hints + ai_family_off(), af_inet())        // ai_family = AF_INET
+            poke8(hints + 8, 1)                              // ai_socktype = SOCK_STREAM
+            resp = malloc(8)
+            i = 0
+            while i < 8 { poke8(resp + i, 0)  i = i + 1 }
+            rc = getaddrinfo(hp, 0, hints, resp)
+        }
+        if rc != 0 {
+            unsafe { free(hp)  free(hints)  free(resp) }
+            // getaddrinfo answers with Winsock error numbers here, not the EAI_* ones: a name that
+            // does not resolve is WSAHOST_NOT_FOUND (11001), and a name with no address of the
+            // family asked for is WSANO_DATA (11004).
+            if rc == 11001 { return DnsResult { addrs: out, err: "no such host" } }
+            if rc == 11004 { return DnsResult { addrs: out, err: "no such host" } }
+            return DnsResult { addrs: out, err: ("the platform resolver failed (" + to_str(rc) + ")") }
+        }
+        let head = read_ptr(resp)
+        var node = head
+        var guard = 0
+        while node != 0 {
+            if guard > 64 { node = 0 }
+            else {
+                if read_i32(node + ai_family_off()) == af_inet() {
+                    let sa = read_ptr(node + ai_addr_off())
+                    if sa != 0 {
+                        var b = ""
+                        unsafe {
+                            var k = 0
+                            while k < 4 { b = (b + chr(peek8(sa + 4 + k)))  k = k + 1 }   // sin_addr
+                        }
+                        out.push(DnsAddr { bytes: b })
+                    }
+                }
+                node = read_ptr(node + ai_next_off())
+                guard = guard + 1
+            }
+        }
+        unsafe { freeaddrinfo(head)  free(hp)  free(hints)  free(resp) }
+        if out.len() == 0 { return DnsResult { addrs: out, err: "the platform resolver returned no IPv4 address" } }
+        return DnsResult { addrs: out, err: "" }
+    }
+}
+
+/// Resolve `host` to IPv4 addresses, trying each configured nameserver in turn.
+///
+/// A dotted-quad is returned as itself without a query: asking a nameserver to resolve an address
+/// is both pointless and, on a network with a hostile resolver, an opportunity.
+pub fn dns_resolve4(host: Str) -> DnsResult {
+    var out: Vec<DnsAddr> = vec()
+    let literal = parse_ipv4(host)
+    if literal.ok != 0 {
+        out.push(DnsAddr { bytes: ((((("" + chr(literal.a)) + chr(literal.b)) + chr(literal.c)) + chr(literal.d))) })
+        return DnsResult { addrs: out, err: "" }
+    }
+    cfg(android) {
+        return android_resolve4(host)
+    }
+    cfg(windows) {
+        return windows_resolve4(host)
+    }
+    let servers = dns_servers()
+    if servers.len() == 0 { return DnsResult { addrs: out, err: "no nameservers configured" } }
+    var last = "no nameservers answered"
+    var i = 0
+    while i < servers.len() {
+        // A different id per attempt, so a late answer to the previous query is not mistaken for
+        // an answer to this one.
+        let id = (((time::unix_ms() + (i * 7919)) + host.len()) & 0xffff)
+        let r = dns_query_server(servers[i], host, dns_type_a(), id)
+        if r.err.len() == 0 { return r }
+        last = copy r.err
+        // "no such host" is an answer, not a failure to reach a server; asking the next one
+        // would be shopping for a different reply.
+        if r.err == "no such host" { return r }
+        i = i + 1
+    }
+    return DnsResult { addrs: out, err: last }
+}
+
+/// Resolve `host` and return the first IPv4 address, or a bad Ip4 if it could not be resolved.
+pub fn resolve_ip4(host: Str) -> Ip4 {
+    let r = dns_resolve4(host)
+    if r.err.len() > 0 { return ipv4_bad() }
+    if r.addrs.len() == 0 { return ipv4_bad() }
+    return ip4_of_addr(r.addrs[0])
+}
+
+/// Resolve and connect in one step, the operation nearly every caller actually wants.
+/// Returns a connected socket fd, or -1.
+pub fn tcp_connect_host(host: Str, port: Int) -> Int {
+    let ip = resolve_ip4(host)
+    if ip.ok == 0 { return 0 - 1 }
+    return tcp_connect4(ip, port)
+}

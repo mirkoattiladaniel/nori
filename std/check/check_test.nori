@@ -1,0 +1,53 @@
+import "std/check" as check
+import "std/rand" as rand
+
+// generators are deterministic in their Rng: same seed -> same draw.
+fn test_gen_int_deterministic() {
+    var r1 = rand::seeded(7)
+    var r2 = rand::seeded(7)
+    var i = 0
+    while i < 30 {
+        assert_eq(check::gen_int(r1, i), check::gen_int(r2, i))
+        i = i + 1
+    }
+}
+
+// shrink_int always offers 0 as the simplest candidate for a non-zero value, and nothing for 0.
+fn test_shrink_int_toward_zero() {
+    let c = check::shrink_int(9)
+    assert_true(c.len() > 0)
+    assert_eq(c[0], 0)
+    assert_eq((check::shrink_int(0)).len(), 0)
+}
+
+// shrinking a Vec offers the empty vector plus strictly-shorter candidates.
+fn test_shrink_veci_shortens() {
+    var v: Vec<Int> = vec()
+    v.push(3) v.push(1) v.push(4)
+    let cands = check::shrink_veci(v)
+    assert_true(cands.len() > 0)
+    assert_eq(cands[0].len(), 0) // first candidate is empty
+    var i = 0
+    while i < cands.len() {
+        assert_true(cands[i].len() < 3)
+        i = i + 1
+    }
+}
+
+// renderers produce readable, source-like text.
+fn test_show_renderers() {
+    assert_streq(check::show_int(0 - 5), "-5")
+    assert_streq(check::show_bool(true), "true")
+    var v: Vec<Int> = vec()
+    v.push(1) v.push(2) v.push(3)
+    assert_streq(check::show_veci(v), "[1, 2, 3]")
+    assert_streq(check::show_str("hi"), "" + chr(34) + "hi" + chr(34))
+}
+
+// shrink candidates are simpler: none equals the original bool `true` staying `true`.
+fn test_shrink_bool() {
+    assert_eq((check::shrink_bool(false)).len(), 0)
+    let c = check::shrink_bool(true)
+    assert_eq(c.len(), 1)
+    assert_false(c[0])
+}

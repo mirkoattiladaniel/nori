@@ -1,0 +1,430 @@
+// Native .nori tests for std/xdg: run with
+//   noric --test std/xdg/xdg_test.nori compiler/runtime.nori --import-root .
+//
+// Host only. The XDG environment variables are pointed at the fixtures under testdata/ (their
+// paths are built from the cwd, which the invocation above sets to the repo root). Expected
+// results come from the freedesktop specifications; the spec rule is quoted beside each check.
+import "std/xdg" as xdg
+import "std/os" as os
+
+/// an absolute fixture path.
+fn fx(p: Str) -> Str {
+    if p.len() == 0 { return os::cwd() + "/std/xdg/testdata" }
+    return os::cwd() + ("/std/xdg/testdata/" + p)
+}
+
+/// clear every XDG variable so a test starts from the spec's defaults.
+fn clear_xdg() {
+    os::set_env("XDG_DATA_HOME", "")
+    os::set_env("XDG_DATA_DIRS", "")
+    os::set_env("XDG_CONFIG_HOME", "")
+    os::set_env("XDG_CONFIG_DIRS", "")
+    os::set_env("XDG_CACHE_HOME", "")
+    os::set_env("XDG_RUNTIME_DIR", "")
+}
+
+/// index of the app with `id`, or -1.
+fn app_idx(apps: Vec<xdg::App>, id: Str) -> Int {
+    var i = 0
+    while i < apps.len() {
+        if xdg::app_id(apps[i]) == id { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ---- XDG base directories (Base Directory Specification) ---------------------------------------
+
+fn test_base_dirs_defaults() {
+    clear_xdg()
+    let home = os::home_dir()
+    assert_true(home.len() > 0)
+    // §2: "If $XDG_DATA_HOME is either not set or empty, a default equal to ~/.local/share should be used."
+    assert_streq(xdg::data_home(), home + "/.local/share")
+    // §2: "If $XDG_DATA_DIRS is either not set or empty, a value equal to /usr/local/share/:/usr/share/ should be used."
+    let dd = xdg::data_dirs()
+    assert_eq(dd.len(), 2)
+    assert_streq(dd[0], "/usr/local/share")
+    assert_streq(dd[1], "/usr/share")
+    // §3: "If $XDG_CONFIG_HOME is either not set or empty, a default equal to ~/.config should be used."
+    assert_streq(xdg::config_home(), home + "/.config")
+    // §3: "If $XDG_CONFIG_DIRS is either not set or empty, a value equal to /etc/xdg should be used."
+    let cd = xdg::config_dirs()
+    assert_eq(cd.len(), 1)
+    assert_streq(cd[0], "/etc/xdg")
+    // §4: "If $XDG_CACHE_HOME is either not set or empty, a default equal to ~/.cache should be used."
+    assert_streq(xdg::cache_home(), home + "/.cache")
+    // §6: $XDG_RUNTIME_DIR "must not be ... guessed"; the spec gives it no default.
+    assert_streq(xdg::runtime_dir(), "")
+}
+
+fn test_base_dirs_env() {
+    let a = fx("apps/data1")
+    let b = fx("apps/data2")
+    os::set_env("XDG_DATA_HOME", a)
+    assert_streq(xdg::data_home(), a)
+    // §2: "All paths set in these environment variables must be absolute"; a relative value is ignored.
+    os::set_env("XDG_DATA_HOME", "relative/dir")
+    assert_streq(xdg::data_home(), os::home_dir() + "/.local/share")
+    os::set_env("XDG_DATA_HOME", "")
+    // §2: XDG_DATA_DIRS is a ':'-separated list; the relative entry is dropped.
+    os::set_env("XDG_DATA_DIRS", a + ":./rel:" + b)
+    let dd = xdg::data_dirs()
+    assert_eq(dd.len(), 2)
+    assert_streq(dd[0], a)
+    assert_streq(dd[1], b)
+    os::set_env("XDG_CONFIG_HOME", a)
+    assert_streq(xdg::config_home(), a)
+    os::set_env("XDG_CACHE_HOME", a)
+    assert_streq(xdg::cache_home(), a)
+    os::set_env("XDG_RUNTIME_DIR", b)
+    assert_streq(xdg::runtime_dir(), b)
+    clear_xdg()
+}
+
+// ---- desktop entries (Desktop Entry Specification 1.5) -----------------------------------------
+
+fn test_parse_basic() {
+    let e = xdg::parse_desktop(read_file(fx("desktop/basic.desktop")))
+    assert_streq(xdg::entry_str(e, "Type", ""), "Application")
+    assert_streq(xdg::entry_str(e, "Name", ""), "Text Editor")
+    // Localized keys: "the values of the keys are looked up in the following order:
+    // lang_COUNTRY@MODIFIER, lang_COUNTRY, lang@MODIFIER, lang, and finally ... without any suffix."
+    assert_streq(xdg::entry_str(e, "Name", "hu"), "Szövegszerkesztő")
+    assert_streq(xdg::entry_str(e, "Name", "hu_HU"), "Szövegszerkesztő (HU)")
+    assert_streq(xdg::entry_str(e, "Name", "hu_HU@mod"), "Szövegszerkesztő (HU mod)")
+    assert_streq(xdg::entry_str(e, "Name", "hu_DE"), "Szövegszerkesztő")          // lang_COUNTRY miss -> lang
+    assert_streq(xdg::entry_str(e, "Name", "de"), "Text Editor")                  // no German key -> plain
+    assert_streq(xdg::entry_str(e, "Name", "C"), "Text Editor")                   // the C locale: default only
+    assert_streq(xdg::entry_str(e, "Name", "hu_HU.UTF-8"), "Szövegszerkesztő (HU)") // charset suffix stripped
+    assert_streq(xdg::entry_str(e, "GenericName", "hu"), "Általános szerkesztő")
+    assert_streq(xdg::entry_str(e, "Comment", "hu"), "Szövegfájlok szerkesztése")
+    // booleans
+    assert_false(xdg::entry_bool(e, "Terminal"))
+    assert_false(xdg::entry_bool(e, "NoDisplay"))
+    assert_false(xdg::entry_bool(e, "Hidden"))
+    // lists: "a list value is a string that contains one or more strings separated by semicolons"
+    let cats = xdg::entry_list(e, "Categories")
+    assert_eq(cats.len(), 2)
+    assert_streq(cats[0], "Utility")
+    assert_streq(cats[1], "TextEditor")
+    let kw = xdg::entry_list(e, "Keywords")
+    assert_eq(kw.len(), 3)
+    assert_streq(kw[2], "file")
+    let mt = xdg::entry_list(e, "MimeType")
+    assert_eq(mt.len(), 2)
+    assert_streq(mt[1], "text/markdown")
+    let osp = xdg::entry_list(e, "OnlyShowIn")
+    assert_eq(osp.len(), 2)
+    assert_streq(osp[0], "GNOME")
+    let nsp = xdg::entry_list(e, "NotShowIn")
+    assert_eq(nsp.len(), 1)
+    assert_streq(nsp[0], "XFCE")
+    // scalar keys read whole
+    assert_streq(xdg::entry_str(e, "StartupWMClass", ""), "editor-ng")
+    assert_streq(xdg::entry_str(e, "Path", ""), "/usr/bin")
+    assert_streq(xdg::entry_str(e, "Icon", ""), "accessories-text-editor")
+    assert_streq(xdg::entry_str(e, "Exec", ""), "editor-ng %F")
+    assert_streq(xdg::entry_str(e, "TryExec", ""), "editor-ng")
+    // "[Desktop Action X]" groups: "the name ... must be prefixed by 'Desktop Action'"
+    let acts = xdg::entry_actions(e)
+    assert_eq(acts.len(), 2)
+    assert_streq(acts[0], "Desktop Action New")
+    assert_streq(xdg::entry_str_in(e, "Desktop Action New", "Name", ""), "New Window")
+    assert_streq(xdg::entry_str_in(e, "Desktop Action New", "Name", "hu"), "Új ablak")
+    assert_streq(xdg::entry_str_in(e, "Desktop Action New", "Exec", ""), "editor-ng --new %u")
+    assert_streq(xdg::entry_str_in(e, "Desktop Action Print", "Name", ""), "Print")
+    // presence
+    assert_true(xdg::entry_has_key(e, "Name"))
+    assert_false(xdg::entry_has_key(e, "NoSuchKey"))
+}
+
+fn test_parse_escapes_and_values() {
+    let e = xdg::parse_desktop(read_file(fx("desktop/values.desktop")))
+    // Escape sequences: "the following escape sequences ... \s \n \t \r \\"; an unknown escape is
+    // treated as its bare character (the backslash is discarded).
+    assert_streq(xdg::entry_str(e, "Name", ""), "Line One Two\nSecondq Q\tTab\rCR\\Bk")
+    assert_streq(xdg::entry_str(e, "UnknownEscape", ""), "qz")
+    // booleans: "The values are 'true' and 'false'"; accepted case-insensitively.
+    assert_true(xdg::entry_bool(e, "Terminal"))
+    assert_false(xdg::entry_bool(e, "NoDisplay"))
+    // lists: empty entries carry nothing for a launcher; a lone ";" is an empty list.
+    let cats = xdg::entry_list(e, "Categories")
+    assert_eq(cats.len(), 3)
+    assert_streq(cats[0], "A")
+    assert_streq(cats[2], "C")
+    let kw = xdg::entry_list(e, "Keywords")
+    assert_eq(kw.len(), 2)
+    assert_streq(kw[1], "k2")
+    assert_eq(xdg::entry_list(e, "MimeType").len(), 0)
+    assert_eq(xdg::entry_list(e, "OnlyShowIn").len(), 0)
+}
+
+fn test_parse_crlf() {
+    let e = xdg::parse_desktop(read_file(fx("desktop/crlf.desktop")))
+    assert_streq(xdg::entry_str(e, "Name", ""), "CRLF App")
+    assert_streq(xdg::entry_str(e, "Exec", ""), "crlf-app")
+    assert_streq(xdg::entry_str(e, "Type", ""), "Application")
+}
+
+// ---- installed applications ---------------------------------------------------------------------
+
+fn test_list_apps() {
+    os::set_env("XDG_DATA_HOME", fx("apps/data1"))
+    os::set_env("XDG_DATA_DIRS", fx("apps/data2"))
+    let apps = xdg::list_apps()
+    // every present application id appears
+    assert_true(app_idx(apps, "main") >= 0)
+    assert_true(app_idx(apps, "sub-extra") >= 0)
+    assert_true(app_idx(apps, "only2") >= 0)
+    assert_true(app_idx(apps, "note") >= 0)
+    assert_true(app_idx(apps, "de-gnome") >= 0)
+    assert_true(app_idx(apps, "de-notgnome") >= 0)
+    assert_true(app_idx(apps, "try-ok") >= 0)
+    // "Hidden ... a value of true ... the file is ignored", and removes the id even from an
+    // earlier directory: hidden-plain hides itself, data2's hide-me.desktop hides data1's id.
+    assert_true(app_idx(apps, "hidden-plain") < 0)
+    assert_true(app_idx(apps, "hide-me") < 0)
+    // a non-.desktop file is not an application
+    assert_eq(apps.len(), 8)
+    // "earlier directories winning": the id dup exists in both; data1's file is the one
+    let d = app_idx(apps, "dup")
+    assert_true(d >= 0)
+    assert_streq(xdg::app_name(apps[d], ""), "Dup First")
+    // Desktop File IDs: "the file name with the '.desktop' extension removed, relative to the
+    // applications directory, with '/' replaced by '-'": sub/extra.desktop -> sub-extra
+    let se = app_idx(apps, "sub-extra")
+    assert_streq(xdg::app_path(apps[se]), fx("apps/data1/applications/sub/extra.desktop"))
+    // fields through the accessors
+    let m = app_idx(apps, "main")
+    assert_streq(xdg::app_name(apps[m], ""), "Main App")
+    assert_streq(xdg::app_generic_name(apps[m], ""), "Main One")
+    assert_streq(xdg::app_exec(apps[m]), "main-app %F")
+    assert_streq(xdg::app_icon(apps[m], ""), "main-icon")
+    assert_streq(xdg::app_type(apps[m]), "Application")
+    assert_false(xdg::app_terminal(apps[m]))
+    let tc = app_idx(apps, "try-ok")
+    assert_streq(xdg::app_try_exec(apps[tc]), "/bin/true")
+    clear_xdg()
+}
+
+fn test_shown_apps() {
+    os::set_env("XDG_DATA_HOME", fx("apps/data1"))
+    os::set_env("XDG_DATA_DIRS", fx("apps/data2"))
+    let apps = xdg::list_apps()
+    var none: Vec<Str> = vec()
+    var gn: Vec<Str> = vec()  gn.push("GNOME")
+    var kde: Vec<Str> = vec()  kde.push("KDE")
+    var xfce: Vec<Str> = vec()  xfce.push("XFCE")
+    // NoDisplay: "If NoDisplay is true ... this entry should be skipped when searching for an
+    // application to present to users"; a failing TryExec: "If ... the program is not installed,
+    // the entry must be ignored"
+    let s0 = xdg::shown_apps(apps, none)
+    assert_true(app_idx(s0, "note") < 0)          // NoDisplay=true and a missing TryExec
+    assert_true(app_idx(s0, "try-ok") >= 0)       // TryExec=/bin/true resolves
+    assert_true(app_idx(s0, "main") >= 0)
+    // OnlyShowIn with no matching desktop environment: excluded
+    assert_true(app_idx(s0, "de-gnome") < 0)
+    // NotShowIn without a match: shown
+    assert_true(app_idx(s0, "de-notgnome") >= 0)
+    let sg = xdg::shown_apps(apps, gn)
+    assert_true(app_idx(sg, "de-gnome") >= 0)     // OnlyShowIn=GNOME;KDE; matches
+    assert_true(app_idx(sg, "de-notgnome") < 0)   // NotShowIn=GNOME;XFCE; matches
+    let sk = xdg::shown_apps(apps, kde)
+    assert_true(app_idx(sk, "de-gnome") >= 0)
+    assert_true(app_idx(sk, "de-notgnome") >= 0)
+    let sx = xdg::shown_apps(apps, xfce)
+    assert_true(app_idx(sx, "de-gnome") < 0)
+    assert_true(app_idx(sx, "de-notgnome") < 0)   // NotShowIn=...;XFCE; matches
+    clear_xdg()
+}
+
+// ---- Exec field codes ---------------------------------------------------------------------------
+
+fn test_exec_field_codes() {
+    var files: Vec<Str> = vec()  files.push("/a/one.txt")  files.push("/a/two.txt")
+    var urls: Vec<Str> = vec()  urls.push("https://example.org/p")
+    var no: Vec<Str> = vec()
+    // "%F ... a list of files": each file is a separate argument
+    let a1 = xdg::expand_exec("ed %F", "Ed", "ic", "/x.desktop", files, no)
+    assert_eq(a1.len(), 3)
+    assert_streq(a1[1], "/a/one.txt")
+    assert_streq(a1[2], "/a/two.txt")
+    // "%f ... a single file name"; with no files the whole token is dropped
+    let a2 = xdg::expand_exec("open %f", "Op", "", "/x.desktop", files, no)
+    assert_eq(a2.len(), 2)
+    assert_streq(a2[1], "/a/one.txt")
+    let a3 = xdg::expand_exec("open %f", "Op", "", "/x.desktop", no, no)
+    assert_eq(a3.len(), 1)
+    assert_streq(a3[0], "open")
+    // "%U ... a list of URLs" / "%u ... a single URL"
+    let a4 = xdg::expand_exec("browse %U", "B", "", "/x.desktop", no, urls)
+    assert_eq(a4.len(), 2)
+    assert_streq(a4[1], "https://example.org/p")
+    let a5 = xdg::expand_exec("browse %u", "B", "", "/x.desktop", no, urls)
+    assert_eq(a5.len(), 2)
+    // "%i ... expanded as two arguments, first '--icon' and then the value of the Icon key"
+    let a6 = xdg::expand_exec("run %i", "R", "my-icon", "/x.desktop", no, no)
+    assert_eq(a6.len(), 3)
+    assert_streq(a6[1], "--icon")
+    assert_streq(a6[2], "my-icon")
+    let a7 = xdg::expand_exec("run %i", "R", "", "/x.desktop", no, no)
+    assert_eq(a7.len(), 1)
+    assert_streq(a7[0], "run")
+    // "%c ... the translated name", "%k ... the location of the desktop file", "%% ... a literal %"
+    let a8 = xdg::expand_exec("show %c at %k %%", "Nice App", "", "/x.desktop", no, no)
+    assert_eq(a8.len(), 5)
+    assert_streq(a8[1], "Nice App")
+    assert_streq(a8[3], "/x.desktop")
+    assert_streq(a8[4], "%")
+    // an unrecognised field code is left literal
+    let a9 = xdg::expand_exec("weird %q", "W", "", "/x.desktop", no, no)
+    assert_eq(a9.len(), 2)
+    assert_streq(a9[1], "%q")
+}
+
+fn test_exec_quoting() {
+    var no: Vec<Str> = vec()
+    // "Arguments ... may be quoted in whole or in part": a quoted argument keeps its space
+    let a1 = xdg::expand_exec("gimp \"--pdb=foo bar\"", "G", "", "", no, no)
+    assert_eq(a1.len(), 2)
+    assert_streq(a1[1], "--pdb=foo bar")
+    // "escaping the double quote character ... by preceding it with an additional double quote"
+    let a2 = xdg::expand_exec("prog \"say \"\"hi\"\"\"", "P", "", "", no, no)
+    assert_eq(a2.len(), 2)
+    assert_streq(a2[1], "say \"hi\"")
+    // the back tick and the dollar sign are escaped the same way
+    let a3 = xdg::expand_exec("prog \"a``b\" \"c$$d\"", "P", "", "", no, no)
+    assert_eq(a3.len(), 3)
+    assert_streq(a3[1], "a`b")
+    assert_streq(a3[2], "c$d")
+    // quoting a part of a word still yields one argument
+    let a4 = xdg::expand_exec("prog pre\" x \"post", "P", "", "", no, no)
+    assert_eq(a4.len(), 2)
+    assert_streq(a4[1], "pre x post")
+    // tabs separate arguments as well
+    let a5 = xdg::expand_exec("prog\ta\tb", "P", "", "", no, no)
+    assert_eq(a5.len(), 3)
+}
+
+// ---- icon lookup (Icon Theme Specification) ------------------------------------------------------
+
+fn test_icon_lookup() {
+    os::set_env("XDG_DATA_HOME", fx(""))
+    os::set_env("XDG_DATA_DIRS", "")
+    // Directories() of the spec: a Fixed dir serves exactly Size; 48x48 has foo.png
+    assert_streq(xdg::icon_lookup_in("mytheme", "foo", 48, 1), fx("icons/mytheme/48x48/apps/foo.png"))
+    assert_streq(xdg::icon_lookup_in("mytheme", "foo", 128, 1), fx("icons/mytheme/128x128/apps/foo.svg"))
+    // Scalable: MinSize..MaxSize contains the size
+    assert_streq(xdg::icon_lookup_in("mytheme", "baz", 64, 1), fx("icons/mytheme/scalable/apps/baz.svg"))
+    // Threshold: |size - Size| <= Threshold (22 ± 4 covers 20)
+    assert_streq(xdg::icon_lookup_in("mytheme", "thr", 20, 1), fx("icons/mytheme/22x22/apps/thr.png"))
+    assert_streq(xdg::icon_lookup_in("mytheme", "thr", 30, 1), "")   // beyond the threshold, nowhere else
+    // the icon is simply not found: the whole chain (mytheme, parent, hicolor) misses
+    assert_streq(xdg::icon_lookup_in("mytheme", "foo", 22, 1), "")
+    assert_streq(xdg::icon_lookup_in("mytheme", "foo", 60, 1), "")
+    // inheritance: "the parent themes ... are searched" via the Inherits key
+    assert_streq(xdg::icon_lookup_in("mytheme", "inherited", 32, 1), fx("icons/parent/32x32/apps/inherited.png"))
+    // ... then hicolor as the final theme: "If no other theme is found, hicolor is used"
+    assert_streq(xdg::icon_lookup_in("mytheme", "hic", 48, 1), fx("icons/hicolor/48x48/apps/hic.png"))
+    assert_streq(xdg::icon_lookup_in("mytheme", "hicscale", 64, 1), fx("icons/hicolor/scalable/apps/hicscale.svg"))
+    // scale: the 64x64/apps dir is Size=32 Scale=2. The spec's Directories() rule for Fixed reads
+// "Size * Scale == size": the directory's own scale, so size 64 matches at any requested scale,
+// and size 32 does not (no dir serves 32px).
+    assert_streq(xdg::icon_lookup_in("mytheme", "dual", 64, 2), fx("icons/mytheme/64x64/apps/dual.png"))
+    assert_streq(xdg::icon_lookup_in("mytheme", "dual", 64, 1), fx("icons/mytheme/64x64/apps/dual.png"))
+    assert_streq(xdg::icon_lookup_in("mytheme", "dual", 32, 1), "")
+    // when several formats of the icon exist in one directory, png/svg beat xpm
+    assert_streq(xdg::icon_lookup_in("mytheme", "both", 22, 1), fx("icons/mytheme/22x22/apps/both.png"))
+    // an unknown theme falls through to hicolor, then to /usr/share/pixmaps
+    assert_streq(xdg::icon_lookup_in("no-such-theme", "nori_xdg_no_such_icon_xyz", 48, 1), "")
+    clear_xdg()
+}
+
+fn test_icon_theme_and_cache() {
+    os::set_env("XDG_DATA_HOME", fx(""))
+    os::set_env("XDG_DATA_DIRS", "")
+    // the parsed theme
+    let t = xdg::load_theme("mytheme")
+    assert_eq(t.dirs.len(), 5)
+    assert_streq(t.dirs[0].name, "48x48/apps")
+    assert_eq(t.dirs[0].kind, xdg::ICON_FIXED())
+    assert_eq(t.dirs[3].kind, xdg::ICON_THRESHOLD())
+    assert_eq(t.dirs[3].threshold, 4)
+    assert_eq(t.dirs[4].scale, 2)
+    assert_eq(t.inherits.len(), 1)
+    assert_streq(t.inherits[0], "parent")
+    let t2 = xdg::load_theme("no-such-theme")
+    assert_eq(t2.dirs.len(), 0)
+    // repeated lookups return the same answer (directory listings are cached)
+    let a1 = xdg::icon_lookup_in("mytheme", "foo", 48, 1)
+    let a2 = xdg::icon_lookup_in("mytheme", "foo", 48, 1)
+    assert_streq(a1, a2)
+    assert_true(a1.len() > 0)
+    // switching data home to a second tree finds themes there (caches are keyed by path)
+    os::set_env("XDG_DATA_HOME", fx("icons2"))
+    assert_streq(xdg::icon_lookup_in("othertheme", "bar", 24, 1), fx("icons2/icons/othertheme/24x24/apps/bar.png"))
+    assert_streq(xdg::icon_lookup_in("othertheme", "foo", 24, 1), "")   // othertheme has no foo
+    clear_xdg()
+}
+
+fn test_icon_lookup_every_base_dir() {
+    // Fixtures: $XDG_DATA_HOME/icons-user has icons/hicolor/48x48/apps/{x,y}.png and no
+    // index.theme; $XDG_DATA_DIRS/icons-system holds hicolor's index.theme (and a same-name
+    // y.png); $HOME/.icons/hicolor/48x48/apps/x.png is a third copy of x. This is the real case
+    // where a user base dir adds icon files to a theme that only a system dir defines.
+    let user = fx("icons-user")
+    let system = fx("icons-system")
+    os::set_env("XDG_DATA_HOME", user)
+    os::set_env("XDG_DATA_DIRS", system)
+    // icon-theme-spec §3: "In at least one of the theme directories there must be a file called
+    // index.theme that describes the theme. The first index.theme found while searching the base
+    // directories in order is used.": hicolor's directory list comes from the system dir (the
+    // user dir has none), but the icon file is searched under every base directory (§5 LookupIcon:
+    // "for each subdir in $(theme subdir list) { for each directory in $(basename list) { for
+    // extension in ('png','svg','xpm') { ... filename = directory/$(themename)/subdir/iconname.
+    // extension ... } } }"), user first, so the user's x.png is found:
+    assert_streq(xdg::icon_lookup("x", 48), fx("icons-user/icons/hicolor/48x48/apps/x.png"))
+    // §3: "A theme can be spread across several base directories by having subdirectories of the
+    // same name. This way users can extend and override system themes.": the same-name y.png
+    // exists in both dirs; base directories are searched in order so the user's wins:
+    assert_streq(xdg::icon_lookup("y", 48), fx("icons-user/icons/hicolor/48x48/apps/y.png"))
+    // §3: "By default, apps should look in $HOME/.icons (for backwards compatibility), in
+    // $XDG_DATA_DIRS/icons and in /usr/share/pixmaps (in that order).": $HOME/.icons is the
+    // first base directory, so its x.png wins over the user data dir's:
+    let old_home = os::env("HOME")
+    os::set_env("HOME", fx("home-icons"))
+    assert_streq(xdg::icon_lookup("x", 48), fx("home-icons/.icons/hicolor/48x48/apps/x.png"))
+    os::set_env("HOME", old_home)
+    clear_xdg()
+}
+
+fn test_icon_resolve() {
+    // Desktop Entry Spec, Icon: "the value ... may be given as an absolute path ... in which case
+    // it is used as is"; otherwise the themed lookup runs (default theme hicolor).
+    assert_streq(xdg::icon_resolve("/usr/share/icons/hicolor/48x48/apps/x.png", 48), "/usr/share/icons/hicolor/48x48/apps/x.png")
+    os::set_env("XDG_DATA_HOME", fx(""))
+    os::set_env("XDG_DATA_DIRS", "")
+    assert_streq(xdg::icon_resolve("hic", 48), fx("icons/hicolor/48x48/apps/hic.png"))
+    assert_streq(xdg::icon_resolve("", 48), "")
+    clear_xdg()
+}
+
+// ---- optional cross-check against the real machine -----------------------------------------------
+
+fn test_real_machine_apps() {
+    // Cross-check on this host's own /usr/share/applications (skips when the directory is absent).
+    if !os::path_exists("/usr/share/applications") { return }
+    os::set_env("XDG_DATA_HOME", "")
+    os::set_env("XDG_DATA_DIRS", "")
+    let apps = xdg::list_apps()
+    assert_true(apps.len() > 0)
+    var i = 0
+    while i < apps.len() {
+        // the spec makes Name mandatory for an application entry
+        assert_true(xdg::app_name(apps[i], "").len() > 0)
+        assert_true(xdg::app_id(apps[i]).len() > 0)
+        i = i + 1
+    }
+    clear_xdg()
+}

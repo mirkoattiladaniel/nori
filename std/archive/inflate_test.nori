@@ -1,0 +1,242 @@
+// Tests for the inflater's safety, run with
+//   noric --test std/archive/inflate_test.nori compiler/runtime.nori --import-root .
+//
+// The inflater must survive any input: a malformed stream ends with an error and never traps or reads
+// outside its input or its output. Real streams from real encoders (PNG IDAT from the colour emoji
+// font's PNG strikes and the image test files, WOFF 1.0 tables (zlib, level 9), a gzip member) are
+// decoded whole, then corrupted thousands of ways (bytes and bits flipped, bytes zeroed and saturated,
+// truncations, slices duplicated) and every corruption decoded again. Hand-built streams pin each
+// check: a distance before the output, a reserved block type, a stored block's LEN/NLEN, the dynamic
+// header's counts, over-subscribed code lengths, a missing end-of-block code, a bad header and
+// checksum, the output cap.
+import "std/archive" as ar
+
+fn rd32(s: Str, at: Int) -> Int { return (ord(s.at(at)) << 24) | (ord(s.at(at + 1)) << 16) | (ord(s.at(at + 2)) << 8) | ord(s.at(at + 3)) }
+fn rd16(s: Str, at: Int) -> Int { return (ord(s.at(at)) << 8) | ord(s.at(at + 1)) }
+fn blob(b: ar::Inflated) -> Str {
+    var s = ""
+    unsafe { s = str_from_buf(ar::inflated_ptr(b), ar::inflated_len(b)) }
+    return s
+}
+
+// every IDAT stream (the chunks of one PNG joined) of the PNGs found in `data`: a PNG file, or a
+// font whose colour glyphs are PNGs
+fn idat_streams(data: Str, inout out: Vec<Str>) {
+    var p = 0
+    while p + 8 <= data.len() {
+        if ord(data.at(p)) == 137 && data.slice(p + 1, p + 4) == "PNG" {
+            var q = p + 8
+            var z = ""
+            var go = true
+            while go && q + 8 <= data.len() {
+                let len = rd32(data, q)
+                let ty = data.slice(q + 4, q + 8)
+                if len < 0 || q + 12 + len > data.len() { go = false }
+                else {
+                    if ty == "IDAT" { z = z + data.slice(q + 8, q + 8 + len) }
+                    if ty == "IEND" { go = false }
+                    q = q + 12 + len
+                }
+            }
+            if z.len() > 0 { out.push(z) }
+            p = q
+        } else { p = p + 1 }
+    }
+}
+// the zlib-compressed tables of a WOFF 1.0 file, and each one's uncompressed length
+fn woff_tables(w: Str, inout zs: Vec<Str>, inout lens: Vec<Int>) {
+    let n = rd16(w, 12)
+    var i = 0
+    while i < n {
+        let e = 44 + i * 20
+        let off = rd32(w, e + 4)
+        let comp = rd32(w, e + 8)
+        let orig = rd32(w, e + 12)
+        if comp < orig { zs.push(w.slice(off, off + comp))  lens.push(orig) }
+        i = i + 1
+    }
+}
+
+fn real_streams(inout zs: Vec<Str>, inout caps: Vec<Int>) {
+    var pngs: Vec<Str> = vec()
+    idat_streams(read_file("std/font/assets/NotoColorEmoji-subset.ttf"), pngs)
+    idat_streams(read_file("std/image/testdata/corners_rgba.png"), pngs)
+    idat_streams(read_file("std/image/testdata/corners_pal.png"), pngs)
+    var i = 0
+    while i < pngs.len() { zs.push(copy pngs[i])  caps.push(0)  i = i + 1 }
+    woff_tables(read_file("std/archive/testdata/sample.woff"), zs, caps)
+}
+
+fn test_real_streams_decode_whole() {
+    var zs: Vec<Str> = vec()
+    var lens: Vec<Int> = vec()
+    real_streams(zs, lens)
+    assert_true(zs.len() >= 8)
+    var i = 0
+    while i < zs.len() {
+        let r = ar::inflate_zlib_checked(zs[i], 0)
+        assert_true(r.ok)
+        if lens[i] > 0 { assert_eq(ar::inflated_len(r.data), lens[i]) }
+        // the unchecked form agrees
+        let u = ar::inflate_zlib(zs[i])
+        assert_streq(blob(u), blob(r.data))
+        ar::inflated_free(u)
+        ar::inflated_free(r.data)
+        i = i + 1
+    }
+    // a gzip member, checked against the file it was made from
+    let g = ar::gunzip_checked(read_file("std/archive/testdata/sample.gz"), 0)
+    assert_true(g.ok)
+    assert_streq(blob(g.data), read_file("std/font/assets/NotoSansArabic-subset.ttf"))
+    ar::inflated_free(g.data)
+}
+
+// a deterministic PRNG
+fn nxt(inout x: Int) -> Int { x = (x * 1103515245 + 12345) & 2147483647  return x >> 8 }
+
+// corrupt `s` one of six ways
+fn mutate(s: Str, kind: Int, inout seed: Int) -> Str {
+    let n = s.len()
+    if n == 0 { return copy s }
+    let at = nxt(seed) % n
+    if kind == 0 { return s.slice(0, at) + chr((ord(s.at(at)) ^ (1 + nxt(seed) % 255)) & 255) + s.slice(at + 1, n) }
+    if kind == 1 { return s.slice(0, at) + chr(ord(s.at(at)) ^ (1 << (nxt(seed) % 8))) + s.slice(at + 1, n) }
+    if kind == 2 { return s.slice(0, at) + chr(0) + s.slice(at + 1, n) }
+    if kind == 3 { return s.slice(0, at) + chr(255) + s.slice(at + 1, n) }
+    if kind == 4 { return s.slice(0, at) }
+    let len = 1 + nxt(seed) % 64
+    var e = at + len
+    if e > n { e = n }
+    return s.slice(0, e) + s.slice(at, n)
+}
+
+fn test_corrupted_real_streams_never_trap() {
+    var zs: Vec<Str> = vec()
+    var lens: Vec<Int> = vec()
+    real_streams(zs, lens)
+    let gz = read_file("std/archive/testdata/sample.gz")
+    var seed = 20260930
+    var tries = 0
+    var errors = 0
+    var i = 0
+    while i < zs.len() {
+        // the header and the first block's tables are where most of the damage bites: half the
+        // corruptions land in the first 64 bytes
+        var k = 0
+        while k < 120 {
+            var m = ""
+            if k % 2 == 0 && zs[i].len() > 64 { m = mutate(zs[i].slice(0, 64), k % 6, seed) + zs[i].slice(64, zs[i].len()) }
+            else { m = mutate(zs[i], k % 6, seed) }
+            var cap = 4 * lens[i] + 65536
+            let r = ar::inflate_zlib_checked(m, cap)
+            assert_true(ar::inflated_len(r.data) <= cap)
+            if !r.ok { errors = errors + 1  assert_true(r.err.len() > 0) }
+            ar::inflated_free(r.data)
+            // and the unchecked form, which must also stop safely
+            let u = ar::inflate_zlib(m)
+            ar::inflated_free(u)
+            tries = tries + 1
+            k = k + 1
+        }
+        i = i + 1
+    }
+    var g = 0
+    while g < 300 {
+        let m = mutate(gz, g % 6, seed)
+        let r = ar::gunzip_checked(m, 1 << 20)
+        if !r.ok { errors = errors + 1 }
+        ar::inflated_free(r.data)
+        // and its payload as a raw DEFLATE stream
+        let rr = ar::inflate_raw_checked(m.slice(10, m.len()), 1 << 20)
+        ar::inflated_free(rr.data)
+        tries = tries + 1
+        g = g + 1
+    }
+    printl("inflate fuzz: " + to_str(tries) + " corrupted streams, " + to_str(errors) + " reported damaged, no trap")
+    assert_true(tries > 1000)
+    assert_true(errors * 2 > tries)
+}
+
+// ---- hand-built streams ------------------------------------------------------------------------
+// an LSB-first bit writer; Huffman codes go out most significant bit first
+struct BW { s: Str, acc: Int, n: Int }
+fn bw() -> BW { return BW { s: "", acc: 0, n: 0 } }
+fn bput(inout w: BW, v: Int, n: Int) {
+    var i = 0
+    while i < n {
+        w.acc = w.acc | (((v >> i) & 1) << w.n)
+        w.n = w.n + 1
+        if w.n == 8 { w.s = w.s + chr(w.acc)  w.acc = 0  w.n = 0 }
+        i = i + 1
+    }
+}
+fn code(inout w: BW, c: Int, n: Int) {
+    var i = n - 1
+    while i >= 0 { bput(w, (c >> i) & 1, 1)  i = i - 1 }
+}
+fn done(inout w: BW) -> Str { if w.n > 0 { w.s = w.s + chr(w.acc)  w.acc = 0  w.n = 0 }  return copy w.s }
+fn err_of(r: ar::InflateResult) -> Str { let e = copy r.err  ar::inflated_free(r.data)  return e }
+
+fn test_each_check() {
+    // fixed block: 'a', then a match of 3 at distance 2: one byte of output, so it reaches before it
+    var w = bw()
+    bput(w, 1, 1)  bput(w, 1, 2)
+    code(w, 48 + 97, 8)             // literal 'a'
+    code(w, 1, 7)                    // length 3 (symbol 257)
+    code(w, 1, 5)                    // distance 2 (symbol 1)
+    code(w, 0, 7)                    // end of block
+    let far = done(w)
+    assert_streq(err_of(ar::inflate_raw_checked(far, 0)), ar::inflate_err_text(10))
+    // the same at distance 1 is fine: "aaaa"
+    var w1 = bw()
+    bput(w1, 1, 1)  bput(w1, 1, 2)  code(w1, 48 + 97, 8)  code(w1, 1, 7)  code(w1, 0, 5)  code(w1, 0, 7)
+    let ok = ar::inflate_raw_checked(done(w1), 0)
+    assert_true(ok.ok)
+    assert_streq(blob(ok.data), "aaaa")
+    ar::inflated_free(ok.data)
+    // …and over a cap of 3 it is too big
+    var w2 = bw()
+    bput(w2, 1, 1)  bput(w2, 1, 2)  code(w2, 48 + 97, 8)  code(w2, 1, 7)  code(w2, 0, 5)  code(w2, 0, 7)
+    assert_streq(err_of(ar::inflate_raw_checked(done(w2), 3)), ar::inflate_err_text(11))
+    // distance symbol 30 (undefined)
+    var w3 = bw()
+    bput(w3, 1, 1)  bput(w3, 1, 2)  code(w3, 48 + 97, 8)  code(w3, 1, 7)  code(w3, 30, 5)  code(w3, 0, 7)
+    assert_streq(err_of(ar::inflate_raw_checked(done(w3), 0)), ar::inflate_err_text(9))
+    // literal/length symbol 286 (fixed code 11000110)
+    var w4 = bw()
+    bput(w4, 1, 1)  bput(w4, 1, 2)  code(w4, 198, 8)
+    assert_streq(err_of(ar::inflate_raw_checked(done(w4), 0)), ar::inflate_err_text(9))
+    // block type 3
+    var w5 = bw()
+    bput(w5, 1, 1)  bput(w5, 3, 2)
+    assert_streq(err_of(ar::inflate_raw_checked(done(w5), 0)), ar::inflate_err_text(2))
+    // a stored block whose NLEN is not ~LEN, and one longer than the input
+    assert_streq(err_of(ar::inflate_raw_checked("" + chr(1) + chr(5) + chr(0) + chr(0) + chr(0) + "hello", 0)), ar::inflate_err_text(3))
+    assert_streq(err_of(ar::inflate_raw_checked("" + chr(1) + chr(5) + chr(0) + chr(250) + chr(255) + "he", 0)), ar::inflate_err_text(3))
+    // a dynamic header counting 287 literal/length codes
+    var w6 = bw()
+    bput(w6, 1, 1)  bput(w6, 2, 2)  bput(w6, 30, 5)  bput(w6, 0, 5)  bput(w6, 0, 4)
+    assert_streq(err_of(ar::inflate_raw_checked(done(w6), 0)), ar::inflate_err_text(4))
+    // over-subscribed code-length code lengths (four codes of length 1)
+    var w7 = bw()
+    bput(w7, 1, 1)  bput(w7, 2, 2)  bput(w7, 0, 5)  bput(w7, 0, 5)  bput(w7, 0, 4)
+    bput(w7, 1, 3)  bput(w7, 1, 3)  bput(w7, 1, 3)  bput(w7, 1, 3)
+    assert_streq(err_of(ar::inflate_raw_checked(done(w7), 0)), ar::inflate_err_text(5))
+    // a repeat (16) before any length: code lengths 16 and 0 at length 1 each
+    var w8 = bw()
+    bput(w8, 1, 1)  bput(w8, 2, 2)  bput(w8, 0, 5)  bput(w8, 0, 5)  bput(w8, 0, 4)
+    bput(w8, 1, 3)  bput(w8, 0, 3)  bput(w8, 0, 3)  bput(w8, 1, 3)     // order: 16, 17, 18, 0
+    code(w8, 1, 1)                                                     // symbol 16 (codes: 0 -> 0, 16 -> 1)
+    bput(w8, 0, 2)
+    assert_streq(err_of(ar::inflate_raw_checked(done(w8), 0)), ar::inflate_err_text(6))
+    // empty input, a truncated stream, a bad zlib header and a bad checksum
+    assert_false(ar::inflate_raw_checked("", 0).ok)
+    let z = ar::deflate_zlib("the quick brown fox jumps over the lazy dog")
+    assert_streq(err_of(ar::inflate_zlib_checked(z.slice(0, z.len() - 9), 0)), ar::inflate_err_text(1))
+    assert_streq(err_of(ar::inflate_zlib_checked("" + chr(9) + z.slice(1, z.len()), 0)), ar::inflate_err_text(12))
+    let last = z.len() - 1
+    assert_streq(err_of(ar::inflate_zlib_checked(z.slice(0, last) + chr((ord(z.at(last)) + 1) & 255), 0)), ar::inflate_err_text(13))
+    let good = ar::inflate_zlib_checked(z, 0)
+    assert_true(good.ok)
+    ar::inflated_free(good.data)
+}

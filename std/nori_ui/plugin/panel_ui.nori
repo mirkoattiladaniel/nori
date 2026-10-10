@@ -1,0 +1,176 @@
+//! A panel's document from a `.ui` file and a `.style` file, the way a web page is HTML and CSS.
+//!
+//! A plugin returns its whole document from `nori_plugin_render` as a string, so a panel written
+//! that way builds the string in code: the shape of the panel, its colours and its data all
+//! concatenated together in one function. That is fine for a status line and awkward for anything a
+//! person might want to restyle. The template renderer, the standalone `.style` parser and the
+//! stylesheet cascade exist for this, but a plugin needs a way to find a file of its own.
+//!
+//! `plugin.dir` answers that, and this turns the answer into a document:
+//!
+//! ```nori,excerpt
+//! ui::plugin::panel_ui_sync(g_doc, ui::plugin::plugin_dir(g_host, "build_panel"), "build")
+//! return os::os_cstr(ui::plugin::panel_ui_doc(g_doc, env))
+//! ```
+//!
+//! The files are read at run time and re-read when their size or mtime moves, so editing
+//! `build.ui` restyles the panel in the next frame with no rebuild, much like working on a web
+//! page. A program that must ship sealed wants `include_str` instead: same text, compiled in, no
+//! files to lose and nothing to edit.
+//!
+//! The data stays in code. A `.ui` file says what the panel looks like and `{{#foreach row in
+//! rows}}` says it repeats; the plugin builds the JSON that fills it. That is the split: markup and
+//! style in files a designer can edit, data and behaviour in Nori.
+
+use core::*
+import "std/dl" as dl
+import "std/json" as json
+import "std/os" as os
+import "std/nori_ui" as ui
+
+/// a panel's two files, and what they were when last read.
+pub struct PanelUi {
+    dir: Str, base: Str,
+    ui_src: Str, style_src: Str,
+    ui_stamp: Str, style_stamp: Str,
+    loaded: Bool, err: Str
+}
+
+pub fn panel_ui_new() -> PanelUi {
+    return PanelUi { dir: "", base: "", ui_src: "", style_src: "",
+                     ui_stamp: "", style_stamp: "", loaded: false, err: "" }
+}
+
+pub fn panel_ui_ok(p: PanelUi) -> Bool { return p.loaded }
+pub fn panel_ui_err(p: PanelUi) -> Str { return copy p.err }
+pub fn panel_ui_source(p: PanelUi) -> Str { return copy p.ui_src }
+pub fn panel_ui_style(p: PanelUi) -> Str { return copy p.style_src }
+
+/// ask the shell where a plugin's library was loaded from. "" when it cannot say.
+pub fn plugin_dir(host: Int, name: Str) -> Str {
+    if host == 0 { return "" }
+    let rep = dl::host_call(host, "plugin.dir", copy name)
+    if rep.len() == 0 { return "" }
+    var d = json::parse(rep)
+    if !json::as_bool(json::field(d, "ok")) { return "" }
+    return copy json::as_str(json::field(d, "result"))
+}
+
+/// where a panel's file is: in the source tree it was built from, or beside the library.
+///
+/// `plugin.dir` names the directory the `.so` was loaded from: `…/build/dev` in a checkout, and the
+/// place a shipped plugin keeps its files. A plugin under development has them in `…/src`, two levels
+/// up, and that is the copy someone is editing.
+///
+/// The source copy wins. `roll` copies `[assets]` next to the library at build time, so after the
+/// first build both exist, and looking beside the library first would ignore every edit to
+/// `src/panel.ui` until the next rebuild. A `src/` exactly two levels above a `build/<profile>/`
+/// directory is this plugin's own source rather than a stray tree, and a shipped plugin has nothing
+/// there at all.
+pub fn panel_ui_path(dir: Str, base: Str, ext: Str) -> Str {
+    let src = dir + ("/../../src/" + (base + ext))
+    if os::path_exists(src) { return src }
+    return dir + ("/" + (base + ext))
+}
+
+/// read `dir/base.ui` and `dir/base.style` if either has changed since the last look.
+///
+/// This costs two stats a frame (`stamp_of`), which is also what the plugin loader itself pays to
+/// watch for a rebuilt `.so`. Returns true when something was re-read, so a caller can throw away
+/// anything it derived from the old text.
+///
+/// A missing `.style` is not an error (a panel may have only structure), but a missing `.ui` is:
+/// there is no document without it, and saying so is better than drawing nothing.
+pub fn panel_ui_sync(inout p: PanelUi, dir: Str, base: Str) -> Bool {
+    if dir.len() == 0 {
+        if !p.loaded && p.err.len() == 0 { p.err = "no plugin directory: the shell did not answer plugin.dir" }
+        return false
+    }
+    let upath = panel_ui_path(dir, base, ".ui")
+    let spath = panel_ui_path(dir, base, ".style")
+    let ust = stamp_of(upath)
+    let sst = stamp_of(spath)
+    if p.loaded && ust == p.ui_stamp && sst == p.style_stamp { return false }
+    p.dir = copy dir
+    p.base = copy base
+    p.ui_stamp = copy ust
+    p.style_stamp = copy sst
+    if ust.len() == 0 {
+        p.loaded = false
+        p.err = "no .ui file at " + upath
+        p.ui_src = ""
+        p.style_src = ""
+        return true
+    }
+    p.ui_src = read_file(upath)
+    p.style_src = ""
+    if sst.len() > 0 { p.style_src = read_file(spath) }
+    p.loaded = true
+    p.err = ""
+    return true
+}
+
+/// the panel's document: the stylesheet, then the template filled in from `env`.
+///
+/// The `.style` file is the document's `stylesheet { }` block. A `.style` source is a sequence of
+/// `class X { … }` / `tag Y { … }` rules (the same rules that block holds), so wrapping rather than
+/// parsing and re-emitting keeps one spelling of a stylesheet in the language, and a `.style` file
+/// can be pasted into a document and a document's block saved out as a file.
+///
+/// An error is a document too. A panel whose template is broken draws the reason, with the line and
+/// column the renderer reported, because the alternative is an empty rectangle and no idea why.
+pub fn panel_ui_doc(p: PanelUi, env: json::Json) -> Str {
+    if !p.loaded { return panel_ui_error_doc(copy p.err) }
+    let r = ui::layout::render_ui_template_json(copy p.ui_src, env)
+    if !r.ok { return panel_ui_error_doc(p.base + (".ui: " + copy r.err)) }
+    if p.style_src.len() == 0 { return copy r.out }
+    return "stylesheet {\n" + (p.style_src + ("\n}\n" + r.out))
+}
+
+/// the rules inside a `stylesheet { … }` block, or the string unchanged when it is already rules.
+///
+/// A document may have only one stylesheet block (a second is "duplicate stylesheet block"), and a
+/// real panel has two sources of style: the shell's theme, which arrives from `shell.theme` as a
+/// whole block, and its own `.style` file. They have to become one block, so the outer braces come
+/// off whichever already has them.
+pub fn panel_ui_sheet_rules(src: Str) -> Str {
+    var i = 0
+    while i < src.len() && (ord(src.at(i)) == 32 || ord(src.at(i)) == 10 || ord(src.at(i)) == 9 || ord(src.at(i)) == 13) { i = i + 1 }
+    let head = "stylesheet"
+    if i + head.len() > src.len() { return copy src }
+    if !(src.slice(i, i + head.len()) == head) { return copy src }
+    var open = 0 - 1
+    var k = i + head.len()
+    while k < src.len() && open < 0 { if ord(src.at(k)) == 123 { open = k }  k = k + 1 }
+    if open < 0 { return copy src }
+    var close = 0 - 1
+    var e = src.len() - 1
+    while e > open && close < 0 { if ord(src.at(e)) == 125 { close = e }  e = e - 1 }
+    if close < 0 { return copy src }
+    return src.slice(open + 1, close)
+}
+
+/// the panel's document with another sheet's rules in front of its own: the shell's theme, whose
+/// classes every panel draws with. Rules later in a block win, so the panel's `.style` overrides.
+pub fn panel_ui_doc_themed(p: PanelUi, env: json::Json, theme: Str) -> Str {
+    if !p.loaded { return panel_ui_error_doc(copy p.err) }
+    let r = ui::layout::render_ui_template_json(copy p.ui_src, env)
+    if !r.ok { return panel_ui_error_doc(p.base + (".ui: " + copy r.err)) }
+    let outer = panel_ui_sheet_rules(theme)
+    let mine = panel_ui_sheet_rules(copy p.style_src)
+    if outer.len() == 0 && mine.len() == 0 { return copy r.out }
+    return "stylesheet {\n" + (outer + ("\n" + (mine + ("\n}\n" + r.out))))
+}
+
+/// what a panel draws when its own files are wrong.
+pub fn panel_ui_error_doc(msg: Str) -> Str {
+    var m = ""
+    var i = 0
+    while i < msg.len() {
+        let c = msg.at(i)
+        let o = ord(c)
+        if o == 92 { m = m + "\\\\" } else if o == 34 { m = m + "\\\"" } else if o < 32 { m = m + " " } else { m = m + c }
+        i = i + 1
+    }
+    return "column { padding: 12 gap: 6 text { text: \"this panel's .ui could not be drawn\" } text { wrap: true text: \"" + (m + "\" } }")
+}

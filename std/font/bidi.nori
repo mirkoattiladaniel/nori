@@ -1,0 +1,546 @@
+// std/font: the Unicode Bidirectional Algorithm (UAX #9, Unicode 16).
+//
+//   let cps = font::utf8_codepoints(text)
+//   let r = font::bidi_resolve(cps, font::BIDI_AUTO())     // r.levels[i]: resolved level, -1 if removed
+//   let order = font::bidi_visual_order(r, 0, cps.len())   // logical indices in visual order
+//
+// Paragraph level (P2/P3), explicit embeddings, overrides and isolates (X1-X10, with the 125-level
+// depth limit and overflow counters), weak types (W1-W7), paired brackets (N0, BD16 with the
+// canonical-equivalent angle brackets), neutrals (N1-N2), implicit levels (I1-I2), and per line
+// the trailing-whitespace reset (L1) and reordering (L2).
+//
+// Characters X9 removes (embedding controls and Boundary_Neutral) get level -1 and do not appear
+// in a visual order. Tested against BidiCharacterTest.txt and FriBidi.
+
+/// paragraph direction from the text (P2/P3)
+pub fn BIDI_AUTO() -> Int { return 2 }
+/// left-to-right paragraph
+pub fn BIDI_LTR() -> Int { return 0 }
+/// right-to-left paragraph
+pub fn BIDI_RTL() -> Int { return 1 }
+
+/// a resolved paragraph: per code point its level (-1 for a character removed by X9) and its
+/// original bidi class; `para_level` is the paragraph embedding level (0 or 1).
+pub struct BidiResult { levels: Vec<Int>, classes: Vec<Int>, para_level: Int }
+
+fn bc_is_strong(c: Int) -> Bool { return c == BC_L() || c == BC_R() || c == BC_AL() }
+fn bc_is_isolate_init(c: Int) -> Bool { return c == BC_LRI() || c == BC_RLI() || c == BC_FSI() }
+fn bc_is_removed(c: Int) -> Bool {
+    return c == BC_RLE() || c == BC_LRE() || c == BC_RLO() || c == BC_LRO() || c == BC_PDF() || c == BC_BN()
+}
+fn bc_is_ni(c: Int) -> Bool {
+    return c == BC_B() || c == BC_S() || c == BC_WS() || c == BC_ON() || c == BC_LRI() || c == BC_RLI() || c == BC_FSI() || c == BC_PDI()
+}
+
+// the PDI matching the isolate initiator at `i`, or n when none (BD9)
+fn matching_pdi(cls: Vec<Int>, i: Int, n: Int) -> Int {
+    var depth = 1
+    var j = i + 1
+    while j < n {
+        let c = cls[j]
+        if bc_is_isolate_init(c) { depth = depth + 1 }
+        else if c == BC_PDI() { depth = depth - 1  if depth == 0 { return j } }
+        else if c == BC_B() { return n }
+        j = j + 1
+    }
+    return n
+}
+// P2/P3 over [from, to): 0 for L, 1 for R/AL, -1 when no strong character (isolates skipped)
+fn first_strong(cls: Vec<Int>, from: Int, to: Int) -> Int {
+    var i = from
+    while i < to {
+        let c = cls[i]
+        if c == BC_L() { return 0 }
+        if c == BC_R() || c == BC_AL() { return 1 }
+        if bc_is_isolate_init(c) { i = matching_pdi(cls, i, to) }
+        else if c == BC_B() { return 0 - 1 }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+/// the paragraph level P2/P3 gives `cps` (0 when there is no strong character)
+pub fn bidi_paragraph_level(cps: Vec<Int>) -> Int {
+    var cls: Vec<Int> = vec()
+    var i = 0
+    while i < cps.len() { cls.push(ucd_bidi_class(cps[i]))  i = i + 1 }
+    let s = first_strong(cls, 0, cls.len())
+    if s < 0 { return 0 }
+    return s
+}
+
+/// resolve the levels of `cps` (one or more paragraphs, split at paragraph separators) with
+/// paragraph direction `dir` (BIDI_AUTO/BIDI_LTR/BIDI_RTL). Each paragraph is also treated as one
+/// line for L1; call bidi_line_levels for the levels of a narrower line.
+pub fn bidi_resolve(cps: Vec<Int>, dir: Int) -> BidiResult {
+    let n = cps.len()
+    var cls: Vec<Int> = vec()
+    var i = 0
+    while i < n { cls.push(ucd_bidi_class(cps[i]))  i = i + 1 }
+    var levels: Vec<Int> = vec()
+    i = 0
+    while i < n { levels.push(0)  i = i + 1 }
+    var first_para_level = 0 - 1
+    var start = 0
+    while start < n {
+        var end = start
+        while end < n && cls[end] != BC_B() { end = end + 1 }
+        if end < n { end = end + 1 }                                      // the separator belongs to its paragraph
+        var pl = 0
+        if dir == BIDI_RTL() { pl = 1 }
+        else if dir == BIDI_AUTO() { let s = first_strong(cls, start, end)  if s > 0 { pl = 1 } }
+        if first_para_level < 0 { first_para_level = pl }
+        resolve_paragraph(cps, cls, levels, start, end, pl)
+        start = end
+    }
+    if first_para_level < 0 {
+        first_para_level = 0
+        if dir == BIDI_RTL() { first_para_level = 1 }
+    }
+    return BidiResult { levels: levels, classes: cls, para_level: first_para_level }
+}
+
+// X1-X8 for one paragraph: explicit levels, and the classes overrides and FSI resolution produce
+fn resolve_paragraph(cps: Vec<Int>, cls: Vec<Int>, inout levels: Vec<Int>, start: Int, end: Int, pl: Int) {
+    let n = end - start
+    var t: Vec<Int> = vec()                                               // working classes
+    var i = 0
+    while i < n { t.push(cls[start + i])  i = i + 1 }
+    var lv: Vec<Int> = vec()
+    i = 0
+    while i < n { lv.push(pl)  i = i + 1 }
+    // the directional status stack
+    var st_level: Vec<Int> = [pl]
+    var st_override: Vec<Int> = [0 - 1]                                  // -1 neutral, else BC_L / BC_R
+    var st_isolate: Vec<Bool> = vec()   // (not a [false] literal: push(true) onto one reads back false)
+    st_isolate.push(false)
+    var overflow_isolate = 0
+    var overflow_embedding = 0
+    var valid_isolate = 0
+    var local: Vec<Int> = vec()                                           // classes of the paragraph (for FSI)
+    i = 0
+    while i < n { local.push(cls[start + i])  i = i + 1 }
+    i = 0
+    while i < n {
+        let c = t[i]
+        let top = st_level.len() - 1
+        if c == BC_RLE() || c == BC_LRE() || c == BC_RLO() || c == BC_LRO() {
+            var nl = 0
+            if c == BC_RLE() || c == BC_RLO() { nl = (st_level[top] + 1) | 1 } else { nl = (st_level[top] + 2) & (0 - 2) }
+            lv[i] = st_level[top]
+            if nl <= 125 && overflow_isolate == 0 && overflow_embedding == 0 {
+                st_level.push(nl)
+                if c == BC_RLO() { st_override.push(BC_R()) } else if c == BC_LRO() { st_override.push(BC_L()) } else { st_override.push(0 - 1) }
+                st_isolate.push(false)
+            } else if overflow_isolate == 0 { overflow_embedding = overflow_embedding + 1 }
+        } else if bc_is_isolate_init(c) {
+            var isrtl = c == BC_RLI()
+            if c == BC_FSI() {
+                let m = matching_pdi(local, i, n)
+                isrtl = first_strong(local, i + 1, m) == 1
+            }
+            lv[i] = st_level[top]
+            if st_override[top] >= 0 { t[i] = st_override[top] }
+            var nl = 0
+            if isrtl { nl = (st_level[top] + 1) | 1 } else { nl = (st_level[top] + 2) & (0 - 2) }
+            if nl <= 125 && overflow_isolate == 0 && overflow_embedding == 0 {
+                valid_isolate = valid_isolate + 1
+                st_level.push(nl)
+                st_override.push(0 - 1)
+                st_isolate.push(true)
+            } else { overflow_isolate = overflow_isolate + 1 }
+        } else if c == BC_PDI() {
+            if overflow_isolate > 0 { overflow_isolate = overflow_isolate - 1 }
+            else if valid_isolate > 0 {
+                overflow_embedding = 0
+                while !st_isolate[st_isolate.len() - 1] { st_level.pop()  st_override.pop()  st_isolate.pop() }
+                st_level.pop()  st_override.pop()  st_isolate.pop()
+                valid_isolate = valid_isolate - 1
+            }
+            let tp = st_level.len() - 1
+            lv[i] = st_level[tp]
+            if st_override[tp] >= 0 { t[i] = st_override[tp] }
+        } else if c == BC_PDF() {
+            lv[i] = st_level[top]
+            if overflow_isolate > 0 { }
+            else if overflow_embedding > 0 { overflow_embedding = overflow_embedding - 1 }
+            else if !st_isolate[top] && st_level.len() >= 2 { st_level.pop()  st_override.pop()  st_isolate.pop() }
+        } else if c == BC_B() {
+            lv[i] = pl
+        } else if c == BC_BN() {
+            lv[i] = st_level[top]
+        } else {
+            lv[i] = st_level[top]
+            if st_override[top] >= 0 { t[i] = st_override[top] }
+        }
+        i = i + 1
+    }
+    // X9: the removed characters; X10: level runs and isolating run sequences
+    var kept: Vec<Int> = vec()                                            // paragraph offsets of kept chars
+    i = 0
+    while i < n { if !bc_is_removed(local[i]) { kept.push(i) }  i = i + 1 }
+    let nk = kept.len()
+    // level runs over kept characters
+    var run_start: Vec<Int> = vec()
+    var run_end: Vec<Int> = vec()                                         // exclusive, in kept indices
+    var k = 0
+    while k < nk {
+        var e = k + 1
+        while e < nk && lv[kept[e]] == lv[kept[k]] { e = e + 1 }
+        run_start.push(k)
+        run_end.push(e)
+        k = e
+    }
+    // the run each kept index is in, and for matching PDIs, chain runs into sequences
+    let nr = run_start.len()
+    var run_of: Vec<Int> = vec()
+    k = 0
+    while k < nk { run_of.push(0)  k = k + 1 }
+    var r = 0
+    while r < nr { k = run_start[r]  while k < run_end[r] { run_of[k] = r  k = k + 1 }  r = r + 1 }
+    // kept index of each paragraph offset
+    var kidx: Vec<Int> = vec()
+    i = 0
+    while i < n { kidx.push(0 - 1)  i = i + 1 }
+    k = 0
+    while k < nk { kidx[kept[k]] = k  k = k + 1 }
+    // the explicit levels, kept apart: sos/eos compare against these, not against levels an earlier
+    // sequence's implicit rules have already raised
+    var xl: Vec<Int> = vec()
+    i = 0
+    while i < n { xl.push(lv[i])  i = i + 1 }
+    var run_used: Vec<Bool> = vec()
+    r = 0
+    while r < nr { run_used.push(false)  r = r + 1 }
+    r = 0
+    while r < nr {
+        if run_used[r] { r = r + 1  continue }
+        // a sequence starts here unless this run begins with a PDI matching an initiator; those are
+        // reached from the initiator's run
+        var seq: Vec<Int> = vec()                                         // kept indices
+        var cur_r = r
+        var go = true
+        while go {
+            run_used[cur_r] = true
+            k = run_start[cur_r]
+            while k < run_end[cur_r] { seq.push(k)  k = k + 1 }
+            let last = kept[run_end[cur_r] - 1]
+            go = false
+            if bc_is_isolate_init(local[last]) {
+                let m = matching_pdi(local, last, n)
+                if m < n && kidx[m] >= 0 {
+                    let nr2 = run_of[kidx[m]]
+                    if !run_used[nr2] { cur_r = nr2  go = true }
+                }
+            }
+        }
+        resolve_sequence(cps, start, local, t, lv, xl, kept, seq, pl, n)
+        r = r + 1
+    }
+    // L1 (the paragraph as one line) and copy out
+    i = 0
+    while i < n { levels[start + i] = lv[i]  i = i + 1 }
+    i = 0
+    while i < n { if bc_is_removed(local[i]) { levels[start + i] = 0 - 1 }  i = i + 1 }
+    apply_l1(local, levels, start, end, pl)
+}
+
+fn dir_of_level(l: Int) -> Int { if (l & 1) != 0 { return BC_R() }  return BC_L() }
+
+// W1-W7, N0-N2, I1-I2 over one isolating run sequence (`seq`: kept indices in order)
+fn resolve_sequence(cps: Vec<Int>, pstart: Int, local: Vec<Int>, inout t: Vec<Int>, inout lv: Vec<Int>, xl: Vec<Int>, kept: Vec<Int>, seq: Vec<Int>, pl: Int, n: Int) {
+    let m = seq.len()
+    if m == 0 { return }
+    let first = kept[seq[0]]
+    let last = kept[seq[m - 1]]
+    let level = xl[first]
+    // sos: the level of the kept character before the sequence's first one
+    var prev_level = pl
+    if seq[0] > 0 { prev_level = xl[kept[seq[0] - 1]] }
+    var hi = level
+    if prev_level > hi { hi = prev_level }
+    let sos = dir_of_level(hi)
+    // eos: the kept character after the last one, unless the sequence ends with an isolate initiator
+    var next_level = pl
+    if !bc_is_isolate_init(local[last]) && seq[m - 1] + 1 < kept.len() { next_level = xl[kept[seq[m - 1] + 1]] }
+    if bc_is_isolate_init(local[last]) { next_level = pl }
+    hi = level
+    if next_level > hi { hi = next_level }
+    let eos = dir_of_level(hi)
+    // the working types of the sequence
+    var ty: Vec<Int> = vec()
+    var j = 0
+    while j < m { ty.push(t[kept[seq[j]]])  j = j + 1 }
+    // W1
+    j = 0
+    while j < m {
+        if ty[j] == BC_NSM() {
+            if j == 0 { ty[j] = sos }
+            else {
+                let p = ty[j - 1]
+                if bc_is_isolate_init(p) || p == BC_PDI() { ty[j] = BC_ON() } else { ty[j] = p }
+            }
+        }
+        j = j + 1
+    }
+    // W2
+    var last_strong = sos
+    j = 0
+    while j < m {
+        let c = ty[j]
+        if c == BC_L() || c == BC_R() || c == BC_AL() { last_strong = c }
+        else if c == BC_EN() && last_strong == BC_AL() { ty[j] = BC_AN() }
+        j = j + 1
+    }
+    // W3
+    j = 0
+    while j < m { if ty[j] == BC_AL() { ty[j] = BC_R() }  j = j + 1 }
+    // W4
+    j = 1
+    while j + 1 < m {
+        let c = ty[j]
+        if c == BC_ES() && ty[j - 1] == BC_EN() && ty[j + 1] == BC_EN() { ty[j] = BC_EN() }
+        else if c == BC_CS() && ty[j - 1] == BC_EN() && ty[j + 1] == BC_EN() { ty[j] = BC_EN() }
+        else if c == BC_CS() && ty[j - 1] == BC_AN() && ty[j + 1] == BC_AN() { ty[j] = BC_AN() }
+        j = j + 1
+    }
+    // W5
+    j = 0
+    while j < m {
+        if ty[j] == BC_ET() {
+            var e = j
+            while e < m && ty[e] == BC_ET() { e = e + 1 }
+            var en = false
+            if j > 0 && ty[j - 1] == BC_EN() { en = true }
+            if e < m && ty[e] == BC_EN() { en = true }
+            if en { var q = j  while q < e { ty[q] = BC_EN()  q = q + 1 } }
+            j = e
+        } else { j = j + 1 }
+    }
+    // W6
+    j = 0
+    while j < m { let c = ty[j]  if c == BC_ES() || c == BC_ET() || c == BC_CS() { ty[j] = BC_ON() }  j = j + 1 }
+    // W7
+    last_strong = sos
+    j = 0
+    while j < m {
+        let c = ty[j]
+        if c == BC_L() || c == BC_R() { last_strong = c }
+        else if c == BC_EN() && last_strong == BC_L() { ty[j] = BC_L() }
+        j = j + 1
+    }
+    let e_dir = dir_of_level(level)
+    // N0: paired brackets
+    resolve_brackets(cps, pstart, local, ty, kept, seq, sos, e_dir)
+    // N1/N2
+    j = 0
+    while j < m {
+        if bc_is_ni(ty[j]) {
+            var e = j
+            while e < m && bc_is_ni(ty[e]) { e = e + 1 }
+            var before = sos
+            if j > 0 { before = strong_dir(ty[j - 1]) }
+            var after = eos
+            if e < m { after = strong_dir(ty[e]) }
+            var d = e_dir
+            if before == after { d = before }
+            var q = j
+            while q < e { ty[q] = d  q = q + 1 }
+            j = e
+        } else { j = j + 1 }
+    }
+    // I1/I2
+    j = 0
+    while j < m {
+        let at = kept[seq[j]]
+        let c = ty[j]
+        var l = lv[at]
+        if (l & 1) == 0 {
+            if c == BC_R() { l = l + 1 } else if c == BC_AN() || c == BC_EN() { l = l + 2 }
+        } else {
+            if c == BC_L() || c == BC_EN() || c == BC_AN() { l = l + 1 }
+        }
+        lv[at] = l
+        t[at] = c
+        j = j + 1
+    }
+}
+// L, R, or (EN/AN) R for neutral resolution
+fn strong_dir(c: Int) -> Int {
+    if c == BC_L() { return BC_L() }
+    if c == BC_R() || c == BC_AL() || c == BC_EN() || c == BC_AN() { return BC_R() }
+    return 0 - 1
+}
+
+// canonical equivalents for bracket matching: U+2329/U+232A are U+3008/U+3009
+fn bracket_canon(cp: Int) -> Int {
+    if cp == 9001 { return 12296 }
+    if cp == 9002 { return 12297 }
+    return cp
+}
+
+fn resolve_brackets(cps: Vec<Int>, pstart: Int, local: Vec<Int>, inout ty: Vec<Int>, kept: Vec<Int>, seq: Vec<Int>, sos: Int, e_dir: Int) {
+    let m = seq.len()
+    // BD16: find the pairs
+    var st_cp: Vec<Int> = vec()
+    var st_pos: Vec<Int> = vec()
+    var po: Vec<Int> = vec()                                              // pair openings (sequence indices)
+    var pc: Vec<Int> = vec()                                              // pair closings
+    var j = 0
+    var overflow = false
+    while j < m && !overflow {
+        if ty[j] == BC_ON() {
+            let cp = cps[pstart + kept[seq[j]]]
+            let bt = ucd_bracket_type(cp)
+            if bt == 1 {
+                if st_cp.len() >= 63 { overflow = true }
+                else { st_cp.push(bracket_canon(ucd_bracket_pair(cp)))  st_pos.push(j) }
+            } else if bt == 2 {
+                let want = bracket_canon(cp)
+                var s = st_cp.len() - 1
+                while s >= 0 {
+                    if st_cp[s] == want {
+                        po.push(st_pos[s])
+                        pc.push(j)
+                        while st_cp.len() > s { st_cp.pop()  st_pos.pop() }
+                        break
+                    }
+                    s = s - 1
+                }
+            }
+        }
+        j = j + 1
+    }
+    if overflow { while po.len() > 0 { po.pop()  pc.pop() } }
+    // sort pairs by opening position
+    var a = 1
+    while a < po.len() {
+        let o = po[a]  let c = pc[a]
+        var b = a
+        while b > 0 && po[b - 1] > o { po[b] = po[b - 1]  pc[b] = pc[b - 1]  b = b - 1 }
+        po[b] = o  pc[b] = c
+        a = a + 1
+    }
+    var p = 0
+    while p < po.len() {
+        let o = po[p]
+        let c = pc[p]
+        var found_e = false
+        var found_o = false
+        var q = o + 1
+        while q < c {
+            let d = strong_dir(ty[q])
+            if d == e_dir { found_e = true }
+            else if d >= 0 { found_o = true }
+            q = q + 1
+        }
+        var newt = 0 - 1
+        if found_e { newt = e_dir }
+        else if found_o {
+            // the context before the opening bracket
+            var ctx = sos
+            q = o - 1
+            while q >= 0 {
+                let d = strong_dir(ty[q])
+                if d >= 0 { ctx = d  break }
+                q = q - 1
+            }
+            if ctx != e_dir { newt = ctx } else { newt = e_dir }
+        }
+        if newt >= 0 {
+            ty[o] = newt
+            ty[c] = newt
+            // NSMs (originally) after either bracket take its new type
+            q = o + 1
+            while q < m && local_of(local, kept, seq, q) == BC_NSM() { ty[q] = newt  q = q + 1 }
+            q = c + 1
+            while q < m && local_of(local, kept, seq, q) == BC_NSM() { ty[q] = newt  q = q + 1 }
+        }
+        p = p + 1
+    }
+}
+fn local_of(local: Vec<Int>, kept: Vec<Int>, seq: Vec<Int>, q: Int) -> Int { return local[kept[seq[q]]] }
+
+// L1: segment and paragraph separators, and whitespace/isolate controls before them or at the end of
+// the line, return to the paragraph level. Removed (X9) characters inside such a run go with it.
+fn apply_l1(cls: Vec<Int>, inout levels: Vec<Int>, start: Int, end: Int, pl: Int) {
+    var i = end - 1
+    var trailing = true
+    while i >= start {
+        let c = cls[i - start]
+        if c == BC_S() || c == BC_B() {
+            levels[i] = pl
+            trailing = true
+        } else if c == BC_WS() || bc_is_isolate_init(c) || c == BC_PDI() {
+            if trailing { levels[i] = pl }
+        } else if bc_is_removed(c) {
+            // stays -1, and does not break the whitespace run
+        } else {
+            trailing = false
+        }
+        i = i - 1
+    }
+}
+
+/// the levels of the line [from, to) of a resolved paragraph, with L1 applied at the line's end
+/// (whitespace before a line break returns to the paragraph level).
+pub fn bidi_line_levels(r: BidiResult, from: Int, to: Int) -> Vec<Int> {
+    var out: Vec<Int> = vec()
+    var i = from
+    while i < to { out.push(r.levels[i])  i = i + 1 }
+    var j = to - 1
+    while j >= from {
+        let c = r.classes[j]
+        if c == BC_WS() || bc_is_isolate_init(c) || c == BC_PDI() { out[j - from] = r.para_level }
+        else if bc_is_removed(c) { }
+        else { break }
+        j = j - 1
+    }
+    return out
+}
+
+/// L2: the logical indices of the line [from, to) in visual (left-to-right) order; characters
+/// removed by X9 are left out.
+pub fn bidi_visual_order(r: BidiResult, from: Int, to: Int) -> Vec<Int> {
+    let lv = bidi_line_levels(r, from, to)
+    return bidi_reorder(lv, from)
+}
+
+/// L2 over an explicit level list (entries of -1 are skipped): indices `base + i` in visual order.
+pub fn bidi_reorder(lv: Vec<Int>, base: Int) -> Vec<Int> {
+    var idx: Vec<Int> = vec()
+    var lev: Vec<Int> = vec()
+    var i = 0
+    var maxl = 0
+    var minodd = 1000
+    while i < lv.len() {
+        if lv[i] >= 0 {
+            idx.push(base + i)
+            lev.push(lv[i])
+            if lv[i] > maxl { maxl = lv[i] }
+            if (lv[i] & 1) == 1 && lv[i] < minodd { minodd = lv[i] }
+        }
+        i = i + 1
+    }
+    var l = maxl
+    while l >= minodd && l >= 1 {
+        var s = 0
+        while s < idx.len() {
+            if lev[s] >= l {
+                var e = s
+                while e < idx.len() && lev[e] >= l { e = e + 1 }
+                var a = s
+                var b = e - 1
+                while a < b {
+                    let ti = idx[a]  idx[a] = idx[b]  idx[b] = ti
+                    let tl = lev[a]  lev[a] = lev[b]  lev[b] = tl
+                    a = a + 1
+                    b = b - 1
+                }
+                s = e
+            } else { s = s + 1 }
+        }
+        l = l - 1
+    }
+    return idx
+}
